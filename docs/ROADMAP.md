@@ -29,21 +29,24 @@ Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 - [x] Persist-on-answer (scope from UI becomes a new Rule)
 - [ ] Smoke test: nftables enqueue + curl => observable DROP/ACCEPT (manual)
 
-## Phase 2 - UI MVP [next]
+## Phase 2 - UI MVP [done]
 
-- [ ] Connect to UDS (tonic UDS client)
-- [ ] Prompt pop-up: process info, destination, Allow/Deny + scope chips
-- [ ] Rules table with edit/delete
-- [ ] Live feed scrolling list
-- [ ] Stats numbers (read from GetStatus)
+- [x] Connect to UDS (tonic + hyper-util TokioIo connector)
+- [x] Prompt cards: process info, destination, Allow/Deny + scope buttons
+- [x] Rules table with delete
+- [x] Live feed scrolling list
+- [x] Stats counter cards (read from GetStatus, 2s polling)
 - [ ] System tray icon (ksni) with quick toggle
 - [ ] Desktop notifications via notify-rust
+- [ ] Inline rule editor (currently rules only created via prompt verdict)
 
-## Phase 3 - CLI
+## Phase 3 - CLI [done]
 
-- [ ] `cfc status` real
-- [ ] `cfc rules list/add/remove/export/import`
-- [ ] `cfc live` terminal feed (color, follow mode)
+- [x] `cfc status` real
+- [x] `cfc rules list/remove`
+- [x] `cfc live` terminal feed
+- [ ] `cfc rules add/export/import` (JSON)
+- [ ] Color output and follow mode polish
 
 ## Phase 4 - eBPF backend
 
