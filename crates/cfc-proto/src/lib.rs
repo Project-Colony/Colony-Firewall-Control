@@ -8,10 +8,10 @@ pub mod v1 {
 }
 
 pub use v1::{
-    firewall_client::FirewallClient, firewall_server::FirewallServer,
-    Action as ProtoAction, ConnectionInfo, Direction as ProtoDirection,
-    Duration as ProtoDuration, ProcessInfo, PromptEvent, Protocol as ProtoProtocol,
-    RuleInfo, RuleScope as ProtoRuleScope, VerdictRequest, VerdictResponse,
+    firewall_client::FirewallClient, firewall_server::FirewallServer, Action as ProtoAction,
+    ConnectionInfo, Direction as ProtoDirection, Duration as ProtoDuration, ProcessInfo,
+    PromptEvent, Protocol as ProtoProtocol, RuleInfo, RuleScope as ProtoRuleScope, VerdictRequest,
+    VerdictResponse,
 };
 
 /// Default socket path used by the daemon and clients.

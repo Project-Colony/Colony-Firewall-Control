@@ -1,0 +1,35 @@
+{
+  "id": "colony-firewall-control",
+  "name": "Colony Firewall Control",
+  "version": "0.1.0",
+  "description": "Application-aware outbound firewall for Linux. Per-app prompts, persistent rules, live connection feed.",
+  "license": "GPL-3.0-or-later",
+  "homepage": "https://github.com/Project-Colony/Colony-Firewall-Control",
+  "repository": "https://github.com/Project-Colony/Colony-Firewall-Control",
+  "maintainer": "MotherSphere",
+  "category": "security",
+  "tags": ["firewall", "security", "network", "outbound", "opensnitch"],
+  "platforms": {
+    "linux-x86_64": {
+      "asset": "colony-firewall-control-0.1.0-linux-x86_64.tar.zst",
+      "binaries": ["colony-firewalld", "colony-firewall", "cfc"],
+      "installPath": "/usr/bin",
+      "postInstall": [
+        "install -d -m 0755 /etc/colony-firewall",
+        "install -m 0644 daemon.toml.sample /etc/colony-firewall/daemon.toml",
+        "install -m 0644 colony-firewalld.service /usr/lib/systemd/system/colony-firewalld.service",
+        "systemctl daemon-reload"
+      ]
+    }
+  },
+  "requiresRoot": true,
+  "depends": [
+    "libnetfilter_queue",
+    "libnfnetlink",
+    "sqlite"
+  ],
+  "optionalDepends": {
+    "nftables": "required to populate NFQUEUE",
+    "libnotify": "desktop notifications"
+  }
+}

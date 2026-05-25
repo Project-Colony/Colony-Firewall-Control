@@ -15,9 +15,9 @@ use tracing::{info, warn};
 
 use cfc_proto::v1::{
     firewall_server::{Firewall, FirewallServer},
-    ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse, ListRulesRequest,
-    ListRulesResponse, PromptEvent, StatusRequest, StatusResponse, SubscribeRequest,
-    UpsertRuleRequest, UpsertRuleResponse, VerdictRequest, VerdictResponse,
+    ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse, ListRulesRequest, ListRulesResponse,
+    PromptEvent, StatusRequest, StatusResponse, SubscribeRequest, UpsertRuleRequest,
+    UpsertRuleResponse, VerdictRequest, VerdictResponse,
 };
 
 struct FirewallService {
@@ -30,8 +30,7 @@ struct FirewallService {
 
 #[tonic::async_trait]
 impl Firewall for FirewallService {
-    type StreamPromptsStream =
-        tokio_stream::wrappers::ReceiverStream<Result<PromptEvent, Status>>;
+    type StreamPromptsStream = tokio_stream::wrappers::ReceiverStream<Result<PromptEvent, Status>>;
 
     async fn stream_prompts(
         &self,
@@ -118,8 +117,7 @@ impl Firewall for FirewallService {
             .into_inner()
             .rule
             .ok_or_else(|| Status::invalid_argument("rule required"))?;
-        let rule = convert::rule_from_pb(&proto)
-            .map_err(|e| Status::invalid_argument(e))?;
+        let rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
         self.store
             .upsert(&rule)
             .map_err(|e| Status::internal(format!("storage: {e}")))?;

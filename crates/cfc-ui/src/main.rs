@@ -109,7 +109,10 @@ impl App {
             last_error: None,
         };
         let socket = app.socket_path.clone();
-        (app, Task::perform(handshake(socket), Message::HandshakeDone))
+        (
+            app,
+            Task::perform(handshake(socket), Message::HandshakeDone),
+        )
     }
 
     fn title(&self) -> String {
@@ -187,6 +190,7 @@ impl App {
                 Task::none()
             }
             Message::PromptEvent(ev) => {
+                notify_prompt(&ev);
                 self.prompts.push(PromptCard { event: ev });
                 Task::none()
             }
@@ -280,12 +284,7 @@ impl App {
     }
 }
 
-fn tab_button<'a>(
-    label: &'a str,
-    this: Tab,
-    current: Tab,
-    badge: usize,
-) -> Element<'a, Message> {
+fn tab_button<'a>(label: &'a str, this: Tab, current: Tab, badge: usize) -> Element<'a, Message> {
     let display = if badge > 0 {
         format!("{label} ({badge})")
     } else {
@@ -308,9 +307,7 @@ fn tab_button_simple<'a>(label: &'a str, this: Tab, current: Tab) -> Element<'a,
 
 fn reconnect_button(state: &DaemonState) -> Element<'_, Message> {
     match state {
-        DaemonState::Connected | DaemonState::Connecting => {
-            container(text("")).into()
-        }
+        DaemonState::Connected | DaemonState::Connecting => container(text("")).into(),
         DaemonState::Failed(_) => button(text("Reconnect"))
             .on_press(Message::Reconnect)
             .padding([4, 10])
@@ -350,4 +347,22 @@ async fn submit_verdict(
         .await
         .map_err(|e| e.to_string())?;
     Ok((prompt_id, accepted))
+}
+
+fn notify_prompt(ev: &proto::PromptEvent) {
+    let (process_name, pid) = match ev.process.as_ref() {
+        Some(p) => (cfc_client::convert::process_display(p), p.pid),
+        None => ("unknown".to_string(), 0),
+    };
+    let target = match ev.connection.as_ref() {
+        Some(c) => format!("{}:{}", c.dst_ip, c.dst_port),
+        None => "?".to_string(),
+    };
+    let body = format!("{process_name} (pid {pid}) -> {target}");
+    let _ = notify_rust::Notification::new()
+        .summary("Colony Firewall: new connection")
+        .body(&body)
+        .icon("network-firewall")
+        .timeout(notify_rust::Timeout::Milliseconds(8000))
+        .show();
 }

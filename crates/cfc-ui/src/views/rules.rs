@@ -9,7 +9,8 @@ pub fn view<'a>(rules: &'a [proto::RuleInfo]) -> Element<'a, Message> {
         return container(
             column![
                 text("No rules yet").size(18),
-                text("Rules are created when you answer a prompt with \"Allow/Deny this app\".").size(12),
+                text("Rules are created when you answer a prompt with \"Allow/Deny this app\".")
+                    .size(12),
             ]
             .spacing(8),
         )

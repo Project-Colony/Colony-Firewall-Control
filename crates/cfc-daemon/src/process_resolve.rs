@@ -108,9 +108,7 @@ fn scan_proc_net(
         let _timeout = cols.next()?;
         let inode_str = cols.next()?;
 
-        if local.eq_ignore_ascii_case(&want_local)
-            && remote.eq_ignore_ascii_case(&want_remote)
-        {
+        if local.eq_ignore_ascii_case(&want_local) && remote.eq_ignore_ascii_case(&want_remote) {
             return inode_str.parse::<u64>().ok();
         }
     }
@@ -122,7 +120,10 @@ fn format_addr_port(ip: IpAddr, port: u16) -> String {
         IpAddr::V4(v4) => {
             // /proc/net/tcp formats IPv4 as 4 bytes little-endian hex.
             let o = v4.octets();
-            format!("{:02X}{:02X}{:02X}{:02X}:{:04X}", o[3], o[2], o[1], o[0], port)
+            format!(
+                "{:02X}{:02X}{:02X}{:02X}:{:04X}",
+                o[3], o[2], o[1], o[0], port
+            )
         }
         IpAddr::V6(v6) => {
             // /proc/net/tcp6 formats IPv6 as 4 little-endian u32s, each

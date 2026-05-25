@@ -62,8 +62,7 @@ impl PromptRouter {
 
     fn enqueue(&self, req: PromptRequest) {
         let prompt_id = uuid::Uuid::new_v4().to_string();
-        let timeout =
-            Duration::from_secs(self.inner.default_policy.prompt_timeout_secs as u64);
+        let timeout = Duration::from_secs(self.inner.default_policy.prompt_timeout_secs as u64);
 
         // If no UI is subscribed, the prompt would just expire to default.
         // Cut the round-trip: answer immediately with no_ui_action.
@@ -81,8 +80,7 @@ impl PromptRouter {
             prompt_id: prompt_id.clone(),
             connection: Some(convert::connection_to_pb(&req.connection)),
             process: Some(convert::process_to_pb(&req.process)),
-            deadline_unix_ms: chrono::Utc::now().timestamp_millis()
-                + timeout.as_millis() as i64,
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64,
         };
 
         {
@@ -129,10 +127,7 @@ impl PromptRouter {
 }
 
 /// Pumps `PromptRequest`s from the NFQUEUE worker into the router.
-pub async fn run_router_task(
-    mut prompt_rx: mpsc::Receiver<PromptRequest>,
-    router: PromptRouter,
-) {
+pub async fn run_router_task(mut prompt_rx: mpsc::Receiver<PromptRequest>, router: PromptRouter) {
     while let Some(req) = prompt_rx.recv().await {
         router.enqueue(req);
     }

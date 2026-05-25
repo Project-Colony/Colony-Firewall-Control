@@ -23,9 +23,7 @@ pub enum Decision {
     /// A persistent rule matched. Return the verdict immediately.
     Resolved(Verdict),
     /// No rule matched. Caller should prompt the user.
-    NeedsPrompt {
-        fallback: Verdict,
-    },
+    NeedsPrompt { fallback: Verdict },
 }
 
 impl Engine {
@@ -54,10 +52,6 @@ impl Engine {
             Action::Deny | Action::Reject => Verdict::default_deny(),
         };
         Decision::NeedsPrompt { fallback }
-    }
-
-    pub fn replace_rules(&self, rules: RuleSet) {
-        *self.inner.rules.write() = rules;
     }
 
     pub fn upsert_rule(&self, rule: Rule) {

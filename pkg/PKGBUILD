@@ -1,0 +1,60 @@
+# Maintainer: MotherSphere <linhajahad@gmail.com>
+pkgname=colony-firewall-control
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Application-aware outbound firewall for Linux, written in Rust"
+arch=('x86_64')
+url="https://github.com/Project-Colony/Colony-Firewall-Control"
+license=('GPL3')
+depends=('libnetfilter_queue' 'libnfnetlink' 'sqlite' 'gcc-libs')
+makedepends=('cargo' 'protobuf' 'pkgconf')
+optdepends=(
+    'nftables: required to populate NFQUEUE with outbound flows'
+    'libnotify: desktop notifications on new prompts'
+)
+backup=('etc/colony-firewall/daemon.toml')
+source=()
+sha256sums=()
+
+prepare() {
+    # Use the local checkout when building from the repo root.
+    if [[ -d "$startdir/.." && -f "$startdir/../Cargo.toml" ]]; then
+        ln -sfn "$startdir/.." "$srcdir/$pkgname-$pkgver"
+    fi
+    cd "$srcdir/$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked
+}
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --workspace --frozen --release
+}
+
+check() {
+    cd "$srcdir/$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --workspace --frozen --release --no-fail-fast
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    install -Dm755 target/release/colony-firewalld "$pkgdir/usr/bin/colony-firewalld"
+    install -Dm755 target/release/colony-firewall  "$pkgdir/usr/bin/colony-firewall"
+    install -Dm755 target/release/cfc              "$pkgdir/usr/bin/cfc"
+
+    install -Dm644 systemd/colony-firewalld.service \
+        "$pkgdir/usr/lib/systemd/system/colony-firewalld.service"
+
+    install -Dm644 systemd/daemon.toml.sample \
+        "$pkgdir/etc/colony-firewall/daemon.toml"
+
+    install -Dm644 systemd/nftables-snippet.conf \
+        "$pkgdir/usr/share/colony-firewall/nftables-snippet.conf"
+
+    install -Dm644 LICENSE   "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -19,8 +19,7 @@ pub fn view<'a>(prompts: &'a [PromptCard]) -> Element<'a, Message> {
         .into();
     }
 
-    let cards: Vec<Element<'a, Message>> =
-        prompts.iter().map(prompt_card).collect();
+    let cards: Vec<Element<'a, Message>> = prompts.iter().map(prompt_card).collect();
 
     container(scrollable(column(cards).spacing(10).padding(8)).height(Length::Fill))
         .padding(8)
@@ -36,9 +35,7 @@ fn prompt_card(card: &PromptCard) -> Element<'_, Message> {
         .map(convert::process_display)
         .unwrap_or_else(|| "unknown process".into());
     let pid = proc.map(|p| p.pid).unwrap_or(0);
-    let cmdline = proc
-        .map(|p| p.cmdline.join(" "))
-        .unwrap_or_default();
+    let cmdline = proc.map(|p| p.cmdline.join(" ")).unwrap_or_default();
 
     let target_line = conn
         .map(|c| format!("{}:{}", c.dst_ip, c.dst_port))

@@ -47,8 +47,12 @@ fn build_stream(key: &SubKey) -> impl Stream<Item = Message> {
     let path = key.path.clone();
     let kind = key.kind;
     match kind {
-        SubKind::Live => Box::pin(live_stream(path)) as std::pin::Pin<Box<dyn Stream<Item = Message> + Send>>,
-        SubKind::Prompts => Box::pin(prompts_stream(path)) as std::pin::Pin<Box<dyn Stream<Item = Message> + Send>>,
+        SubKind::Live => {
+            Box::pin(live_stream(path)) as std::pin::Pin<Box<dyn Stream<Item = Message> + Send>>
+        }
+        SubKind::Prompts => {
+            Box::pin(prompts_stream(path)) as std::pin::Pin<Box<dyn Stream<Item = Message> + Send>>
+        }
     }
 }
 
@@ -83,9 +87,7 @@ fn live_stream(path: PathBuf) -> impl Stream<Item = Message> + Send {
                         }
                     }
                     Err(e) => {
-                        let _ = output
-                            .send(Message::LiveStreamEnded(e.to_string()))
-                            .await;
+                        let _ = output.send(Message::LiveStreamEnded(e.to_string())).await;
                         break;
                     }
                 }
@@ -126,9 +128,7 @@ fn prompts_stream(path: PathBuf) -> impl Stream<Item = Message> + Send {
                         }
                     }
                     Err(e) => {
-                        let _ = output
-                            .send(Message::PromptStreamEnded(e.to_string()))
-                            .await;
+                        let _ = output.send(Message::PromptStreamEnded(e.to_string())).await;
                         break;
                     }
                 }

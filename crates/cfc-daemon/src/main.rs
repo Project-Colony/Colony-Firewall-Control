@@ -46,13 +46,14 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "colony-firewalld starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "colony-firewalld starting"
+    );
 
-    let cfg = config::Config::load_or_default(&args.config)
-        .context("loading config")?;
+    let cfg = config::Config::load_or_default(&args.config).context("loading config")?;
 
-    let store = storage::RuleStore::open(&cfg.storage.path)
-        .context("opening rule store")?;
+    let store = storage::RuleStore::open(&cfg.storage.path).context("opening rule store")?;
 
     let engine = decision::Engine::new(store.snapshot()?, cfg.default_policy);
 

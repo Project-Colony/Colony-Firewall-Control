@@ -14,8 +14,6 @@ pub enum ParseError {
     Truncated(&'static str),
     #[error("unsupported IP version {0}")]
     UnsupportedVersion(u8),
-    #[error("unsupported next-header {0:#x}")]
-    UnsupportedNextHeader(u8),
 }
 
 /// IANA protocol numbers we recognize.

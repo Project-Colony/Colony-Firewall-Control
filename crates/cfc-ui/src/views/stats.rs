@@ -14,16 +14,10 @@ pub fn view<'a>(status: Option<&'a proto::StatusResponse>) -> Element<'a, Messag
     let uptime = humanize_seconds(s.uptime_seconds);
 
     let card = |label: &'a str, value: String| -> Element<'a, Message> {
-        container(
-            column![
-                text(label).size(11),
-                text(value).size(22),
-            ]
-            .spacing(4),
-        )
-        .padding(12)
-        .width(Length::Fixed(170.0))
-        .into()
+        container(column![text(label).size(11), text(value).size(22),].spacing(4))
+            .padding(12)
+            .width(Length::Fixed(170.0))
+            .into()
     };
 
     container(

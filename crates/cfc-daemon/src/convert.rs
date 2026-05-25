@@ -1,8 +1,6 @@
 //! Conversions between `cfc_core` types and the gRPC schema in `cfc_proto`.
 
-use cfc_core::{
-    Action, Connection, Direction, Process, Protocol, Rule, RuleScope, Verdict,
-};
+use cfc_core::{Action, Connection, Direction, Process, Protocol, Rule, RuleScope, Verdict};
 use cfc_proto::v1 as pb;
 use std::str::FromStr;
 
@@ -115,10 +113,7 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
         dst_net: s.dst_net.map(|n| n.to_string()).unwrap_or_default(),
         dst_port: s.dst_port.map(|p| p as u32).unwrap_or(0),
         has_dst_port: s.dst_port.is_some(),
-        protocol: s
-            .protocol
-            .map(|p| protocol_to_pb(p) as i32)
-            .unwrap_or(0),
+        protocol: s.protocol.map(|p| protocol_to_pb(p) as i32).unwrap_or(0),
         has_protocol: s.protocol.is_some(),
     }
 }

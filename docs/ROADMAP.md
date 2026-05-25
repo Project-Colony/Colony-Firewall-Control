@@ -7,12 +7,14 @@ Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 - [x] Workspace skeleton
 - [x] `cfc-core`: types (Rule, Verdict, Connection, Process)
 - [x] `cfc-proto`: gRPC schema
+- [x] `cfc-client`: shared UDS gRPC client
 - [x] `cfc-daemon`: module skeletons
 - [x] `cfc-ui`: iced skeleton with parchment theme + 4 tabs
 - [x] `cfc-cli`: clap skeleton
 - [x] systemd unit + nft snippet
-- [ ] CI: cargo check + clippy + fmt on push
-- [ ] AUR PKGBUILD draft
+- [x] CI: cargo fmt + clippy + test + build
+- [x] AUR PKGBUILD draft
+- [x] Colony app store manifest (`pkg/colony.json`)
 
 ## Phase 1 - Daemon MVP [done]
 
@@ -36,16 +38,17 @@ Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 - [x] Rules table with delete
 - [x] Live feed scrolling list
 - [x] Stats counter cards (read from GetStatus, 2s polling)
+- [x] Desktop notifications via notify-rust on new prompts
 - [ ] System tray icon (ksni) with quick toggle
-- [ ] Desktop notifications via notify-rust
 - [ ] Inline rule editor (currently rules only created via prompt verdict)
 
 ## Phase 3 - CLI [done]
 
 - [x] `cfc status` real
 - [x] `cfc rules list/remove`
+- [x] `cfc rules add` with full scope flags
+- [x] `cfc rules export/import` (JSON)
 - [x] `cfc live` terminal feed
-- [ ] `cfc rules add/export/import` (JSON)
 - [ ] Color output and follow mode polish
 
 ## Phase 4 - eBPF backend

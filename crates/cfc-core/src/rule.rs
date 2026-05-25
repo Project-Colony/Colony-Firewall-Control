@@ -124,11 +124,7 @@ pub struct RuleSet {
 }
 
 impl RuleSet {
-    pub fn lookup(
-        &self,
-        conn: &crate::Connection,
-        proc: &crate::Process,
-    ) -> Option<&Rule> {
+    pub fn lookup(&self, conn: &crate::Connection, proc: &crate::Process) -> Option<&Rule> {
         self.rules
             .iter()
             .filter(|r| r.enabled)

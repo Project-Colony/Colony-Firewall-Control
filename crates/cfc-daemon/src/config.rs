@@ -5,7 +5,7 @@ use cfc_core::Action;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub default_policy: DefaultPolicy,
@@ -37,15 +37,9 @@ impl Default for DefaultPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NfqConfig {
     pub queue_num: u16,
-}
-
-impl Default for NfqConfig {
-    fn default() -> Self {
-        Self { queue_num: 0 }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,20 +58,9 @@ impl Default for StorageConfig {
 impl Config {
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(txt) => toml::from_str(&txt)
-                .with_context(|| format!("parsing {}", path.display())),
+            Ok(txt) => toml::from_str(&txt).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            default_policy: DefaultPolicy::default(),
-            nfqueue: NfqConfig::default(),
-            storage: StorageConfig::default(),
         }
     }
 }

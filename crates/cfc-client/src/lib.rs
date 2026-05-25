@@ -78,17 +78,11 @@ impl Client {
     }
 
     pub async fn list_rules(&mut self) -> Result<Vec<proto::RuleInfo>, ClientError> {
-        let resp = self
-            .inner
-            .list_rules(proto::ListRulesRequest {})
-            .await?;
+        let resp = self.inner.list_rules(proto::ListRulesRequest {}).await?;
         Ok(resp.into_inner().rules)
     }
 
-    pub async fn upsert_rule(
-        &mut self,
-        rule: proto::RuleInfo,
-    ) -> Result<String, ClientError> {
+    pub async fn upsert_rule(&mut self, rule: proto::RuleInfo) -> Result<String, ClientError> {
         let resp = self
             .inner
             .upsert_rule(proto::UpsertRuleRequest { rule: Some(rule) })
