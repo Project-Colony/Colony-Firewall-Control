@@ -152,6 +152,8 @@ pub enum Message {
     CloseEditor,
     ToggleRuleEnabled(String),
     RulesFilterChanged(String),
+    TogglePaused,
+    PausedSet(Result<bool, String>),
     EditorName(String),
     EditorAction(proto::Action),
     EditorDuration(proto::Duration),
@@ -319,6 +321,21 @@ impl App {
                 self.rules_filter = s;
                 Task::none()
             }
+            Message::TogglePaused => {
+                let current = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
+                let socket = self.socket_path.clone();
+                Task::perform(set_paused(socket, !current), Message::PausedSet)
+            }
+            Message::PausedSet(Ok(paused)) => {
+                if let Some(s) = &mut self.status {
+                    s.paused = paused;
+                }
+                Task::none()
+            }
+            Message::PausedSet(Err(e)) => {
+                self.last_error = Some(e);
+                Task::none()
+            }
             Message::EditorName(s) => {
                 if let Some(ed) = &mut self.editor {
                     ed.name = s;
@@ -404,11 +421,40 @@ impl App {
             DaemonState::Connected => "Connected".to_string(),
             DaemonState::Failed(e) => format!("Disconnected: {e}"),
         };
+        let paused = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
+
+        let pause_btn: Element<'_, Message> = if matches!(self.daemon, DaemonState::Connected) {
+            if paused {
+                button(text("Resume").size(12))
+                    .padding([4, 12])
+                    .on_press(Message::TogglePaused)
+                    .style(iced::widget::button::primary)
+                    .into()
+            } else {
+                button(text("Pause").size(12))
+                    .padding([4, 12])
+                    .on_press(Message::TogglePaused)
+                    .style(iced::widget::button::secondary)
+                    .into()
+            }
+        } else {
+            Space::new().into()
+        };
+
+        let paused_badge: Element<'_, Message> = if paused {
+            container(text("PAUSED - all flows allowed").size(11))
+                .padding([2, 8])
+                .into()
+        } else {
+            Space::new().into()
+        };
 
         let header = row![
             text("Colony Firewall Control").size(22),
+            paused_badge,
             Space::new().width(Length::Fill),
             text(status_text).size(12),
+            pause_btn,
             reconnect_button(&self.daemon),
         ]
         .padding(12)
@@ -511,6 +557,11 @@ async fn delete_rule(path: PathBuf, id: String) -> Result<(String, bool), String
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
     let ok = client.delete_rule(&id).await.map_err(|e| e.to_string())?;
     Ok((id, ok))
+}
+
+async fn set_paused(path: PathBuf, paused: bool) -> Result<bool, String> {
+    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    client.set_paused(paused).await.map_err(|e| e.to_string())
 }
 
 async fn fetch_rules(path: PathBuf) -> Result<Vec<proto::RuleInfo>, String> {

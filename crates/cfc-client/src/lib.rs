@@ -98,6 +98,14 @@ impl Client {
         Ok(resp.into_inner().deleted)
     }
 
+    pub async fn set_paused(&mut self, paused: bool) -> Result<bool, ClientError> {
+        let resp = self
+            .inner
+            .set_paused(proto::SetPausedRequest { paused })
+            .await?;
+        Ok(resp.into_inner().paused)
+    }
+
     pub async fn submit_verdict(
         &mut self,
         prompt_id: &str,

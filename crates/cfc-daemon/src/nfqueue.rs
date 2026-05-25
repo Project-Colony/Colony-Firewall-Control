@@ -41,15 +41,21 @@ pub async fn spawn(
     let mut queue = match Queue::open() {
         Ok(q) => q,
         Err(e) => {
-            error!("failed to open NFQUEUE socket: {e}. NFQUEUE worker disabled");
+            error!("failed to open NFQUEUE socket: {e}");
+            error!("hint: NFQUEUE needs CAP_NET_ADMIN. Run as root or via the");
+            error!("hint: bundled colony-firewalld.service systemd unit. If both");
+            error!("hint: are in place, check that the nfnetlink_queue kernel");
+            error!("hint: module is loaded:  modprobe nfnetlink_queue");
+            error!("NFQUEUE worker disabled - daemon continues running for UI tests");
             return Ok(tokio::spawn(async {}));
         }
     };
     if let Err(e) = queue.bind(queue_num) {
-        error!(
-            queue_num,
-            "failed to bind NFQUEUE: {e}. Are we running as root with CAP_NET_ADMIN?"
-        );
+        error!(queue_num, "failed to bind NFQUEUE {queue_num}: {e}");
+        error!("hint: another process may already own this queue number.");
+        error!("hint: list owners with:  ss -f netlink | grep nfqueue");
+        error!("hint: or pick a different number in /etc/colony-firewall/daemon.toml");
+        error!("hint: under [nfqueue] queue_num = N, and update the matching nft rule.");
         return Ok(tokio::spawn(async {}));
     }
 
@@ -83,6 +89,13 @@ fn recv_loop(
                 continue;
             }
         };
+
+        // Paused mode: short-circuit to ACCEPT, no parsing, no engine work.
+        if stats.is_paused() {
+            msg.set_verdict(NfqVerdict::Accept);
+            let _ = queue.verdict(msg);
+            continue;
+        }
 
         let payload = msg.get_payload();
         let mut conn = match packet::parse(payload, Direction::Outbound) {

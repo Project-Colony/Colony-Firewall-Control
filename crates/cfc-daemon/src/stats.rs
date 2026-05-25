@@ -1,6 +1,6 @@
 //! Runtime counters shared across daemon components.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,6 +15,7 @@ struct StatsInner {
     connections_allowed: AtomicU64,
     connections_denied: AtomicU64,
     prompts_pending: AtomicU64,
+    paused: AtomicBool,
 }
 
 impl Stats {
@@ -26,6 +27,7 @@ impl Stats {
                 connections_allowed: AtomicU64::new(0),
                 connections_denied: AtomicU64::new(0),
                 prompts_pending: AtomicU64::new(0),
+                paused: AtomicBool::new(false),
             }),
         }
     }
@@ -70,6 +72,14 @@ impl Stats {
 
     pub fn prompts_pending(&self) -> u64 {
         self.inner.prompts_pending.load(Ordering::Relaxed)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.inner.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.inner.paused.store(paused, Ordering::Relaxed);
     }
 }
 

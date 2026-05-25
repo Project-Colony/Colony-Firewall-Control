@@ -197,7 +197,18 @@ impl Firewall for FirewallService {
             connections_today: self.stats.connections_total(),
             connections_allowed: self.stats.connections_allowed(),
             connections_denied: self.stats.connections_denied(),
+            paused: self.stats.is_paused(),
         }))
+    }
+
+    async fn set_paused(
+        &self,
+        req: Request<cfc_proto::v1::SetPausedRequest>,
+    ) -> Result<Response<cfc_proto::v1::SetPausedResponse>, Status> {
+        let paused = req.into_inner().paused;
+        self.stats.set_paused(paused);
+        tracing::info!("paused = {paused}");
+        Ok(Response::new(cfc_proto::v1::SetPausedResponse { paused }))
     }
 }
 

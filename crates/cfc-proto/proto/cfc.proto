@@ -24,6 +24,10 @@ service Firewall {
 
   // Daemon status / stats.
   rpc GetStatus(StatusRequest) returns (StatusResponse);
+
+  // Temporarily allow all flows without consulting rules. The daemon stays
+  // running, just short-circuits NFQUEUE to ACCEPT for every packet.
+  rpc SetPaused(SetPausedRequest) returns (SetPausedResponse);
 }
 
 message SubscribeRequest {
@@ -133,6 +137,14 @@ message StatusResponse {
   uint64 connections_today = 5;
   uint64 connections_allowed = 6;
   uint64 connections_denied = 7;
+  bool paused = 8;
+}
+
+message SetPausedRequest {
+  bool paused = 1;
+}
+message SetPausedResponse {
+  bool paused = 1;
 }
 
 enum Action {
