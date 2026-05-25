@@ -11,9 +11,10 @@ fn main() -> iced::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    iced::application(App::title, App::update, App::view)
+    iced::application(App::new, App::update, App::view)
+        .title(App::title)
         .theme(App::theme)
-        .run_with(App::new)
+        .run()
 }
 
 #[derive(Debug, Default)]
@@ -34,6 +35,7 @@ enum Tab {
 #[derive(Debug, Clone)]
 enum Message {
     TabSelected(Tab),
+    #[allow(dead_code)]
     DaemonStatus(Result<String, String>),
 }
 
@@ -64,8 +66,8 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let header = row![
             text("Colony Firewall Control").size(22),
-            Space::with_width(Length::Fill),
-            text(&self.status_text).size(12),
+            Space::new().width(Length::Fill),
+            text(self.status_text.clone()).size(12),
         ]
         .padding(12)
         .spacing(12)
@@ -89,6 +91,8 @@ impl App {
 
         container(column![header, tabs, body].spacing(12))
             .padding(8)
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     }
 
