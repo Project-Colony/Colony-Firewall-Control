@@ -71,3 +71,164 @@ impl Engine {
         self.inner.rules.read().clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DefaultPolicy;
+    use cfc_core::{Direction, Protocol, RuleScope, VerdictSource};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
+
+    fn dp_allow() -> DefaultPolicy {
+        DefaultPolicy {
+            no_ui_action: Action::Allow,
+            timeout_action: Action::Allow,
+            prompt_timeout_secs: 15,
+        }
+    }
+
+    fn dp_deny() -> DefaultPolicy {
+        DefaultPolicy {
+            no_ui_action: Action::Deny,
+            timeout_action: Action::Deny,
+            prompt_timeout_secs: 10,
+        }
+    }
+
+    fn conn(dst_port: u16) -> Connection {
+        Connection::new(
+            Protocol::Tcp,
+            Direction::Outbound,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            54321,
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            dst_port,
+        )
+    }
+
+    fn proc(exe: &str) -> Process {
+        Process {
+            pid: 100,
+            ppid: Some(1),
+            uid: 1000,
+            gid: 1000,
+            exe: PathBuf::from(exe),
+            cmdline: vec![exe.to_string()],
+            cwd: None,
+            sha256: None,
+            started_at: None,
+        }
+    }
+
+    fn allow_port_rule(port: u16) -> Rule {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(port);
+        Rule::new(format!("allow-{port}"), Action::Allow, scope)
+    }
+
+    fn deny_port_rule(port: u16) -> Rule {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(port);
+        Rule::new(format!("deny-{port}"), Action::Deny, scope)
+    }
+
+    #[test]
+    fn no_rules_returns_needs_prompt() {
+        let engine = Engine::new(RuleSet::default(), dp_allow());
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::NeedsPrompt { fallback } => {
+                assert_eq!(fallback.action, Action::Allow);
+            }
+            _ => panic!("expected NeedsPrompt"),
+        }
+    }
+
+    #[test]
+    fn matching_allow_rule_resolves_to_allow() {
+        let mut rs = RuleSet::default();
+        rs.rules.push(allow_port_rule(443));
+        let engine = Engine::new(rs, dp_deny());
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::Resolved(v) => {
+                assert_eq!(v.action, Action::Allow);
+                assert!(matches!(v.source, VerdictSource::Rule(_)));
+            }
+            _ => panic!("expected Resolved"),
+        }
+    }
+
+    #[test]
+    fn matching_deny_rule_resolves_to_deny() {
+        let mut rs = RuleSet::default();
+        rs.rules.push(deny_port_rule(443));
+        let engine = Engine::new(rs, dp_allow());
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::Resolved(v) => assert_eq!(v.action, Action::Deny),
+            _ => panic!("expected Resolved"),
+        }
+    }
+
+    #[test]
+    fn fallback_respects_default_policy_deny() {
+        let engine = Engine::new(RuleSet::default(), dp_deny());
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::NeedsPrompt { fallback } => {
+                assert_eq!(fallback.action, Action::Deny);
+            }
+            _ => panic!("expected NeedsPrompt"),
+        }
+    }
+
+    #[test]
+    fn upsert_rule_takes_effect_immediately() {
+        let engine = Engine::new(RuleSet::default(), dp_allow());
+        // No rule -> NeedsPrompt.
+        assert!(matches!(
+            engine.evaluate(&conn(443), &proc("/usr/bin/curl")),
+            Decision::NeedsPrompt { .. }
+        ));
+
+        engine.upsert_rule(allow_port_rule(443));
+
+        assert!(matches!(
+            engine.evaluate(&conn(443), &proc("/usr/bin/curl")),
+            Decision::Resolved(_)
+        ));
+    }
+
+    #[test]
+    fn remove_rule_clears_match() {
+        let rule = allow_port_rule(443);
+        let id = rule.id;
+        let mut rs = RuleSet::default();
+        rs.rules.push(rule);
+        let engine = Engine::new(rs, dp_allow());
+
+        assert!(matches!(
+            engine.evaluate(&conn(443), &proc("/usr/bin/curl")),
+            Decision::Resolved(_)
+        ));
+
+        engine.remove_rule(id);
+        assert!(matches!(
+            engine.evaluate(&conn(443), &proc("/usr/bin/curl")),
+            Decision::NeedsPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_clones_rules() {
+        let mut rs = RuleSet::default();
+        rs.rules.push(allow_port_rule(80));
+        rs.rules.push(allow_port_rule(443));
+        let engine = Engine::new(rs, dp_allow());
+
+        let snap = engine.snapshot();
+        assert_eq!(snap.rules.len(), 2);
+
+        // Mutating the snapshot must not affect the engine.
+        drop(snap);
+        assert_eq!(engine.snapshot().rules.len(), 2);
+    }
+}

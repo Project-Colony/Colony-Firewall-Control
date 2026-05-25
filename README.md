@@ -6,88 +6,179 @@ A Colony-flavored port of [opensnitch](https://github.com/evilsocket/opensnitch)
 from Go/Python to Rust, with an [iced](https://iced.rs/) UI matching the
 Colony app aesthetic (parchment + burgundy).
 
-## Status
+## Why
 
-Pre-alpha. Workspace scaffold only. Not usable yet.
+The Linux desktop has no built-in outbound firewall with per-application
+prompts. The closest equivalent of [Windows Firewall Control](https://www.malwarebytes.com/windows-firewall-control)
+is opensnitch, which works but ships a Go daemon plus a 200 MB PyQt5 GUI.
+Colony Firewall Control gives you the same model in a single Rust workspace:
+NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 
-## Goals
+## Features
 
-- **Per-app outbound filtering**: prompt on every new connection (process + destination)
-- **eBPF-first**: kernel-side decision for whitelisted flows, NFQUEUE only for unknown
-- **Single static binary**: no PyQt5, no protobuf-python, no clang at build time
-- **Colony integration**: iced UI, parchment theme, distributable via Colony app store
-- **Memory-safe**: Rust top to bottom for a root daemon parsing untrusted packets
+- Per-application outbound filtering with NFQUEUE intercept
+- Live pop-ups for unknown connections, persistent rules for known ones
+- iced GUI with parchment / burgundy theme, four tabs (Prompts / Rules /
+  Live / Stats)
+- Desktop notifications for new prompts when the window is hidden
+- Headless CLI (`cfc`) for status, rule CRUD, live feed
+- JSON export / import for backup and machine-to-machine sync
+- opensnitch JSON import for one-shot migration
+- Named profiles: relaxed / balanced / strict (in `daemon.toml`)
+- Memory-safe Rust top to bottom for a root daemon parsing untrusted packets
 
 ## Architecture
 
 ```
 +----------------------------+
-|  cfc-ui  (iced, user)      |
-|   pop-up, rules editor     |
-+------------+---------------+
-             | tonic / gRPC over UDS
-+------------v---------------+
-|  cfc-daemon  (systemd)     |
-|   nfq + aya/eBPF           |
-|   decision engine          |
-|   sqlite rules store       |
+|  cfc-ui   (iced, user)     |     +----------------+
+|   pop-ups, rules editor    | --- |  cfc-cli (tty) |
++------------+---------------+     +-------+--------+
+             | tonic gRPC over UDS         |
+             v                             v
++----------------------------+
+|  cfc-daemon  (systemd, root)
+|   - NFQUEUE intercept
+|   - process resolution (/proc + sock_diag)
+|   - decision engine
+|   - sqlite rules store
+|   - prompt router (sync NFQ <-> async UI)
 +----------------------------+
 ```
 
-| Crate | Purpose |
-|-------|---------|
-| `cfc-core` | Shared types: `Rule`, `Verdict`, `Connection`, `Process` |
-| `cfc-proto` | gRPC schema for daemon <-> UI IPC |
-| `cfc-daemon` | Root daemon. NFQUEUE intercept, decision engine, rule persistence |
-| `cfc-ui` | iced GUI: prompts, rules, live feed |
-| `cfc-cli` | CLI control tool (allow/deny/list, no GUI required) |
+Five workspace crates:
 
-## Roadmap
+| Crate         | Role                                                     |
+|---------------|----------------------------------------------------------|
+| `cfc-core`    | Shared types: `Rule`, `Verdict`, `Connection`, `Process` |
+| `cfc-proto`   | gRPC schema (tonic + tonic-prost)                        |
+| `cfc-client`  | Shared UDS gRPC client wrapper                           |
+| `cfc-daemon`  | Privileged daemon                                        |
+| `cfc-ui`      | iced GUI                                                 |
+| `cfc-cli`     | Terminal control tool                                    |
 
-### Phase 0 - Foundation (current)
-- [x] Workspace scaffold
-- [ ] Type definitions in `cfc-core`
-- [ ] gRPC schema in `cfc-proto`
-- [ ] systemd unit + install scripts
+## Install
 
-### Phase 1 - Daemon MVP (NFQUEUE only)
-- [ ] NFQUEUE packet intercept via `nfq` crate
-- [ ] Process resolution via `/proc/{pid}` (TOCTOU aware)
-- [ ] Rule storage (sqlite via `rusqlite`)
-- [ ] Decision engine: lookup -> verdict
-- [ ] gRPC server for UI connection
+### Arch Linux (AUR)
 
-### Phase 2 - UI MVP
-- [ ] iced app skeleton with Colony theme
-- [ ] New-connection pop-up
-- [ ] Rules list / editor
-- [ ] Live connection feed
-- [ ] Tray icon via `ksni`
+```sh
+cp pkg/PKGBUILD ./
+makepkg -si
+```
 
-### Phase 3 - CLI
-- [ ] `cfc-cli rules list/add/remove/export`
-- [ ] `cfc-cli live` (terminal connection feed)
-- [ ] `cfc-cli stats`
+### Manual
 
-### Phase 4 - eBPF backend
-- [ ] Process-exec capture via `aya`
-- [ ] DNS sniff via eBPF (cure NFQUEUE DNS race)
-- [ ] Fast-path whitelisting in kernel
+```sh
+cargo build --workspace --release
 
-### Phase 5 - Polish
-- [ ] VirusTotal lookup integration
-- [ ] Profiles (medium/high/no filtering)
-- [ ] Rule import from opensnitch
-- [ ] PKGBUILD for AUR / Colony app manifest
+sudo install -Dm755 target/release/colony-firewalld /usr/bin/colony-firewalld
+sudo install -Dm755 target/release/colony-firewall  /usr/bin/colony-firewall
+sudo install -Dm755 target/release/cfc              /usr/bin/cfc
+sudo install -Dm644 systemd/colony-firewalld.service /usr/lib/systemd/system/
+sudo install -Dm644 systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
+sudo systemctl daemon-reload
+sudo systemctl enable --now colony-firewalld
+```
+
+Then enqueue outbound flows with the nftables snippet:
+
+```sh
+sudo nft -f systemd/nftables-snippet.conf
+```
+
+## Quick start
+
+Open the GUI:
+
+```sh
+colony-firewall
+```
+
+Or drive everything from the CLI:
+
+```sh
+# Status
+cfc status
+
+# Add a rule from the command line
+cfc rules add --action allow --exe /usr/bin/curl --dst-port 443
+
+# Watch traffic decisions in real time (colorized)
+cfc live
+
+# Back up rules
+cfc rules export --out rules.json
+
+# Migrate from an existing opensnitch install
+cfc rules import-opensnitch /etc/opensnitchd/rules
+```
+
+## Profiles
+
+`daemon.toml` accepts a `profile` key with three presets:
+
+| Profile  | No UI    | Timeout  | Window |
+|----------|----------|----------|--------|
+| relaxed  | Allow    | Allow    | 60s    |
+| balanced | Allow    | Allow    | 15s    | (default)
+| strict   | Deny     | Deny     | 10s    |
+
+Use `strict` only when you always have the UI running, otherwise you lose
+network when the daemon starts before the UI does (fail-closed posture).
+
+## Development
+
+Requires Rust stable (>= 1.78) and `protobuf-compiler`. On Debian/Ubuntu:
+
+```sh
+sudo apt install protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
+```
+
+```sh
+cargo build --workspace --profile fast
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+```
+
+The daemon needs `CAP_NET_ADMIN` to bind NFQUEUE, so run it as root or via
+the bundled systemd unit. The UI and CLI run as your regular user.
+
+For development without root, the daemon accepts `--dry-run` which skips
+the NFQUEUE bind and lets you exercise the gRPC server and UI against a
+daemon that just reports rules and a stub status feed:
+
+```sh
+cargo run -p cfc-daemon -- --debug --dry-run --socket /tmp/cfc.sock
+cargo run -p cfc-ui     # in another terminal
+```
+
+## Status
+
+| Phase                    | State |
+|--------------------------|-------|
+| 0  Foundation            | done  |
+| 1  Daemon MVP            | done  |
+| 2  UI MVP                | done  |
+| 3  CLI                   | done  |
+| 4  eBPF backend          | TODO  |
+| 5a CI                    | done  |
+| 5b Packaging             | done  |
+| 5  System tray, VT       | TODO  |
+
+See `docs/ROADMAP.md` for the full checklist.
 
 ## License
 
-GPL-3.0-or-later. Inherited from [opensnitch](https://github.com/evilsocket/opensnitch)
-since this is a derivative port.
+GPL-3.0-or-later. Inherited from
+[opensnitch](https://github.com/evilsocket/opensnitch) since this is a
+derivative port.
 
 ## Credits
 
-- [opensnitch](https://github.com/evilsocket/opensnitch) by Simone Margaritelli
-  (evilsocket) and Gustavo Iniguez Goia - the project we are porting.
-- The Rust [aya](https://github.com/aya-rs/aya) and [iced](https://iced.rs/)
-  ecosystems.
+- [opensnitch](https://github.com/evilsocket/opensnitch) by Simone
+  Margaritelli (evilsocket) and Gustavo Iniguez Goia - the project we are
+  porting.
+- The Rust [tonic](https://github.com/hyperium/tonic),
+  [aya](https://github.com/aya-rs/aya), [iced](https://iced.rs/), and
+  [nfq](https://crates.io/crates/nfq) crates.

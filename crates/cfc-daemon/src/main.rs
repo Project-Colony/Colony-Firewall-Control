@@ -30,6 +30,13 @@ struct Args {
     /// Run in foreground with verbose logging.
     #[arg(long)]
     debug: bool,
+
+    /// Skip NFQUEUE bind. Useful for testing the gRPC + UI surface without
+    /// root or actually filtering traffic. The daemon still serves
+    /// ListRules/UpsertRule/GetStatus over the UDS, but never intercepts
+    /// any packets and never emits Live/Prompt events.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[tokio::main]
@@ -76,15 +83,22 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("starting IPC server")?;
 
-    let nfq_handle = nfqueue::spawn(
-        cfg.nfqueue.queue_num,
-        engine.clone(),
-        prompt_tx,
-        observed_tx,
-        stats,
-    )
-    .await
-    .context("starting NFQUEUE worker")?;
+    let nfq_handle = if args.dry_run {
+        info!("--dry-run set: skipping NFQUEUE bind");
+        tokio::spawn(async {
+            std::future::pending::<()>().await;
+        })
+    } else {
+        nfqueue::spawn(
+            cfg.nfqueue.queue_num,
+            engine.clone(),
+            prompt_tx,
+            observed_tx,
+            stats,
+        )
+        .await
+        .context("starting NFQUEUE worker")?
+    };
 
     info!(socket = %socket_path.display(), "ready");
 
