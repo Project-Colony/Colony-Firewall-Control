@@ -50,6 +50,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 nfq = "0.2"
 procfs = "0.18"
 
+# DNS reverse lookup
+dns-lookup = "2.0"
+
 # Process / system
 nix = { version = "0.31", features = ["process", "user", "signal"] }
 libc = "0.2"

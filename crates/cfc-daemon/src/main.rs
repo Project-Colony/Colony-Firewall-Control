@@ -8,6 +8,7 @@ use tracing::info;
 mod config;
 mod convert;
 mod decision;
+mod dns;
 mod ipc;
 mod nfqueue;
 mod packet;
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (observed_tx, _) = tokio::sync::broadcast::channel(1024);
     let stats = stats::Stats::new();
+    let dns_cache = dns::DnsCache::new();
     let router = prompts::PromptRouter::new(cfg.default_policy, stats.clone());
 
     let (ipc_handle, prompt_tx) = ipc::spawn(
@@ -95,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
             prompt_tx,
             observed_tx,
             stats,
+            dns_cache,
         )
         .await
         .context("starting NFQUEUE worker")?

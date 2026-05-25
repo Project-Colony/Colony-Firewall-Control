@@ -1,6 +1,7 @@
 //! NFQUEUE intercept worker.
 
 use crate::decision::{Decision, Engine};
+use crate::dns::DnsCache;
 use crate::packet;
 use crate::process_resolve;
 use crate::stats::Stats;
@@ -33,6 +34,7 @@ pub async fn spawn(
     prompt_tx: PromptTx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
+    dns_cache: DnsCache,
 ) -> anyhow::Result<JoinHandle<()>> {
     info!(queue_num, "opening NFQUEUE");
 
@@ -54,7 +56,7 @@ pub async fn spawn(
     info!(queue_num, "NFQUEUE bound, entering recv loop");
 
     let handle = tokio::task::spawn_blocking(move || {
-        recv_loop(queue, engine, prompt_tx, observed_tx, stats);
+        recv_loop(queue, engine, prompt_tx, observed_tx, stats, dns_cache);
     });
 
     Ok(tokio::spawn(async move {
@@ -70,6 +72,7 @@ fn recv_loop(
     prompt_tx: PromptTx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
+    dns_cache: DnsCache,
 ) {
     loop {
         let mut msg = match queue.recv() {
@@ -82,7 +85,7 @@ fn recv_loop(
         };
 
         let payload = msg.get_payload();
-        let conn = match packet::parse(payload, Direction::Outbound) {
+        let mut conn = match packet::parse(payload, Direction::Outbound) {
             Ok(c) => c,
             Err(e) => {
                 debug!("dropping unparseable packet: {e}");
@@ -99,15 +102,31 @@ fn recv_loop(
             conn.dst_ip,
             conn.dst_port,
         );
+
+        // Always allow our own traffic. Otherwise the daemon's reverse DNS
+        // resolver would itself be intercepted, deadlocking on a verdict
+        // we can't produce until the resolver returns.
+        if let Some(pid) = pid_hint {
+            if dns_cache.is_self(pid) {
+                msg.set_verdict(NfqVerdict::Accept);
+                let _ = queue.verdict(msg);
+                continue;
+            }
+        }
+
         let proc = match pid_hint {
             Some(pid) => process_resolve::resolve(pid),
             None => Process::unknown(0),
         };
-        let conn = if let Some(pid) = pid_hint {
-            conn.with_process(pid, proc.uid)
-        } else {
-            conn
-        };
+        if let Some(pid) = pid_hint {
+            conn = conn.with_process(pid, proc.uid);
+        }
+
+        // Attach cached hostname if any, kick off a fresh lookup for next time.
+        if let Some(host) = dns_cache.lookup_cached(conn.dst_ip) {
+            conn = conn.with_host(host);
+        }
+        dns_cache.enqueue_lookup(conn.dst_ip);
 
         let decision = engine.evaluate(&conn, &proc);
         let verdict = match decision {
