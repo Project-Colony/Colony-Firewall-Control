@@ -1,0 +1,26 @@
+[package]
+name = "cfc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Colony Firewall Control - CLI control tool"
+
+[[bin]]
+name = "cfc"
+path = "src/main.rs"
+
+[dependencies]
+cfc-core = { path = "../cfc-core" }
+cfc-proto = { path = "../cfc-proto" }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,31 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.tmp
+
+# Local config
+/local/
+.env
+.env.local
+
+# Runtime
+*.pid
+*.sock
+*.db-journal
+*.db-wal
+*.db-shm

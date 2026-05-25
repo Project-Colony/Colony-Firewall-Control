@@ -1,0 +1,16 @@
+# Colony Firewall daemon config. Install to /etc/colony-firewall/daemon.toml.
+
+[default_policy]
+# When no rule matches and no UI is connected to answer prompts, what do we do?
+no_ui_action = "Allow"
+# When a prompt expires without a user answer, what do we do?
+timeout_action = "Allow"
+# How long a prompt waits for a user answer, in seconds.
+prompt_timeout_secs = 15
+
+[nfqueue]
+# NFQUEUE number. Must match the iptables/nftables rule that enqueues packets.
+queue_num = 0
+
+[storage]
+path = "/var/lib/colony-firewall/rules.db"

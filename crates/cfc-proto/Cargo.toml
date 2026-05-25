@@ -1,0 +1,17 @@
+[package]
+name = "cfc-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Colony Firewall Control - gRPC IPC schema"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }

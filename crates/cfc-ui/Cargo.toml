@@ -1,0 +1,31 @@
+[package]
+name = "cfc-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Colony Firewall Control - iced GUI"
+
+[[bin]]
+name = "colony-firewall"
+path = "src/main.rs"
+
+[dependencies]
+cfc-core = { path = "../cfc-core" }
+cfc-proto = { path = "../cfc-proto" }
+
+iced = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+notify-rust = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }

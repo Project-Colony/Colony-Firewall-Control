@@ -1,0 +1,44 @@
+[package]
+name = "cfc-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Colony Firewall Control - privileged decision daemon"
+
+[[bin]]
+name = "colony-firewalld"
+path = "src/main.rs"
+
+[dependencies]
+cfc-core = { path = "../cfc-core" }
+cfc-proto = { path = "../cfc-proto" }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+nfq = { workspace = true }
+procfs = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+ipnet = { workspace = true }
+clap = { workspace = true }

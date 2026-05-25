@@ -1,0 +1,41 @@
+[Unit]
+Description=Colony Firewall Control daemon
+Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/colony-firewalld --config /etc/colony-firewall/daemon.toml
+Restart=on-failure
+RestartSec=2
+
+# Privileges
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
+NoNewPrivileges=true
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/colony-firewall /run/colony-firewall /var/log/colony-firewall
+RuntimeDirectory=colony-firewall
+RuntimeDirectoryMode=0755
+StateDirectory=colony-firewall
+StateDirectoryMode=0750
+LogsDirectory=colony-firewall
+
+# Sandboxing
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+
+# Required for NFQUEUE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
+[Install]
+WantedBy=multi-user.target

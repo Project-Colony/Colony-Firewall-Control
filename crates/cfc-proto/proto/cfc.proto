@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package cfc.v1;
+
+// Colony Firewall Control IPC schema.
+// Spoken between the root daemon (server) and UI/CLI clients over a Unix
+// domain socket.
+
+service Firewall {
+  // The UI subscribes once and receives a streaming feed of new connections
+  // that need a verdict from the user.
+  rpc StreamPrompts(SubscribeRequest) returns (stream PromptEvent);
+
+  // The UI returns a verdict for a specific prompt id.
+  rpc SubmitVerdict(VerdictRequest) returns (VerdictResponse);
+
+  // Rules CRUD.
+  rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
+  rpc UpsertRule(UpsertRuleRequest) returns (UpsertRuleResponse);
+  rpc DeleteRule(DeleteRuleRequest) returns (DeleteRuleResponse);
+
+  // Live observed connections (for the live view, no verdict requested).
+  rpc StreamConnections(SubscribeRequest) returns (stream ConnectionEvent);
+
+  // Daemon status / stats.
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+message SubscribeRequest {
+  string client_id = 1;
+}
+
+message PromptEvent {
+  string prompt_id = 1;
+  ConnectionInfo connection = 2;
+  ProcessInfo process = 3;
+  int64 deadline_unix_ms = 4;
+}
+
+message VerdictRequest {
+  string prompt_id = 1;
+  Action action = 2;
+  Duration duration = 3;
+  RuleScope persist_scope = 4;
+}
+
+message VerdictResponse {
+  bool accepted = 1;
+  string error = 2;
+}
+
+message ConnectionEvent {
+  ConnectionInfo connection = 1;
+  ProcessInfo process = 2;
+  Action verdict = 3;
+  string rule_id = 4;
+}
+
+message ConnectionInfo {
+  string id = 1;
+  int64 timestamp_unix_ms = 2;
+  Protocol protocol = 3;
+  Direction direction = 4;
+  string src_ip = 5;
+  uint32 src_port = 6;
+  string dst_ip = 7;
+  uint32 dst_port = 8;
+  string dst_host = 9;
+}
+
+message ProcessInfo {
+  uint32 pid = 1;
+  uint32 ppid = 2;
+  uint32 uid = 3;
+  uint32 gid = 4;
+  string exe = 5;
+  repeated string cmdline = 6;
+  string cwd = 7;
+  string sha256 = 8;
+}
+
+message RuleScope {
+  string exe_path = 1;
+  string exe_sha256 = 2;
+  string parent_exe = 3;
+  uint32 uid = 4;
+  bool has_uid = 5;
+  string dst_host = 6;
+  string dst_net = 7;
+  uint32 dst_port = 8;
+  bool has_dst_port = 9;
+  Protocol protocol = 10;
+  bool has_protocol = 11;
+}
+
+message RuleInfo {
+  string id = 1;
+  string name = 2;
+  bool enabled = 3;
+  Action action = 4;
+  Duration duration = 5;
+  RuleScope scope = 6;
+  int64 created_at_unix_ms = 7;
+  uint64 hit_count = 8;
+}
+
+message ListRulesRequest {}
+message ListRulesResponse {
+  repeated RuleInfo rules = 1;
+}
+
+message UpsertRuleRequest {
+  RuleInfo rule = 1;
+}
+message UpsertRuleResponse {
+  string id = 1;
+  string error = 2;
+}
+
+message DeleteRuleRequest {
+  string id = 1;
+}
+message DeleteRuleResponse {
+  bool deleted = 1;
+}
+
+message StatusRequest {}
+message StatusResponse {
+  string version = 1;
+  uint64 uptime_seconds = 2;
+  uint64 rules_count = 3;
+  uint64 prompts_pending = 4;
+  uint64 connections_today = 5;
+  uint64 connections_allowed = 6;
+  uint64 connections_denied = 7;
+}
+
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  ACTION_ALLOW = 1;
+  ACTION_DENY = 2;
+  ACTION_REJECT = 3;
+}
+
+enum Duration {
+  DURATION_UNSPECIFIED = 0;
+  DURATION_ONCE = 1;
+  DURATION_UNTIL_RESTART = 2;
+  DURATION_ALWAYS = 3;
+}
+
+enum Protocol {
+  PROTOCOL_UNSPECIFIED = 0;
+  PROTOCOL_TCP = 1;
+  PROTOCOL_UDP = 2;
+  PROTOCOL_ICMP = 3;
+  PROTOCOL_OTHER = 4;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_OUTBOUND = 1;
+  DIRECTION_INBOUND = 2;
+}
