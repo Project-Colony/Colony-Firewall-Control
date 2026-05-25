@@ -35,6 +35,8 @@ enum RulesCmd {
     List,
     /// Delete a rule by id.
     Remove { id: String },
+    /// Toggle a rule's enabled state by id.
+    Toggle { id: String },
     /// Add a new rule.
     Add(AddArgs),
     /// Export all rules as JSON to stdout.
@@ -137,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Rules { cmd } => match cmd {
             RulesCmd::List => cmd_rules_list(&mut client).await?,
             RulesCmd::Remove { id } => cmd_rules_remove(&mut client, &id).await?,
+            RulesCmd::Toggle { id } => cmd_rules_toggle(&mut client, &id).await?,
             RulesCmd::Add(args) => cmd_rules_add(&mut client, args).await?,
             RulesCmd::Export { out } => cmd_rules_export(&mut client, out).await?,
             RulesCmd::Import { file, replace } => {
@@ -192,6 +195,21 @@ async fn cmd_rules_remove(client: &mut Client, id: &str) -> anyhow::Result<()> {
     } else {
         println!("no rule with id {id}");
     }
+    Ok(())
+}
+
+async fn cmd_rules_toggle(client: &mut Client, id: &str) -> anyhow::Result<()> {
+    let rules = client.list_rules().await?;
+    let Some(mut rule) = rules.into_iter().find(|r| r.id == id) else {
+        anyhow::bail!("no rule with id {id}");
+    };
+    rule.enabled = !rule.enabled;
+    client.upsert_rule(rule.clone()).await?;
+    println!(
+        "{}: {}",
+        id,
+        if rule.enabled { "enabled" } else { "disabled" }
+    );
     Ok(())
 }
 

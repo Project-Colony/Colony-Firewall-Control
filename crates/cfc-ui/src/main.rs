@@ -40,10 +40,13 @@ pub struct App {
     pub status: Option<proto::StatusResponse>,
     pub last_error: Option<String>,
     pub editor: Option<RuleEditor>,
+    pub rules_filter: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct RuleEditor {
+    /// Some when editing an existing rule, None when creating a new one.
+    pub editing_id: Option<String>,
     pub name: String,
     pub action: proto::Action,
     pub duration: proto::Duration,
@@ -58,6 +61,7 @@ pub struct RuleEditor {
 impl Default for RuleEditor {
     fn default() -> Self {
         Self {
+            editing_id: None,
             name: String::new(),
             action: proto::Action::Allow,
             duration: proto::Duration::Always,
@@ -66,6 +70,31 @@ impl Default for RuleEditor {
             dst_net: String::new(),
             dst_port: String::new(),
             protocol: None,
+            validation: None,
+        }
+    }
+}
+
+impl RuleEditor {
+    pub fn from_existing(rule: &proto::RuleInfo) -> Self {
+        let scope = rule.scope.as_ref();
+        let protocol = scope
+            .and_then(|s| s.has_protocol.then_some(s.protocol))
+            .and_then(|p| proto::Protocol::try_from(p).ok())
+            .filter(|p| !matches!(p, proto::Protocol::Unspecified));
+        Self {
+            editing_id: Some(rule.id.clone()),
+            name: rule.name.clone(),
+            action: proto::Action::try_from(rule.action).unwrap_or(proto::Action::Allow),
+            duration: proto::Duration::try_from(rule.duration).unwrap_or(proto::Duration::Always),
+            exe: scope.map(|s| s.exe_path.clone()).unwrap_or_default(),
+            dst_host: scope.map(|s| s.dst_host.clone()).unwrap_or_default(),
+            dst_net: scope.map(|s| s.dst_net.clone()).unwrap_or_default(),
+            dst_port: scope
+                .and_then(|s| s.has_dst_port.then_some(s.dst_port))
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            protocol,
             validation: None,
         }
     }
@@ -119,7 +148,10 @@ pub enum Message {
     },
     VerdictSubmitted(Result<(String, bool), String>),
     OpenEditor,
+    EditExistingRule(String),
     CloseEditor,
+    ToggleRuleEnabled(String),
+    RulesFilterChanged(String),
     EditorName(String),
     EditorAction(proto::Action),
     EditorDuration(proto::Duration),
@@ -150,6 +182,7 @@ impl App {
             status: None,
             last_error: None,
             editor: None,
+            rules_filter: String::new(),
         };
         let socket = app.socket_path.clone();
         (
@@ -263,8 +296,27 @@ impl App {
                 self.editor = Some(RuleEditor::default());
                 Task::none()
             }
+            Message::EditExistingRule(id) => {
+                if let Some(rule) = self.rules.iter().find(|r| r.id == id) {
+                    self.editor = Some(RuleEditor::from_existing(rule));
+                }
+                Task::none()
+            }
             Message::CloseEditor => {
                 self.editor = None;
+                Task::none()
+            }
+            Message::ToggleRuleEnabled(id) => {
+                let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) else {
+                    return Task::none();
+                };
+                rule.enabled = !rule.enabled;
+                let updated = rule.clone();
+                let socket = self.socket_path.clone();
+                Task::perform(upsert_rule(socket, updated), Message::RuleSaved)
+            }
+            Message::RulesFilterChanged(s) => {
+                self.rules_filter = s;
                 Task::none()
             }
             Message::EditorName(s) => {
@@ -374,7 +426,7 @@ impl App {
 
         let body: Element<'_, Message> = match self.tab {
             Tab::Prompts => views::prompts::view(&self.prompts),
-            Tab::Rules => views::rules::view(&self.rules, self.editor.as_ref()),
+            Tab::Rules => views::rules::view(&self.rules, &self.rules_filter, self.editor.as_ref()),
             Tab::Live => views::live::view(&self.live),
             Tab::Stats => views::stats::view(self.status.as_ref()),
         };
@@ -523,7 +575,7 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
     };
 
     Ok(proto::RuleInfo {
-        id: String::new(),
+        id: ed.editing_id.clone().unwrap_or_default(),
         name,
         enabled: true,
         action: ed.action as i32,

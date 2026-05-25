@@ -8,12 +8,13 @@ use crate::{Message, RuleEditor};
 
 pub fn view<'a>(
     rules: &'a [proto::RuleInfo],
+    filter: &'a str,
     editor: Option<&'a RuleEditor>,
 ) -> Element<'a, Message> {
     let body: Element<'a, Message> = if let Some(ed) = editor {
         editor_view(ed)
     } else {
-        list_view(rules)
+        list_view(rules, filter)
     };
 
     container(body)
@@ -23,14 +24,51 @@ pub fn view<'a>(
         .into()
 }
 
-fn list_view<'a>(rules: &'a [proto::RuleInfo]) -> Element<'a, Message> {
+fn rule_matches_filter(r: &proto::RuleInfo, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let n = needle.to_ascii_lowercase();
+    if r.name.to_ascii_lowercase().contains(&n) {
+        return true;
+    }
+    if let Some(s) = r.scope.as_ref() {
+        if s.exe_path.to_ascii_lowercase().contains(&n) {
+            return true;
+        }
+        if s.dst_host.to_ascii_lowercase().contains(&n) {
+            return true;
+        }
+        if s.dst_net.to_ascii_lowercase().contains(&n) {
+            return true;
+        }
+    }
+    false
+}
+
+fn list_view<'a>(rules: &'a [proto::RuleInfo], filter: &'a str) -> Element<'a, Message> {
+    let filtered: Vec<&proto::RuleInfo> = rules
+        .iter()
+        .filter(|r| rule_matches_filter(r, filter))
+        .collect();
+
     let toolbar = row![
         button(text("+ Add rule").size(12))
             .padding([4, 12])
             .on_press(Message::OpenEditor)
             .style(iced::widget::button::primary),
+        text_input("Search by name / exe / host", filter)
+            .on_input(Message::RulesFilterChanged)
+            .padding(4)
+            .size(12)
+            .width(Length::Fixed(260.0)),
         Space::new().width(Length::Fill),
-        text(format!("{} rules", rules.len())).size(11),
+        text(if filter.is_empty() {
+            format!("{} rules", rules.len())
+        } else {
+            format!("{}/{} rules", filtered.len(), rules.len())
+        })
+        .size(11),
     ]
     .spacing(8)
     .padding(6)
@@ -52,17 +90,27 @@ fn list_view<'a>(rules: &'a [proto::RuleInfo]) -> Element<'a, Message> {
         .into();
     }
 
+    if filtered.is_empty() {
+        return column![
+            toolbar,
+            container(text(format!("No rules match \"{filter}\"")).size(13)).padding(16),
+        ]
+        .spacing(6)
+        .into();
+    }
+
     let header = row![
+        text("on").size(11).width(Length::Fixed(40.0)),
         text("action").size(11).width(Length::Fixed(60.0)),
         text("duration").size(11).width(Length::Fixed(90.0)),
         text("summary").size(11).width(Length::Fill),
-        text("hits").size(11).width(Length::Fixed(60.0)),
-        text("").width(Length::Fixed(80.0)),
+        text("hits").size(11).width(Length::Fixed(50.0)),
+        text("").width(Length::Fixed(130.0)),
     ]
     .spacing(6)
     .padding(6);
 
-    let rows: Vec<Element<'a, Message>> = rules.iter().map(rule_row).collect();
+    let rows: Vec<Element<'a, Message>> = filtered.iter().map(|r| rule_row(r)).collect();
 
     column![
         toolbar,
@@ -74,8 +122,22 @@ fn list_view<'a>(rules: &'a [proto::RuleInfo]) -> Element<'a, Message> {
 }
 
 fn rule_row(r: &proto::RuleInfo) -> Element<'_, Message> {
-    let id = r.id.clone();
+    let id_for_toggle = r.id.clone();
+    let id_for_edit = r.id.clone();
+    let id_for_delete = r.id.clone();
+    let toggle_label = if r.enabled { "on" } else { "off" };
+    let toggle_style = if r.enabled {
+        iced::widget::button::primary
+    } else {
+        iced::widget::button::secondary
+    };
+
     row![
+        button(text(toggle_label).size(11))
+            .padding([2, 6])
+            .on_press(Message::ToggleRuleEnabled(id_for_toggle))
+            .style(toggle_style)
+            .width(Length::Fixed(40.0)),
         text(convert::action_label(r.action))
             .size(12)
             .width(Length::Fixed(60.0)),
@@ -85,12 +147,15 @@ fn rule_row(r: &proto::RuleInfo) -> Element<'_, Message> {
         text(convert::rule_summary(r)).size(12).width(Length::Fill),
         text(r.hit_count.to_string())
             .size(12)
-            .width(Length::Fixed(60.0)),
+            .width(Length::Fixed(50.0)),
+        button(text("Edit").size(11))
+            .padding([2, 8])
+            .on_press(Message::EditExistingRule(id_for_edit))
+            .style(iced::widget::button::secondary),
         button(text("Delete").size(11))
             .padding([2, 8])
-            .on_press(Message::DeleteRule(id))
+            .on_press(Message::DeleteRule(id_for_delete))
             .style(iced::widget::button::danger),
-        Space::new(),
     ]
     .spacing(6)
     .padding(4)
@@ -100,7 +165,12 @@ fn rule_row(r: &proto::RuleInfo) -> Element<'_, Message> {
 
 fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     let title = row![
-        text("New rule").size(18),
+        text(if ed.editing_id.is_some() {
+            "Edit rule"
+        } else {
+            "New rule"
+        })
+        .size(18),
         Space::new().width(Length::Fill),
         button(text("Cancel").size(12))
             .padding([4, 10])
