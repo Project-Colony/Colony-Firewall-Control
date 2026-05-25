@@ -12,6 +12,7 @@ mod config;
 mod decision;
 mod ipc;
 mod nfqueue;
+mod packet;
 mod process_resolve;
 mod storage;
 
@@ -59,13 +60,25 @@ async fn main() -> anyhow::Result<()> {
         .socket
         .unwrap_or_else(|| PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH));
 
-    let (ipc_handle, prompt_tx) = ipc::spawn(socket_path.clone(), engine.clone(), store.clone())
-        .await
-        .context("starting IPC server")?;
+    let (observed_tx, _) = tokio::sync::broadcast::channel(1024);
 
-    let nfq_handle = nfqueue::spawn(cfg.nfqueue.queue_num, engine.clone(), prompt_tx)
-        .await
-        .context("starting NFQUEUE worker")?;
+    let (ipc_handle, prompt_tx) = ipc::spawn(
+        socket_path.clone(),
+        engine.clone(),
+        store.clone(),
+        observed_tx.clone(),
+    )
+    .await
+    .context("starting IPC server")?;
+
+    let nfq_handle = nfqueue::spawn(
+        cfg.nfqueue.queue_num,
+        engine.clone(),
+        prompt_tx,
+        observed_tx,
+    )
+    .await
+    .context("starting NFQUEUE worker")?;
 
     info!(socket = %socket_path.display(), "ready");
 

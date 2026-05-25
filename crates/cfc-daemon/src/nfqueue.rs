@@ -4,41 +4,143 @@
 //! kernel, parses the 5-tuple, resolves the owning process, asks the
 //! decision engine, and writes back ACCEPT or DROP.
 //!
-//! NOTE: this is currently a skeleton. Real packet parsing, process
-//! resolution and prompt round-trip land in Phase 1.
+//! Runs the blocking `nfq::Queue::recv()` on a dedicated `spawn_blocking`
+//! thread and bridges back to async land via channels.
 
-use crate::decision::Engine;
-use tokio::sync::mpsc;
+use crate::decision::{Decision, Engine};
+use crate::packet;
+use crate::process_resolve;
+use cfc_core::{Action, Connection, Direction, Process, Verdict};
+use nfq::{Queue, Verdict as NfqVerdict};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 pub type PromptTx = mpsc::Sender<PromptRequest>;
 
 /// A request from the NFQUEUE worker to the IPC layer asking for a verdict.
 pub struct PromptRequest {
-    pub connection: cfc_core::Connection,
-    pub process: cfc_core::Process,
-    pub responder: tokio::sync::oneshot::Sender<cfc_core::Verdict>,
+    pub connection: Connection,
+    pub process: Process,
+    pub responder: oneshot::Sender<Verdict>,
+}
+
+/// Observed connection (post-decision) broadcast to the live feed.
+#[derive(Debug, Clone)]
+pub struct ObservedConnection {
+    pub connection: Connection,
+    pub process: Process,
+    pub verdict: Verdict,
 }
 
 pub async fn spawn(
     queue_num: u16,
-    _engine: Engine,
+    engine: Engine,
     _prompt_tx: PromptTx,
+    observed_tx: tokio::sync::broadcast::Sender<ObservedConnection>,
 ) -> anyhow::Result<JoinHandle<()>> {
-    info!(queue_num, "NFQUEUE worker would attach here");
+    info!(queue_num, "opening NFQUEUE");
+
+    let mut queue = match Queue::open() {
+        Ok(q) => q,
+        Err(e) => {
+            error!("failed to open NFQUEUE socket: {e}. NFQUEUE worker disabled");
+            return Ok(tokio::spawn(async {}));
+        }
+    };
+    if let Err(e) = queue.bind(queue_num) {
+        error!(
+            queue_num,
+            "failed to bind NFQUEUE: {e}. Are we running as root with CAP_NET_ADMIN?"
+        );
+        return Ok(tokio::spawn(async {}));
+    }
+
+    info!(queue_num, "NFQUEUE bound, entering recv loop");
 
     let handle = tokio::task::spawn_blocking(move || {
-        // TODO Phase 1: open nfq::Queue, loop recv -> parse -> resolve ->
-        // engine.evaluate() -> set_verdict(). For now we just park.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            warn!("nfqueue worker is a stub - no packets being processed yet");
-        }
+        recv_loop(queue, engine, observed_tx);
     });
 
-    // Wrap the JoinHandle<()> from spawn_blocking into a future-shaped one.
     Ok(tokio::spawn(async move {
-        let _ = handle.await;
+        if let Err(e) = handle.await {
+            error!("NFQUEUE blocking task joined with error: {e}");
+        }
     }))
+}
+
+fn recv_loop(
+    mut queue: Queue,
+    engine: Engine,
+    observed_tx: tokio::sync::broadcast::Sender<ObservedConnection>,
+) {
+    loop {
+        let mut msg = match queue.recv() {
+            Ok(m) => m,
+            Err(e) => {
+                error!("NFQUEUE recv error: {e}, sleeping then retrying");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+        };
+
+        let payload = msg.get_payload();
+        let conn = match packet::parse(payload, Direction::Outbound) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("dropping unparseable packet: {e}");
+                msg.set_verdict(NfqVerdict::Accept);
+                let _ = queue.verdict(msg);
+                continue;
+            }
+        };
+
+        let pid_hint = process_resolve::pid_for_socket(
+            conn.protocol,
+            conn.src_ip,
+            conn.src_port,
+            conn.dst_ip,
+            conn.dst_port,
+        );
+        let proc = match pid_hint {
+            Some(pid) => process_resolve::resolve(pid),
+            None => Process::unknown(0),
+        };
+        let conn = if let Some(pid) = pid_hint {
+            conn.with_process(pid, proc.uid)
+        } else {
+            conn
+        };
+
+        let decision = engine.evaluate(&conn, &proc);
+        let verdict = match decision {
+            Decision::Resolved(v) => v,
+            Decision::NeedsPrompt { fallback } => {
+                // Phase 1c: no prompt round-trip yet, fall back to default policy.
+                trace!(
+                    pid = ?conn.pid,
+                    dst = %conn.dst_ip,
+                    port = conn.dst_port,
+                    "no rule match - applying default policy"
+                );
+                fallback
+            }
+        };
+
+        let nfq_verdict = match verdict.action {
+            Action::Allow => NfqVerdict::Accept,
+            Action::Deny | Action::Reject => NfqVerdict::Drop,
+        };
+
+        msg.set_verdict(nfq_verdict);
+        if let Err(e) = queue.verdict(msg) {
+            warn!("setting NFQUEUE verdict failed: {e}");
+        }
+
+        let _ = observed_tx.send(ObservedConnection {
+            connection: conn,
+            process: proc,
+            verdict,
+        });
+    }
 }

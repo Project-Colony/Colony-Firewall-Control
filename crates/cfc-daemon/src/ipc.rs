@@ -1,15 +1,11 @@
 //! gRPC server over a Unix domain socket.
-//!
-//! Skeleton: opens the socket and accepts connections, but service handlers
-//! are stubs returning `Unimplemented` for now. Phase 1 wires them to the
-//! decision engine + storage.
 
 use crate::decision::Engine;
-use crate::nfqueue::{PromptRequest, PromptTx};
+use crate::nfqueue::{ObservedConnection, PromptRequest, PromptTx};
 use crate::storage::RuleStore;
 use anyhow::Context;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -28,6 +24,8 @@ struct FirewallService {
     store: RuleStore,
     #[allow(dead_code)]
     prompt_tx: PromptTx,
+    #[allow(dead_code)]
+    observed_tx: broadcast::Sender<ObservedConnection>,
 }
 
 #[tonic::async_trait]
@@ -39,35 +37,35 @@ impl Firewall for FirewallService {
         &self,
         _req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
-        Err(Status::unimplemented("StreamPrompts: Phase 1"))
+        Err(Status::unimplemented("StreamPrompts: Phase 1d"))
     }
 
     async fn submit_verdict(
         &self,
         _req: Request<VerdictRequest>,
     ) -> Result<Response<VerdictResponse>, Status> {
-        Err(Status::unimplemented("SubmitVerdict: Phase 1"))
+        Err(Status::unimplemented("SubmitVerdict: Phase 1d"))
     }
 
     async fn list_rules(
         &self,
         _req: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
-        Err(Status::unimplemented("ListRules: Phase 1"))
+        Err(Status::unimplemented("ListRules: Phase 1d"))
     }
 
     async fn upsert_rule(
         &self,
         _req: Request<UpsertRuleRequest>,
     ) -> Result<Response<UpsertRuleResponse>, Status> {
-        Err(Status::unimplemented("UpsertRule: Phase 1"))
+        Err(Status::unimplemented("UpsertRule: Phase 1d"))
     }
 
     async fn delete_rule(
         &self,
         _req: Request<DeleteRuleRequest>,
     ) -> Result<Response<DeleteRuleResponse>, Status> {
-        Err(Status::unimplemented("DeleteRule: Phase 1"))
+        Err(Status::unimplemented("DeleteRule: Phase 1d"))
     }
 
     type StreamConnectionsStream = tokio_stream::wrappers::ReceiverStream<
@@ -78,7 +76,7 @@ impl Firewall for FirewallService {
         &self,
         _req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamConnectionsStream>, Status> {
-        Err(Status::unimplemented("StreamConnections: Phase 1"))
+        Err(Status::unimplemented("StreamConnections: Phase 1d"))
     }
 
     async fn get_status(
@@ -101,6 +99,7 @@ pub async fn spawn(
     socket_path: PathBuf,
     engine: Engine,
     store: RuleStore,
+    observed_tx: broadcast::Sender<ObservedConnection>,
 ) -> anyhow::Result<(JoinHandle<()>, PromptTx)> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -113,6 +112,7 @@ pub async fn spawn(
         engine,
         store,
         prompt_tx: prompt_tx.clone(),
+        observed_tx,
     };
 
     let uds = tokio::net::UnixListener::bind(&socket_path)
