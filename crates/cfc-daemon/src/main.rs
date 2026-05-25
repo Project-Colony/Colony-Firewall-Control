@@ -12,6 +12,7 @@ mod ipc;
 mod nfqueue;
 mod packet;
 mod process_resolve;
+mod prompts;
 mod stats;
 mod storage;
 
@@ -61,12 +62,14 @@ async fn main() -> anyhow::Result<()> {
 
     let (observed_tx, _) = tokio::sync::broadcast::channel(1024);
     let stats = stats::Stats::new();
+    let router = prompts::PromptRouter::new(cfg.default_policy, stats.clone());
 
     let (ipc_handle, prompt_tx) = ipc::spawn(
         socket_path.clone(),
         engine.clone(),
         store.clone(),
         observed_tx.clone(),
+        router,
         stats.clone(),
     )
     .await

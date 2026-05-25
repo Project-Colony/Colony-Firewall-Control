@@ -30,7 +30,7 @@ pub struct ObservedConnection {
 pub async fn spawn(
     queue_num: u16,
     engine: Engine,
-    _prompt_tx: PromptTx,
+    prompt_tx: PromptTx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
 ) -> anyhow::Result<JoinHandle<()>> {
@@ -54,7 +54,7 @@ pub async fn spawn(
     info!(queue_num, "NFQUEUE bound, entering recv loop");
 
     let handle = tokio::task::spawn_blocking(move || {
-        recv_loop(queue, engine, observed_tx, stats);
+        recv_loop(queue, engine, prompt_tx, observed_tx, stats);
     });
 
     Ok(tokio::spawn(async move {
@@ -67,6 +67,7 @@ pub async fn spawn(
 fn recv_loop(
     mut queue: Queue,
     engine: Engine,
+    prompt_tx: PromptTx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
 ) {
@@ -112,13 +113,25 @@ fn recv_loop(
         let verdict = match decision {
             Decision::Resolved(v) => v,
             Decision::NeedsPrompt { fallback } => {
-                trace!(
-                    pid = ?conn.pid,
-                    dst = %conn.dst_ip,
-                    port = conn.dst_port,
-                    "no rule match - applying default policy (Phase 1e will prompt UI)"
-                );
-                fallback
+                let (tx, rx) = oneshot::channel();
+                let req = PromptRequest {
+                    connection: conn.clone(),
+                    process: proc.clone(),
+                    responder: tx,
+                };
+                match prompt_tx.blocking_send(req) {
+                    Ok(()) => match rx.blocking_recv() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            trace!("prompt channel dropped, falling back");
+                            fallback
+                        }
+                    },
+                    Err(_) => {
+                        trace!("prompt_tx closed, falling back");
+                        fallback
+                    }
+                }
             }
         };
 

@@ -3,6 +3,7 @@
 use crate::convert;
 use crate::decision::Engine;
 use crate::nfqueue::{ObservedConnection, PromptRequest, PromptTx};
+use crate::prompts::PromptRouter;
 use crate::stats::Stats;
 use crate::storage::RuleStore;
 use anyhow::Context;
@@ -15,36 +16,89 @@ use tracing::{info, warn};
 use cfc_proto::v1::{
     firewall_server::{Firewall, FirewallServer},
     ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse, ListRulesRequest,
-    ListRulesResponse, StatusRequest, StatusResponse, SubscribeRequest,
+    ListRulesResponse, PromptEvent, StatusRequest, StatusResponse, SubscribeRequest,
     UpsertRuleRequest, UpsertRuleResponse, VerdictRequest, VerdictResponse,
 };
 
 struct FirewallService {
     engine: Engine,
     store: RuleStore,
-    #[allow(dead_code)]
-    prompt_tx: PromptTx,
     observed_tx: broadcast::Sender<ObservedConnection>,
+    router: PromptRouter,
     stats: Stats,
 }
 
 #[tonic::async_trait]
 impl Firewall for FirewallService {
     type StreamPromptsStream =
-        tokio_stream::wrappers::ReceiverStream<Result<cfc_proto::v1::PromptEvent, Status>>;
+        tokio_stream::wrappers::ReceiverStream<Result<PromptEvent, Status>>;
 
     async fn stream_prompts(
         &self,
         _req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
-        Err(Status::unimplemented("StreamPrompts: Phase 1e"))
+        let (tx, rx) = mpsc::channel(64);
+        let mut sub = self.router.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match sub.recv().await {
+                    Ok(event) => {
+                        if tx.send(Ok(event)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("prompt stream client lagged by {n} prompts");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn submit_verdict(
         &self,
-        _req: Request<VerdictRequest>,
+        req: Request<VerdictRequest>,
     ) -> Result<Response<VerdictResponse>, Status> {
-        Err(Status::unimplemented("SubmitVerdict: Phase 1e"))
+        let req = req.into_inner();
+        let action = convert::action_from_pb(req.action);
+        let verdict = cfc_core::Verdict {
+            action,
+            source: cfc_core::VerdictSource::UserPrompt,
+        };
+
+        if let Some(scope_pb) = req.persist_scope.clone() {
+            let scope = convert::scope_from_pb(&scope_pb);
+            let duration = convert::duration_from_pb(req.duration);
+            let rule = cfc_core::Rule {
+                id: uuid::Uuid::new_v4(),
+                name: format!("user prompt {}", &req.prompt_id),
+                enabled: true,
+                action,
+                duration,
+                scope,
+                created_at: chrono::Utc::now(),
+                hit_count: 0,
+            };
+            if let Err(e) = self.store.upsert(&rule) {
+                warn!("failed to persist rule from prompt verdict: {e}");
+            } else {
+                self.engine.upsert_rule(rule);
+            }
+        }
+
+        let accepted = self.router.submit(&req.prompt_id, verdict);
+        Ok(Response::new(VerdictResponse {
+            accepted,
+            error: if accepted {
+                String::new()
+            } else {
+                format!("no pending prompt with id {}", req.prompt_id)
+            },
+        }))
     }
 
     async fn list_rules(
@@ -154,6 +208,7 @@ pub async fn spawn(
     engine: Engine,
     store: RuleStore,
     observed_tx: broadcast::Sender<ObservedConnection>,
+    router: PromptRouter,
     stats: Stats,
 ) -> anyhow::Result<(JoinHandle<()>, PromptTx)> {
     if let Some(parent) = socket_path.parent() {
@@ -161,13 +216,18 @@ pub async fn spawn(
     }
     let _ = std::fs::remove_file(&socket_path);
 
-    let (prompt_tx, _prompt_rx) = mpsc::channel::<PromptRequest>(256);
+    let (prompt_tx, prompt_rx) = mpsc::channel::<PromptRequest>(256);
+
+    let router_for_pump = router.clone();
+    tokio::spawn(async move {
+        crate::prompts::run_router_task(prompt_rx, router_for_pump).await;
+    });
 
     let service = FirewallService {
         engine,
         store,
-        prompt_tx: prompt_tx.clone(),
         observed_tx,
+        router,
         stats,
     };
 

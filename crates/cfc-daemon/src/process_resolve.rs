@@ -14,7 +14,7 @@
 use cfc_core::{Process, Protocol};
 use procfs::process::{FDTarget, Process as ProcFsProcess};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -175,6 +175,7 @@ fn pid_owning_inode(inode: u64, deadline: Instant) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn formats_ipv4() {
