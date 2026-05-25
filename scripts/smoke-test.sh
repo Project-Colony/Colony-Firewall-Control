@@ -95,4 +95,14 @@ if [[ -n "${FIRST_ID}" ]]; then
     "${CFC}" --socket "${SOCKET}" rules remove "${FIRST_ID}"
 fi
 
+say "cfc pause"
+"${CFC}" --socket "${SOCKET}" pause
+"${CFC}" --socket "${SOCKET}" status | grep -E "paused\s+yes" >/dev/null \
+    || { echo "expected status to show paused=yes"; exit 1; }
+
+say "cfc resume"
+"${CFC}" --socket "${SOCKET}" resume
+"${CFC}" --socket "${SOCKET}" status | grep -E "paused\s+no" >/dev/null \
+    || { echo "expected status to show paused=no after resume"; exit 1; }
+
 say "Smoke test passed"

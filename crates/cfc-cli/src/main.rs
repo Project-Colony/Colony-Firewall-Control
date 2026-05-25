@@ -27,6 +27,10 @@ enum Command {
     },
     /// Stream live connections to the terminal.
     Live,
+    /// Temporarily allow all flows (auto-resumes after 10 minutes).
+    Pause,
+    /// Resume normal filtering immediately.
+    Resume,
 }
 
 #[derive(Debug, Subcommand)]
@@ -160,6 +164,14 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Live => cmd_live(&mut client).await?,
+        Command::Pause => {
+            let paused = client.set_paused(true).await?;
+            println!("paused = {paused} (auto-resumes in 10 min)");
+        }
+        Command::Resume => {
+            let paused = client.set_paused(false).await?;
+            println!("paused = {paused}");
+        }
     }
 
     Ok(())
@@ -169,6 +181,7 @@ async fn cmd_status(client: &mut Client) -> anyhow::Result<()> {
     let s = client.status().await?;
     println!("version          {}", s.version);
     println!("uptime           {}s", s.uptime_seconds);
+    println!("paused           {}", if s.paused { "yes" } else { "no" });
     println!("rules            {}", s.rules_count);
     println!("prompts pending  {}", s.prompts_pending);
     println!(
