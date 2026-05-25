@@ -206,8 +206,23 @@ impl Firewall for FirewallService {
         req: Request<cfc_proto::v1::SetPausedRequest>,
     ) -> Result<Response<cfc_proto::v1::SetPausedResponse>, Status> {
         let paused = req.into_inner().paused;
-        self.stats.set_paused(paused);
-        tracing::info!("paused = {paused}");
+        let generation = self.stats.set_paused(paused);
+        tracing::info!("paused = {paused} (generation {generation})");
+
+        // Safety net: if we just paused, schedule an auto-resume in 10
+        // minutes. The generation check makes this a no-op if the user
+        // toggles again before the timer fires.
+        if paused {
+            let stats = self.stats.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                if stats.pause_generation() == generation && stats.is_paused() {
+                    stats.set_paused(false);
+                    tracing::info!("auto-unpaused after 10 min (generation {generation})");
+                }
+            });
+        }
+
         Ok(Response::new(cfc_proto::v1::SetPausedResponse { paused }))
     }
 }

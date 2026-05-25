@@ -16,6 +16,10 @@ struct StatsInner {
     connections_denied: AtomicU64,
     prompts_pending: AtomicU64,
     paused: AtomicBool,
+    /// Incremented each time `set_paused` is called. Used so the
+    /// auto-unpause timer can be invalidated if the user toggles in the
+    /// meantime.
+    pause_generation: AtomicU64,
 }
 
 impl Stats {
@@ -28,6 +32,7 @@ impl Stats {
                 connections_denied: AtomicU64::new(0),
                 prompts_pending: AtomicU64::new(0),
                 paused: AtomicBool::new(false),
+                pause_generation: AtomicU64::new(0),
             }),
         }
     }
@@ -78,8 +83,16 @@ impl Stats {
         self.inner.paused.load(Ordering::Relaxed)
     }
 
-    pub fn set_paused(&self, paused: bool) {
+    /// Sets the paused flag and bumps the generation. Returns the new
+    /// generation so callers can check whether the state has changed
+    /// before doing follow-up work (e.g. an auto-unpause timer).
+    pub fn set_paused(&self, paused: bool) -> u64 {
         self.inner.paused.store(paused, Ordering::Relaxed);
+        self.inner.pause_generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn pause_generation(&self) -> u64 {
+        self.inner.pause_generation.load(Ordering::Relaxed)
     }
 }
 

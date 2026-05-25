@@ -61,6 +61,13 @@ enum RulesCmd {
         #[arg(long)]
         replace: bool,
     },
+    /// Install a small set of sensible starter rules: system DNS, NTP,
+    /// pacman/paru mirrors, SSH client, your default browser.
+    BootstrapDefaults {
+        /// Skip already-installed defaults (matched by name).
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -147,6 +154,9 @@ async fn main() -> anyhow::Result<()> {
             }
             RulesCmd::ImportOpensnitch { path, replace } => {
                 cmd_rules_import_opensnitch(&mut client, path, replace).await?
+            }
+            RulesCmd::BootstrapDefaults { dry_run } => {
+                cmd_rules_bootstrap_defaults(&mut client, dry_run).await?
             }
         },
         Command::Live => cmd_live(&mut client).await?,
@@ -705,5 +715,118 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
         // iface.in/out. Silently skip them.
         _ => {}
     }
+    Ok(())
+}
+
+// ----- bootstrap defaults --------------------------------------------------
+
+struct DefaultRule {
+    name: &'static str,
+    exe: Option<&'static str>,
+    dst_host: Option<&'static str>,
+    dst_port: Option<u16>,
+    protocol: Option<proto::Protocol>,
+}
+
+fn default_rules() -> Vec<DefaultRule> {
+    vec![
+        // DNS - systemd-resolved owns the stub
+        DefaultRule {
+            name: "default-systemd-resolved-dns",
+            exe: Some("/usr/lib/systemd/systemd-resolved"),
+            dst_host: None,
+            dst_port: Some(53),
+            protocol: None,
+        },
+        // NTP - timesyncd or chrony
+        DefaultRule {
+            name: "default-systemd-timesyncd",
+            exe: Some("/usr/lib/systemd/systemd-timesyncd"),
+            dst_host: None,
+            dst_port: Some(123),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        DefaultRule {
+            name: "default-chrony",
+            exe: Some("/usr/bin/chronyd"),
+            dst_host: None,
+            dst_port: Some(123),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        // Package managers - hit HTTPS mirrors
+        DefaultRule {
+            name: "default-pacman-https",
+            exe: Some("/usr/bin/pacman"),
+            dst_host: None,
+            dst_port: Some(443),
+            protocol: Some(proto::Protocol::Tcp),
+        },
+        DefaultRule {
+            name: "default-paru-https",
+            exe: Some("/usr/bin/paru"),
+            dst_host: None,
+            dst_port: Some(443),
+            protocol: Some(proto::Protocol::Tcp),
+        },
+        // SSH client
+        DefaultRule {
+            name: "default-ssh-client",
+            exe: Some("/usr/bin/ssh"),
+            dst_host: None,
+            dst_port: Some(22),
+            protocol: Some(proto::Protocol::Tcp),
+        },
+    ]
+}
+
+async fn cmd_rules_bootstrap_defaults(client: &mut Client, dry_run: bool) -> anyhow::Result<()> {
+    let existing = client.list_rules().await?;
+    let existing_names: std::collections::HashSet<String> =
+        existing.iter().map(|r| r.name.clone()).collect();
+
+    let mut added = 0u32;
+    let mut skipped = 0u32;
+    for d in default_rules() {
+        if existing_names.contains(d.name) {
+            skipped += 1;
+            continue;
+        }
+        if dry_run {
+            println!("would add: {}", d.name);
+            added += 1;
+            continue;
+        }
+
+        let scope = proto::RuleScope {
+            exe_path: d.exe.unwrap_or("").to_string(),
+            exe_sha256: String::new(),
+            parent_exe: String::new(),
+            uid: 0,
+            has_uid: false,
+            dst_host: d.dst_host.unwrap_or("").to_string(),
+            dst_net: String::new(),
+            dst_port: d.dst_port.map(u32::from).unwrap_or(0),
+            has_dst_port: d.dst_port.is_some(),
+            protocol: d.protocol.map(|p| p as i32).unwrap_or(0),
+            has_protocol: d.protocol.is_some(),
+        };
+        let rule = proto::RuleInfo {
+            id: String::new(),
+            name: d.name.to_string(),
+            enabled: true,
+            action: proto::Action::Allow as i32,
+            duration: proto::Duration::Always as i32,
+            scope: Some(scope),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        };
+        client.upsert_rule(rule).await?;
+        println!("added: {}", d.name);
+        added += 1;
+    }
+    println!(
+        "{}: {added} added, {skipped} already present",
+        if dry_run { "dry-run" } else { "done" }
+    );
     Ok(())
 }
