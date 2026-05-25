@@ -648,15 +648,38 @@ name = "cfc-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfc-client",
  "cfc-core",
  "cfc-proto",
  "chrono",
  "clap",
+ "futures",
  "prost",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cfc-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cfc-core",
+ "cfc-proto",
+ "chrono",
+ "hyper-util",
+ "ipnet",
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -721,10 +744,13 @@ name = "cfc-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfc-client",
  "cfc-core",
  "cfc-proto",
  "chrono",
+ "futures",
  "iced",
+ "ipnet",
  "notify-rust",
  "prost",
  "serde",
@@ -734,6 +760,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

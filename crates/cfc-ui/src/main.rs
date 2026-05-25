@@ -1,30 +1,58 @@
 //! Colony Firewall Control - UI entry point.
 
+mod streams;
 mod theme;
 mod views;
 
-use iced::widget::{column, container, row, text, Space};
-use iced::{Element, Length, Task};
+use cfc_client::{proto, Client};
+use iced::widget::{button, column, container, row, text, Space};
+use iced::{Element, Length, Subscription, Task};
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::info;
+
+const SOCKET_PATH: &str = "/run/colony-firewall/cfc.sock";
+const LIVE_CAP: usize = 500;
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,cfc_ui=info")),
+        )
         .init();
 
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
+        .subscription(App::subscription)
         .run()
 }
 
-#[derive(Debug, Default)]
-struct App {
-    tab: Tab,
-    status_text: String,
+pub struct App {
+    pub socket_path: PathBuf,
+    pub tab: Tab,
+    pub daemon: DaemonState,
+    pub rules: Vec<proto::RuleInfo>,
+    pub live: VecDeque<LiveEntry>,
+    pub prompts: Vec<PromptCard>,
+    pub status: Option<proto::StatusResponse>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveEntry {
+    pub event: proto::ConnectionEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptCard {
+    pub event: proto::PromptEvent,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub enum Tab {
     #[default]
     Prompts,
     Rules,
@@ -33,19 +61,55 @@ enum Tab {
 }
 
 #[derive(Debug, Clone)]
-enum Message {
+pub enum DaemonState {
+    Connecting,
+    Connected,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
     TabSelected(Tab),
-    #[allow(dead_code)]
-    DaemonStatus(Result<String, String>),
+    Reconnect,
+    HandshakeDone(Result<HandshakeData, String>),
+    RulesLoaded(Result<Vec<proto::RuleInfo>, String>),
+    DeleteRule(String),
+    RuleDeleted(Result<(String, bool), String>),
+    StatusLoaded(Result<proto::StatusResponse, String>),
+    StatusTick,
+    LiveEvent(proto::ConnectionEvent),
+    LiveStreamEnded(String),
+    PromptEvent(proto::PromptEvent),
+    PromptStreamEnded(String),
+    SubmitVerdict {
+        prompt_id: String,
+        action: proto::Action,
+        scope: Option<proto::RuleScope>,
+        duration: proto::Duration,
+    },
+    VerdictSubmitted(Result<(String, bool), String>),
+}
+
+#[derive(Debug, Clone)]
+pub struct HandshakeData {
+    pub status: proto::StatusResponse,
+    pub rules: Vec<proto::RuleInfo>,
 }
 
 impl App {
     fn new() -> (Self, Task<Message>) {
         let app = Self {
+            socket_path: PathBuf::from(SOCKET_PATH),
             tab: Tab::Prompts,
-            status_text: "Not connected to daemon".to_string(),
+            daemon: DaemonState::Connecting,
+            rules: Vec::new(),
+            live: VecDeque::with_capacity(LIVE_CAP),
+            prompts: Vec::new(),
+            status: None,
+            last_error: None,
         };
-        (app, Task::none())
+        let socket = app.socket_path.clone();
+        (app, Task::perform(handshake(socket), Message::HandshakeDone))
     }
 
     fn title(&self) -> String {
@@ -54,42 +118,145 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::TabSelected(t) => self.tab = t,
-            Message::DaemonStatus(Ok(s)) => self.status_text = s,
-            Message::DaemonStatus(Err(e)) => {
-                self.status_text = format!("daemon error: {e}")
+            Message::TabSelected(t) => {
+                self.tab = t;
+                Task::none()
+            }
+            Message::Reconnect => {
+                self.daemon = DaemonState::Connecting;
+                self.last_error = None;
+                let socket = self.socket_path.clone();
+                Task::perform(handshake(socket), Message::HandshakeDone)
+            }
+            Message::HandshakeDone(Ok(data)) => {
+                self.daemon = DaemonState::Connected;
+                self.status = Some(data.status);
+                self.rules = data.rules;
+                self.last_error = None;
+                info!("connected to daemon");
+                Task::none()
+            }
+            Message::HandshakeDone(Err(e)) => {
+                self.daemon = DaemonState::Failed(e.clone());
+                self.last_error = Some(e);
+                Task::none()
+            }
+            Message::RulesLoaded(Ok(rules)) => {
+                self.rules = rules;
+                Task::none()
+            }
+            Message::RulesLoaded(Err(e)) => {
+                self.last_error = Some(e);
+                Task::none()
+            }
+            Message::DeleteRule(id) => {
+                let socket = self.socket_path.clone();
+                Task::perform(delete_rule(socket, id), Message::RuleDeleted)
+            }
+            Message::RuleDeleted(Ok((id, true))) => {
+                self.rules.retain(|r| r.id != id);
+                Task::none()
+            }
+            Message::RuleDeleted(Ok((_, false))) => Task::none(),
+            Message::RuleDeleted(Err(e)) => {
+                self.last_error = Some(e);
+                Task::none()
+            }
+            Message::StatusLoaded(Ok(s)) => {
+                self.status = Some(s);
+                Task::none()
+            }
+            Message::StatusLoaded(Err(_)) => Task::none(),
+            Message::StatusTick => {
+                if matches!(self.daemon, DaemonState::Connected) {
+                    let socket = self.socket_path.clone();
+                    Task::perform(fetch_status(socket), Message::StatusLoaded)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::LiveEvent(ev) => {
+                self.live.push_front(LiveEntry { event: ev });
+                while self.live.len() > LIVE_CAP {
+                    self.live.pop_back();
+                }
+                Task::none()
+            }
+            Message::LiveStreamEnded(e) => {
+                self.last_error = Some(format!("live stream ended: {e}"));
+                Task::none()
+            }
+            Message::PromptEvent(ev) => {
+                self.prompts.push(PromptCard { event: ev });
+                Task::none()
+            }
+            Message::PromptStreamEnded(e) => {
+                self.last_error = Some(format!("prompt stream ended: {e}"));
+                Task::none()
+            }
+            Message::SubmitVerdict {
+                prompt_id,
+                action,
+                scope,
+                duration,
+            } => {
+                self.prompts.retain(|p| p.event.prompt_id != prompt_id);
+                let socket = self.socket_path.clone();
+                Task::perform(
+                    submit_verdict(socket, prompt_id, action, scope, duration),
+                    Message::VerdictSubmitted,
+                )
+            }
+            Message::VerdictSubmitted(Ok(_)) => Task::none(),
+            Message::VerdictSubmitted(Err(e)) => {
+                self.last_error = Some(e);
+                Task::none()
             }
         }
-        Task::none()
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let status_text = match &self.daemon {
+            DaemonState::Connecting => "Connecting...".to_string(),
+            DaemonState::Connected => "Connected".to_string(),
+            DaemonState::Failed(e) => format!("Disconnected: {e}"),
+        };
+
         let header = row![
             text("Colony Firewall Control").size(22),
             Space::new().width(Length::Fill),
-            text(self.status_text.clone()).size(12),
+            text(status_text).size(12),
+            reconnect_button(&self.daemon),
         ]
         .padding(12)
         .spacing(12)
         .align_y(iced::Alignment::Center);
 
         let tabs = row![
-            tab_button("Prompts", Tab::Prompts, self.tab),
-            tab_button("Rules", Tab::Rules, self.tab),
-            tab_button("Live", Tab::Live, self.tab),
-            tab_button("Stats", Tab::Stats, self.tab),
+            tab_button("Prompts", Tab::Prompts, self.tab, self.prompts.len()),
+            tab_button_simple("Rules", Tab::Rules, self.tab),
+            tab_button_simple("Live", Tab::Live, self.tab),
+            tab_button_simple("Stats", Tab::Stats, self.tab),
         ]
         .spacing(8)
         .padding([0, 12]);
 
         let body: Element<'_, Message> = match self.tab {
-            Tab::Prompts => views::prompts::view(),
-            Tab::Rules => views::rules::view(),
-            Tab::Live => views::live::view(),
-            Tab::Stats => views::stats::view(),
+            Tab::Prompts => views::prompts::view(&self.prompts),
+            Tab::Rules => views::rules::view(&self.rules),
+            Tab::Live => views::live::view(&self.live),
+            Tab::Stats => views::stats::view(self.status.as_ref()),
         };
 
-        container(column![header, tabs, body].spacing(12))
+        let footer: Element<'_, Message> = if let Some(err) = &self.last_error {
+            container(text(format!("error: {err}")).size(11))
+                .padding(6)
+                .into()
+        } else {
+            container(text("")).into()
+        };
+
+        container(column![header, tabs, body, footer].spacing(8))
             .padding(8)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -99,11 +266,33 @@ impl App {
     fn theme(&self) -> iced::Theme {
         theme::parchment()
     }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subs = Vec::new();
+
+        if matches!(self.daemon, DaemonState::Connected) {
+            subs.push(iced::time::every(Duration::from_secs(2)).map(|_| Message::StatusTick));
+            subs.push(streams::live_subscription(self.socket_path.clone()));
+            subs.push(streams::prompts_subscription(self.socket_path.clone()));
+        }
+
+        Subscription::batch(subs)
+    }
 }
 
-fn tab_button<'a>(label: &'a str, this: Tab, current: Tab) -> Element<'a, Message> {
+fn tab_button<'a>(
+    label: &'a str,
+    this: Tab,
+    current: Tab,
+    badge: usize,
+) -> Element<'a, Message> {
+    let display = if badge > 0 {
+        format!("{label} ({badge})")
+    } else {
+        label.to_string()
+    };
     let is_active = this == current;
-    let btn = iced::widget::button(text(label))
+    let btn = button(text(display))
         .on_press(Message::TabSelected(this))
         .padding([6, 14]);
     if is_active {
@@ -111,4 +300,54 @@ fn tab_button<'a>(label: &'a str, this: Tab, current: Tab) -> Element<'a, Messag
     } else {
         btn.style(iced::widget::button::secondary).into()
     }
+}
+
+fn tab_button_simple<'a>(label: &'a str, this: Tab, current: Tab) -> Element<'a, Message> {
+    tab_button(label, this, current, 0)
+}
+
+fn reconnect_button(state: &DaemonState) -> Element<'_, Message> {
+    match state {
+        DaemonState::Connected | DaemonState::Connecting => {
+            container(text("")).into()
+        }
+        DaemonState::Failed(_) => button(text("Reconnect"))
+            .on_press(Message::Reconnect)
+            .padding([4, 10])
+            .style(iced::widget::button::primary)
+            .into(),
+    }
+}
+
+async fn handshake(path: PathBuf) -> Result<HandshakeData, String> {
+    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let status = client.status().await.map_err(|e| e.to_string())?;
+    let rules = client.list_rules().await.map_err(|e| e.to_string())?;
+    Ok(HandshakeData { status, rules })
+}
+
+async fn fetch_status(path: PathBuf) -> Result<proto::StatusResponse, String> {
+    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    client.status().await.map_err(|e| e.to_string())
+}
+
+async fn delete_rule(path: PathBuf, id: String) -> Result<(String, bool), String> {
+    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let ok = client.delete_rule(&id).await.map_err(|e| e.to_string())?;
+    Ok((id, ok))
+}
+
+async fn submit_verdict(
+    path: PathBuf,
+    prompt_id: String,
+    action: proto::Action,
+    scope: Option<proto::RuleScope>,
+    duration: proto::Duration,
+) -> Result<(String, bool), String> {
+    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let accepted = client
+        .submit_verdict(&prompt_id, action, duration, scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((prompt_id, accepted))
 }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cfc-core",
     "crates/cfc-proto",
+    "crates/cfc-client",
     "crates/cfc-daemon",
     "crates/cfc-ui",
     "crates/cfc-cli",
@@ -28,6 +29,8 @@ tonic-prost-build = "0.14"
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = { version = "0.1.18", features = ["net"] }
 futures = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 
 # Storage
 rusqlite = { version = "0.39", features = ["bundled"] }
