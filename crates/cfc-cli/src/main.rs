@@ -830,3 +830,159 @@ async fn cmd_rules_bootstrap_defaults(client: &mut Client, dry_run: bool) -> any
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod opensnitch_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(json: &str) -> anyhow::Result<proto::RuleInfo> {
+        let osn: OsnRule = serde_json::from_str(json)?;
+        convert_opensnitch(Path::new("test.json"), osn)
+    }
+
+    #[test]
+    fn simple_process_path() {
+        let r = parse(
+            r#"{
+              "name": "firefox-https",
+              "enabled": true,
+              "action": "allow",
+              "duration": "always",
+              "operator": {
+                "type": "simple",
+                "operand": "process.path",
+                "data": "/usr/lib/firefox/firefox"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.name, "firefox-https");
+        assert_eq!(r.action, proto::Action::Allow as i32);
+        let scope = r.scope.unwrap();
+        assert_eq!(scope.exe_path, "/usr/lib/firefox/firefox");
+    }
+
+    #[test]
+    fn list_of_predicates() {
+        let r = parse(
+            r#"{
+              "name": "curl-443",
+              "enabled": true,
+              "action": "allow",
+              "duration": "always",
+              "operator": {
+                "type": "list",
+                "operand": "list",
+                "list": [
+                  {"type": "simple", "operand": "process.path", "data": "/usr/bin/curl"},
+                  {"type": "simple", "operand": "dest.port", "data": "443"},
+                  {"type": "simple", "operand": "protocol", "data": "TCP"}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        let scope = r.scope.unwrap();
+        assert_eq!(scope.exe_path, "/usr/bin/curl");
+        assert_eq!(scope.dst_port, 443);
+        assert!(scope.has_dst_port);
+        assert_eq!(scope.protocol, proto::Protocol::Tcp as i32);
+        assert!(scope.has_protocol);
+    }
+
+    #[test]
+    fn deny_action_recognized() {
+        let r = parse(
+            r#"{
+              "name": "block-evil",
+              "action": "deny",
+              "duration": "once",
+              "operator": {
+                "type": "simple",
+                "operand": "dest.host",
+                "data": "evil.example"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.action, proto::Action::Deny as i32);
+        assert_eq!(r.duration, proto::Duration::Once as i32);
+        assert_eq!(r.scope.unwrap().dst_host, "evil.example");
+    }
+
+    #[test]
+    fn dest_ip_becomes_cidr() {
+        let r = parse(
+            r#"{
+              "name": "block-ip",
+              "action": "deny",
+              "operator": {"type": "simple", "operand": "dest.ip", "data": "1.2.3.4"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.scope.unwrap().dst_net, "1.2.3.4/32");
+    }
+
+    #[test]
+    fn ipv6_dest_ip_becomes_128_cidr() {
+        let r = parse(
+            r#"{
+              "name": "block-v6",
+              "action": "deny",
+              "operator": {"type": "simple", "operand": "dest.ip", "data": "2001:db8::1"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.scope.unwrap().dst_net, "2001:db8::1/128");
+    }
+
+    #[test]
+    fn empty_rule_rejected() {
+        // No operator at all -> no convertible predicates -> error.
+        let err = parse(
+            r#"{
+              "name": "nothing",
+              "action": "allow"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no convertible predicates"));
+    }
+
+    #[test]
+    fn unknown_operands_silently_skipped() {
+        // process.command isn't supported but the rule has a valid
+        // process.path too - the latter alone is enough.
+        let r = parse(
+            r#"{
+              "name": "mixed",
+              "action": "allow",
+              "operator": {
+                "type": "list",
+                "operand": "list",
+                "list": [
+                  {"type": "simple", "operand": "process.command", "data": "curl -s X"},
+                  {"type": "simple", "operand": "process.path", "data": "/usr/bin/curl"}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.scope.unwrap().exe_path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn regexp_type_treated_like_simple() {
+        let r = parse(
+            r#"{
+              "name": "rxp",
+              "action": "allow",
+              "operator": {"type": "regexp", "operand": "process.path", "data": "/usr/bin/.*"}
+            }"#,
+        )
+        .unwrap();
+        // We don't actually evaluate regex but the data lands in exe_path.
+        assert_eq!(r.scope.unwrap().exe_path, "/usr/bin/.*");
+    }
+}
