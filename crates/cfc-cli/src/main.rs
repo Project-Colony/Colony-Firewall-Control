@@ -51,6 +51,14 @@ enum RulesCmd {
         #[arg(long)]
         replace: bool,
     },
+    /// Import rules from an opensnitch rules directory or single JSON file.
+    ImportOpensnitch {
+        /// Path to opensnitch rules dir (e.g. /etc/opensnitchd/rules) or a single .json.
+        path: PathBuf,
+        /// Replace mode: delete all existing rules first.
+        #[arg(long)]
+        replace: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -133,6 +141,9 @@ async fn main() -> anyhow::Result<()> {
             RulesCmd::Export { out } => cmd_rules_export(&mut client, out).await?,
             RulesCmd::Import { file, replace } => {
                 cmd_rules_import(&mut client, file, replace).await?
+            }
+            RulesCmd::ImportOpensnitch { path, replace } => {
+                cmd_rules_import_opensnitch(&mut client, path, replace).await?
             }
         },
         Command::Live => cmd_live(&mut client).await?,
@@ -456,4 +467,206 @@ fn proto_rules_to_export(rules: &[proto::RuleInfo]) -> Vec<ExportedRule> {
             }
         })
         .collect()
+}
+
+// ----- opensnitch import ----------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct OsnRule {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_allow_str")]
+    action: String,
+    #[serde(default = "default_duration")]
+    duration: String,
+    #[serde(default)]
+    operator: Option<OsnOperator>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[serde(tag = "type")]
+enum OsnOperator {
+    Simple(OsnSimple),
+    Regexp(OsnSimple),
+    List(OsnList),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OsnSimple {
+    operand: String,
+    #[serde(default)]
+    data: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OsnList {
+    #[serde(default)]
+    #[allow(dead_code)]
+    operand: String,
+    #[serde(default)]
+    list: Vec<OsnOperator>,
+}
+
+fn default_allow_str() -> String {
+    "allow".into()
+}
+
+async fn cmd_rules_import_opensnitch(
+    client: &mut Client,
+    path: PathBuf,
+    replace: bool,
+) -> anyhow::Result<()> {
+    let files: Vec<PathBuf> = if path.is_dir() {
+        std::fs::read_dir(&path)
+            .with_context(|| format!("reading dir {}", path.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect()
+    } else {
+        vec![path.clone()]
+    };
+
+    if files.is_empty() {
+        anyhow::bail!("no .json files found under {}", path.display());
+    }
+
+    if replace {
+        let existing = client.list_rules().await?;
+        for r in existing {
+            let _ = client.delete_rule(&r.id).await;
+        }
+    }
+
+    let mut imported = 0u32;
+    let mut skipped = 0u32;
+    for file in &files {
+        let json =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let osn: OsnRule = match serde_json::from_str(&json) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skip {}: parse error: {e}", file.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        match convert_opensnitch(file, osn) {
+            Ok(rule) => {
+                client.upsert_rule(rule).await?;
+                imported += 1;
+            }
+            Err(e) => {
+                eprintln!("skip {}: {e}", file.display());
+                skipped += 1;
+            }
+        }
+    }
+    println!("imported {imported} rules ({skipped} skipped)");
+    Ok(())
+}
+
+fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<proto::RuleInfo> {
+    let action = match osn.action.to_ascii_lowercase().as_str() {
+        "deny" | "drop" => proto::Action::Deny,
+        "reject" => proto::Action::Reject,
+        _ => proto::Action::Allow,
+    };
+    let duration = match osn.duration.to_ascii_lowercase().as_str() {
+        "once" => proto::Duration::Once,
+        "until restart" | "until-restart" | "restart" => proto::Duration::UntilRestart,
+        _ => proto::Duration::Always,
+    };
+
+    let mut scope = proto::RuleScope::default();
+    if let Some(op) = osn.operator {
+        apply_operator(&op, &mut scope)?;
+    }
+
+    let scope_empty = scope.exe_path.is_empty()
+        && scope.dst_host.is_empty()
+        && scope.dst_net.is_empty()
+        && !scope.has_dst_port
+        && !scope.has_protocol
+        && !scope.has_uid;
+    if scope_empty {
+        anyhow::bail!("no convertible predicates");
+    }
+
+    let name = osn.name.unwrap_or_else(|| {
+        file.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "opensnitch-import".into())
+    });
+
+    Ok(proto::RuleInfo {
+        id: String::new(),
+        name,
+        enabled: osn.enabled,
+        action: action as i32,
+        duration: duration as i32,
+        scope: Some(scope),
+        created_at_unix_ms: 0,
+        hit_count: 0,
+    })
+}
+
+fn apply_operator(op: &OsnOperator, scope: &mut proto::RuleScope) -> anyhow::Result<()> {
+    match op {
+        OsnOperator::Simple(s) | OsnOperator::Regexp(s) => apply_simple(s, scope),
+        OsnOperator::List(l) => {
+            for sub in &l.list {
+                apply_operator(sub, scope)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<()> {
+    match s.operand.as_str() {
+        "process.path" => scope.exe_path = s.data.clone(),
+        "process.hash.sha256" => scope.exe_sha256 = s.data.clone(),
+        "user.id" => {
+            if let Ok(uid) = s.data.parse::<u32>() {
+                scope.uid = uid;
+                scope.has_uid = true;
+            }
+        }
+        "dest.host" | "dest.domain" => scope.dst_host = s.data.clone(),
+        "dest.ip" => {
+            // single IP -> /32 or /128
+            if s.data.contains(':') {
+                scope.dst_net = format!("{}/128", s.data);
+            } else {
+                scope.dst_net = format!("{}/32", s.data);
+            }
+        }
+        "dest.network" => scope.dst_net = s.data.clone(),
+        "dest.port" => {
+            if let Ok(port) = s.data.parse::<u32>() {
+                scope.dst_port = port;
+                scope.has_dst_port = true;
+            }
+        }
+        "protocol" => {
+            let proto = match s.data.to_ascii_uppercase().as_str() {
+                "TCP" => Some(proto::Protocol::Tcp as i32),
+                "UDP" => Some(proto::Protocol::Udp as i32),
+                "ICMP" => Some(proto::Protocol::Icmp as i32),
+                _ => None,
+            };
+            if let Some(p) = proto {
+                scope.protocol = p;
+                scope.has_protocol = true;
+            }
+        }
+        // Operands we don't yet support: process.command, process.id,
+        // iface.in/out. Silently skip them.
+        _ => {}
+    }
+    Ok(())
 }

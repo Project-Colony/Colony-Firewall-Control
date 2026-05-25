@@ -1,12 +1,25 @@
 # Colony Firewall daemon config. Install to /etc/colony-firewall/daemon.toml.
 
-[default_policy]
-# When no rule matches and no UI is connected to answer prompts, what do we do?
-no_ui_action = "Allow"
-# When a prompt expires without a user answer, what do we do?
-timeout_action = "Allow"
-# How long a prompt waits for a user answer, in seconds.
-prompt_timeout_secs = 15
+# Named preset. Pick one of: "relaxed", "balanced", "strict".
+# Omit to use "balanced" defaults.
+#
+#   relaxed  - Allow when no UI / on timeout, 60s prompt window.
+#              Best for laptops where you don't always have the UI open.
+#   balanced - Allow when no UI / on timeout, 15s window. (default)
+#   strict   - Deny when no UI / on timeout, 10s window.
+#              Fail-closed posture; only use if you keep the UI running.
+#
+# If you uncomment any [default_policy] field below, that block becomes
+# authoritative and the profile is ignored.
+profile = "balanced"
+
+# [default_policy]
+# # What to do when no rule matches and no UI is connected.
+# no_ui_action = "Allow"
+# # What to do if a prompt expires.
+# timeout_action = "Allow"
+# # How long a prompt waits for a user answer, in seconds.
+# prompt_timeout_secs = 15
 
 [nfqueue]
 # NFQUEUE number. Must match the iptables/nftables rule that enqueues packets.

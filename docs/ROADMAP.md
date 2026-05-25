@@ -39,8 +39,8 @@ Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 - [x] Live feed scrolling list
 - [x] Stats counter cards (read from GetStatus, 2s polling)
 - [x] Desktop notifications via notify-rust on new prompts
+- [x] Inline rule editor in Rules tab (name, action, duration, exe, host, net, port, protocol)
 - [ ] System tray icon (ksni) with quick toggle
-- [ ] Inline rule editor (currently rules only created via prompt verdict)
 
 ## Phase 3 - CLI [done]
 
@@ -48,6 +48,7 @@ Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 - [x] `cfc rules list/remove`
 - [x] `cfc rules add` with full scope flags
 - [x] `cfc rules export/import` (JSON)
+- [x] `cfc rules import-opensnitch` (parses opensnitch's rule JSON)
 - [x] `cfc live` terminal feed
 - [ ] Color output and follow mode polish
 
@@ -61,7 +62,7 @@ Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 ## Phase 5 - Polish
 
 - [ ] VirusTotal lookup integration (optional, opt-in)
-- [ ] Profile presets: medium / high / no-filtering
-- [ ] Import rules from opensnitch JSON
-- [ ] Colony app store manifest (`colony.json`)
-- [ ] AUR PKGBUILD + signed release
+- [x] Profile presets: relaxed / balanced / strict
+- [x] Import rules from opensnitch JSON
+- [x] Colony app store manifest (`colony.json`)
+- [x] AUR PKGBUILD draft (signed release pending)

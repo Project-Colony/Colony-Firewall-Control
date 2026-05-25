@@ -39,6 +39,36 @@ pub struct App {
     pub prompts: Vec<PromptCard>,
     pub status: Option<proto::StatusResponse>,
     pub last_error: Option<String>,
+    pub editor: Option<RuleEditor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuleEditor {
+    pub name: String,
+    pub action: proto::Action,
+    pub duration: proto::Duration,
+    pub exe: String,
+    pub dst_host: String,
+    pub dst_net: String,
+    pub dst_port: String,
+    pub protocol: Option<proto::Protocol>,
+    pub validation: Option<String>,
+}
+
+impl Default for RuleEditor {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            action: proto::Action::Allow,
+            duration: proto::Duration::Always,
+            exe: String::new(),
+            dst_host: String::new(),
+            dst_net: String::new(),
+            dst_port: String::new(),
+            protocol: None,
+            validation: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +118,18 @@ pub enum Message {
         duration: proto::Duration,
     },
     VerdictSubmitted(Result<(String, bool), String>),
+    OpenEditor,
+    CloseEditor,
+    EditorName(String),
+    EditorAction(proto::Action),
+    EditorDuration(proto::Duration),
+    EditorExe(String),
+    EditorDstHost(String),
+    EditorDstNet(String),
+    EditorDstPort(String),
+    EditorProtocol(Option<proto::Protocol>),
+    SaveRule,
+    RuleSaved(Result<String, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +149,7 @@ impl App {
             prompts: Vec::new(),
             status: None,
             last_error: None,
+            editor: None,
         };
         let socket = app.socket_path.clone();
         (
@@ -216,6 +259,90 @@ impl App {
                 self.last_error = Some(e);
                 Task::none()
             }
+            Message::OpenEditor => {
+                self.editor = Some(RuleEditor::default());
+                Task::none()
+            }
+            Message::CloseEditor => {
+                self.editor = None;
+                Task::none()
+            }
+            Message::EditorName(s) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.name = s;
+                }
+                Task::none()
+            }
+            Message::EditorAction(a) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.action = a;
+                }
+                Task::none()
+            }
+            Message::EditorDuration(d) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.duration = d;
+                }
+                Task::none()
+            }
+            Message::EditorExe(s) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.exe = s;
+                }
+                Task::none()
+            }
+            Message::EditorDstHost(s) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.dst_host = s;
+                }
+                Task::none()
+            }
+            Message::EditorDstNet(s) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.dst_net = s;
+                }
+                Task::none()
+            }
+            Message::EditorDstPort(s) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.dst_port = s;
+                }
+                Task::none()
+            }
+            Message::EditorProtocol(p) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.protocol = p;
+                }
+                Task::none()
+            }
+            Message::SaveRule => {
+                let Some(editor) = &mut self.editor else {
+                    return Task::none();
+                };
+                match build_rule_from_editor(editor) {
+                    Ok(rule) => {
+                        editor.validation = None;
+                        let socket = self.socket_path.clone();
+                        Task::perform(upsert_rule(socket, rule), Message::RuleSaved)
+                    }
+                    Err(e) => {
+                        editor.validation = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::RuleSaved(Ok(_)) => {
+                self.editor = None;
+                let socket = self.socket_path.clone();
+                Task::perform(fetch_rules(socket), Message::RulesLoaded)
+            }
+            Message::RuleSaved(Err(e)) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.validation = Some(e.clone());
+                }
+                self.last_error = Some(e);
+                Task::none()
+            }
         }
     }
 
@@ -247,7 +374,7 @@ impl App {
 
         let body: Element<'_, Message> = match self.tab {
             Tab::Prompts => views::prompts::view(&self.prompts),
-            Tab::Rules => views::rules::view(&self.rules),
+            Tab::Rules => views::rules::view(&self.rules, self.editor.as_ref()),
             Tab::Live => views::live::view(&self.live),
             Tab::Stats => views::stats::view(self.status.as_ref()),
         };
@@ -332,6 +459,79 @@ async fn delete_rule(path: PathBuf, id: String) -> Result<(String, bool), String
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
     let ok = client.delete_rule(&id).await.map_err(|e| e.to_string())?;
     Ok((id, ok))
+}
+
+async fn fetch_rules(path: PathBuf) -> Result<Vec<proto::RuleInfo>, String> {
+    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    client.list_rules().await.map_err(|e| e.to_string())
+}
+
+async fn upsert_rule(path: PathBuf, rule: proto::RuleInfo) -> Result<String, String> {
+    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    client.upsert_rule(rule).await.map_err(|e| e.to_string())
+}
+
+fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
+    let name = if ed.name.trim().is_empty() {
+        "ui-added".to_string()
+    } else {
+        ed.name.trim().to_string()
+    };
+
+    let dst_port = if ed.dst_port.trim().is_empty() {
+        None
+    } else {
+        Some(
+            ed.dst_port
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("\"{}\" is not a valid port", ed.dst_port))?,
+        )
+    };
+
+    let dst_net = ed.dst_net.trim();
+    if !dst_net.is_empty() {
+        dst_net
+            .parse::<ipnet::IpNet>()
+            .map_err(|e| format!("dst-net invalid: {e}"))?;
+    }
+
+    // Need at least one scope predicate, else the rule would match everything.
+    let scope_empty = ed.exe.trim().is_empty()
+        && ed.dst_host.trim().is_empty()
+        && dst_net.is_empty()
+        && dst_port.is_none()
+        && ed.protocol.is_none();
+    if scope_empty {
+        return Err(
+            "rule must restrict at least one of: exe, dst-host, dst-net, dst-port, protocol".into(),
+        );
+    }
+
+    let scope = proto::RuleScope {
+        exe_path: ed.exe.trim().to_string(),
+        exe_sha256: String::new(),
+        parent_exe: String::new(),
+        uid: 0,
+        has_uid: false,
+        dst_host: ed.dst_host.trim().to_string(),
+        dst_net: dst_net.to_string(),
+        dst_port: dst_port.map(u32::from).unwrap_or(0),
+        has_dst_port: dst_port.is_some(),
+        protocol: ed.protocol.map(|p| p as i32).unwrap_or(0),
+        has_protocol: ed.protocol.is_some(),
+    };
+
+    Ok(proto::RuleInfo {
+        id: String::new(),
+        name,
+        enabled: true,
+        action: ed.action as i32,
+        duration: ed.duration as i32,
+        scope: Some(scope),
+        created_at_unix_ms: 0,
+        hit_count: 0,
+    })
 }
 
 async fn submit_verdict(
