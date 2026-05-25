@@ -6,7 +6,8 @@
 
 use crate::config::DefaultPolicy;
 use cfc_core::{Action, Connection, Process, Rule, RuleSet, Verdict};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -17,6 +18,9 @@ pub struct Engine {
 struct EngineInner {
     rules: RwLock<RuleSet>,
     default_policy: DefaultPolicy,
+    /// Per-rule hit counter increments. Merged into the persisted
+    /// `Rule::hit_count` on snapshot() and periodically flushed.
+    hits: Mutex<HashMap<uuid::Uuid, u64>>,
 }
 
 pub enum Decision {
@@ -32,6 +36,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 rules: RwLock::new(rules),
                 default_policy,
+                hits: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -39,11 +44,15 @@ impl Engine {
     /// Evaluate without blocking. Returns `Resolved` if a rule matches,
     /// otherwise `NeedsPrompt`.
     pub fn evaluate(&self, conn: &Connection, proc: &Process) -> Decision {
-        let rules = self.inner.rules.read();
-        if let Some(rule) = rules.lookup(conn, proc) {
-            let verdict = match rule.action {
-                Action::Allow => Verdict::allow_from_rule(rule.id),
-                Action::Deny | Action::Reject => Verdict::deny_from_rule(rule.id),
+        let rule_match = {
+            let rules = self.inner.rules.read();
+            rules.lookup(conn, proc).map(|r| (r.id, r.action))
+        };
+        if let Some((rule_id, action)) = rule_match {
+            *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
+            let verdict = match action {
+                Action::Allow => Verdict::allow_from_rule(rule_id),
+                Action::Deny | Action::Reject => Verdict::deny_from_rule(rule_id),
             };
             return Decision::Resolved(verdict);
         }
@@ -68,7 +77,21 @@ impl Engine {
     }
 
     pub fn snapshot(&self) -> RuleSet {
-        self.inner.rules.read().clone()
+        let mut rs = self.inner.rules.read().clone();
+        let hits = self.inner.hits.lock();
+        for rule in &mut rs.rules {
+            if let Some(extra) = hits.get(&rule.id) {
+                rule.hit_count = rule.hit_count.saturating_add(*extra);
+            }
+        }
+        rs
+    }
+
+    /// Returns the live hit deltas accumulated since the last `drain_hits`
+    /// (or since startup) and resets them. Used by the periodic flush so
+    /// the in-memory deltas get merged into sqlite without double-counting.
+    pub fn drain_hits(&self) -> HashMap<uuid::Uuid, u64> {
+        std::mem::take(&mut *self.inner.hits.lock())
     }
 }
 

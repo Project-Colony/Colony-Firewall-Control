@@ -61,6 +61,42 @@ impl RuleStore {
         )?;
         Ok(n > 0)
     }
+
+    /// Merges per-rule hit increments into the persisted JSON `data` blob.
+    /// Skips rules that have been deleted since the increment was recorded.
+    pub fn merge_hit_counts(
+        &self,
+        increments: &std::collections::HashMap<uuid::Uuid, u64>,
+    ) -> anyhow::Result<()> {
+        if increments.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        for (id, extra) in increments {
+            let id_str = id.to_string();
+            let mut stmt = tx.prepare("SELECT data FROM rules WHERE id = ?1")?;
+            let row: Option<String> = stmt
+                .query_row(rusqlite::params![&id_str], |row| row.get(0))
+                .ok();
+            let Some(json) = row else { continue };
+            let mut rule: Rule = match serde_json::from_str(&json) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("skipping hit merge for {id}: bad JSON: {e}");
+                    continue;
+                }
+            };
+            rule.hit_count = rule.hit_count.saturating_add(*extra);
+            let new_json = serde_json::to_string(&rule)?;
+            tx.execute(
+                "UPDATE rules SET data = ?2 WHERE id = ?1",
+                rusqlite::params![id_str, new_json],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 const SCHEMA: &str = r#"

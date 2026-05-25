@@ -184,3 +184,143 @@ fn empty_to_none(s: &str) -> Option<String> {
         Some(s.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cfc_core::{Direction, Duration, Rule, RuleScope};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
+
+    #[test]
+    fn action_roundtrip() {
+        for a in [Action::Allow, Action::Deny, Action::Reject] {
+            let pb = action_to_pb(a) as i32;
+            assert_eq!(action_from_pb(pb), a);
+        }
+    }
+
+    #[test]
+    fn action_unspecified_maps_to_allow() {
+        // Defensive: an out-of-range / unspecified value should be the
+        // permissive default.
+        assert_eq!(action_from_pb(0), Action::Allow);
+        assert_eq!(action_from_pb(99), Action::Allow);
+    }
+
+    #[test]
+    fn protocol_roundtrip() {
+        for p in [Protocol::Tcp, Protocol::Udp, Protocol::Icmp] {
+            let pb = protocol_to_pb(p) as i32;
+            assert_eq!(protocol_from_pb(pb), p);
+        }
+    }
+
+    #[test]
+    fn duration_roundtrip_common_cases() {
+        assert_eq!(
+            duration_from_pb(duration_to_pb(Duration::Once) as i32),
+            Duration::Once
+        );
+        assert_eq!(
+            duration_from_pb(duration_to_pb(Duration::UntilRestart) as i32),
+            Duration::UntilRestart
+        );
+        assert_eq!(
+            duration_from_pb(duration_to_pb(Duration::Always) as i32),
+            Duration::Always
+        );
+    }
+
+    #[test]
+    fn duration_seconds_collapses_to_always() {
+        // We don't carry the Seconds variant on the wire; it round-trips
+        // through "Always" by design.
+        assert_eq!(
+            duration_from_pb(duration_to_pb(Duration::Seconds(60)) as i32),
+            Duration::Always
+        );
+    }
+
+    #[test]
+    fn scope_roundtrip_full() {
+        let scope = RuleScope {
+            exe_path: Some(PathBuf::from("/usr/bin/curl")),
+            exe_sha256: Some("abc123".into()),
+            parent_exe: Some(PathBuf::from("/bin/bash")),
+            uid: Some(1000),
+            dst_host: Some("example.com".into()),
+            dst_net: Some("10.0.0.0/8".parse().unwrap()),
+            dst_port: Some(443),
+            protocol: Some(Protocol::Tcp),
+        };
+        let pb = scope_to_pb(&scope);
+        let back = scope_from_pb(&pb);
+        assert_eq!(back, scope);
+    }
+
+    #[test]
+    fn scope_roundtrip_empty() {
+        let scope = RuleScope::any();
+        let pb = scope_to_pb(&scope);
+        let back = scope_from_pb(&pb);
+        assert_eq!(back, scope);
+    }
+
+    #[test]
+    fn rule_roundtrip() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        scope.dst_port = Some(443);
+        let rule = Rule::new("curl-https", Action::Allow, scope);
+
+        let pb = rule_to_pb(&rule);
+        let back = convert::rule_from_pb_helper(&pb);
+        assert_eq!(back.id, rule.id);
+        assert_eq!(back.name, rule.name);
+        assert_eq!(back.action, rule.action);
+        assert_eq!(back.duration, rule.duration);
+        assert_eq!(back.scope, rule.scope);
+    }
+
+    #[test]
+    fn rule_from_pb_invalid_id() {
+        let pb = cfc_proto::v1::RuleInfo {
+            id: "not-a-uuid".into(),
+            name: "x".into(),
+            enabled: true,
+            action: cfc_proto::v1::Action::Allow as i32,
+            duration: cfc_proto::v1::Duration::Always as i32,
+            scope: Some(cfc_proto::v1::RuleScope::default()),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        };
+        assert!(rule_from_pb(&pb).is_err());
+    }
+
+    #[test]
+    fn connection_to_pb_carries_5tuple() {
+        let conn = cfc_core::Connection::new(
+            Protocol::Tcp,
+            Direction::Outbound,
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            5555,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            443,
+        );
+        let pb = connection_to_pb(&conn);
+        assert_eq!(pb.src_ip, "1.2.3.4");
+        assert_eq!(pb.dst_ip, "8.8.8.8");
+        assert_eq!(pb.src_port, 5555);
+        assert_eq!(pb.dst_port, 443);
+        assert_eq!(pb.protocol, cfc_proto::v1::Protocol::Tcp as i32);
+    }
+
+    // Helper that does an empty-id rule_from_pb (skips uuid parsing).
+    mod convert {
+        use super::*;
+        pub fn rule_from_pb_helper(pb: &cfc_proto::v1::RuleInfo) -> Rule {
+            super::rule_from_pb(pb).expect("test rule should be valid")
+        }
+    }
+}

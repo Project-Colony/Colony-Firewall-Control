@@ -103,13 +103,38 @@ async fn main() -> anyhow::Result<()> {
         .context("starting NFQUEUE worker")?
     };
 
+    // Periodic hit-count flush so the persisted rule.hit_count reflects
+    // recent matches even if the daemon crashes.
+    let flush_engine = engine.clone();
+    let flush_store = store.clone();
+    let flush_handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.tick().await; // skip immediate fire
+        loop {
+            tick.tick().await;
+            let deltas = flush_engine.drain_hits();
+            if !deltas.is_empty() {
+                if let Err(e) = flush_store.merge_hit_counts(&deltas) {
+                    tracing::warn!("hit-count flush failed: {e}");
+                }
+            }
+        }
+    });
+
     info!(socket = %socket_path.display(), "ready");
 
     tokio::select! {
         r = ipc_handle => r.context("ipc task crashed")?,
         r = nfq_handle => r.context("nfqueue task crashed")?,
+        r = flush_handle => r.context("hit-flush task crashed")?,
         _ = tokio::signal::ctrl_c() => {
-            info!("SIGINT received, shutting down");
+            info!("SIGINT received, flushing hits and shutting down");
+            let deltas = engine.drain_hits();
+            if !deltas.is_empty() {
+                if let Err(e) = store.merge_hit_counts(&deltas) {
+                    tracing::warn!("final hit-count flush failed: {e}");
+                }
+            }
         }
     }
 
