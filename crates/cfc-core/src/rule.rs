@@ -131,3 +131,170 @@ impl RuleSet {
             .find(|r| r.scope.matches(conn, proc))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Connection, Direction, Process, Protocol};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
+
+    fn mk_conn() -> Connection {
+        Connection::new(
+            Protocol::Tcp,
+            Direction::Outbound,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            54321,
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            443,
+        )
+    }
+
+    fn mk_proc(exe: &str) -> Process {
+        Process {
+            pid: 100,
+            ppid: Some(1),
+            uid: 1000,
+            gid: 1000,
+            exe: PathBuf::from(exe),
+            cmdline: vec![exe.to_string()],
+            cwd: None,
+            sha256: None,
+            started_at: None,
+        }
+    }
+
+    #[test]
+    fn empty_set_returns_none() {
+        let set = RuleSet::default();
+        let conn = mk_conn();
+        let proc = mk_proc("/usr/bin/curl");
+        assert!(set.lookup(&conn, &proc).is_none());
+    }
+
+    #[test]
+    fn matches_by_exe_only() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let rule = Rule::new("curl", Action::Allow, scope);
+
+        let set = RuleSet {
+            rules: vec![rule.clone()],
+        };
+        let conn = mk_conn();
+
+        assert!(set.lookup(&conn, &mk_proc("/usr/bin/curl")).is_some());
+        assert!(set.lookup(&conn, &mk_proc("/usr/bin/wget")).is_none());
+    }
+
+    #[test]
+    fn matches_by_dst_port_only() {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+        let rule = Rule::new("https", Action::Allow, scope);
+
+        let set = RuleSet { rules: vec![rule] };
+        let proc = mk_proc("/usr/bin/curl");
+        let mut conn = mk_conn();
+
+        assert!(set.lookup(&conn, &proc).is_some());
+        conn.dst_port = 80;
+        assert!(set.lookup(&conn, &proc).is_none());
+    }
+
+    #[test]
+    fn matches_by_cidr() {
+        let mut scope = RuleScope::any();
+        scope.dst_net = Some("10.0.0.0/8".parse().unwrap());
+        let rule = Rule::new("rfc1918-10", Action::Deny, scope);
+
+        let set = RuleSet { rules: vec![rule] };
+        let proc = mk_proc("/usr/bin/curl");
+        let mut conn = mk_conn();
+
+        conn.dst_ip = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
+        assert!(set.lookup(&conn, &proc).is_some());
+
+        conn.dst_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(set.lookup(&conn, &proc).is_none());
+    }
+
+    #[test]
+    fn multiple_predicates_must_all_match() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        scope.dst_port = Some(443);
+        scope.protocol = Some(Protocol::Tcp);
+        let rule = Rule::new("curl-https-tcp", Action::Allow, scope);
+
+        let set = RuleSet { rules: vec![rule] };
+        let proc = mk_proc("/usr/bin/curl");
+
+        // All three match -> hit.
+        let mut conn = mk_conn();
+        assert!(set.lookup(&conn, &proc).is_some());
+
+        // Wrong port -> miss.
+        conn.dst_port = 80;
+        assert!(set.lookup(&conn, &proc).is_none());
+
+        // Wrong proto -> miss.
+        conn.dst_port = 443;
+        conn.protocol = Protocol::Udp;
+        assert!(set.lookup(&conn, &proc).is_none());
+
+        // Wrong exe -> miss.
+        conn.protocol = Protocol::Tcp;
+        assert!(set.lookup(&conn, &mk_proc("/usr/bin/python")).is_none());
+    }
+
+    #[test]
+    fn disabled_rules_skipped() {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+        let mut rule = Rule::new("https", Action::Allow, scope);
+        rule.enabled = false;
+
+        let set = RuleSet { rules: vec![rule] };
+        let conn = mk_conn();
+        let proc = mk_proc("/usr/bin/curl");
+        assert!(set.lookup(&conn, &proc).is_none());
+    }
+
+    #[test]
+    fn first_matching_rule_wins() {
+        let mut scope_a = RuleScope::any();
+        scope_a.dst_port = Some(443);
+        let allow = Rule::new("allow-https", Action::Allow, scope_a);
+
+        let mut scope_b = RuleScope::any();
+        scope_b.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let deny = Rule::new("deny-curl", Action::Deny, scope_b);
+
+        let set = RuleSet {
+            rules: vec![allow, deny],
+        };
+        let conn = mk_conn();
+        let proc = mk_proc("/usr/bin/curl");
+
+        let hit = set.lookup(&conn, &proc).expect("should match first rule");
+        assert_eq!(hit.action, Action::Allow);
+        assert_eq!(hit.name, "allow-https");
+    }
+
+    #[test]
+    fn uid_predicate() {
+        let mut scope = RuleScope::any();
+        scope.uid = Some(1000);
+        let rule = Rule::new("uid-1000", Action::Allow, scope);
+
+        let set = RuleSet { rules: vec![rule] };
+        let conn = mk_conn();
+
+        assert!(set.lookup(&conn, &mk_proc("/anything")).is_some());
+
+        let mut other = mk_proc("/anything");
+        other.uid = 2000;
+        assert!(set.lookup(&conn, &other).is_none());
+    }
+}

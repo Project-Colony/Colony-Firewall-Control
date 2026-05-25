@@ -304,10 +304,17 @@ async fn cmd_rules_import(
 }
 
 async fn cmd_live(client: &mut Client) -> anyhow::Result<()> {
+    use owo_colors::{OwoColorize, Stream::Stdout};
+
     let mut stream = client.stream_connections("cfc-cli".into()).await?;
     println!(
         "{:<8} {:<5} {:<6} {:<21} -> {:<21}  {:<6}",
-        "time", "proto", "pid", "src", "dst", "verdict"
+        "time".bold(),
+        "proto".bold(),
+        "pid".bold(),
+        "src".bold(),
+        "dst".bold(),
+        "verdict".bold(),
     );
     while let Some(item) = stream.next().await {
         let ev = match item {
@@ -330,14 +337,26 @@ async fn cmd_live(client: &mut Client) -> anyhow::Result<()> {
             .unwrap_or_else(|| "?".into());
         let src = format!("{}:{}", conn.src_ip, conn.src_port);
         let dst = format!("{}:{}", conn.dst_ip, conn.dst_port);
+        let verdict_label = convert::action_label(ev.verdict);
+        let verdict_colored = match cfc_proto::v1::Action::try_from(ev.verdict)
+            .unwrap_or(cfc_proto::v1::Action::Unspecified)
+        {
+            cfc_proto::v1::Action::Allow => {
+                format!("{}", verdict_label.if_supports_color(Stdout, |s| s.green()))
+            }
+            cfc_proto::v1::Action::Deny | cfc_proto::v1::Action::Reject => {
+                format!("{}", verdict_label.if_supports_color(Stdout, |s| s.red()))
+            }
+            _ => verdict_label.to_string(),
+        };
         println!(
             "{:<8} {:<5} {:<6} {:<21} -> {:<21}  {}",
-            time,
+            time.if_supports_color(Stdout, |s| s.dimmed()),
             convert::protocol_label(conn.protocol),
             pid,
             src,
-            dst,
-            convert::action_label(ev.verdict)
+            dst.if_supports_color(Stdout, |s| s.cyan()),
+            verdict_colored,
         );
     }
     Ok(())
