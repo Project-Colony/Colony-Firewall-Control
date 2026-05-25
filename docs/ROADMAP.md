@@ -2,33 +2,36 @@
 
 Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 
-## Phase 0 - Foundation [current]
+## Phase 0 - Foundation [done]
 
 - [x] Workspace skeleton
 - [x] `cfc-core`: types (Rule, Verdict, Connection, Process)
 - [x] `cfc-proto`: gRPC schema
-- [x] `cfc-daemon`: skeleton modules (nfqueue, decision, storage, ipc)
+- [x] `cfc-daemon`: module skeletons
 - [x] `cfc-ui`: iced skeleton with parchment theme + 4 tabs
 - [x] `cfc-cli`: clap skeleton
 - [x] systemd unit + nft snippet
 - [ ] CI: cargo check + clippy + fmt on push
 - [ ] AUR PKGBUILD draft
 
-## Phase 1 - Daemon MVP
+## Phase 1 - Daemon MVP [done]
 
-- [ ] Real NFQUEUE recv loop in `nfqueue.rs`
-- [ ] IPv4/IPv6 5-tuple parse from raw packet
-- [ ] Process resolution via `procfs` (with TOCTOU guard)
-- [ ] Socket-inode -> pid lookup via netlink sock_diag (faster than /proc walk)
-- [ ] Rule lookup + verdict back to kernel
-- [ ] Persist new rules (UpsertRule wired)
-- [ ] gRPC handlers: ListRules, UpsertRule, DeleteRule, GetStatus
-- [ ] Prompt round-trip (StreamPrompts + SubmitVerdict) with timeout
-- [ ] Smoke test: nftables enqueue + curl => DROP/ACCEPT observable
+- [x] NFQUEUE recv loop via `nfq` crate (spawn_blocking + recv loop)
+- [x] IPv4/IPv6 + TCP/UDP/ICMP 5-tuple parse from raw packet
+- [x] Process resolution: /proc/net/{tcp,udp}{,6} -> inode -> /proc/*/fd
+- [x] Decision engine evaluate path wired
+- [x] Rule storage (sqlite via `rusqlite`)
+- [x] gRPC server bound on Unix domain socket
+- [x] Handlers: ListRules, UpsertRule, DeleteRule, GetStatus, StreamConnections
+- [x] Atomic stats counters (uptime, total/allowed/denied, prompts pending)
+- [x] PromptRouter: sync NFQUEUE worker <-> async UI subscribers
+- [x] StreamPrompts + SubmitVerdict with timeout fallback
+- [x] Persist-on-answer (scope from UI becomes a new Rule)
+- [ ] Smoke test: nftables enqueue + curl => observable DROP/ACCEPT (manual)
 
-## Phase 2 - UI MVP
+## Phase 2 - UI MVP [next]
 
-- [ ] Connect to UDS (tonic-with-named-pipe)
+- [ ] Connect to UDS (tonic UDS client)
 - [ ] Prompt pop-up: process info, destination, Allow/Deny + scope chips
 - [ ] Rules table with edit/delete
 - [ ] Live feed scrolling list
