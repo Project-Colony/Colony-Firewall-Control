@@ -1,18 +1,12 @@
 //! NFQUEUE intercept worker.
-//!
-//! Owns the netfilter queue file descriptor. For every packet handed by the
-//! kernel, parses the 5-tuple, resolves the owning process, asks the
-//! decision engine, and writes back ACCEPT or DROP.
-//!
-//! Runs the blocking `nfq::Queue::recv()` on a dedicated `spawn_blocking`
-//! thread and bridges back to async land via channels.
 
 use crate::decision::{Decision, Engine};
 use crate::packet;
 use crate::process_resolve;
+use crate::stats::Stats;
 use cfc_core::{Action, Connection, Direction, Process, Verdict};
 use nfq::{Queue, Verdict as NfqVerdict};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -37,7 +31,8 @@ pub async fn spawn(
     queue_num: u16,
     engine: Engine,
     _prompt_tx: PromptTx,
-    observed_tx: tokio::sync::broadcast::Sender<ObservedConnection>,
+    observed_tx: broadcast::Sender<ObservedConnection>,
+    stats: Stats,
 ) -> anyhow::Result<JoinHandle<()>> {
     info!(queue_num, "opening NFQUEUE");
 
@@ -59,7 +54,7 @@ pub async fn spawn(
     info!(queue_num, "NFQUEUE bound, entering recv loop");
 
     let handle = tokio::task::spawn_blocking(move || {
-        recv_loop(queue, engine, observed_tx);
+        recv_loop(queue, engine, observed_tx, stats);
     });
 
     Ok(tokio::spawn(async move {
@@ -72,7 +67,8 @@ pub async fn spawn(
 fn recv_loop(
     mut queue: Queue,
     engine: Engine,
-    observed_tx: tokio::sync::broadcast::Sender<ObservedConnection>,
+    observed_tx: broadcast::Sender<ObservedConnection>,
+    stats: Stats,
 ) {
     loop {
         let mut msg = match queue.recv() {
@@ -116,12 +112,11 @@ fn recv_loop(
         let verdict = match decision {
             Decision::Resolved(v) => v,
             Decision::NeedsPrompt { fallback } => {
-                // Phase 1c: no prompt round-trip yet, fall back to default policy.
                 trace!(
                     pid = ?conn.pid,
                     dst = %conn.dst_ip,
                     port = conn.dst_port,
-                    "no rule match - applying default policy"
+                    "no rule match - applying default policy (Phase 1e will prompt UI)"
                 );
                 fallback
             }
@@ -135,6 +130,11 @@ fn recv_loop(
         msg.set_verdict(nfq_verdict);
         if let Err(e) = queue.verdict(msg) {
             warn!("setting NFQUEUE verdict failed: {e}");
+        }
+
+        match verdict.action {
+            Action::Allow => stats.record_allow(),
+            Action::Deny | Action::Reject => stats.record_deny(),
         }
 
         let _ = observed_tx.send(ObservedConnection {

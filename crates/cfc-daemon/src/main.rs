@@ -1,7 +1,4 @@
 //! Colony Firewall daemon entry point.
-//!
-//! Runs as root, owns the NFQUEUE socket, exposes a gRPC server on a Unix
-//! domain socket for UI/CLI clients.
 
 use anyhow::Context;
 use clap::Parser;
@@ -9,11 +6,13 @@ use std::path::PathBuf;
 use tracing::info;
 
 mod config;
+mod convert;
 mod decision;
 mod ipc;
 mod nfqueue;
 mod packet;
 mod process_resolve;
+mod stats;
 mod storage;
 
 #[derive(Debug, Parser)]
@@ -61,12 +60,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH));
 
     let (observed_tx, _) = tokio::sync::broadcast::channel(1024);
+    let stats = stats::Stats::new();
 
     let (ipc_handle, prompt_tx) = ipc::spawn(
         socket_path.clone(),
         engine.clone(),
         store.clone(),
         observed_tx.clone(),
+        stats.clone(),
     )
     .await
     .context("starting IPC server")?;
@@ -76,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         engine.clone(),
         prompt_tx,
         observed_tx,
+        stats,
     )
     .await
     .context("starting NFQUEUE worker")?;

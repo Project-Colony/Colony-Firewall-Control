@@ -1,31 +1,31 @@
 //! gRPC server over a Unix domain socket.
 
+use crate::convert;
 use crate::decision::Engine;
 use crate::nfqueue::{ObservedConnection, PromptRequest, PromptTx};
+use crate::stats::Stats;
 use crate::storage::RuleStore;
 use anyhow::Context;
 use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 use cfc_proto::v1::{
     firewall_server::{Firewall, FirewallServer},
-    DeleteRuleRequest, DeleteRuleResponse, ListRulesRequest, ListRulesResponse,
-    StatusRequest, StatusResponse, SubscribeRequest, UpsertRuleRequest,
-    UpsertRuleResponse, VerdictRequest, VerdictResponse,
+    ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse, ListRulesRequest,
+    ListRulesResponse, StatusRequest, StatusResponse, SubscribeRequest,
+    UpsertRuleRequest, UpsertRuleResponse, VerdictRequest, VerdictResponse,
 };
 
 struct FirewallService {
-    #[allow(dead_code)]
     engine: Engine,
-    #[allow(dead_code)]
     store: RuleStore,
     #[allow(dead_code)]
     prompt_tx: PromptTx,
-    #[allow(dead_code)]
     observed_tx: broadcast::Sender<ObservedConnection>,
+    stats: Stats,
 }
 
 #[tonic::async_trait]
@@ -37,60 +37,114 @@ impl Firewall for FirewallService {
         &self,
         _req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
-        Err(Status::unimplemented("StreamPrompts: Phase 1d"))
+        Err(Status::unimplemented("StreamPrompts: Phase 1e"))
     }
 
     async fn submit_verdict(
         &self,
         _req: Request<VerdictRequest>,
     ) -> Result<Response<VerdictResponse>, Status> {
-        Err(Status::unimplemented("SubmitVerdict: Phase 1d"))
+        Err(Status::unimplemented("SubmitVerdict: Phase 1e"))
     }
 
     async fn list_rules(
         &self,
         _req: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
-        Err(Status::unimplemented("ListRules: Phase 1d"))
+        let snapshot = self.engine.snapshot();
+        let rules = snapshot.rules.iter().map(convert::rule_to_pb).collect();
+        Ok(Response::new(ListRulesResponse { rules }))
     }
 
     async fn upsert_rule(
         &self,
-        _req: Request<UpsertRuleRequest>,
+        req: Request<UpsertRuleRequest>,
     ) -> Result<Response<UpsertRuleResponse>, Status> {
-        Err(Status::unimplemented("UpsertRule: Phase 1d"))
+        let proto = req
+            .into_inner()
+            .rule
+            .ok_or_else(|| Status::invalid_argument("rule required"))?;
+        let rule = convert::rule_from_pb(&proto)
+            .map_err(|e| Status::invalid_argument(e))?;
+        self.store
+            .upsert(&rule)
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        let id = rule.id.to_string();
+        self.engine.upsert_rule(rule);
+        Ok(Response::new(UpsertRuleResponse {
+            id,
+            error: String::new(),
+        }))
     }
 
     async fn delete_rule(
         &self,
-        _req: Request<DeleteRuleRequest>,
+        req: Request<DeleteRuleRequest>,
     ) -> Result<Response<DeleteRuleResponse>, Status> {
-        Err(Status::unimplemented("DeleteRule: Phase 1d"))
+        let id_str = req.into_inner().id;
+        let id = uuid::Uuid::parse_str(&id_str)
+            .map_err(|e| Status::invalid_argument(format!("bad uuid: {e}")))?;
+        let deleted = self
+            .store
+            .delete(id)
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        if deleted {
+            self.engine.remove_rule(id);
+        }
+        Ok(Response::new(DeleteRuleResponse { deleted }))
     }
 
-    type StreamConnectionsStream = tokio_stream::wrappers::ReceiverStream<
-        Result<cfc_proto::v1::ConnectionEvent, Status>,
-    >;
+    type StreamConnectionsStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ConnectionEvent, Status>>;
 
     async fn stream_connections(
         &self,
         _req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamConnectionsStream>, Status> {
-        Err(Status::unimplemented("StreamConnections: Phase 1d"))
+        let (tx, rx) = mpsc::channel(256);
+        let mut sub = self.observed_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match sub.recv().await {
+                    Ok(obs) => {
+                        let ev = ConnectionEvent {
+                            connection: Some(convert::connection_to_pb(&obs.connection)),
+                            process: Some(convert::process_to_pb(&obs.process)),
+                            verdict: convert::verdict_to_pb_action(&obs.verdict) as i32,
+                            rule_id: match obs.verdict.source {
+                                cfc_core::VerdictSource::Rule(id) => id.to_string(),
+                                _ => String::new(),
+                            },
+                        };
+                        if tx.send(Ok(ev)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("connection stream client lagged by {n} events");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn get_status(
         &self,
         _req: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
+        let rules_count = self.engine.snapshot().rules.len() as u64;
         Ok(Response::new(StatusResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            uptime_seconds: 0,
-            rules_count: 0,
-            prompts_pending: 0,
-            connections_today: 0,
-            connections_allowed: 0,
-            connections_denied: 0,
+            uptime_seconds: self.stats.uptime_seconds(),
+            rules_count,
+            prompts_pending: self.stats.prompts_pending(),
+            connections_today: self.stats.connections_total(),
+            connections_allowed: self.stats.connections_allowed(),
+            connections_denied: self.stats.connections_denied(),
         }))
     }
 }
@@ -100,6 +154,7 @@ pub async fn spawn(
     engine: Engine,
     store: RuleStore,
     observed_tx: broadcast::Sender<ObservedConnection>,
+    stats: Stats,
 ) -> anyhow::Result<(JoinHandle<()>, PromptTx)> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -113,6 +168,7 @@ pub async fn spawn(
         store,
         prompt_tx: prompt_tx.clone(),
         observed_tx,
+        stats,
     };
 
     let uds = tokio::net::UnixListener::bind(&socket_path)
