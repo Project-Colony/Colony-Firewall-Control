@@ -416,23 +416,99 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let status_text = match &self.daemon {
-            DaemonState::Connecting => "Connecting...".to_string(),
-            DaemonState::Connected => "Connected".to_string(),
-            DaemonState::Failed(e) => format!("Disconnected: {e}"),
-        };
         let paused = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
+
+        let sidebar = self.sidebar();
+        let header = self.header_bar(paused);
+        let body: Element<'_, Message> = match self.tab {
+            Tab::Prompts => views::prompts::view(&self.prompts),
+            Tab::Rules => views::rules::view(&self.rules, &self.rules_filter, self.editor.as_ref()),
+            Tab::Live => views::live::view(&self.live),
+            Tab::Stats => views::stats::view(self.status.as_ref()),
+        };
+
+        let body_card = container(body)
+            .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::card);
+
+        let footer: Element<'_, Message> = if let Some(err) = &self.last_error {
+            container(text(format!("⚠  {err}")).size(11))
+                .padding([6, 12])
+                .width(Length::Fill)
+                .style(theme::footer_bar)
+                .into()
+        } else {
+            Space::new().into()
+        };
+
+        let main_panel = column![
+            header,
+            container(body_card).padding([10, 12]).height(Length::Fill),
+            footer,
+        ];
+
+        row![sidebar, main_panel].into()
+    }
+
+    fn sidebar(&self) -> Element<'_, Message> {
+        let title_block = column![text("Colony").size(20), text("Firewall Control").size(14),]
+            .spacing(2)
+            .padding([18, 16]);
+
+        let nav = column![
+            nav_item("Prompts", Tab::Prompts, self.tab, self.prompts.len()),
+            nav_item("Rules", Tab::Rules, self.tab, 0),
+            nav_item("Live", Tab::Live, self.tab, 0),
+            nav_item("Stats", Tab::Stats, self.tab, 0),
+        ]
+        .spacing(0);
+
+        let inner = column![
+            title_block,
+            divider(),
+            nav,
+            Space::new().height(Length::Fill),
+            container(text(format!("v{}", env!("CARGO_PKG_VERSION"))).size(10)).padding([10, 16]),
+        ]
+        .height(Length::Fill);
+
+        container(inner)
+            .width(Length::Fixed(190.0))
+            .height(Length::Fill)
+            .style(theme::sidebar_bg)
+            .into()
+    }
+
+    fn header_bar(&self, paused: bool) -> Element<'_, Message> {
+        let (badge_label, badge_style): (&str, fn(&iced::Theme) -> iced::widget::container::Style) =
+            match &self.daemon {
+                DaemonState::Connecting => ("● connecting", theme::badge_warn),
+                DaemonState::Connected => {
+                    if paused {
+                        ("● paused", theme::badge_warn)
+                    } else {
+                        ("● connected", theme::badge_ok)
+                    }
+                }
+                DaemonState::Failed(_) => ("● disconnected", theme::badge_err),
+            };
+
+        let badge = container(text(badge_label).size(11))
+            .padding([3, 10])
+            .style(badge_style);
 
         let pause_btn: Element<'_, Message> = if matches!(self.daemon, DaemonState::Connected) {
             if paused {
                 button(text("Resume").size(12))
-                    .padding([4, 12])
+                    .padding([4, 14])
                     .on_press(Message::TogglePaused)
                     .style(iced::widget::button::primary)
                     .into()
             } else {
                 button(text("Pause").size(12))
-                    .padding([4, 12])
+                    .padding([4, 14])
                     .on_press(Message::TogglePaused)
                     .style(iced::widget::button::secondary)
                     .into()
@@ -441,54 +517,36 @@ impl App {
             Space::new().into()
         };
 
-        let paused_badge: Element<'_, Message> = if paused {
-            container(text("PAUSED - all flows allowed").size(11))
-                .padding([2, 8])
-                .into()
-        } else {
-            Space::new().into()
+        let reconnect: Element<'_, Message> = match &self.daemon {
+            DaemonState::Failed(_) => button(text("Reconnect").size(12))
+                .padding([4, 14])
+                .on_press(Message::Reconnect)
+                .style(iced::widget::button::primary)
+                .into(),
+            _ => Space::new().into(),
         };
 
-        let header = row![
-            text("Colony Firewall Control").size(22),
-            paused_badge,
+        let title_text = match self.tab {
+            Tab::Prompts => "Pending prompts",
+            Tab::Rules => "Rules",
+            Tab::Live => "Live connections",
+            Tab::Stats => "Stats",
+        };
+
+        let inner = row![
+            text(title_text).size(18),
             Space::new().width(Length::Fill),
-            text(status_text).size(12),
+            badge,
             pause_btn,
-            reconnect_button(&self.daemon),
+            reconnect,
         ]
-        .padding(12)
         .spacing(12)
-        .align_y(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center)
+        .padding([12, 16]);
 
-        let tabs = row![
-            tab_button("Prompts", Tab::Prompts, self.tab, self.prompts.len()),
-            tab_button_simple("Rules", Tab::Rules, self.tab),
-            tab_button_simple("Live", Tab::Live, self.tab),
-            tab_button_simple("Stats", Tab::Stats, self.tab),
-        ]
-        .spacing(8)
-        .padding([0, 12]);
-
-        let body: Element<'_, Message> = match self.tab {
-            Tab::Prompts => views::prompts::view(&self.prompts),
-            Tab::Rules => views::rules::view(&self.rules, &self.rules_filter, self.editor.as_ref()),
-            Tab::Live => views::live::view(&self.live),
-            Tab::Stats => views::stats::view(self.status.as_ref()),
-        };
-
-        let footer: Element<'_, Message> = if let Some(err) = &self.last_error {
-            container(text(format!("error: {err}")).size(11))
-                .padding(6)
-                .into()
-        } else {
-            container(text("")).into()
-        };
-
-        container(column![header, tabs, body, footer].spacing(8))
-            .padding(8)
+        container(inner)
             .width(Length::Fill)
-            .height(Length::Fill)
+            .style(theme::header_bar)
             .into()
     }
 
@@ -509,36 +567,43 @@ impl App {
     }
 }
 
-fn tab_button<'a>(label: &'a str, this: Tab, current: Tab, badge: usize) -> Element<'a, Message> {
-    let display = if badge > 0 {
-        format!("{label} ({badge})")
-    } else {
-        label.to_string()
-    };
+fn nav_item<'a>(label: &'a str, this: Tab, current: Tab, badge: usize) -> Element<'a, Message> {
     let is_active = this == current;
-    let btn = button(text(display))
-        .on_press(Message::TabSelected(this))
-        .padding([6, 14]);
-    if is_active {
-        btn.style(iced::widget::button::primary).into()
+    let label_text = text(label).size(14);
+    let row_content: Element<'_, Message> = if badge > 0 {
+        row![
+            label_text,
+            Space::new().width(Length::Fill),
+            container(text(badge.to_string()).size(11))
+                .padding([1, 7])
+                .style(theme::badge_err),
+        ]
+        .align_y(iced::Alignment::Center)
+        .into()
     } else {
-        btn.style(iced::widget::button::secondary).into()
+        row![label_text].into()
+    };
+
+    let btn = button(row_content)
+        .on_press(Message::TabSelected(this))
+        .padding([10, 18])
+        .width(Length::Fill);
+
+    if is_active {
+        btn.style(theme::nav_item_active).into()
+    } else {
+        btn.style(theme::nav_item_inactive).into()
     }
 }
 
-fn tab_button_simple<'a>(label: &'a str, this: Tab, current: Tab) -> Element<'a, Message> {
-    tab_button(label, this, current, 0)
-}
-
-fn reconnect_button(state: &DaemonState) -> Element<'_, Message> {
-    match state {
-        DaemonState::Connected | DaemonState::Connecting => container(text("")).into(),
-        DaemonState::Failed(_) => button(text("Reconnect"))
-            .on_press(Message::Reconnect)
-            .padding([4, 10])
-            .style(iced::widget::button::primary)
-            .into(),
-    }
+fn divider<'a>() -> Element<'a, Message> {
+    container(Space::new().height(Length::Fixed(1.0)))
+        .width(Length::Fill)
+        .style(|_| iced::widget::container::Style {
+            background: Some(iced::Background::Color(theme::HAIRLINE)),
+            ..Default::default()
+        })
+        .into()
 }
 
 async fn handshake(path: PathBuf) -> Result<HandshakeData, String> {
