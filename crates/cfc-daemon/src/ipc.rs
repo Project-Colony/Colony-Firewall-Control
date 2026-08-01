@@ -74,7 +74,7 @@ impl Firewall for FirewallService {
             let duration = convert::duration_from_pb(req.duration);
             let rule = cfc_core::Rule {
                 id: uuid::Uuid::new_v4(),
-                name: format!("user prompt {}", &req.prompt_id),
+                name: format!("user prompt {}", req.prompt_id),
                 enabled: true,
                 action,
                 duration,
