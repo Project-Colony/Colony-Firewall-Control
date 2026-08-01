@@ -110,15 +110,11 @@ impl DnsCache {
             // `dns_lookup::lookup_addr` is sync (getnameinfo); move to a
             // blocking thread so the tokio runtime stays responsive.
             let hostname = tokio::task::spawn_blocking(move || {
-                dns_lookup::lookup_addr(&ip).ok().and_then(|h| {
+                dns_lookup::lookup_addr(&ip)
+                    .ok()
                     // libc may return the input IP as a string if no PTR
                     // record exists. Treat that as a negative result.
-                    if h == ip.to_string() {
-                        None
-                    } else {
-                        Some(h)
-                    }
-                })
+                    .filter(|h| *h != ip.to_string())
             })
             .await
             .unwrap_or(None);
