@@ -1,19 +1,27 @@
 //! Bounded, panic-free DNS response parsing.
 //!
-//! This is the arithmetic half of the `cgroup_skb/ingress` program in
-//! `cfc-ebpf`. It is written to the eBPF verifier's rules and therefore obeys
-//! some unusual constraints:
+//! This runs in the **daemon**, over the payload prefix that the
+//! `cgroup_skb/ingress` program in `cfc-ebpf` copies into a
+//! [`crate::DnsPacket`]. It used to run in the kernel; it does not any more,
+//! because the nested answer x label x byte loops below cost more than the
+//! verifier's 1,000,000-instruction complexity budget allows (see
+//! `crates/cfc-ebpf/README.md`).
+//!
+//! The style it was written in survives that move intact, and deliberately so —
+//! this is a parser for attacker-influenced bytes:
 //!
 //! * **no panics** — every read goes through [`Option`]-returning accessors, so
-//!   the compiler never emits a bounds-check panic path. A BPF object with a
-//!   reachable `panic!` either fails to link (no `core::fmt`) or traps.
+//!   there is no bounds-check panic path to reach. A malformed packet returns
+//!   `None`; it never aborts the ring-buffer consumer.
 //! * **no unbounded loops** — every loop has a *compile-time constant* trip
-//!   count and exits early via `break`. The verifier walks all paths, so a
-//!   runtime-bounded loop is either rejected or explodes the instruction count.
+//!   count and exits early via `break`, so a compression bomb or a lying
+//!   `ancount` costs a fixed amount of work.
 //! * **no dynamic slicing** — `&buf[a..b]` panics; only `slice::get` is used.
-//! * **no big stack frames** — BPF gives a program 512 bytes of stack *total*.
-//!   [`DnsAnswer`] alone is 276 bytes, so the caller owns it (in a per-CPU map
-//!   on the kernel side) and the parser only ever holds a handful of `usize`s.
+//! * **no allocation and no large stack frames** — [`DnsAnswer`] is 276 bytes
+//!   and is caller-owned scratch, reused across records.
+//!
+//! It also still compiles under `no_std`, which keeps the option of moving
+//! pieces back into the kernel open.
 //!
 //! # What is supported
 //!
@@ -46,14 +54,20 @@ pub const MAX_NAME_LEN: usize = 253;
 /// Longest single label, per RFC 1035 §2.3.4.
 pub const MAX_LABEL_LEN: usize = 63;
 
-/// Upper bound on labels walked while resolving one name (compression jumps
-/// included). Keeps the verifier's path budget small.
+/// Labels walked while resolving one name, compression jumps included.
+///
+/// A real hostname is well under this; the bound exists so the walk is
+/// obviously terminating on malformed input.
 pub const MAX_LABELS: usize = 32;
 
 /// Compression pointers followed per name before the packet is rejected.
 pub const MAX_LABEL_JUMPS: usize = 4;
 
 /// Answer records examined per response. Records past this cap are ignored.
+///
+/// Eight covers a normal A/AAAA reply and every CNAME chain worth caring
+/// about. Anything beyond the cap is simply not observed; the PTR path still
+/// names those addresses.
 pub const MAX_ANSWERS: usize = 8;
 
 /// Questions walked before the response is rejected. Real responses have 1.
@@ -315,6 +329,9 @@ pub fn read_name(
                 break;
             }
             let ch = c.u8_at(off + 1 + k)?;
+            // `written + label_len <= MAX_NAME_LEN` was checked above and
+            // `k < label_len`, so this index is always in range. `get_mut`
+            // keeps that a fact rather than an assumption.
             *out.get_mut(written + k)? = ch;
             k += 1;
         }
@@ -404,12 +421,11 @@ pub fn parse_answer_at(
 
 /// Drives the whole answer section, invoking `f` for every `A`/`AAAA` record.
 ///
-/// This is the exact loop the BPF program runs; keeping it here is what makes
-/// the kernel-side control flow host-testable.
+/// This is the entry point the daemon's `DNS_PACKETS` ring-buffer consumer
+/// calls, over `&DnsPacket::payload()`.
 ///
-/// `scratch` is caller-owned because [`DnsAnswer`] is 276 bytes and would blow
-/// more than half of a BPF program's 512-byte stack. On the kernel side it
-/// lives in a `PerCpuArray`.
+/// `scratch` is caller-owned so a consumer draining a burst of packets reuses
+/// one 276-byte buffer instead of rebuilding it per record.
 ///
 /// Returns the number of records passed to `f` (never more than
 /// [`MAX_ANSWERS`]).
@@ -870,17 +886,20 @@ mod tests {
     }
 
     #[test]
-    fn answer_cap_is_enforced_at_eight() {
-        let mut p = Pkt::response(1, 9);
+    fn answer_cap_is_enforced() {
+        let extra = 5u8;
+        let total = MAX_ANSWERS as u8 + extra;
+        let mut p = Pkt::response(1, u16::from(total));
         p.question("many.example");
-        for i in 0..9u8 {
-            p.a_record("many.example", 100 + i as u32, [10, 0, 0, i]);
+        for i in 0..total {
+            p.a_record("many.example", 100 + u32::from(i), [10, 0, 0, i]);
         }
         let got = collect(&p.bytes());
         assert_eq!(got.len(), MAX_ANSWERS, "must stop at MAX_ANSWERS");
-        assert_eq!(got[7].ttl, 107);
-        // and the 9th (10.0.0.8) never appears
-        assert!(got.iter().all(|a| a.ip[3] != 8));
+        // The kept ones are the first N, in order...
+        assert_eq!(got[MAX_ANSWERS - 1].ttl, 100 + MAX_ANSWERS as u32 - 1);
+        // ...and nothing past the cap leaks through.
+        assert!(got.iter().all(|a| a.ip[3] < MAX_ANSWERS as u8));
     }
 
     #[test]

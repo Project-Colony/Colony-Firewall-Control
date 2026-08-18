@@ -29,7 +29,7 @@
 //! ```ignore
 //! unsafe impl aya::Pod for cfc_ebpf_common::ExecEvent {}
 //! unsafe impl aya::Pod for cfc_ebpf_common::ExitEvent {}
-//! unsafe impl aya::Pod for cfc_ebpf_common::DnsAnswer {}
+//! unsafe impl aya::Pod for cfc_ebpf_common::DnsPacket {}
 //! ```
 //!
 //! which is sound precisely because of the layout rules above.
@@ -54,12 +54,18 @@ pub const COMM_LEN: usize = 16;
 /// number of bytes actually stored.
 pub const FILENAME_LEN: usize = 256;
 
-/// Size of the scratch buffer the DNS program copies packet bytes into.
+/// Size of the DNS payload prefix the kernel program copies out of a packet.
 ///
-/// 512 bytes covers the classic non-EDNS UDP DNS limit (RFC 1035 §4.2.1).
-/// Larger responses are parsed up to this bound and then truncated, which is
-/// safe: [`dns::for_each_answer`] simply stops at the first record it cannot
-/// read in full.
+/// 512 is the RFC 1035 §4.2.1 limit on an unextended UDP DNS message, so this
+/// captures a whole classic response. It costs the verifier almost nothing:
+/// the kernel only ever *copies* into this buffer with constant-length
+/// `bpf_skb_load_bytes` calls and never indexes it, because the parsing now
+/// happens in userspace (see [`DnsPacket`]).
+///
+/// EDNS(0) responses may be larger; those are truncated to this prefix, which
+/// is safe. [`dns::for_each_answer`] stops at the first record it cannot read
+/// in full, and any address it therefore misses is still named by the PTR
+/// path.
 pub const DNS_BUF_LEN: usize = 512;
 
 // ---------------------------------------------------------------------------
@@ -210,6 +216,73 @@ impl Default for DnsAnswer {
 }
 
 // ---------------------------------------------------------------------------
+// DnsPacket
+// ---------------------------------------------------------------------------
+
+/// A prefix of one DNS response payload, copied verbatim off the wire.
+///
+/// This is what the `cgroup_skb/ingress` program actually publishes. The kernel
+/// does not parse DNS at all: it confirms the datagram is UDP from source port
+/// 53, checks the QR bit, and copies the payload here. Userspace then runs
+/// [`dns::for_each_answer`] over [`Self::payload`] and turns the result into
+/// [`DnsAnswer`]s.
+///
+/// The reason is the verifier's 1,000,000-instruction complexity budget: the
+/// nested answer x label x byte loops of in-kernel name parsing blew past it
+/// (see `crates/cfc-ebpf/README.md`). A constant-length copy does not.
+///
+/// Layout (`size_of` = 514, `align_of` = 2):
+///
+/// ```text
+///   0..2    len
+///   2..514  data
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsPacket {
+    /// Number of valid bytes in [`Self::data`] (<= [`DNS_BUF_LEN`]).
+    pub len: u16,
+    /// The DNS message, starting at its 12-byte header.
+    ///
+    /// Only the first [`Self::len`] bytes are meaningful. The kernel writes
+    /// exactly that many and leaves the tail as whatever the ring-buffer slot
+    /// held before (there is no 512-byte `memset` the BPF backend would
+    /// lower). Always read it through [`Self::payload`], which clamps.
+    pub data: [u8; DNS_BUF_LEN],
+}
+
+impl DnsPacket {
+    /// An all-zero packet.
+    pub const fn zeroed() -> Self {
+        Self {
+            len: 0,
+            data: [0; DNS_BUF_LEN],
+        }
+    }
+
+    /// The valid bytes: `len`, clamped to the buffer.
+    ///
+    /// Unlike the string fields there is no NUL to stop at -- DNS payloads are
+    /// binary -- so `len` is the only bound, and it is clamped here rather than
+    /// trusted.
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        let n = self.len as usize;
+        let n = if n < DNS_BUF_LEN { n } else { DNS_BUF_LEN };
+        match self.data.get(..n) {
+            Some(s) => s,
+            None => &[],
+        }
+    }
+}
+
+impl Default for DnsPacket {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // no_std-safe accessors (available everywhere)
 // ---------------------------------------------------------------------------
 
@@ -268,7 +341,7 @@ impl DnsAnswer {
 
 #[cfg(feature = "std")]
 mod std_impls {
-    use super::{DnsAnswer, ExecEvent};
+    use super::{DnsAnswer, DnsPacket, ExecEvent};
     use std::borrow::Cow;
     use std::fmt;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -342,6 +415,16 @@ mod std_impls {
                 .finish()
         }
     }
+
+    // Same reasoning: 512 raw payload bytes are not something to print by
+    // accident. The length is the only part worth logging.
+    impl fmt::Debug for DnsPacket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DnsPacket")
+                .field("len", &self.len)
+                .finish_non_exhaustive()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +465,17 @@ mod tests {
     }
 
     #[test]
+    fn dns_packet_layout_is_frozen() {
+        assert_eq!(size_of::<DnsPacket>(), 514);
+        assert_eq!(align_of::<DnsPacket>(), 2);
+        assert_eq!(
+            2 + DNS_BUF_LEN,
+            size_of::<DnsPacket>(),
+            "DnsPacket gained implicit padding"
+        );
+    }
+
+    #[test]
     fn zeroed_constructors_are_all_zero() {
         let e = ExecEvent::zeroed();
         let bytes: &[u8] = unsafe_transmute_exec(&e);
@@ -390,6 +484,45 @@ mod tests {
         let a = DnsAnswer::zeroed();
         let bytes: &[u8] = unsafe_transmute_dns(&a);
         assert!(bytes.iter().all(|b| *b == 0));
+
+        let p = DnsPacket::zeroed();
+        assert_eq!(p.len, 0);
+        assert!(p.data.iter().all(|b| *b == 0));
+    }
+
+    // -- DnsPacket ---------------------------------------------------------
+
+    #[test]
+    fn dns_packet_payload_respects_len() {
+        let mut p = DnsPacket::zeroed();
+        p.data[..4].copy_from_slice(b"\xab\xcd\x81\x80");
+        p.len = 4;
+        assert_eq!(p.payload(), b"\xab\xcd\x81\x80");
+    }
+
+    #[test]
+    fn dns_packet_payload_clamps_a_lying_len() {
+        let mut p = DnsPacket::zeroed();
+        // The kernel can only ever write DNS_BUF_LEN bytes, but a truncated or
+        // corrupted ring record must not turn into an out-of-bounds read.
+        p.len = u16::MAX;
+        assert_eq!(p.payload().len(), DNS_BUF_LEN);
+    }
+
+    #[test]
+    fn dns_packet_payload_is_empty_when_len_is_zero() {
+        assert!(DnsPacket::zeroed().payload().is_empty());
+    }
+
+    #[test]
+    fn dns_packet_debug_does_not_dump_the_buffer() {
+        let mut p = DnsPacket::zeroed();
+        p.len = 7;
+        let s = format!("{p:?}");
+        assert!(s.contains("len: 7"), "{s}");
+        // 512 bytes of payload in a log line would be unreadable at best and a
+        // way to leak query contents into the journal at worst.
+        assert!(s.len() < 64, "Debug printed the payload: {s}");
     }
 
     // Small local helpers keep `#![forbid(unsafe_code)]` intact for the crate

@@ -172,6 +172,33 @@ The kernel also reports the originating uid and gid with each queued packet
 never a fabricated 0, which used to make unattributed traffic match root's
 uid-scoped rules.
 
+### With the eBPF layer on
+
+A table fed by the exec/exit tracepoints is consulted *before* `/proc`:
+
+| field | from `/proc` | from the exec table |
+|---|---|---|
+| `ppid` | `/proc/<pid>/stat` field 4 | exec event |
+| `uid`, `gid` | `/proc/<pid>/status` | exec event, i.e. the values at `execve()` |
+| `exe` | `/proc/<pid>/exe` | only as a fallback, when `/proc` is gone |
+| `cmdline`, `cwd`, digest, package | `/proc` | unchanged |
+
+Two `/proc` file parses disappear per uncached resolve, but the real win is the
+last row of the first column: a process that exited between the packet and the
+`/proc` read used to resolve to `unknown`, and now resolves to a name. That is
+the common case for exactly the short-lived processes worth prompting about.
+
+It does **not** remove the socket -> pid step - NFQUEUE gives the daemon a
+packet, not a pid - and it does not override a readable `/proc/<pid>/exe`,
+because the exec event carries the path as passed to `execve()` (possibly
+relative, possibly an unresolved symlink) while rules, the digest and package
+provenance are all in terms of the canonical path of the mapped image.
+
+Pid reuse is handled exactly, not heuristically: each exec record is bound to
+`/proc/<pid>/stat`'s start time, captured by the ring-buffer consumer right
+after the event arrives, and a lookup presenting a different start time drops
+the record and falls back to `/proc`.
+
 ## Rule evaluation
 
 `RuleSet` is kept sorted so that lookup is a linear scan that returns the
@@ -305,18 +332,51 @@ Signals:
   database path, the socket path, the event cap, the IPC group - is bound at
   startup and needs a restart.
 
-## Packet flow (Phase 4, eBPF fast-path)
+## The eBPF layer
 
-The expensive parts of the current flow are the userspace round-trip and the
-`/proc` walk. Phase 4 replaces both:
+Three kernel-side programs (`crates/cfc-ebpf`, built separately by
+`cargo xtask build-ebpf`) and their userspace loader (`cfc-daemon/src/ebpf/`).
+Off by default at *both* the cargo-feature level (`--features ebpf`, which is
+what pulls `aya` in) and the config level (`[ebpf] enabled`).
 
-- **eBPF capture-on-exec**: hooks `sched_process_exec` and `cgroup_socket`
-  to build a kernel-side `(pid, exe, sha256)` table. No `/proc` walk needed.
-- **eBPF whitelist fast-path**: a BPF_MAP populated by the daemon with
-  already-allowed `(pid, dst_ip, dst_port)` tuples. The kernel-side filter
-  accepts these without ever reaching NFQUEUE.
+| program | attach | what the daemon does with it |
+|---|---|---|
+| `tracepoint/sched/sched_process_exec` | `sched:sched_process_exec` | fills a pid -> (exe, comm, uid, gid, ppid) table |
+| `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts from that table |
+| `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads out; the daemon parses them and lifts the `A`/`AAAA` records |
 
-Only unknown flows make the userspace round-trip.
+**This is enrichment, not a fast path.** Verdicts still come from NFQUEUE, and
+nothing here filters anything - the `cgroup_skb` program returns "pass"
+unconditionally. What the programs buy is *better answers to questions the
+daemon already asks*, and every one of them degrades independently: a missing
+object, no `CAP_BPF`, a kernel without BTF, a verifier rejection or a host with
+no cgroup v2 each cost one capability and produce one warning. There is no
+configuration in which the firewall stops filtering because eBPF was
+unavailable.
+
+**Loaded from a path, not embedded.** The kernel-side crate needs a dated
+nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately
+excluded from this workspace so a plain stable build never touches any of that.
+`aya::include_bytes_aligned!` would hand that dependency straight back - so the
+object is installed to `[ebpf] object_path` (default
+`/usr/lib/colony-firewall/cfc-ebpf.o`) and read at startup instead. The two
+build graphs stay independent and are matched at install time.
+
+**BTF, done by the loader.** Rust/aya has no CO-RE field relocation, so the
+programs cannot look up `task_struct::real_parent` themselves; they read two
+`.rodata` globals that default to 0 ("unresolved", report ppid 0). The loader
+parses `/sys/kernel/btf/vmlinux` and patches both offsets in before load. It
+parses the blob directly rather than through `aya::Btf`, because aya-obj 0.3
+exposes `id_by_type_name_kind` and keeps every route from a type id to a member
+offset `pub(crate)`. Side benefit: the parser has no aya dependency and is unit
+tested in the default build.
+
+**Ring buffers.** One tokio task per buffer, each a `tokio::io::unix::AsyncFd`
+around `aya::maps::RingBuf`: await readable, drain everything present, clear
+readiness. Records are copied out of the mapped ring immediately, so a slow
+consumer never holds the producer's tail. None of this is on the packet path -
+the consumers write into the process table and the DNS cache, and the NFQUEUE
+worker only ever reads them.
 
 ## Why GPL-3.0?
 

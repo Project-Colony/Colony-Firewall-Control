@@ -32,8 +32,21 @@ pub struct UdpPayload {
     pub dst_port: u16,
     /// Offset of the first payload byte, relative to the start of the buffer.
     pub offset: usize,
-    /// Number of payload bytes actually readable (already clamped to `valid`).
+    /// Number of payload bytes actually readable **in this buffer**, i.e.
+    /// [`Self::declared_len`] clamped to `valid`.
+    ///
+    /// This is what a caller that parses out of `buf` wants. A caller that only
+    /// classified the headers here and will fetch the payload from somewhere
+    /// else -- the kernel program copies it straight out of the skb -- wants
+    /// [`Self::declared_len`] instead, or it will silently truncate to however
+    /// much of the *header* prefix happened to be copied.
     pub len: usize,
+    /// Payload length the UDP header declares, independent of `valid`.
+    ///
+    /// Not validated against anything: a datagram may claim more than it
+    /// carries, so a caller reading elsewhere must still clamp this to whatever
+    /// that elsewhere actually holds.
+    pub declared_len: usize,
 }
 
 #[inline(always)]
@@ -114,6 +127,7 @@ pub fn udp_payload_from_l3(buf: &[u8], valid: usize) -> Option<UdpPayload> {
         dst_port,
         offset,
         len,
+        declared_len: declared,
     })
 }
 
@@ -227,6 +241,30 @@ mod tests {
         let u = udp_payload_from_l3(&p, 100).unwrap();
         assert_eq!(u.offset, 28);
         assert_eq!(u.len, 72, "declared 200, only 72 readable");
+        assert_eq!(
+            u.declared_len, 200,
+            "the declared length must survive the clamp"
+        );
+    }
+
+    #[test]
+    fn declared_len_ignores_the_buffer_and_len_does_not() {
+        // The distinction that matters to the kernel program: it classifies
+        // headers out of a short prefix but copies the payload from the skb,
+        // so it must not inherit the prefix's truncation.
+        let p = ipv4_udp(&[0u8; 300], 53, 1, 5, 0);
+        for valid in [40usize, 64, 80] {
+            let u = udp_payload_from_l3(&p, valid).unwrap();
+            assert_eq!(u.declared_len, 300);
+            assert_eq!(u.len, valid - 28);
+        }
+        // A datagram that over-claims: `declared_len` is what it said, not
+        // what it carries, and callers must clamp it themselves.
+        let mut short = ipv4_udp(b"xy", 53, 1, 5, 0);
+        short[24..26].copy_from_slice(&500u16.to_be_bytes());
+        let u = udp_payload_from_l3(&short, short.len()).unwrap();
+        assert_eq!(u.declared_len, 492);
+        assert_eq!(u.len, 2, "only two bytes are really there");
     }
 
     #[test]

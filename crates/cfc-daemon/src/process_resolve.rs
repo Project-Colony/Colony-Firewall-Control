@@ -1,5 +1,5 @@
 //! Process resolution: given a 5-tuple, find the local pid that owns the
-//! socket, then read /proc/{pid} to fill a `Process` record.
+//! socket, then describe that pid as a `Process`.
 //!
 //! Resolution strategy, fastest first:
 //!   1. netlink sock_diag exact-tuple query ([`crate::sock_diag`]): one
@@ -9,12 +9,39 @@
 //!      unconnected-UDP, wildcard-bind, v4-mapped-in-v6).
 //!   3. inode -> pid via a verified TTL cache, else a /proc/*/fd walk.
 //!
-//! TOCTOU note: the resolved pid may have exited by the time we read
-//! /proc/{pid}/exe. We return `Process::unknown(pid)` in that case. The
-//! process cache is keyed by (pid, starttime) so pid reuse invalidates
+//! TOCTOU note: the resolved pid may have exited by the time we describe it.
+//! The process cache is keyed by (pid, starttime) so pid reuse invalidates
 //! naturally, and the inode cache re-verifies its answer with a single
 //! readlink before trusting it.
+//!
+//! # Where the kernel exec table fits
+//!
+//! When the eBPF layer is running (see [`crate::ebpf`]), a table fed by the
+//! `sched_process_exec` / `sched_process_exit` tracepoints is consulted
+//! *before* `/proc` in [`resolve`]. Precisely what that changes:
+//!
+//! | field | without eBPF | with eBPF |
+//! |---|---|---|
+//! | `ppid` | `/proc/<pid>/stat` field 4 | exec event (or `None` if BTF offsets were unresolved) |
+//! | `uid`/`gid` | `/proc/<pid>/status` `Ruid`/`Rgid` | exec event, i.e. the values at `execve()` |
+//! | `exe` | `/proc/<pid>/exe` | `/proc/<pid>/exe`, falling back to the exec event's path when `/proc` is gone |
+//! | `cmdline`, `cwd` | `/proc/<pid>/{cmdline,cwd}` | unchanged - no kernel source |
+//! | `sha256`, package | `/proc/<pid>/exe` | unchanged - the digest must be of the mapped image |
+//!
+//! So it removes two `/proc` file parses per uncached resolve and, more
+//! importantly, produces a *named* process where the pre-eBPF path could only
+//! return [`Process::unknown`] - the short-lived-process case that a
+//! packet-triggered `/proc` read loses by construction.
+//!
+//! It does **not** remove the socket -> pid step: NFQUEUE hands the daemon a
+//! packet, not a pid, so `sock_diag` (or the table walk, or the `/proc/*/fd`
+//! scan) still runs first. And it does not override a readable
+//! `/proc/<pid>/exe`, because the exec event carries the path as passed to
+//! `execve()` - possibly relative, possibly an unresolved symlink - while
+//! rules, the digest and package provenance are all in terms of the
+//! canonical path of the image the kernel actually mapped.
 
+use crate::ebpf::proc_table::KernelProcTable;
 use cfc_core::{Process, Protocol};
 use parking_lot::Mutex;
 use procfs::process::{FDTarget, Process as ProcFsProcess};
@@ -60,10 +87,12 @@ static PROCESS_CACHE: LazyLock<Mutex<TtlCache<(u32, u64), Process>>> =
 static SHA_CACHE: LazyLock<Mutex<TtlCache<(u64, u64, i64, i64), Option<String>>>> =
     LazyLock::new(|| Mutex::new(TtlCache::new(SHA_CACHE_TTL, CACHE_CAP)));
 
-/// Build a full Process record from /proc/{pid}.
+/// Build a full Process record for `pid`, from the kernel exec table where
+/// one is available and from /proc/{pid} for everything else.
 ///
 /// Cached by (pid, starttime from /proc/{pid}/stat field 22): a recycled
-/// pid has a different starttime, so it can never hit a stale entry.
+/// pid has a different starttime, so it can never hit a stale entry. That
+/// same start time is what the exec table is verified against.
 pub fn resolve(pid: u32) -> Process {
     let now = Instant::now();
     let starttime = read_starttime(pid);
@@ -74,7 +103,7 @@ pub fn resolve(pid: u32) -> Process {
         }
     }
 
-    match resolve_inner(pid) {
+    match resolve_inner(pid, starttime, now, crate::ebpf::proc_table::global()) {
         Ok(p) => {
             if let Some(st) = starttime {
                 PROCESS_CACHE.lock().insert((pid, st), p.clone(), now);
@@ -85,13 +114,62 @@ pub fn resolve(pid: u32) -> Process {
     }
 }
 
-fn resolve_inner(pid: u32) -> anyhow::Result<Process> {
-    let p = ProcFsProcess::new(pid as i32)?;
-    let stat = p.stat()?;
-    let status = p.status()?;
-    let exe = p.exe().unwrap_or_else(|_| PathBuf::from("<deleted>"));
-    let cmdline = p.cmdline().unwrap_or_default();
-    let cwd = p.cwd().ok();
+/// The table is a parameter rather than a reach into
+/// `crate::ebpf::proc_table::global()` so the tests below can drive both
+/// branches without mutating process-wide state that every other test in the
+/// binary shares.
+fn resolve_inner(
+    pid: u32,
+    starttime: Option<u64>,
+    now: Instant,
+    table: &KernelProcTable,
+) -> anyhow::Result<Process> {
+    // Kernel-sourced identity, if the exec tracepoint is attached and the
+    // record still belongs to this process (the table checks `starttime`
+    // itself, so a recycled pid returns None here rather than a stale name).
+    let kern = table.get(pid, starttime, now);
+
+    // /proc may be entirely gone by now; every read below is independently
+    // optional so that a process which exited mid-resolve still yields
+    // whatever is known rather than collapsing to `unknown`.
+    let p = ProcFsProcess::new(pid as i32).ok();
+    if p.is_none() && kern.is_none() {
+        anyhow::bail!("pid {pid} has neither a /proc entry nor a kernel exec record");
+    }
+
+    let proc_exe = p.as_ref().and_then(|p| p.exe().ok());
+    let cmdline = p
+        .as_ref()
+        .and_then(|p| p.cmdline().ok())
+        .unwrap_or_default();
+    let cwd = p.as_ref().and_then(|p| p.cwd().ok());
+
+    let (ppid, uid, gid) = match &kern {
+        // The exec event already carries all three, so /proc/{pid}/stat and
+        // /proc/{pid}/status are not read at all on this path.
+        Some(k) => (k.ppid, Some(k.uid), Some(k.gid)),
+        None => {
+            let stat = p.as_ref().and_then(|p| p.stat().ok());
+            let status = p.as_ref().and_then(|p| p.status().ok());
+            (
+                stat.map(|s| s.ppid as u32),
+                status.as_ref().map(|s| s.ruid),
+                status.as_ref().map(|s| s.rgid),
+            )
+        }
+    };
+
+    // /proc/{pid}/exe wins whenever it is readable: it is the canonical path
+    // of the image the kernel mapped, which is what rules match and what the
+    // digest below describes. The exec event's path is the fallback for a
+    // process that is already gone, and only when it is absolute (see
+    // `KernelProc::absolute_exe`).
+    let exe = proc_exe
+        .or_else(|| {
+            kern.as_ref()
+                .and_then(|k| k.absolute_exe().map(Path::to_path_buf))
+        })
+        .unwrap_or_else(|| PathBuf::from("<deleted>"));
 
     // Package provenance reuses the digest computed just above rather than
     // re-hashing. That digest comes from /proc/{pid}/exe -- the binary the
@@ -100,6 +178,9 @@ fn resolve_inner(pid: u32) -> anyhow::Result<Process> {
     // mismatch means the running binary is not the one the package shipped
     // (replaced, patched, or swapped under a live process), which is what
     // makes `Modified` worth shouting about. See `crate::provenance`.
+    //
+    // This is deliberately NOT taken from the exec event: an exec-time path
+    // says which file was launched, not which bytes are running now.
     //
     // Everything underneath is cached (path index by database mtime,
     // per-executable records by (dev, inode, mtime)), and this whole
@@ -110,9 +191,9 @@ fn resolve_inner(pid: u32) -> anyhow::Result<Process> {
 
     Ok(Process {
         pid,
-        ppid: Some(stat.ppid as u32),
-        uid: Some(status.ruid),
-        gid: Some(status.rgid),
+        ppid,
+        uid,
+        gid,
         exe,
         cmdline,
         cwd,
@@ -376,7 +457,12 @@ fn fd_points_at_socket(pid: u32, fd: i32, inode: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn read_starttime(pid: u32) -> Option<u64> {
+/// Process start time in clock ticks since boot, the pid-reuse discriminator.
+///
+/// `pub(crate)` because the eBPF exec consumer captures it too, right after an
+/// exec event arrives, to bind the kernel record to the exact process it
+/// describes (see `crate::ebpf::proc_table`).
+pub(crate) fn read_starttime(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_starttime(&stat)
 }
@@ -772,6 +858,117 @@ mod tests {
         assert_eq!(
             sha256_file(Path::new("/nonexistent/cfc-test"), SHA256_MAX_LEN),
             None
+        );
+    }
+
+    // -- kernel exec table integration --------------------------------------
+
+    use cfc_ebpf_common::{ExecEvent, FILENAME_LEN};
+
+    /// A pid that cannot exist: pid_max is at most 2^22 on 64-bit Linux.
+    const DEAD_PID: u32 = 0x7fff_fffe;
+
+    fn kernel_table(pid: u32, exe: &str, uid: u32, ppid: u32) -> KernelProcTable {
+        let t = KernelProcTable::new();
+        t.set_live(true);
+        let mut e = ExecEvent::zeroed();
+        e.pid = pid;
+        e.ppid = ppid;
+        e.uid = uid;
+        e.gid = uid + 1;
+        let n = exe.len().min(FILENAME_LEN);
+        e.filename[..n].copy_from_slice(&exe.as_bytes()[..n]);
+        e.filename_len = n as u16;
+        t.observe_exec(&e, None, Instant::now());
+        t
+    }
+
+    #[test]
+    fn a_process_that_already_exited_is_named_from_the_exec_record() {
+        // This is the case the pre-eBPF path loses by construction: NFQUEUE
+        // delivers the packet, the process is already reaped, /proc has
+        // nothing, and attribution used to collapse to `unknown`.
+        let table = kernel_table(DEAD_PID, "/usr/bin/curl", 1000, 7);
+        let p = resolve_inner(DEAD_PID, None, Instant::now(), &table).unwrap();
+        assert_eq!(p.pid, DEAD_PID);
+        assert_eq!(p.exe, PathBuf::from("/usr/bin/curl"));
+        assert_eq!(p.uid, Some(1000));
+        assert_eq!(p.gid, Some(1001));
+        assert_eq!(p.ppid, Some(7));
+        assert_eq!(p.sha256, None, "no mapped image left to hash");
+        assert!(p.cmdline.is_empty());
+    }
+
+    #[test]
+    fn without_a_kernel_record_a_dead_pid_still_fails_the_way_it_used_to() {
+        let empty = KernelProcTable::new();
+        assert!(resolve_inner(DEAD_PID, None, Instant::now(), &empty).is_err());
+        // ... and `resolve` turns that into the unattributed record, with no
+        // fabricated uid. That contract is what keeps uid-scoped root rules
+        // from matching traffic nobody could attribute.
+        let unknown = Process::unknown(DEAD_PID);
+        assert_eq!(unknown.uid, None);
+        assert_eq!(unknown.gid, None);
+    }
+
+    #[test]
+    fn kernel_uid_gid_and_ppid_replace_the_proc_status_read() {
+        let me = std::process::id();
+        let table = kernel_table(me, "/nonexistent/from-the-exec-event", 4242, 77);
+        let st = read_starttime(me);
+        let p = resolve_inner(me, st, Instant::now(), &table).unwrap();
+        assert_eq!(
+            p.uid,
+            Some(4242),
+            "exec-time uid wins over /proc/self/status"
+        );
+        assert_eq!(p.gid, Some(4243));
+        assert_eq!(p.ppid, Some(77));
+    }
+
+    #[test]
+    fn a_readable_proc_exe_always_wins_over_the_exec_path() {
+        // The exec event records the path passed to execve(); /proc/<pid>/exe
+        // is the canonical path of the image actually mapped, and it is what
+        // the digest, package provenance and every `exe` rule are written in
+        // terms of. Switching the eBPF layer on must not silently change the
+        // path a running process is reported under.
+        let me = std::process::id();
+        let real = std::fs::read_link(format!("/proc/{me}/exe")).unwrap();
+        let table = kernel_table(me, "/nonexistent/from-the-exec-event", 1000, 1);
+        let p = resolve_inner(me, read_starttime(me), Instant::now(), &table).unwrap();
+        assert_eq!(p.exe, real);
+    }
+
+    #[test]
+    fn a_relative_exec_path_is_never_used_as_an_exe() {
+        // `./configure`-style paths mean nothing outside the launcher's cwd.
+        let table = kernel_table(DEAD_PID, "./configure", 1000, 1);
+        let p = resolve_inner(DEAD_PID, None, Instant::now(), &table).unwrap();
+        assert_eq!(p.exe, PathBuf::from("<deleted>"));
+        assert_eq!(p.uid, Some(1000), "the rest of the record is still used");
+    }
+
+    #[test]
+    fn a_table_that_is_not_live_changes_nothing() {
+        let table = kernel_table(DEAD_PID, "/usr/bin/curl", 1000, 7);
+        table.set_live(false);
+        assert!(resolve_inner(DEAD_PID, None, Instant::now(), &table).is_err());
+    }
+
+    #[test]
+    fn a_recycled_pid_falls_back_to_proc_instead_of_reusing_the_record() {
+        let me = std::process::id();
+        let table = kernel_table(me, "/nonexistent/from-the-exec-event", 4242, 77);
+        // Bind the record to one start time...
+        assert!(table.get(me, Some(1), Instant::now()).is_some());
+        // ...then resolve with a different one, as a recycled pid would.
+        let p = resolve_inner(me, Some(2), Instant::now(), &table).unwrap();
+        assert_ne!(p.uid, Some(4242), "the stale exec record must not be used");
+        assert_eq!(
+            p.uid,
+            Some(nix::unistd::getuid().as_raw()),
+            "the /proc reads take over"
         );
     }
 }

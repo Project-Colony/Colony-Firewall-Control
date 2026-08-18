@@ -9,9 +9,9 @@
 #
 # The change applies without dropping a packet, and a file that fails to
 # parse is rejected with the running policy left in place. Every OTHER
-# section here - [nfqueue], [storage], [pause], [events], [ipc] - is bound
-# at startup and needs `systemctl restart colony-firewalld`. Each section
-# below says which it is.
+# section here - [nfqueue], [storage], [pause], [events], [ipc], [ebpf] - is
+# bound at startup and needs `systemctl restart colony-firewalld`. Each
+# section below says which it is.
 
 # Named preset. Pick one of: "relaxed", "balanced", "strict".
 # Omit to use "balanced" defaults.
@@ -144,6 +144,48 @@ max_rows = 100000
 # Set false to skip all of it; process resolution and rule matching are
 # unaffected either way.
 enabled = true
+
+# Needs a restart. Programs are loaded, verified and attached exactly once,
+# at startup; SIGHUP deliberately does not re-attach them.
+# [ebpf]
+# # Load the kernel-side programs (crates/cfc-ebpf) and use them to enrich
+# # process attribution and hostname resolution. OFF by default.
+# #
+# # WHAT IT ADDS
+# #   sched_process_exec  - exec-time exe/uid/gid/ppid for every process, and
+# #     a NAME for processes that exited before /proc could be read. Today a
+# #     short-lived `curl` often shows up as an unattributed connection purely
+# #     because it was reaped between the packet and the /proc walk.
+# #   sched_process_exit  - evicts those records the moment the process dies,
+# #     so a recycled pid can never inherit another program's identity.
+# #   cgroup_skb/ingress  - reads the A/AAAA records out of the DNS responses
+# #     this machine actually receives. Those mappings are FIRST-HAND: the
+# #     name's own zone said so, before the connection happened. The PTR path
+# #     asks the destination address's owner what it would like to be called,
+# #     which for outbound filtering is the party you may be blocking. See
+# #     "A warning about dst_host" in docs/HARDENING.md - observed answers
+# #     raise the bar there considerably, but do not turn a hostname allow
+# #     rule into a boundary.
+# #
+# # WHAT IT DOES NOT DO
+# # It does not filter, and it cannot. Verdicts still come from NFQUEUE. It
+# # also does not remove the socket -> pid step, because NFQUEUE hands the
+# # daemon a packet, not a pid.
+# #
+# # REQUIREMENTS - all of which degrade to a warning, never to a failure to
+# # start. If any of this is missing the daemon logs what it could not do and
+# # runs exactly as it does with this switched off.
+# #   * a daemon built with `--features ebpf` (the shipped package may not be);
+# #   * the object below, built by `cargo xtask build-ebpf`;
+# #   * kernel >= 5.8 with BTF (/sys/kernel/btf/vmlinux) and cgroup v2;
+# #   * CAP_BPF and CAP_PERFMON, which the shipped unit grants, plus its
+# #     `SystemCallFilter=bpf perf_event_open` line. If you hand-edited the
+# #     unit and dropped either, every bpf(2) call returns EPERM.
+# enabled = false
+# # Where the BPF object was installed. Omit for the packaged default,
+# # /usr/lib/colony-firewall/cfc-ebpf.o. Point it at
+# # `cargo xtask ebpf-path` output when working on the programs themselves.
+# object_path = "/usr/lib/colony-firewall/cfc-ebpf.o"
 
 # Needs a restart (the socket is secured once, right after bind).
 [ipc]

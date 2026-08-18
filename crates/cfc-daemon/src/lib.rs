@@ -15,6 +15,7 @@ pub mod config;
 pub mod convert;
 pub mod decision;
 pub mod dns;
+pub mod ebpf;
 pub mod ipc;
 pub mod nfqueue;
 pub mod packet;

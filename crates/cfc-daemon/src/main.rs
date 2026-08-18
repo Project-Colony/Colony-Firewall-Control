@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 // The daemon's internals live in the library target (`src/lib.rs`) so the
 // integration tests can assemble the same graph this binary does. This file
 // stays the only place that wires them together for real.
-use cfc_daemon::{config, decision, dns, ipc, nfqueue, prompts, sd_notify, stats, storage};
+use cfc_daemon::{config, decision, dns, ebpf, ipc, nfqueue, prompts, sd_notify, stats, storage};
 
 /// How stale the NFQUEUE worker's activity stamp may get before the
 /// watchdog task considers the worker wedged and withholds the systemd
@@ -116,6 +116,14 @@ async fn run() -> anyhow::Result<()> {
     // NFQUEUE worker thread over a std channel.
     let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
     let router = prompts::PromptRouter::new(policy.clone(), stats.clone(), verdict_tx);
+
+    // eBPF enrichment, before the datapath so the exec table and the observed
+    // DNS answers are already filling by the time the first packet is judged.
+    // Held for the daemon's lifetime: dropping it detaches the programs.
+    // Every failure inside is a warning, never a reason not to filter - see
+    // `cfc_daemon::ebpf`.
+    let _ebpf = ebpf::start(&cfg.ebpf, dns_cache.clone());
+    _ebpf.report.log();
 
     // Persist every decided flow into the events table. Subscribes to the
     // live feed before the datapath starts so nothing is missed, and never

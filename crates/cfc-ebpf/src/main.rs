@@ -7,11 +7,16 @@
 //! |------------------------------------|-------------------------------------------|
 //! | `tracepoint/sched/sched_process_exec` | record every `execve` in `PROCS` + `EXEC_EVENTS` |
 //! | `tracepoint/sched/sched_process_exit` | evict dead pids from `PROCS` + `EXIT_EVENTS`     |
-//! | `cgroup_skb/ingress`                 | lift `A`/`AAAA` answers into `DNS_ANSWERS`       |
+//! | `cgroup_skb/ingress`                 | copy DNS response payloads into `DNS_PACKETS`    |
 //!
 //! All the interesting arithmetic lives in `cfc-ebpf-common` so it can be
 //! unit-tested on the host; this file is the thin, verifier-shaped shell around
 //! it: map declarations, helper calls and bounded copies.
+//!
+//! The DNS program does **no parsing**. It classifies the packet with the
+//! cheap header arithmetic in `cfc_ebpf_common::net`, checks two bytes of the
+//! DNS header, and copies the payload out. Parsing it in the kernel cost more
+//! than the verifier's 1,000,000-instruction budget; see `README.md`.
 
 #![no_std]
 #![no_main]
@@ -25,9 +30,9 @@ use aya_ebpf::macros::{cgroup_skb, map, tracepoint};
 use aya_ebpf::maps::{HashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::{SkBuffContext, TracePointContext};
 use aya_ebpf::{EbpfContext as _, Global};
-use cfc_ebpf_common::dns::{self, DNS_HEADER_LEN, DnsCursor};
+use cfc_ebpf_common::dns::DNS_HEADER_LEN;
 use cfc_ebpf_common::net::{self, IPV4_MIN_HEADER_LEN, UDP_HEADER_LEN};
-use cfc_ebpf_common::{DNS_BUF_LEN, DnsAnswer, ExecEvent, ExitEvent};
+use cfc_ebpf_common::{DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent};
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -49,9 +54,13 @@ static EXEC_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
-/// Stream of `A`/`AAAA` answers observed on the wire.
+/// Stream of DNS response payloads observed on the wire.
+///
+/// Records are 514 bytes, so this holds ~500 responses. Userspace parses them;
+/// a full ring just means it fell behind and some answers are missed, which
+/// costs a hostname, never a packet.
 #[map]
-static DNS_ANSWERS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static DNS_PACKETS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 /// Scratch space for the 292-byte [`ExecEvent`].
 ///
@@ -62,13 +71,23 @@ static DNS_ANSWERS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static EXEC_SCRATCH: PerCpuArray<ExecEvent> = PerCpuArray::with_max_entries(1, 0);
 
-/// Scratch space for the 276-byte [`DnsAnswer`]. Same reasoning.
-#[map]
-static ANSWER_SCRATCH: PerCpuArray<DnsAnswer> = PerCpuArray::with_max_entries(1, 0);
+/// Bytes copied out of a packet for header classification.
+///
+/// Only headers are read out of this buffer, so it is sized for the worst-case
+/// header stack and nothing more: a 60-byte IPv4 header with full options, an
+/// 8-byte UDP header, and the first 12 bytes of the DNS message. The payload
+/// itself never passes through here.
+const PKT_SCRATCH_LEN: usize = 80;
 
-/// Scratch space for the copied packet prefix. Same reasoning, more so.
+/// Scratch space for the copied packet prefix. Same reasoning as
+/// `EXEC_SCRATCH`, more so.
+///
+/// Only the L3/L4 headers and one byte of the DNS header are ever *read* out
+/// of this. The payload the daemon parses is copied straight from the skb into
+/// the ring-buffer record, so this buffer is never indexed by anything the
+/// verifier has to reason about in a loop.
 #[map]
-static PKT_SCRATCH: PerCpuArray<[u8; DNS_BUF_LEN]> = PerCpuArray::with_max_entries(1, 0);
+static PKT_SCRATCH: PerCpuArray<[u8; PKT_SCRATCH_LEN]> = PerCpuArray::with_max_entries(1, 0);
 
 // ---------------------------------------------------------------------------
 // Load-time globals
@@ -270,7 +289,7 @@ pub fn cfc_sched_process_exit(_ctx: TracePointContext) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// cgroup_skb/ingress -- DNS answers
+// cgroup_skb/ingress -- DNS response payloads
 // ---------------------------------------------------------------------------
 
 /// `cgroup_skb` verdict: let the packet through. This program is an observer
@@ -280,12 +299,20 @@ const SKB_PASS: i32 = 1;
 /// Shortest packet that could possibly contain a DNS response header.
 const MIN_DNS_PACKET: usize = IPV4_MIN_HEADER_LEN + UDP_HEADER_LEN + DNS_HEADER_LEN;
 
+/// QR bit, in the high byte of the DNS flags word (byte 2 of the header).
+const DNS_QR: u8 = 0x80;
+
 #[cgroup_skb(ingress)]
 pub fn cfc_dns_ingress(ctx: SkBuffContext) -> i32 {
     let _ = try_dns(&ctx);
     SKB_PASS
 }
 
+/// Classify, gate, copy, submit. Nothing else.
+///
+/// Everything past "these bytes are a UDP datagram from port 53 whose QR bit is
+/// set" -- opcode, rcode, counts, questions, answers, names, compression -- is
+/// the daemon's job, because that is where a parser is allowed to have loops.
 fn try_dns(ctx: &SkBuffContext) -> Result<(), i64> {
     let skb_len = ctx.len() as usize;
     if skb_len < MIN_DNS_PACKET {
@@ -303,22 +330,71 @@ fn try_dns(ctx: &SkBuffContext) -> Result<(), i64> {
         return Ok(());
     }
 
-    let answer_slot = ANSWER_SCRATCH.get_ptr_mut(0).ok_or(-1i64)?;
-    // SAFETY: per-CPU slot, non-preemptible program. See EXEC_SCRATCH.
-    let answer = unsafe { &mut *answer_slot };
+    // How much payload there really is. Deliberately NOT `udp.len`: that is
+    // clamped to the header prefix copied above, so using it here would cap
+    // every capture at ~50 bytes.
+    let avail = skb_len.saturating_sub(udp.offset);
+    let mut payload_len = if udp.declared_len < avail {
+        udp.declared_len
+    } else {
+        avail
+    };
+    if payload_len > DNS_BUF_LEN {
+        payload_len = DNS_BUF_LEN;
+    }
+    if payload_len < DNS_HEADER_LEN {
+        return Ok(());
+    }
 
-    // As with `ExecEvent`, no whole-struct zeroing: 276 bytes is past what the
-    // BPF backend will expand inline. `parse_answer_at` writes `ip`, `is_v6`,
-    // `ttl`, `name_len` and `_pad` on every accepted record and NUL-terminates
-    // `name`, so nothing stale is reachable from userspace.
+    // One byte of sanity, so a stray port-53 datagram (or a query echoed back
+    // by something odd) does not cost a 514-byte ring-buffer record. Anything
+    // subtler than this -- opcode, rcode, counts -- belongs in userspace.
+    //
+    // The flags byte has to be inside the *copied prefix*, which is a stricter
+    // condition than "inside the payload": `get` bounds the read against the
+    // scratch buffer, and this bounds it against the bytes really written.
+    if udp.offset + 3 > copied {
+        return Ok(());
+    }
+    let flags_hi = *buf.get(udp.offset + 2).ok_or(-1i64)?;
+    if flags_hi & DNS_QR == 0 {
+        return Ok(());
+    }
 
-    let cursor = DnsCursor::with_base(buf, udp.offset, udp.len);
-    dns::for_each_answer(&cursor, answer, |a| {
-        // A full ring buffer just means userspace fell behind; drop and move on.
-        let _ = DNS_ANSWERS.output::<DnsAnswer>(a, 0);
-    });
+    publish_payload(ctx, udp.offset, payload_len)
+}
 
-    Ok(())
+/// Reserves a [`DnsPacket`] and fills it straight from the skb.
+///
+/// The payload is *not* copied out of `PKT_SCRATCH`: that would be a memcpy
+/// from a runtime offset, which the BPF backend turns into a libcall the linker
+/// rejects. A second `bpf_skb_load_bytes` -- which takes a runtime offset and
+/// only needs a constant *length* -- writes the ring-buffer record directly,
+/// so the payload is copied exactly once and never touches the stack.
+#[inline(always)]
+fn publish_payload(ctx: &SkBuffContext, offset: usize, len: usize) -> Result<(), i64> {
+    // A full ring buffer just means userspace fell behind; drop and move on.
+    let mut entry = DNS_PACKETS.reserve::<DnsPacket>(0).ok_or(-1i64)?;
+    let pkt = entry.as_mut_ptr();
+    // SAFETY: `pkt` points at `size_of::<DnsPacket>()` bytes of reserved,
+    // writable ring-buffer memory. `&raw mut` computes the field address
+    // without ever forming a reference to uninitialised memory.
+    let dst = unsafe { &raw mut (*pkt).data }.cast::<u8>();
+
+    match copy_payload(ctx, offset, len, dst) {
+        Some(n) => {
+            // SAFETY: as above; `len` is the first field of the record.
+            unsafe { (&raw mut (*pkt).len).write(n as u16) };
+            entry.submit(0);
+            Ok(())
+        }
+        None => {
+            // Nothing was written, so publishing it would hand userspace a
+            // record of stale ring memory.
+            entry.discard(0);
+            Err(-1)
+        }
+    }
 }
 
 /// Copies the head of the packet into the per-CPU scratch buffer.
@@ -329,50 +405,175 @@ fn try_dns(ctx: &SkBuffContext) -> Result<(), i64> {
 /// copy: each rung is a separate call site with a literal length, and the first
 /// one that fits wins.
 ///
-/// Returns the number of bytes actually copied. A packet longer than the
-/// largest rung is simply truncated -- `for_each_answer` stops at the first
-/// record it cannot read in full.
+/// Returns the number of bytes actually copied. Rungs are 8 bytes apart because
+/// the shortest thing this has to reach is `udp.offset + 3` on a 60-byte IPv6
+/// response, and there are only six of them, because the buffer stops at the
+/// headers.
 #[inline(always)]
-fn load_prefix(ctx: &SkBuffContext, buf: &mut [u8; DNS_BUF_LEN]) -> Option<usize> {
+fn load_prefix(ctx: &SkBuffContext, buf: &mut [u8; PKT_SCRATCH_LEN]) -> Option<usize> {
     let avail = ctx.len() as usize;
+    let dst = buf.as_mut_ptr();
 
-    // Rungs are 64 bytes apart, so at most 63 trailing bytes are dropped.
-    if avail >= 512 && load_exact::<512>(ctx, buf) {
-        return Some(512);
+    // Descending literals, top rung == the buffer, so every one of them is
+    // in bounds by inspection.
+    if avail >= PKT_SCRATCH_LEN && load_at::<{ PKT_SCRATCH_LEN }>(ctx, 0, dst) {
+        return Some(PKT_SCRATCH_LEN);
     }
-    if avail >= 448 && load_exact::<448>(ctx, buf) {
-        return Some(448);
+    if avail >= 72 && load_at::<72>(ctx, 0, dst) {
+        return Some(72);
     }
-    if avail >= 384 && load_exact::<384>(ctx, buf) {
-        return Some(384);
-    }
-    if avail >= 320 && load_exact::<320>(ctx, buf) {
-        return Some(320);
-    }
-    if avail >= 256 && load_exact::<256>(ctx, buf) {
-        return Some(256);
-    }
-    if avail >= 192 && load_exact::<192>(ctx, buf) {
-        return Some(192);
-    }
-    if avail >= 128 && load_exact::<128>(ctx, buf) {
-        return Some(128);
-    }
-    if avail >= 64 && load_exact::<64>(ctx, buf) {
+    if avail >= 64 && load_at::<64>(ctx, 0, dst) {
         return Some(64);
     }
-    if avail >= MIN_DNS_PACKET && load_exact::<{ MIN_DNS_PACKET }>(ctx, buf) {
+    if avail >= 56 && load_at::<56>(ctx, 0, dst) {
+        return Some(56);
+    }
+    if avail >= 48 && load_at::<48>(ctx, 0, dst) {
+        return Some(48);
+    }
+    if avail >= MIN_DNS_PACKET && load_at::<{ MIN_DNS_PACKET }>(ctx, 0, dst) {
         return Some(MIN_DNS_PACKET);
     }
     None
 }
 
+/// Copies the DNS payload into the reserved ring-buffer record, **exactly**.
+///
+/// Same constant-length constraint as [`load_prefix`], but here it has to cover
+/// 12..=512 bytes, and one ladder fine enough to do that would be sixty-odd
+/// rungs. So it is three passes:
+///
+/// 1. **coarse**, 64-byte steps, 0..=448, at `dst[0..]`;
+/// 2. **fine**, 8-byte steps over what is left, appended right behind it;
+/// 3. **tail**, a fixed 8-byte read positioned to *end* exactly at the end of
+///    the payload, which fills in the last `len % 8` bytes.
+///
+/// Passes 1 and 2 are single-choice ladders, so this is 8 x 8 x 2 paths for the
+/// verifier rather than 2^n, and their destination offsets are constants on
+/// every one of them. Pass 3 overlaps whatever pass 2 already wrote -- copying
+/// the same bytes twice is free, and it is what makes the result exact.
+///
+/// Exactness is not a nicety here. Truncating even three bytes truncates the
+/// *last answer record*, and the common case is a response with exactly one
+/// answer, so a rounded-down copy would have thrown away most of what this
+/// program exists to collect.
+///
+/// The coarse pass stops at 448 rather than 512 so that `coarse + fine <= 504`
+/// is something the verifier can see without carrying a relation between them;
+/// a payload that fills the buffer takes the whole-buffer fast path above it.
 #[inline(always)]
-fn load_exact<const N: usize>(ctx: &SkBuffContext, buf: &mut [u8; DNS_BUF_LEN]) -> bool {
-    match buf.get_mut(..N) {
-        Some(dst) => ctx.load_bytes(0, dst).is_ok(),
-        None => false,
+fn copy_payload(ctx: &SkBuffContext, offset: usize, len: usize, dst: *mut u8) -> Option<usize> {
+    if len >= DNS_BUF_LEN && load_at::<{ DNS_BUF_LEN }>(ctx, offset, dst) {
+        return Some(DNS_BUF_LEN);
     }
+
+    let coarse = if len >= 448 && load_at::<448>(ctx, offset, dst) {
+        448
+    } else if len >= 384 && load_at::<384>(ctx, offset, dst) {
+        384
+    } else if len >= 320 && load_at::<320>(ctx, offset, dst) {
+        320
+    } else if len >= 256 && load_at::<256>(ctx, offset, dst) {
+        256
+    } else if len >= 192 && load_at::<192>(ctx, offset, dst) {
+        192
+    } else if len >= 128 && load_at::<128>(ctx, offset, dst) {
+        128
+    } else if len >= 64 && load_at::<64>(ctx, offset, dst) {
+        64
+    } else {
+        0
+    };
+
+    // SAFETY: `coarse <= 448` and the fine rungs below are all <= 56, so every
+    // write stays inside the 512-byte `data` field of the reserved record.
+    let mid = unsafe { dst.add(coarse) };
+    let at = offset + coarse;
+    let rest = len - coarse;
+
+    let fine = if rest >= 56 && load_at::<56>(ctx, at, mid) {
+        56
+    } else if rest >= 48 && load_at::<48>(ctx, at, mid) {
+        48
+    } else if rest >= 40 && load_at::<40>(ctx, at, mid) {
+        40
+    } else if rest >= 32 && load_at::<32>(ctx, at, mid) {
+        32
+    } else if rest >= 24 && load_at::<24>(ctx, at, mid) {
+        24
+    } else if rest >= 16 && load_at::<16>(ctx, at, mid) {
+        16
+    } else if rest >= 8 && load_at::<8>(ctx, at, mid) {
+        8
+    } else {
+        0
+    };
+
+    let mut total = coarse + fine;
+
+    // Pass 3. `len - 8` is in `4..=504` (the caller guarantees `len >= 12` and
+    // clamps it to `DNS_BUF_LEN`), so an 8-byte write there ends at 512 at the
+    // very worst -- which is the bound the verifier needs, and the reason the
+    // clamp in `try_dns` is written as an assignment it can see.
+    if total < len {
+        let back = len - 8;
+        // SAFETY: `back + 8 == len <= DNS_BUF_LEN`, so this stays inside the
+        // record's `data` field.
+        if load_at::<8>(ctx, offset + back, unsafe { dst.add(back) }) {
+            total = len;
+        }
+    }
+
+    // A record shorter than a DNS header tells userspace nothing, and the
+    // caller has already established that the payload is at least that long,
+    // so getting here means the helper refused every rung.
+    if total >= DNS_HEADER_LEN {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// Copies exactly `N` bytes from `offset` in the skb to `dst`, or fails.
+///
+/// This calls `bpf_skb_load_bytes` directly instead of going through
+/// `SkBuffContext::load_bytes`, and that is not a style preference: the aya
+/// wrapper recomputes the length as `min(skb.len - offset, dst.len())` at
+/// runtime, so the verifier sees a *range* rather than the constant. The
+/// bottom of that range is zero, and the kernel rejects a zero-sized read:
+///
+/// ```text
+/// 101: (85) call bpf_skb_load_bytes#26
+/// R4 invalid zero-sized read: u64=[0,39]
+/// ```
+///
+/// Passing `N` straight through keeps it a literal in the emitted code, which
+/// is exactly what the ladders above are built to guarantee. The caller has
+/// already checked that the skb holds at least `offset + N` bytes.
+#[inline(always)]
+fn load_at<const N: usize>(ctx: &SkBuffContext, offset: usize, dst: *mut u8) -> bool {
+    // Guards the const parameter against the larger of the two destinations,
+    // so a rung wider than any buffer here is a compile-visible `false` and
+    // not an overflow. The narrower destination (`PKT_SCRATCH`) is covered by
+    // `load_prefix` topping out at exactly `PKT_SCRATCH_LEN`.
+    if N == 0 || N > DNS_BUF_LEN {
+        return false;
+    }
+    // SAFETY: `ctx.skb.skb` is the kernel-provided `__sk_buff` for this
+    // invocation. `dst` is either the per-CPU `PKT_SCRATCH` slot or a position
+    // inside the `data` field of a reserved `DnsPacket` record; both callers
+    // establish that `N` bytes fit from there (see their doc comments). The
+    // helper bounds-checks the source itself and returns non-zero rather than
+    // reading past the packet.
+    let ret = unsafe {
+        aya_ebpf::helpers::generated::bpf_skb_load_bytes(
+            ctx.skb.skb as *const _,
+            offset as u32,
+            dst.cast(),
+            N as u32,
+        )
+    };
+    ret == 0
 }
 
 // ---------------------------------------------------------------------------

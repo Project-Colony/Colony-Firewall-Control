@@ -19,9 +19,31 @@ path = "src/lib.rs"
 name = "colony-firewalld"
 path = "src/main.rs"
 
+[features]
+default = []
+# Load and attach the kernel-side eBPF programs (crates/cfc-ebpf).
+#
+# OFF by default, on purpose. It is the only thing that pulls `aya` in, and
+# turning it on is a promise the machine can keep: the daemon needs CAP_BPF +
+# CAP_PERFMON and an installed BPF object. `cargo build --workspace` on a host
+# that has never seen bpf-linker must keep building exactly what it always
+# built, so the feature is opt-in at build time AND at config time
+# (`[ebpf] enabled`, also false by default).
+#
+# Note that the object itself is NOT built by this feature and is NOT embedded
+# in the binary: it is loaded at runtime from `[ebpf] object_path`. See the
+# module docs in src/ebpf.rs for why.
+ebpf = ["dep:aya"]
+
 [dependencies]
 cfc-core = { path = "../cfc-core" }
 cfc-proto = { path = "../cfc-proto" }
+# POD event types shared with the kernel-side crate. Unconditional: the
+# kernel process table is compiled (and unit-tested) in every configuration,
+# it is simply never fed without the `ebpf` feature. The crate is
+# dependency-free, so this costs nothing.
+cfc-ebpf-common = { workspace = true }
+aya = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

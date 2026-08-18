@@ -117,6 +117,32 @@ lean on a hostname *allow* rule as your only boundary. For allow rules,
 pin `exe` + `dst_port` (+ `dst_net` where destinations are stable)
 instead.
 
+#### Observed answers, with `[ebpf] enabled`
+
+Turning the eBPF layer on adds a second, better source. The
+`cgroup_skb/ingress` program copies the DNS *responses* this machine
+receives off the wire, and the daemon lifts the `A`/`AAAA` records
+straight out of them. Those mappings win over anything the PTR path
+produces.
+
+The difference is who is being asked. A PTR answer is the destination
+address's owner saying what it would like to be called - second-hand,
+after the fact, from the party you may be trying to block. An observed
+answer is first-hand: this host asked a resolver for `example.com` and
+was told an address, *before* the connection it explains, by the zone
+that owns the name. The "hostile server names itself `api.github.com`"
+problem does not arise, because the destination no longer gets a vote.
+
+What it does not fix: the program reads packets off the wire, before the
+resolving library's transaction-id and source-port checks. Anything
+arriving from source port 53 that parses as a response is observed,
+including a forgery that the resolver will go on to reject - and that is
+the same attacker who could also forge the forward lookup FCrDNS
+depends on. Observed answers raise the bar; they do not make a hostname
+allow rule a boundary. The advice above is unchanged.
+
+Answers are cached for the record's own TTL, clamped to 60s..1h.
+
 ## Deny or Reject?
 
 Both stop the connection; they differ in what the application sees.
@@ -327,9 +353,10 @@ to shrink what a code-execution bug could reach:
 
 | Directive                          | Why                             |
 |------------------------------------|---------------------------------|
-| `CapabilityBoundingSet`, `AmbientCapabilities` | Only three capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc` |
+| `CapabilityBoundingSet`, `AmbientCapabilities` | Five capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer |
 | `NoNewPrivileges`                  | No regaining privileges via setuid binaries |
 | `SystemCallFilter=@system-service` | seccomp; the biggest blast-radius reduction available |
+| `SystemCallFilter=bpf perf_event_open` | The two syscalls the eBPF layer needs, named individually |
 | `SystemCallArchitectures=native`   | Closes the 32-bit-syscall bypass of that filter |
 | `MemoryDenyWriteExecute`           | Nothing here JITs; no W+X memory |
 | `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths` | Read-only filesystem apart from the state, runtime and log directories |
@@ -347,6 +374,42 @@ and the owning pid is found by walking `/proc/*/fd` for a matching
 unknown process, which defeats the entire tool. Same reason
 `CAP_SYS_PTRACE` is in the bounding set. If you are hand-editing the
 unit, do not "harden" either of these.
+
+### `CAP_BPF`, `CAP_PERFMON` and the seccomp filter
+
+These are granted unconditionally, even though the eBPF layer is off by
+default and needs a daemon built `--features ebpf` to do anything at
+all. Keeping the switch in one place (`[ebpf] enabled` in
+`daemon.toml`) beats making operators edit a unit file; unexercised
+capabilities are not an attack surface.
+
+`SystemCallFilter=bpf perf_event_open` is **required** and is not
+implied by `@system-service`. Checked with
+`systemd-analyze syscall-filter`: `bpf` lives in `@privileged`,
+`perf_event_open` in `@debug`, and neither set is part of the service
+baseline. There is no `@bpf` set. Without that line every `bpf(2)` call
+returns `EPERM` and the daemon silently falls back to `sock_diag` +
+`/proc` - the startup log line names which sources are live, and is the
+place to check.
+
+The two syscalls are named individually rather than pulling in
+`@privileged` or `@debug` wholesale, which would also restore `mount`,
+`chroot`, the setuid family, `ptrace` and `process_vm_readv`.
+`perf_event_open` is needed because that is how a tracepoint program is
+attached; the `cgroup_skb` program goes through `bpf(BPF_LINK_CREATE)`
+alone.
+
+**`MemoryDenyWriteExecute` stays on with eBPF enabled.** It restricts
+this process's own mappings, and the BPF JIT does not run in this
+process: `bpf(2)` hands the kernel an instruction array, and the
+verifier and JIT run kernel-side, emitting into kernel memory that a
+per-process address-space policy has no bearing on. `LockPersonality`
+is likewise untouched by any of this. Both were verified empirically by
+running the loader under the full directive set with `systemd-run`.
+
+`ProtectControlGroups=true` also stays: attaching `cgroup_skb` needs a
+read-only fd on the cgroup v2 root as an attach target, not write access
+to `cgroupfs`.
 
 ## Fail-open or fail-closed
 

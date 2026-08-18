@@ -29,6 +29,13 @@ authors = ["MotherSphere <linhajahad@gmail.com>"]
 # Dependency-free and no_std-capable; the daemon consumes it with default
 # (std) features for the string/IpAddr helpers.
 cfc-ebpf-common = { path = "crates/cfc-ebpf-common" }
+# Userspace half of the eBPF backend: loads the object built by
+# `cargo xtask build-ebpf`, attaches it, and reads the ring buffers. An
+# OPTIONAL dependency of cfc-daemon behind its `ebpf` feature, which is off by
+# default -- so a plain `cargo build --workspace` never compiles it. aya 0.14
+# pairs with the aya-ebpf 0.2.x the kernel-side crate uses, and declares
+# rust-version 1.87, comfortably inside this workspace's 1.88 MSRV.
+aya = "0.14"
 
 # IPC
 tonic = "0.14"

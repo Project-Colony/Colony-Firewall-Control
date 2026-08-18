@@ -32,8 +32,27 @@ RestartSec=2
 TimeoutStopSec=15
 
 # Privileges
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
+#
+# CAP_NET_ADMIN  NFQUEUE, and the cgroup_skb attach.
+# CAP_NET_RAW    the raw sockets that make Reject differ from Deny.
+# CAP_SYS_PTRACE process attribution reads other processes' /proc entries.
+# CAP_BPF        bpf(2): loading programs and creating/reading maps.
+# CAP_PERFMON    perf_event_open(2), which is how a tracepoint program is
+#                actually attached (the two sched_process_* programs).
+#
+# CAP_BPF and CAP_PERFMON are granted unconditionally even though the eBPF
+# backend is off by default ([ebpf] enabled in daemon.toml, and the daemon has
+# to be built --features ebpf as well). Granting them here rather than making
+# operators edit the unit keeps the switch in one place; with the feature off
+# they are simply never exercised.
+#
+# On kernels older than 5.8 neither capability exists and bpf(2) requires
+# CAP_SYS_ADMIN instead. This unit does not add that - it would hand the daemon
+# most of root, to enable a feature whose kernel requirements (ring buffers,
+# BTF) start at 5.8 anyway. On such a kernel the load fails, the daemon warns
+# and carries on without it, which is the correct outcome.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
 NoNewPrivileges=true
 
 # Filesystem
@@ -58,13 +77,46 @@ ProtectClock=true
 ProtectHostname=true
 RestrictSUIDSGID=true
 # Pure-Rust daemon; nothing JITs or needs writable+executable memory.
+#
+# This stays on with the eBPF backend enabled. MemoryDenyWriteExecute is a
+# per-process mmap/mprotect restriction, and the BPF JIT does not run in this
+# process at all - bpf(2) hands the kernel an instruction array, the verifier
+# and JIT run kernel-side, and the resulting machine code lives in kernel
+# memory that this unit's address-space policy has no bearing on. Likewise
+# LockPersonality: personality(2) is never called here, by the daemon or by
+# aya.
 MemoryDenyWriteExecute=true
 # Biggest RCE-blast-radius reduction available: seccomp-filter syscalls to
 # the service baseline. @network-io is not a systemd syscall set; socket
 # syscalls are already in @system-service. Deliberately NOT setting
 # ProtectProc=invisible: process attribution walks other processes' /proc
 # entries (/proc/net inode -> /proc/*/fd).
+#
+# bpf and perf_event_open are listed EXPLICITLY, by name, because
+# @system-service does NOT cover either of them. Verified with
+# `systemd-analyze syscall-filter` on systemd 261:
+#
+#   bpf              is in @privileged (and @known), not @system-service
+#   perf_event_open  is in @debug      (and @known), not @system-service
+#
+# There is no @bpf set - if you go looking for one, that is why. Without these
+# two lines every bpf(2) call returns EPERM under this unit and the daemon
+# degrades to sock_diag + /proc, silently as far as the operator is concerned
+# apart from one warning at startup.
+#
+# Naming the two syscalls rather than adding @privileged or @debug is
+# deliberate and is the whole point: @privileged would also hand back mount,
+# chroot and the setuid family, and @debug would hand back ptrace and
+# process_vm_readv - a much larger surface than "load a verified program and
+# attach it to a tracepoint" needs. perf_event_open is required because that
+# is how a tracepoint program is attached; the cgroup_skb program goes through
+# bpf(BPF_LINK_CREATE) alone.
+#
+# Listing them costs nothing when the eBPF backend is off: an allowed syscall
+# that is never called is not an attack surface, and CAP_BPF is a separate gate
+# on making it succeed.
 SystemCallFilter=@system-service
+SystemCallFilter=bpf perf_event_open
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 # The control socket is chmod/chgrp'd explicitly by the daemon after bind

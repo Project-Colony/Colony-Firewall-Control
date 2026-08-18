@@ -35,6 +35,7 @@ pub struct Config {
     pub events: EventsConfig,
     pub ipc: IpcConfig,
     pub provenance: ProvenanceConfig,
+    pub ebpf: EbpfConfig,
 }
 
 impl Default for Config {
@@ -239,6 +240,29 @@ impl Default for ProvenanceConfig {
     }
 }
 
+/// The eBPF enrichment layer (see `crate::ebpf`).
+///
+/// Needs a **restart**: programs are loaded and attached once, at startup.
+/// SIGHUP deliberately does not touch this - re-attaching a verifier-checked
+/// program set while packets are flowing is not something a config reload
+/// should be able to do by accident.
+///
+/// Unlike every other section here, the defaults are `Default`-derived rather
+/// than hand-written: "off, no path" is exactly what `bool`/`Option` already
+/// mean, and spelling it out invites the two from drifting apart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EbpfConfig {
+    /// Load and attach the kernel-side programs. Off by default: this is new,
+    /// it needs an installed BPF object and two extra capabilities, and
+    /// everything it provides is an improvement on an answer the daemon can
+    /// already produce without it.
+    pub enabled: bool,
+    /// Where the BPF object built by `cargo xtask build-ebpf` was installed.
+    /// `None` means `crate::ebpf::DEFAULT_OBJECT_PATH`.
+    pub object_path: Option<PathBuf>,
+}
+
 /// Raw on-disk shape. Only `[default_policy]` needs Option-per-field (it
 /// interacts with `profile`); the other sections carry their own defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -252,6 +276,7 @@ struct ConfigToml {
     events: EventsConfig,
     ipc: IpcConfig,
     provenance: ProvenanceConfig,
+    ebpf: EbpfConfig,
 }
 
 impl ConfigToml {
@@ -278,6 +303,7 @@ impl ConfigToml {
             events: self.events,
             ipc: self.ipc,
             provenance: self.provenance,
+            ebpf: self.ebpf,
         }
     }
 }
@@ -336,10 +362,42 @@ mod tests {
         assert_eq!(cfg.ipc.group, "colony-firewall");
         assert!(cfg.ipc.require_group);
         assert!(cfg.provenance.enabled);
+        assert!(!cfg.ebpf.enabled);
+        assert_eq!(cfg.ebpf.object_path, None);
         assert_eq!(
             cfg.storage.path,
             PathBuf::from("/var/lib/colony-firewall/rules.db")
         );
+    }
+
+    #[test]
+    fn ebpf_is_off_by_default_and_opt_in_only() {
+        // This is a security-relevant default, not a style choice: turning it
+        // on means loading kernel code and granting CAP_BPF/CAP_PERFMON.
+        assert!(!Config::from_toml_str("").unwrap().ebpf.enabled);
+        assert!(
+            !Config::from_toml_str("[ebpf]\n").unwrap().ebpf.enabled,
+            "an empty section keeps the default"
+        );
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [ebpf]
+            enabled = true
+            object_path = "/opt/cfc/cfc-ebpf.o"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.ebpf.enabled);
+        assert_eq!(
+            cfg.ebpf.object_path,
+            Some(PathBuf::from("/opt/cfc/cfc-ebpf.o"))
+        );
+
+        // Enabling without naming a path falls back to the packaged location.
+        let cfg = Config::from_toml_str("[ebpf]\nenabled = true\n").unwrap();
+        assert!(cfg.ebpf.enabled);
+        assert_eq!(cfg.ebpf.object_path, None);
     }
 
     #[test]
@@ -493,6 +551,7 @@ mod tests {
         assert_eq!(cfg.ipc.group, "colony-firewall");
         assert!(cfg.ipc.require_group);
         assert!(cfg.provenance.enabled);
+        assert!(!cfg.ebpf.enabled, "the sample must ship eBPF switched off");
         assert_eq!(
             cfg.storage.path,
             PathBuf::from("/var/lib/colony-firewall/rules.db")

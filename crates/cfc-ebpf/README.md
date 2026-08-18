@@ -81,10 +81,29 @@ Two details:
 
 ### 3. `cgroup_skb/ingress` → `cfc_dns_ingress`
 
-Matches inbound UDP datagrams with **source port 53**, parses the DNS response,
-and pushes one `DnsAnswer` per `A`/`AAAA` record to the `DNS_ANSWERS` ring
-buffer. It always returns `1` (pass) — it is an observer and never drops
-traffic.
+Matches inbound UDP datagrams with **source port 53** and copies the DNS
+payload into the `DNS_PACKETS` ring buffer as a `DnsPacket`. It always returns
+`1` (pass) — it is an observer and never drops traffic.
+
+It does **not parse DNS**. That is the whole design, and it is not a
+simplification for its own sake: in-kernel DNS parsing does not fit in the
+verifier's complexity budget. See
+[Why the DNS parsing is in userspace](#why-the-dns-parsing-is-in-userspace).
+
+What the kernel half does, in order:
+
+1. `skb->len >= 40` (the shortest possible IPv4 + UDP + DNS header);
+2. copy up to 80 bytes — the worst-case header stack — into `PKT_SCRATCH`;
+3. `cfc_ebpf_common::net::udp_payload_from_l3` to confirm IPv4/IPv6 + UDP,
+   unfragmented, and to locate the payload;
+4. source port == 53;
+5. payload length >= 12 and the **QR bit** set (`payload[2] & 0x80`) — one byte
+   of sanity so a stray port-53 datagram does not cost a 514-byte record;
+6. reserve a `DnsPacket`, copy the payload straight from the skb into it, write
+   the length, submit.
+
+Everything past that — opcode, rcode, section counts, questions, answers,
+names, compression pointers — is the daemon's job.
 
 #### Why `cgroup_skb/ingress` and not `socket_filter`
 
@@ -104,6 +123,13 @@ covers everything.
 
 #### What the DNS parser supports
 
+The parser is `cfc_ebpf_common::dns`, running in the **daemon**, over
+`DnsPacket::payload()`. It still obeys the panic-free, constant-loop-bound,
+no-dynamic-slicing style it was written in — that style is worth keeping for a
+parser fed attacker-influenced bytes, and it keeps the option of moving pieces
+back into the kernel open — but it no longer answers to the verifier, so the
+caps are set for correctness rather than for a budget.
+
 * `A` (type 1) and `AAAA` (type 28) records, class `IN`, in the **answer**
   section of a response (`QR=1`) with `RCODE == NOERROR`.
 * Name compression pointers (RFC 1035 §4.1.4), which real resolvers use for
@@ -116,11 +142,11 @@ covers everything.
 
 | skipped | why |
 |---|---|
-| answers past the 8th | verifier loop budget; `MAX_ANSWERS = 8` |
+| answers past the 8th | `MAX_ANSWERS = 8`; more than that from one response is not worth the work |
 | responses with > 4 questions | the answer offset needs the questions walked; real responses have 1 |
 | names longer than 253 bytes | RFC limit, and the `DnsAnswer::name` field size |
 | labels > 63 bytes, reserved label types (`0b01`/`0b10`) | malformed |
-| everything past 512 captured bytes | scratch buffer size; parsing stops at the first record it cannot read *in full* |
+| everything past 512 captured bytes | `DNS_BUF_LEN`, i.e. the RFC 1035 §4.2.1 limit on an unextended UDP message; larger EDNS(0) responses are truncated and parsing stops at the first record it cannot read *in full* |
 | `CNAME`/`NS`/`SOA`/`MX`/… | skipped by `rdlength`, not reported |
 | the authority and additional sections | not needed for IP→name attribution |
 | IPv4 fragments after the first | they carry no UDP header |
@@ -136,23 +162,30 @@ covers everything.
 | `PROCS` | `HASH` | `u32 → ExecEvent` (10240) | live processes by tgid |
 | `EXEC_EVENTS` | `RINGBUF` | 256 KiB | exec stream |
 | `EXIT_EVENTS` | `RINGBUF` | 64 KiB | exit stream |
-| `DNS_ANSWERS` | `RINGBUF` | 256 KiB | `A`/`AAAA` answer stream |
+| `DNS_PACKETS` | `RINGBUF` | 256 KiB | DNS response payloads (514-byte records) |
 | `EXEC_SCRATCH` | `PERCPU_ARRAY` | 1 × `ExecEvent` | see below |
-| `ANSWER_SCRATCH` | `PERCPU_ARRAY` | 1 × `DnsAnswer` | see below |
-| `PKT_SCRATCH` | `PERCPU_ARRAY` | 1 × `[u8; 512]` | copied packet prefix |
+| `PKT_SCRATCH` | `PERCPU_ARRAY` | 1 × `[u8; 80]` | copied header prefix |
 
-The three scratch maps exist because **a BPF program gets 512 bytes of stack in
-total**. `ExecEvent` alone is 292 bytes and `DnsAnswer` is 276; neither can live
-on the stack next to everything else. Per-CPU array slots are the standard
-workaround and cost nothing at runtime — BPF programs are non-preemptible, so a
-slot cannot be clobbered mid-program.
+Six maps, not seven: `ANSWER_SCRATCH` (1 × `DnsAnswer`) is gone with the
+in-kernel parser that needed it.
 
-Measured stack usage of the built object:
+The scratch maps exist because **a BPF program gets 512 bytes of stack in
+total**, and `ExecEvent` alone is 292 bytes. Per-CPU array slots are the
+standard workaround and cost nothing at runtime — BPF programs are
+non-preemptible, so a slot cannot be clobbered mid-program.
+
+`PKT_SCRATCH` is 80 bytes rather than 512 because only *headers* are read out
+of it now: 60 bytes of worst-case IPv4 header, 8 of UDP, and the first 12 of the
+DNS message. The payload never passes through it — `bpf_skb_load_bytes` writes
+it directly into the reserved ring-buffer record, so it is copied exactly once
+and never touches the stack.
+
+Measured size and stack usage of the built object:
 
 ```text
-cgroup_skb/ingress                     831 insns, 232 bytes of stack
-tracepoint/sched/sched_process_exec    153 insns,  48 bytes of stack
-tracepoint/sched/sched_process_exit     23 insns,   4 bytes of stack
+cgroup_skb/ingress                     355 insns, 56 bytes of stack
+tracepoint/sched/sched_process_exec    158 insns, 48 bytes of stack
+tracepoint/sched/sched_process_exit     25 insns,  4 bytes of stack
 ```
 
 ---
@@ -206,16 +239,87 @@ Two independent causes, both fixed here:
 
 **`bpf_skb_load_bytes` needs a constant length**, and fails outright if that
 length runs past the end of the skb. There is no "copy up to N bytes". Hence the
-descending ladder in `load_prefix`: constant-size attempts at 512, 448, 384,
-320, 256, 192, 128, 64 and finally 40 (`MIN_DNS_PACKET` = 20 + 8 + 12), first
-fit wins. Rungs are 64 bytes apart, so at most 63 trailing bytes of a packet are
-dropped.
+descending ladders: constant-size attempts, first fit wins.
 
-**No unchecked pointer arithmetic on packet data.** Every packet byte is read
-through the copied `PKT_SCRATCH` buffer, itself filled only by
-`ctx.load_bytes()`. The programs never touch `skb->data`/`skb->data_end`
-directly. Kernel memory (the `task_struct` walk) goes exclusively through
+There are two of them, because they have different jobs:
+
+* `load_prefix` fills `PKT_SCRATCH` for header classification. Rungs at 80, 72,
+  64, 56, 48 and 40 (`MIN_DNS_PACKET` = 20 + 8 + 12) — 8 bytes apart, because
+  the shortest thing it has to reach is `udp.offset + 3` on a 60-byte IPv6
+  response.
+* `copy_payload` fills the ring-buffer record, and has to cover 12..=512 bytes.
+  One ladder fine enough for that would be sixty-odd rungs, so it is three
+  passes: **coarse** in 64-byte steps (0..=448), **fine** in 8-byte steps over
+  what is left, and a **tail** — one fixed 8-byte read positioned to *end*
+  exactly at the end of the payload, filling in the last `len % 8` bytes. The
+  tail overlaps what the fine pass already wrote; copying the same bytes twice
+  is free, and it is what makes the result exact.
+
+That exactness is load-bearing, and was found the hard way. A first version
+rounded the length down to a multiple of 8 — losing at most 7 bytes, which
+sounded harmless. It is not: those 7 bytes are the *end of the last answer
+record*, `parse_answer_at` refuses a record it cannot read in full, and the
+common case is a response carrying exactly one answer. The rounded version
+captured packets perfectly and produced zero answers.
+
+Note also that `copy_payload` is driven by `UdpPayload::declared_len` (the
+length in the UDP header) and **not** by `UdpPayload::len`. The latter is
+clamped to however much of the packet was copied into `PKT_SCRATCH`, which is
+only ever headers — using it would have capped every capture at ~50 bytes.
+
+**No unchecked pointer arithmetic on packet data.** Every packet byte the
+program *reads* comes through the copied `PKT_SCRATCH` buffer, and every byte it
+*forwards* is written by the kernel's own helper into a reserved ring-buffer
+record. The programs never touch `skb->data`/`skb->data_end` directly. Kernel
+memory (the `task_struct` walk) goes exclusively through
 `bpf_probe_read_kernel`, which faults gracefully instead of oopsing.
+
+### Why the DNS parsing is in userspace
+
+The verifier gives a program **1,000,000 instructions** of state exploration.
+Not instructions executed — instructions *walked*, across every path it has to
+prove safe. In-kernel DNS name parsing does not fit, and the gap is not close.
+
+The kernel-side parser was written to every rule above: constant loop bounds,
+`slice::get` everywhere, no allocation, scratch in a per-CPU map. Three verifier
+rejections were diagnosed and fixed in sequence — a zero-sized
+`bpf_skb_load_bytes` read (the aya wrapper's `min`, see above), an unprovable
+store into the name buffer (fixed with an index mask, because LLVM deletes a
+redundant *check* but cannot delete a mask that changes the value), and then
+lowered caps. It still died on:
+
+```text
+processed 1000001 insns (limit 1000000)
+```
+
+at roughly **24,000 states**, on kernel 7.1.8. Lowering the caps further did not
+move it — not `MAX_ANSWERS` 8 → 4, not `MAX_LABELS` 32 → 24, not `DNS_BUF_LEN`
+512 → 256. That is the tell. The cost is not any single bound but the *product*
+of the nested `answer × label × byte` loops, which the verifier must explore
+exhaustively; shaving a factor off one term leaves the shape intact.
+
+So the parsing moved out. The kernel now does only what the kernel is uniquely
+able to do — see the packet, cheaply, in flight — and the daemon does the part
+that needs loops, where there is no verifier and where the parser
+(`cfc_ebpf_common::dns`, 63 host tests) already lived.
+
+The result, measured on the same kernel:
+
+| program | verified insns | budget used |
+|---|---|---|
+| `cfc_dns_ingress` | **17,058** | 1.7% |
+| `cfc_sched_process_exec` | 248 | 0.02% |
+| `cfc_sched_process_exit` | 25 | 0.003% |
+
+From over budget to 1.7% of it. The loader logs these counts at `debug` on
+every load (`verified_insns`), so a change that makes a program dramatically
+more expensive is visible before it becomes "the program stopped loading on
+someone else's kernel".
+
+The costs of the split, stated plainly: one extra copy of the payload (into the
+ring buffer), 514-byte records instead of 276-byte ones, and DNS answers now
+arrive after a ring-buffer hop instead of being extracted in place. None of it
+is on the packet path — NFQUEUE only ever *reads* the resulting `DnsCache`.
 
 ### `ppid` and the absence of CO-RE
 
@@ -344,15 +448,91 @@ three programs should be attachable independently, so losing the cgroup attach
 ### Consuming the types
 
 `cfc-ebpf-common` deliberately does **not** depend on `aya`, so that the marker
-trait does not drag aya into the stable workspace's dependency graph. The
-loader should write, next to its map handles:
+trait does not drag aya into the stable workspace's dependency graph.
 
-```rust
-unsafe impl aya::Pod for cfc_ebpf_common::ExecEvent {}
-unsafe impl aya::Pod for cfc_ebpf_common::ExitEvent {}
-unsafe impl aya::Pod for cfc_ebpf_common::DnsAnswer {}
+An earlier version of this section told the loader to write
+`unsafe impl aya::Pod for cfc_ebpf_common::ExecEvent {}`. **That does not
+compile**, and cannot: `aya::Pod` and `ExecEvent` are both foreign to
+`cfc-daemon`, so the impl is refused by the orphan rule (E0117). It is also
+unnecessary - `aya::Pod` is needed for *typed map access*
+(`aya::maps::HashMap<_, K, V>`, `Array<_, V>`, `EbpfLoader::override_global`),
+and the loader touches none of the typed maps: everything userspace needs
+arrives through the ring buffers, which hand back `&[u8]`. Records are decoded
+with a checked-length `ptr::read_unaligned`, which is sound for exactly the
+reasons the marker trait would have asserted: all three types are `#[repr(C)]`,
+contain no pointers, no `Drop` and no niches, and carry explicit padding fields
+that the kernel side always writes.
+
+`PROCS` is therefore never read from userspace at all. It stays because the
+insert-before-publish ordering is what makes an `EXEC_EVENTS` record imply a
+live map entry, and because a future in-kernel consumer (a whitelist fast path)
+would want it.
+
+### What the loader actually does
+
+Implemented in `crates/cfc-daemon/src/ebpf/`, behind the daemon's `ebpf` cargo
+feature (off by default) and `[ebpf] enabled` in `daemon.toml` (also off).
+
+1. reads the object from `[ebpf] object_path`, default
+   `/usr/lib/colony-firewall/cfc-ebpf.o`. It is **not** embedded with
+   `include_bytes_aligned!`: that would make a stable `cargo build --features
+   ebpf` depend on this crate's nightly + bpf-linker toolchain, which is
+   exactly what excluding this crate from the workspace was for.
+2. resolves `TASK_REAL_PARENT_OFFSET` / `TASK_TGID_OFFSET` from
+   `/sys/kernel/btf/vmlinux` and patches them in with
+   `EbpfLoader::override_global` (`set_global` is deprecated as of aya 0.13.2).
+   It parses the BTF blob by hand rather than through `aya::Btf`, because
+   aya-obj 0.3 exposes only `Btf::id_by_type_name_kind` publicly and keeps
+   `Btf::types()`, `type_by_id`, `BtfMember` and `Struct::members` all
+   `pub(crate)` - there is no public "offset of this member" API.
+3. attaches each program independently; any failure is a warning.
+4. drains each ring buffer from a tokio task built on
+   `AsyncFd<RingBuf<MapData>>`.
+
+Programs are addressed by their **ELF symbol** (`cfc_sched_process_exec`,
+`cfc_sched_process_exit`, `cfc_dns_ingress`), not by section name.
+
+### Verified on a live kernel
+
+Loaded and attached under root on kernel 7.1.8 (x86_64). **All three programs
+load, verify and attach**, and `dns_capture = true`.
+
+* the BTF patch works end to end — a captured exec event reads
+  `KernelProc { pid: 1472174, ppid: Some(1472170), uid: 0, gid: 0,
+  exe: "/usr/bin/sleep", comm: "sleep" }`, with a **resolved ppid**, which is
+  only possible if both `.rodata` offsets reached the program;
+* the exit tracepoint evicts the record when the process dies;
+* `cgroup_skb/ingress` captures real answers. Observed in one run, off the
+  wire, through the ring buffer and the userspace parser and into `DnsCache`:
+
+  ```text
+  one.one.one.one -> 1.1.1.1
+  one.one.one.one -> 1.0.0.1
+  one.one.one.one -> 2606:4700:4700::1111
+  one.one.one.one -> 2606:4700:4700::1001
+  example.com     -> 104.20.23.154
+  example.com     -> 172.66.147.243
+  ```
+
+  Note that those were captured off *systemd-resolved's* socket, not the test
+  process's: the program is attached to the cgroup v2 root, so it sees the whole
+  machine. The corollary is that a name the local resolver answers from its own
+  cache produces no packet and therefore no observation — which is why the live
+  half of the test prints and asserts nothing.
+
+#### Reproducing it
+
+```sh
+cargo xtask build-ebpf
+cargo test -p cfc-daemon --profile fast --features ebpf --no-run
+sudo -n env CFC_EBPF_OBJECT=$(cargo xtask ebpf-path) \
+    ./target/fast/deps/cfc_daemon-<hash> --ignored --nocapture loads_and_attaches
 ```
 
-which is sound because all three are `#[repr(C)]`, contain no pointers, no
-`Drop` and no niches, and carry explicit padding fields that the kernel side
-always writes.
+`loads_and_attaches_on_this_kernel` asserts both tracepoints attach, that the
+BTF offsets resolve, that `dns_capture` is true, and that a DNS answer reaches
+`DnsCache`. The last one is hermetic on purpose: it binds `127.0.0.1:53`, sends
+one handmade response to a socket of its own, and requires the answer to come
+out the far end. Loopback is enough because `cgroup_skb/ingress` runs at the
+receiving socket rather than at a device — so the assertion needs no resolver,
+no uplink, and no luck.
