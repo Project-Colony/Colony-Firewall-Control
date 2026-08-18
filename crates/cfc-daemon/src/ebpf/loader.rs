@@ -501,7 +501,7 @@ mod tests {
     /// and the object built by `cargo xtask build-ebpf`.
     ///
     ///     cargo xtask build-ebpf
-    ///     cargo build -p cfc-daemon --features ebpf --tests --profile fast
+    ///     cargo build -p cfc-daemon --tests --profile fast
     ///     sudo -E CFC_EBPF_OBJECT=$(cargo xtask ebpf-path) \
     ///       ./target/fast/deps/cfc_daemon-<hash> --ignored --nocapture loads_and_attaches
     ///

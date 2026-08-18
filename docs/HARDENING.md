@@ -377,11 +377,12 @@ unit, do not "harden" either of these.
 
 ### `CAP_BPF`, `CAP_PERFMON` and the seccomp filter
 
-These are granted unconditionally, even though the eBPF layer is off by
-default and needs a daemon built `--features ebpf` to do anything at
-all. Keeping the switch in one place (`[ebpf] enabled` in
-`daemon.toml`) beats making operators edit a unit file; unexercised
-capabilities are not an attack surface.
+These are granted unconditionally, even though the eBPF layer is off at
+runtime by default (`[ebpf] enabled`). The loader is compiled into the
+shipped daemon, so the config switch is the only thing between a stock
+install and a ring-0 attach — keeping that switch in one place beats
+making operators edit a unit file, and a capability nothing exercises is
+not an attack surface.
 
 `SystemCallFilter=bpf perf_event_open` is **required** and is not
 implied by `@system-service`. Checked with

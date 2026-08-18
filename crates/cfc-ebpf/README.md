@@ -471,7 +471,7 @@ would want it.
 ### What the loader actually does
 
 Implemented in `crates/cfc-daemon/src/ebpf/`, behind the daemon's `ebpf` cargo
-feature (off by default) and `[ebpf] enabled` in `daemon.toml` (also off).
+feature (**on** by default) and `[ebpf] enabled` in `daemon.toml` (still off).
 
 1. reads the object from `[ebpf] object_path`, default
    `/usr/lib/colony-firewall/cfc-ebpf.o`. It is **not** embedded with
@@ -524,7 +524,7 @@ load, verify and attach**, and `dns_capture = true`.
 
 ```sh
 cargo xtask build-ebpf
-cargo test -p cfc-daemon --profile fast --features ebpf --no-run
+cargo test -p cfc-daemon --profile fast --no-run
 sudo -n env CFC_EBPF_OBJECT=$(cargo xtask ebpf-path) \
     ./target/fast/deps/cfc_daemon-<hash> --ignored --nocapture loads_and_attaches
 ```

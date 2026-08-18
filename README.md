@@ -385,7 +385,7 @@ cargo run -p cfc-ui     # in another terminal
 | 2  UI MVP                    | done, except the system tray icon |
 | 3  CLI                       | done  |
 | 3.5 Hardening & correctness  | done  |
-| 4  eBPF backend              | done, opt-in (`--features ebpf`) |
+| 4  eBPF backend              | done; compiled in by default, gated by `[ebpf] enabled` |
 | 5a CI                        | done  |
 | 5b Packaging                 | in progress (AUR-ready PKGBUILD in `pkg/`, not yet published) |
 | 5  System tray, VirusTotal   | TODO  |

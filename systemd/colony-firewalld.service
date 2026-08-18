@@ -41,10 +41,11 @@ TimeoutStopSec=15
 #                actually attached (the two sched_process_* programs).
 #
 # CAP_BPF and CAP_PERFMON are granted unconditionally even though the eBPF
-# backend is off by default ([ebpf] enabled in daemon.toml, and the daemon has
-# to be built --features ebpf as well). Granting them here rather than making
-# operators edit the unit keeps the switch in one place; with the feature off
-# they are simply never exercised.
+# backend is off at runtime by default ([ebpf] enabled in daemon.toml). The
+# loader itself is compiled into the shipped daemon, so that config switch is
+# the only gate. Granting the capabilities here rather than making operators
+# edit the unit keeps the switch in one place; while the switch is off they are
+# simply never exercised.
 #
 # On kernels older than 5.8 neither capability exists and bpf(2) requires
 # CAP_SYS_ADMIN instead. This unit does not add that - it would hand the daemon

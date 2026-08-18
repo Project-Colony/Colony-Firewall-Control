@@ -336,8 +336,11 @@ Signals:
 
 Three kernel-side programs (`crates/cfc-ebpf`, built separately by
 `cargo xtask build-ebpf`) and their userspace loader (`cfc-daemon/src/ebpf/`).
-Off by default at *both* the cargo-feature level (`--features ebpf`, which is
-what pulls `aya` in) and the config level (`[ebpf] enabled`).
+The loader is compiled in by default (the `ebpf` cargo feature, which is what
+pulls `aya` in); the layer stays off at runtime until `[ebpf] enabled` is set.
+Compiling it in is not the same as running it: while the config switch is off,
+`start` returns before any `bpf(2)` call, so a default build is exactly as
+inert as one built with `--no-default-features`.
 
 | program | attach | what the daemon does with it |
 |---|---|---|

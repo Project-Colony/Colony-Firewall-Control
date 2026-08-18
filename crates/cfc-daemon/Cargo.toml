@@ -20,15 +20,25 @@ name = "colony-firewalld"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["ebpf"]
 # Load and attach the kernel-side eBPF programs (crates/cfc-ebpf).
 #
-# OFF by default, on purpose. It is the only thing that pulls `aya` in, and
-# turning it on is a promise the machine can keep: the daemon needs CAP_BPF +
-# CAP_PERFMON and an installed BPF object. `cargo build --workspace` on a host
-# that has never seen bpf-linker must keep building exactly what it always
-# built, so the feature is opt-in at build time AND at config time
-# (`[ebpf] enabled`, also false by default).
+# ON by default. Compiling the loader in is not the same as running it: while
+# `[ebpf] enabled` is off, `start` returns before any `bpf(2)` call, before any
+# `/sys/kernel/btf/vmlinux` read and before any cgroup attach -- so a default
+# build is exactly as inert at runtime as one built without the feature. What
+# the flip buys is that the shipped binary is *able* to bring the ring-0 layer
+# up on a host that can support it, instead of demanding a rebuild first.
+#
+# The feature pulls in `aya` and nothing else. aya is pure Rust: compiling it
+# needs no bpf-linker, no BPF-capable kernel, no root and no nightly. Only
+# *loading* has requirements (CAP_BPF + CAP_PERFMON, an installed object), and
+# every one of them degrades to a note rather than a failure.
+#
+# To build without it: `cargo build -p cfc-daemon --no-default-features`.
+# Package-scoped on purpose -- an unscoped `--workspace --no-default-features`
+# also strips `default = ["std"]` from cfc-ebpf-common, which builds today only
+# by feature unification.
 #
 # Note that the object itself is NOT built by this feature and is NOT embedded
 # in the binary: it is loaded at runtime from `[ebpf] object_path`. See the

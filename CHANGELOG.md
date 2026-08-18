@@ -7,7 +7,9 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- **eBPF backend** (opt-in: `--features ebpf` plus `[ebpf] enabled`).
+- **eBPF backend**. Compiled into the daemon by default; still gated at
+  runtime by `[ebpf] enabled`, which remains off. Build without it with
+  `cargo build -p cfc-daemon --no-default-features`.
   Three kernel programs: `sched_process_exec` / `sched_process_exit`
   fill a kernel-sourced process table, so attribution no longer races a
   short-lived process through `/proc`; `cgroup_skb/ingress` observes the

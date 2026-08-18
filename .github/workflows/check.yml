@@ -71,6 +71,31 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --locked --no-fail-fast
 
+  # The eBPF loader is compiled in by default, so `--no-default-features` is now
+  # the configuration nothing else in CI exercises -- and it is the one that
+  # keeps the promise that the firewall builds and runs with no eBPF support at
+  # all. Without this job the `#[cfg(not(feature = "ebpf"))]` arm in
+  # src/ebpf.rs is compiled by nothing and rots silently.
+  #
+  # Package-scoped on purpose. An unscoped `--workspace --no-default-features`
+  # would also strip `default = ["std"]` from cfc-ebpf-common, which builds
+  # today only because feature unification puts it back.
+  no-ebpf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy -p cfc-daemon --no-default-features --all-targets --locked -- -D warnings
+      - run: cargo test -p cfc-daemon --no-default-features --locked --no-fail-fast
+
   build:
     runs-on: ubuntu-latest
     steps:

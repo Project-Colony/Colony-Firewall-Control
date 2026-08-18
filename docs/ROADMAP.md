@@ -146,8 +146,9 @@ were wrong or missing once the happy path worked.
 
 ## Phase 4 - eBPF backend [mostly done]
 
-Off by default: needs `--features ebpf` at build time and `[ebpf]
-enabled` in `daemon.toml`. Verified end to end on kernel 7.1.8.
+Compiled in by default (the `ebpf` cargo feature); still off at runtime
+until `[ebpf] enabled` is set in `daemon.toml`. Verified end to end on
+kernel 7.1.8.
 
 - [x] aya project setup, BPF target in workspace (own workspace, own
       pinned nightly, excluded from the stable build; `cargo xtask

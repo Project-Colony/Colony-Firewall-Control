@@ -20,16 +20,23 @@
 //! configuration in which the firewall stops filtering because eBPF was
 //! unavailable.
 //!
-//! # Two switches, both off by default
+//! # Two switches
 //!
-//! 1. the `ebpf` **cargo feature**, which is what pulls `aya` in. Off by
-//!    default so `cargo build --workspace` on a machine that has never heard
-//!    of bpf-linker builds exactly what it always did.
+//! 1. the `ebpf` **cargo feature**, which is what pulls `aya` in. **On by
+//!    default.** Compiling the loader in is not the same as running it, and
+//!    aya is pure Rust: the build needs no bpf-linker, no nightly, no
+//!    BPF-capable kernel and no root. A binary that is unable to load the
+//!    ring-0 layer at all is not a useful default. Opt out with
+//!    `cargo build -p cfc-daemon --no-default-features` (package-scoped on
+//!    purpose; see the comment in `Cargo.toml`).
 //! 2. `[ebpf] enabled` in `daemon.toml`, off by default while this is new.
 //!
 //! With the feature off, [`start`] returns immediately and reports "compiled
 //! out". With the feature on and the config off, it reports "disabled". Both
-//! are normal states, not errors.
+//! are normal states, not errors -- and at runtime they are indistinguishable:
+//! neither reaches `bpf(2)`, reads `/sys/kernel/btf/vmlinux`, or touches a
+//! cgroup. The difference is only whether flipping the config can work without
+//! a rebuild.
 //!
 //! # Why the object is loaded from a path rather than embedded
 //!
@@ -39,7 +46,8 @@
 //! `bpfel-unknown-none` target and a matching `bpf-linker`, and the whole
 //! point of excluding it (see `crates/cfc-ebpf/README.md`) is that a plain
 //! stable `cargo build --workspace` never touches any of that. Embedding would
-//! hand that dependency straight back: `cargo build --features ebpf` would
+//! hand that dependency straight back - and now that the feature is on by
+//! default, it would hand it to *every* build: a plain `cargo build` would
 //! fail on any machine without the BPF toolchain, or - worse - succeed against
 //! a stale object left in `target/` from an older build.
 //!
@@ -90,8 +98,9 @@ use crate::dns::DnsCache;
 /// built with `cargo xtask build-ebpf`, which needs `bpf-linker` and the
 /// nightly pinned in `crates/cfc-ebpf/rust-toolchain.toml` at *build* time
 /// only - the object has no runtime dependencies. The daemon binary must be
-/// built with `--features ebpf`, and `/etc/colony-firewall/daemon.toml` must
-/// carry `[ebpf] enabled = true`. Any of those missing degrades cleanly, so
+/// built with the `ebpf` feature, which is on by default, and
+/// `/etc/colony-firewall/daemon.toml` must carry `[ebpf] enabled = true`. Any
+/// of those missing degrades cleanly, so
 /// shipping the object without flipping the config is a safe default for a
 /// first release.
 pub const DEFAULT_OBJECT_PATH: &str = "/usr/lib/colony-firewall/cfc-ebpf.o";
@@ -152,6 +161,10 @@ impl Report {
             }
         }
         tracing::info!(
+            // Now that compiling the loader out is the unusual case, the
+            // journal has to say which build this is: "no eBPF" and "eBPF that
+            // could not load" look identical from the outside otherwise.
+            compiled_in = self.compiled_in,
             exec_tracking = self.exec_tracking,
             exit_tracking = self.exit_tracking,
             dns_capture = self.dns_capture,
@@ -211,8 +224,9 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache) -> Runtime {
             report: Report::inert(
                 true,
                 false,
-                "[ebpf] enabled = true but this build has no eBPF support; \
-                 rebuild the daemon with --features ebpf",
+                "[ebpf] enabled = true but this build was compiled with \
+                 --no-default-features, so it has no eBPF support; rebuild \
+                 without that flag (the `ebpf` feature is on by default)",
             ),
         }
     };
@@ -262,11 +276,21 @@ mod tests {
         rt.report.log();
     }
 
-    #[test]
-    fn an_enabled_config_without_an_object_still_starts() {
+    // `#[tokio::test]`, not `#[test]`: with the `ebpf` feature on by default
+    // this now traverses the real loader, which spawns the ring-buffer
+    // consumers. It happens to pass outside a runtime today only because
+    // `std::fs::read` fails before the first `tokio::spawn` -- i.e. for a
+    // reason unrelated to what the test asserts. Give it a runtime so the
+    // assertion is about the degrade path and not about where the panic lands.
+    #[tokio::test]
+    async fn an_enabled_config_without_an_object_still_starts() {
+        // A path inside a fresh temp dir rather than a literal `/nonexistent`:
+        // the point is "the object is absent", and hardcoding an absolute path
+        // that some host might one day actually have makes the test lie.
+        let dir = tempfile::tempdir().expect("tempdir");
         let cfg = EbpfConfig {
             enabled: true,
-            object_path: Some(std::path::PathBuf::from("/nonexistent/cfc-ebpf.o")),
+            object_path: Some(dir.path().join("cfc-ebpf.o")),
         };
         let rt = start(&cfg, DnsCache::new());
         assert!(rt.report.configured);

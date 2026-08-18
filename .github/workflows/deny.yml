@@ -22,3 +22,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+          # Explicit, not inherited. aya arrives through the `ebpf` feature,
+          # and whether an unqualified `check` scans optional dependencies is
+          # an action default nobody here has pinned. Say --all-features so the
+          # advisory scan provably covers the ring-0 layer's dependency tree.
+          arguments: --all-features
