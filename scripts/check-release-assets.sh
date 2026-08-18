@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# Asserts that the release tarball actually contains every file the
+# packaging recipes expect to find in it.
+#
+# The Colony app-store channel installs from a flat tarball: the commands
+# in pkg/colony.json's "postInstall" run with the extracted directory as
+# their working directory, so every relative source they name must have
+# been staged by the "Assemble tarball" step in
+# .github/workflows/release.yml. When it is not, the install silently
+# skips that file -- which is how the sysusers fragment went missing and
+# left the control socket root-only.
+#
+# Checks, all fatal:
+#   1. every relative source named by a colony.json postInstall `install`
+#      command exists in the repo, and its basename is staged by
+#      release.yml's assemble step;
+#   2. every binary in colony.json "binaries" is staged;
+#   3. every repo-relative source installed by pkg/PKGBUILD and
+#      pkg/PKGBUILD-git exists in the repo.
+#
+# Wired into CI (check.yml). Run it by hand with: ./scripts/check-release-assets.sh
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+MANIFEST="${ROOT}/pkg/colony.json"
+WORKFLOW="${ROOT}/.github/workflows/release.yml"
+
+for f in "${MANIFEST}" "${WORKFLOW}"; do
+    if [[ ! -f "${f}" ]]; then
+        echo "error: missing ${f}" >&2
+        exit 1
+    fi
+done
+
+problems=()
+
+# --- what release.yml stages -------------------------------------------------
+#
+# Everything between "name: Assemble tarball" and the next step. Any
+# repo-relative path mentioned there is considered staged; the tarball is
+# flat, so only the basename matters to the manifest.
+staged_paths="$(awk '
+    /^      - name: Assemble tarball/ { in_step = 1; next }
+    /^      - / { if (in_step) exit }
+    in_step { print }
+' "${WORKFLOW}" \
+    | grep -oE '(^|[[:space:]])(target/release/[A-Za-z0-9._-]+|(systemd|pkg|docs)/[A-Za-z0-9._-]+|(README|CHANGELOG)\.md|LICENSE)' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sort -u)"
+
+if [[ -z "${staged_paths}" ]]; then
+    echo "error: could not find the 'Assemble tarball' step in ${WORKFLOW}" >&2
+    echo "       (did the step get renamed? this guard keys off its name)" >&2
+    exit 1
+fi
+
+staged_basenames="$(printf '%s\n' "${staged_paths}" | while IFS= read -r p; do
+    [[ -n "${p}" ]] && basename "${p}"
+done | sort -u)"
+
+is_staged() {
+    printf '%s\n' "${staged_basenames}" | grep -Fxq -- "$1"
+}
+
+# Resolve a flat tarball basename back to its path in the repo.
+repo_path_for() {
+    local base="$1" dir
+    for dir in systemd pkg docs .; do
+        if [[ -f "${ROOT}/${dir}/${base}" ]]; then
+            printf '%s/%s\n' "${dir#./}" "${base}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --- 1 + 2: colony.json ------------------------------------------------------
+manifest_refs="$(python3 - "${MANIFEST}" <<'PY'
+import json, re, shlex, sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    manifest = json.load(fh)
+
+# Flags that consume the following token.
+VALUE_FLAGS = {"-m", "--mode", "-o", "--owner", "-g", "--group", "-t",
+               "--target-directory", "-S", "--suffix"}
+
+
+def operands(tokens):
+    """Non-flag operands of an `install` invocation, plus whether -d/-t was used."""
+    ops, directory_mode, skip = [], False, False
+    for tok in tokens:
+        if skip:
+            skip = False
+            continue
+        if tok in VALUE_FLAGS:
+            skip = True
+            continue
+        if tok.startswith("-") and tok != "-":
+            if re.search(r"[dt]", tok.lstrip("-").split("=")[0]):
+                directory_mode = True
+            continue
+        ops.append(tok)
+    return ops, directory_mode
+
+
+for platform in manifest.get("platforms", {}).values():
+    for binary in platform.get("binaries", []):
+        print("BIN", binary)
+    for command in platform.get("postInstall", []):
+        for part in re.split(r"\|\||&&|;", command):
+            try:
+                tokens = shlex.split(part)
+            except ValueError:
+                continue
+            if not tokens or "install" not in tokens:
+                continue
+            tokens = tokens[tokens.index("install") + 1:]
+            ops, directory_mode = operands(tokens)
+            if directory_mode or len(ops) < 2:
+                continue
+            for src in ops[:-1]:
+                if not src.startswith("/"):
+                    print("SRC", src)
+PY
+)"
+
+if [[ -z "${manifest_refs}" ]]; then
+    problems+=("pkg/colony.json: no postInstall sources or binaries found - has the manifest schema changed?")
+fi
+
+while IFS=' ' read -r kind name; do
+    [[ -z "${kind:-}" ]] && continue
+    case "${kind}" in
+    SRC)
+        if ! repo_path="$(repo_path_for "${name}")"; then
+            problems+=("pkg/colony.json postInstall installs '${name}', which does not exist in the repo")
+        elif ! is_staged "${name}"; then
+            problems+=("pkg/colony.json postInstall installs '${name}' (repo: ${repo_path}), but release.yml never stages it into the tarball")
+        fi
+        ;;
+    BIN)
+        if ! is_staged "${name}"; then
+            problems+=("pkg/colony.json declares binary '${name}', but release.yml never stages it into the tarball")
+        fi
+        ;;
+    esac
+done <<<"${manifest_refs}"
+
+# --- 3: PKGBUILD sources exist ----------------------------------------------
+for pkgbuild in pkg/PKGBUILD pkg/PKGBUILD-git; do
+    [[ -f "${ROOT}/${pkgbuild}" ]] || continue
+    while IFS= read -r src; do
+        [[ -n "${src}" ]] || continue
+        if [[ ! -f "${ROOT}/${src}" ]]; then
+            problems+=("${pkgbuild} installs '${src}', which does not exist in the repo")
+        fi
+    done < <(grep -oE '(^|[[:space:]])((systemd|pkg|docs)/[A-Za-z0-9._/-]+|(README|CHANGELOG)\.md|LICENSE)([[:space:]]|$)' "${ROOT}/${pkgbuild}" \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sort -u)
+done
+
+if [[ ${#problems[@]} -ne 0 ]]; then
+    echo "release assets out of sync with the packaging recipes:" >&2
+    for p in "${problems[@]}"; do
+        echo "  - ${p}" >&2
+    done
+    echo >&2
+    echo "Fix: stage the missing files in the 'Assemble tarball' step of" >&2
+    echo ".github/workflows/release.yml (the tarball layout is flat)." >&2
+    exit 1
+fi
+
+echo "release assets consistent: every colony.json postInstall source and binary is staged by release.yml"

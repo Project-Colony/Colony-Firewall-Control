@@ -325,10 +325,19 @@ choice for a server you cannot babysit; it also means the firewall only
 enforces what you explicitly wrote down. Send `SIGHUP` and it takes
 effect without a restart.
 
-Note that `cfc prompts` and the GUI can both be connected at once. A
-prompt goes to every subscriber, but only a subscriber that actually
-received it can answer it - so a verdict from a different user's session
-is refused with "this prompt was not delivered to you".
+Note that `cfc prompts` and the GUI can both be connected at once, and
+both see the prompts addressed to you. Delivery is scoped by the uid
+that owns the connecting process: you receive prompts for your own
+processes, root receives everything, and traffic the daemon could not
+attribute to any process goes to every session. Only a subscriber that
+actually received a prompt can answer it, so a verdict from another
+user's session is refused with "this prompt was not delivered to you".
+
+One consequence worth knowing on a desktop: prompts for root-owned
+processes are only delivered to a root subscriber. With none connected,
+they resolve immediately with `no_ui_action` rather than waiting out the
+timeout. If you want to answer those interactively, run `sudo cfc
+prompts`. See docs/HARDENING.md for the full delivery table.
 
 ## Reject behaves like Deny
 

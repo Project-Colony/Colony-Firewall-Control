@@ -100,6 +100,15 @@ pub struct RuleEditor {
     pub dst_port: String,
     pub protocol: Option<proto::Protocol>,
     pub validation: Option<String>,
+    /// Metadata of the rule being edited, carried through untouched.
+    ///
+    /// `UpsertRule` overwrites the stored row wholesale, so emitting zeroes
+    /// here would reset the creation date to now, drop the hit count and
+    /// silently re-enable a rule the user had turned off. A brand-new rule
+    /// keeps the defaults below and lets the daemon fill them in.
+    pub created_at_unix_ms: i64,
+    pub hit_count: u64,
+    pub enabled: bool,
 }
 
 impl Default for RuleEditor {
@@ -115,6 +124,9 @@ impl Default for RuleEditor {
             dst_port: String::new(),
             protocol: None,
             validation: None,
+            created_at_unix_ms: 0,
+            hit_count: 0,
+            enabled: true,
         }
     }
 }
@@ -140,6 +152,9 @@ impl RuleEditor {
                 .unwrap_or_default(),
             protocol,
             validation: None,
+            created_at_unix_ms: rule.created_at_unix_ms,
+            hit_count: rule.hit_count,
+            enabled: rule.enabled,
         }
     }
 
@@ -243,6 +258,9 @@ pub enum Message {
     DeadlineTick,
     /// Slow tick, alive only while disconnected; drives the backoff retry.
     RetryTick,
+    /// A gRPC subscription came (back) up. cfc-client reports this itself,
+    /// so the badge no longer has to wait for the next event to recover.
+    StreamConnected,
     LiveEvent(proto::ConnectionEvent),
     LiveStreamEnded(String),
     PromptEvent(proto::PromptEvent),
@@ -369,18 +387,22 @@ impl App {
         Task::perform(handshake(socket), Message::HandshakeDone)
     }
 
-    /// Moves to `Failed` and arms the backoff retry. Coalesced into one log
-    /// line so a daemon that stays down does not scroll anything away.
+    /// Moves to `Failed` and arms the backoff retry.
+    ///
+    /// The log line carries cfc-client's reason (missing socket, group
+    /// permissions, stale socket) rather than a fixed string, and stays
+    /// byte-identical across retries so the ring coalesces it into one
+    /// counted entry instead of scrolling everything else away.
     fn mark_failed(&mut self, detail: String) {
         let was_connected = self.connected();
+        let line = format::unreachable_log_line(&detail);
         self.daemon = DaemonState::Failed(detail);
         self.status_failures = 0;
         self.stream_trouble = false;
         let delay = backoff_secs(self.retry_attempts);
         self.retry_attempts = self.retry_attempts.saturating_add(1);
         self.retry_at_ms = Some(self.now_ms + delay * 1000);
-        self.log
-            .warn("daemon unreachable, retrying...", self.now_ms);
+        self.log.warn(line, self.now_ms);
         if was_connected {
             info!("lost connection to daemon");
         }
@@ -535,6 +557,10 @@ impl App {
                     _ => Task::none(),
                 }
             }
+            Message::StreamConnected => {
+                self.stream_trouble = false;
+                Task::none()
+            }
             Message::LiveEvent(ev) => {
                 self.stream_trouble = false;
                 self.session.record(&ev);
@@ -548,7 +574,7 @@ impl App {
                 Task::none()
             }
             Message::LiveStreamEnded(e) => {
-                // streams.rs reconnects on its own every couple of seconds;
+                // cfc-client reconnects on its own with a capped backoff;
                 // surface it once as connection state, not as footer spam.
                 self.stream_trouble = true;
                 info!("live stream interrupted: {e}");
@@ -639,8 +665,10 @@ impl App {
                 let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) else {
                     return Task::none();
                 };
-                rule.enabled = !rule.enabled;
-                let updated = rule.clone();
+                let updated = toggled_rule(rule);
+                // Optimistic: the row flips now, the next RulesLoaded (or
+                // the RuleSaved error path) re-reads the daemon's truth.
+                rule.enabled = updated.enabled;
                 let socket = self.socket_path.clone();
                 Task::perform(upsert_rule(socket, updated), Message::RuleSaved)
             }
@@ -896,11 +924,33 @@ impl App {
 
         let main_panel = column![
             header,
+            self.connection_hint(),
             container(body_card).padding([10, 12]).height(Length::Fill),
             self.status_area(),
         ];
 
         row![sidebar, main_panel].into()
+    }
+
+    /// Why the connection failed, directly under the "disconnected" badge.
+    ///
+    /// cfc-client knows exactly what went wrong and how to fix it; the badge
+    /// alone leaves a first-run user staring at red with no hint that the
+    /// answer is usually group membership. Its own full-width line so the
+    /// (long) advice wraps instead of squeezing the header row.
+    fn connection_hint(&self) -> Element<'_, Message> {
+        let DaemonState::Failed(detail) = &self.daemon else {
+            return Space::new().into();
+        };
+        let hint = format::connection_hint(detail, format::CONNECTION_HINT_MAX);
+        if hint.is_empty() {
+            return Space::new().into();
+        }
+        container(text(hint).size(11))
+            .padding([6, 16])
+            .width(Length::Fill)
+            .style(theme::banner_err)
+            .into()
     }
 
     /// The status ring: newest first, each line individually dismissable.
@@ -1276,13 +1326,26 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
     Ok(proto::RuleInfo {
         id: ed.editing_id.clone().unwrap_or_default(),
         name,
-        enabled: true,
+        // Carried from the edited rule (defaults for a new one) - see
+        // RuleEditor: the daemon replaces the whole row with this message.
+        enabled: ed.enabled,
         action: ed.action as i32,
         duration: ed.duration as i32,
         scope: Some(scope),
-        created_at_unix_ms: 0,
-        hit_count: 0,
+        created_at_unix_ms: ed.created_at_unix_ms,
+        hit_count: ed.hit_count,
     })
+}
+
+/// The rule to send for an enable/disable toggle: exactly what the daemon
+/// last reported, with only `enabled` flipped. Anything reconstructed here
+/// would write the UI's stale view of `hit_count` / `created_at` back over
+/// the daemon's own.
+fn toggled_rule(rule: &proto::RuleInfo) -> proto::RuleInfo {
+    proto::RuleInfo {
+        enabled: !rule.enabled,
+        ..rule.clone()
+    }
 }
 
 async fn submit_verdict(
@@ -1376,6 +1439,102 @@ mod tests {
         assert_eq!(ed.dst_net, "2001:db8::1/128");
         assert!(ed.dst_port.is_empty());
         assert!(ed.protocol.is_none());
+    }
+
+    /// A rule as the daemon reports it: created a while ago, already hit,
+    /// and deliberately switched off by the user.
+    fn existing_rule() -> proto::RuleInfo {
+        proto::RuleInfo {
+            id: "rule-1".into(),
+            name: "let curl out".into(),
+            enabled: false,
+            action: proto::Action::Deny as i32,
+            duration: proto::Duration::Always as i32,
+            scope: Some(proto::RuleScope {
+                exe_path: "/usr/bin/curl".into(),
+                dst_port: 443,
+                has_dst_port: true,
+                ..Default::default()
+            }),
+            created_at_unix_ms: 1_700_000_000_000,
+            hit_count: 42,
+        }
+    }
+
+    #[test]
+    fn editing_a_rule_preserves_its_metadata() {
+        let original = existing_rule();
+        let mut ed = RuleEditor::from_existing(&original);
+        // The user changes one field and saves.
+        ed.dst_port = "8443".into();
+
+        let rebuilt = build_rule_from_editor(&ed).unwrap();
+        assert_eq!(rebuilt.id, original.id);
+        assert_eq!(
+            rebuilt.created_at_unix_ms, original.created_at_unix_ms,
+            "editing must not reset the creation date"
+        );
+        assert_eq!(
+            rebuilt.hit_count, original.hit_count,
+            "editing must not zero the hit count"
+        );
+        assert!(
+            !rebuilt.enabled,
+            "editing must not re-enable a rule the user disabled"
+        );
+        assert_eq!(rebuilt.scope.unwrap().dst_port, 8443);
+    }
+
+    #[test]
+    fn a_new_rule_starts_with_empty_metadata() {
+        let rule = build_rule_from_editor(&editor_with_scope()).unwrap();
+        assert!(rule.id.is_empty(), "the daemon assigns the id");
+        assert_eq!(rule.created_at_unix_ms, 0, "the daemon stamps the creation");
+        assert_eq!(rule.hit_count, 0);
+        assert!(rule.enabled);
+    }
+
+    #[test]
+    fn a_rule_seeded_from_an_observed_flow_is_new() {
+        let ed = RuleEditor::from_observed("/bin/x", "example.com", "1.2.3.4", 443, 1);
+        assert_eq!(ed.created_at_unix_ms, 0);
+        assert_eq!(ed.hit_count, 0);
+        assert!(ed.enabled);
+        assert!(ed.editing_id.is_none());
+    }
+
+    #[test]
+    fn toggling_enabled_changes_nothing_else() {
+        let original = existing_rule();
+        let toggled = toggled_rule(&original);
+        assert!(toggled.enabled);
+        assert_eq!(
+            toggled,
+            proto::RuleInfo {
+                enabled: true,
+                ..original.clone()
+            },
+            "the toggle must round-trip the rule as received"
+        );
+        // Toggling twice is a no-op: no hit count drift per click.
+        assert_eq!(toggled_rule(&toggled), original);
+    }
+
+    #[test]
+    fn a_failed_connection_logs_the_actionable_reason_once() {
+        let detail = "permission denied on /run/colony-firewall/cfc.sock - add your user to \
+                      the colony-firewall group (sudo usermod -aG colony-firewall $USER) then \
+                      log out and back in, or run as root";
+        let mut log = StatusLog::default();
+        // Four retry rounds against a daemon that stays down.
+        for i in 0..4 {
+            log.warn(format::unreachable_log_line(detail), 1_000 + i);
+        }
+        assert_eq!(log.len(), 1, "retries must coalesce, not scroll the ring");
+        let entry = log.iter().next().unwrap();
+        assert_eq!(entry.count, 4);
+        assert!(entry.display().contains("colony-firewall group"));
+        assert!(entry.display().ends_with("(x4)"));
     }
 
     #[test]

@@ -104,6 +104,9 @@ impl Engine {
         self.inner.rules.write().rules.retain(|r| r.id != id);
     }
 
+    /// The rule set as callers should see it: persisted counts plus the
+    /// deltas not yet flushed. Lock order is rules-then-hits everywhere
+    /// (see `drain_hits`).
     pub fn snapshot(&self) -> RuleSet {
         let mut rs = self.inner.rules.read().clone();
         let hits = self.inner.hits.lock();
@@ -118,8 +121,24 @@ impl Engine {
     /// Returns the live hit deltas accumulated since the last `drain_hits`
     /// (or since startup) and resets them. Used by the periodic flush so
     /// the in-memory deltas get merged into sqlite without double-counting.
+    ///
+    /// The deltas are also folded into the in-memory rules on the way out.
+    /// Without that, draining would make `snapshot` (and therefore
+    /// ListRules) fall back to the counts loaded at startup plus only the
+    /// deltas since the last flush - so every 30s flush would visibly reset
+    /// the hit counts in the UI even though sqlite had them all along.
+    ///
+    /// Takes `rules` before `hits`, matching `snapshot`, so the two can
+    /// never deadlock against each other.
     pub fn drain_hits(&self) -> HashMap<uuid::Uuid, u64> {
-        std::mem::take(&mut *self.inner.hits.lock())
+        let mut rules = self.inner.rules.write();
+        let deltas = std::mem::take(&mut *self.inner.hits.lock());
+        for rule in &mut rules.rules {
+            if let Some(extra) = deltas.get(&rule.id) {
+                rule.hit_count = rule.hit_count.saturating_add(*extra);
+            }
+        }
+        deltas
     }
 }
 
@@ -361,5 +380,32 @@ mod tests {
         // Mutating the snapshot must not affect the engine.
         drop(snap);
         assert_eq!(engine.snapshot().rules.len(), 2);
+    }
+
+    #[test]
+    fn draining_hits_does_not_reset_the_reported_count() {
+        // The periodic flush drains deltas into sqlite. If draining did not
+        // also fold them into the in-memory rules, ListRules would drop
+        // back to the startup count every 30 seconds.
+        let mut rs = RuleSet::default();
+        rs.rules.push(allow_port_rule(443));
+        let engine = Engine::new(rs, shared(dp_allow()));
+
+        engine.evaluate(&conn(443), &proc("/usr/bin/curl"));
+        engine.evaluate(&conn(443), &proc("/usr/bin/curl"));
+        assert_eq!(engine.snapshot().rules[0].hit_count, 2);
+
+        let deltas = engine.drain_hits();
+        assert_eq!(deltas.values().sum::<u64>(), 2, "deltas go to storage");
+        assert_eq!(
+            engine.snapshot().rules[0].hit_count,
+            2,
+            "and stay visible after the flush"
+        );
+
+        engine.evaluate(&conn(443), &proc("/usr/bin/curl"));
+        assert_eq!(engine.snapshot().rules[0].hit_count, 3);
+        // A second drain must not re-report what storage already merged.
+        assert_eq!(engine.drain_hits().values().sum::<u64>(), 1);
     }
 }

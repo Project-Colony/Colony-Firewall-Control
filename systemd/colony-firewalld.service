@@ -16,6 +16,12 @@ WatchdogSec=30
 ExecStart=/usr/bin/colony-firewalld --config /etc/colony-firewall/daemon.toml
 Restart=on-failure
 RestartSec=2
+# Final backstop only. On SIGTERM the daemon asks the NFQUEUE worker to
+# leave its loop and then shuts the tokio runtime down with its own short
+# grace, so a healthy stop completes in well under a second; this bounds
+# the pathological case instead of letting systemd's 90s default turn every
+# restart into a minute and a half of "timed out, killing".
+TimeoutStopSec=15
 
 # Privileges
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE

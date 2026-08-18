@@ -194,13 +194,21 @@ impl TestDaemon {
             .expect("connecting to the test daemon")
     }
 
-    /// Hands the router a prompt exactly as the NFQUEUE worker would.
+    /// Hands the router a prompt exactly as the NFQUEUE worker would, about
+    /// a process this uid owns - so a subscriber from this process is
+    /// entitled to see it.
     async fn push_prompt(&self, prompt_id: u64) {
+        self.push_prompt_for(prompt_id, own_process()).await;
+    }
+
+    /// As [`push_prompt`](Self::push_prompt), but for a caller-chosen
+    /// process (i.e. a caller-chosen owner uid).
+    async fn push_prompt_for(&self, prompt_id: u64, process: Process) {
         self.prompt_tx
             .send(PromptRequest {
                 prompt_id,
                 connection: connection(443),
-                process: process(),
+                process,
             })
             .await
             .expect("prompt channel closed");
@@ -378,6 +386,22 @@ fn process() -> Process {
     let mut p = Process::unknown(4242);
     p.exe = PathBuf::from("/usr/bin/curl");
     p.uid = Some(1000);
+    p
+}
+
+/// Uid this test process runs as - which is also the uid every client here
+/// connects with, since they are all this process.
+fn self_uid() -> u32 {
+    nix::unistd::Uid::current().as_raw()
+}
+
+/// A process owned by whoever is running the suite. Prompt delivery is
+/// uid-scoped, so a prompt that the harness expects a subscriber to
+/// *receive* must be about a process this uid owns - the normal
+/// single-desktop-session shape.
+fn own_process() -> Process {
+    let mut p = process();
+    p.uid = Some(self_uid());
     p
 }
 
@@ -564,12 +588,18 @@ async fn prompt_timeout_falls_back_and_makes_a_late_answer_a_no_op() {
 // ---------------------------------------------------------------------------
 
 /// The full guarantee - peer A cannot answer peer B's prompt - needs two
-/// peers with *different* uids, which a single-uid test process cannot
-/// produce: the audience is keyed by uid, so a second connection from this
-/// same process is indistinguishable from the first. What *is* reachable
-/// end-to-end is the other half of the same check: a prompt this uid was
-/// never handed is refused. The uid-vs-uid logic itself is covered by the
-/// `PromptAudience` unit tests in `src/ipc.rs`.
+/// *client* peers with different uids, which a single-uid test process
+/// cannot produce: a second connection from this same process is
+/// indistinguishable from the first. What is reachable end-to-end is
+/// everything that does not need a second client: a prompt this uid was
+/// never handed is refused ([`verdict_for_an_undelivered_prompt_is_refused`]),
+/// a prompt about a process this uid owns *is* delivered
+/// ([`prompt_round_trip_answers_the_worker_and_persists_the_rule`], whose
+/// prompt is owned by `self_uid()`), a prompt owned by a *different* uid is
+/// not ([`prompt_for_another_uid_is_not_delivered`]), and an unattributed
+/// one reaches everyone ([`unattributed_prompt_is_delivered_to_any_session`]).
+/// The uid-vs-uid predicate itself is covered by the `should_deliver` unit
+/// tests in `src/prompts.rs`.
 #[tokio::test]
 async fn verdict_for_an_undelivered_prompt_is_refused() {
     let d = TestDaemon::build().await;
@@ -598,6 +628,96 @@ async fn verdict_for_an_undelivered_prompt_is_refused() {
         );
     }
     d.assert_no_verdict();
+}
+
+/// A prompt about another user's process is never handed to this session,
+/// and - because no subscriber may see it - it resolves immediately with
+/// `no_ui_action` instead of stalling the packet until `timeout_action`.
+#[tokio::test]
+async fn prompt_for_another_uid_is_not_delivered() {
+    if running_as_root() {
+        // uid 0 is entitled to every prompt by design, so there is no
+        // "another uid" this process could fail to be shown.
+        return;
+    }
+    // Two distinguishable outcomes: Allow can only have come from the
+    // no-audience fast path, Deny only from the timeout sweeper.
+    let d = TestDaemon::builder()
+        .policy(DefaultPolicy {
+            no_ui_action: Action::Allow,
+            timeout_action: Action::Deny,
+            prompt_timeout_secs: 30,
+        })
+        .build()
+        .await;
+    let mut client = d.client().await;
+    let mut prompts = client
+        .stream_prompts("test".into())
+        .await
+        .expect("subscribing to prompts");
+
+    let mut foreign = process();
+    foreign.uid = Some(self_uid().wrapping_add(1));
+    d.push_prompt_for(77, foreign).await;
+
+    let verdict = d.next_verdict().await;
+    assert_eq!(verdict.prompt_id, 77);
+    assert_eq!(
+        verdict.verdict.action,
+        Action::Allow,
+        "a prompt no session may see must take the no_ui_action fast path, \
+         not wait out prompt_timeout_secs"
+    );
+    assert_eq!(d.stats.prompts_pending(), 0, "it never became pending");
+
+    // And the stream really saw nothing: the verdict above is already the
+    // whole story, so a short budget is enough to prove the absence.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), prompts.message())
+            .await
+            .is_err(),
+        "another session's prompt must not reach this stream"
+    );
+
+    // Not delivered means not answerable, either.
+    let result = client
+        .submit_verdict("77", pb::Action::Deny, pb::Duration::Once, None)
+        .await;
+    let status = status_of(result.expect_err("the ownership check must refuse"));
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    d.assert_no_verdict();
+}
+
+/// Unattributed traffic (the process exited before /proc could be read) has
+/// no owner to match, so every session is offered it. Deliberate: the
+/// alternative is that nobody is ever asked about it.
+#[tokio::test]
+async fn unattributed_prompt_is_delivered_to_any_session() {
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let mut prompts = client
+        .stream_prompts("test".into())
+        .await
+        .expect("subscribing to prompts");
+
+    let mut orphan = process();
+    orphan.uid = None;
+    d.push_prompt_for(78, orphan).await;
+
+    let event = next_message(&mut prompts).await;
+    assert_eq!(event.prompt_id, "78");
+    assert_eq!(
+        event.process.expect("process").uid,
+        None,
+        "the wire must keep 'unknown owner' distinct from uid 0"
+    );
+
+    // Delivered, therefore answerable.
+    assert!(client
+        .submit_verdict("78", pb::Action::Deny, pb::Duration::Once, None)
+        .await
+        .expect("submitting the verdict"));
+    assert_eq!(d.next_verdict().await.verdict.action, Action::Deny);
 }
 
 // ---------------------------------------------------------------------------

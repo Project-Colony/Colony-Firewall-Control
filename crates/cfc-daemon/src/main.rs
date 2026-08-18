@@ -3,8 +3,9 @@
 use anyhow::Context;
 use clap::Parser;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 
@@ -13,12 +14,23 @@ use tracing::{error, info, warn};
 // stays the only place that wires them together for real.
 use cfc_daemon::{config, decision, dns, ipc, nfqueue, prompts, sd_notify, stats, storage};
 
-/// How stale the NFQUEUE worker's busy-stamp may get before the watchdog
-/// task considers the worker wedged and withholds the systemd heartbeat.
-/// Must comfortably exceed the worker's longest legitimate busy stretch
-/// (per-packet work is milliseconds) and, combined with WatchdogSec=30 in
-/// the unit, bounds wedged-daemon detection at roughly 90 seconds.
+/// How stale the NFQUEUE worker's activity stamp may get before the
+/// watchdog task considers the worker wedged and withholds the systemd
+/// heartbeat. The worker's loop never blocks for more than a few
+/// milliseconds at a time (see `nfqueue`'s module docs), so any staleness
+/// on this scale is a real wedge. Combined with WatchdogSec=30 in the unit,
+/// this bounds wedged-daemon detection at roughly 90 seconds.
 const WORKER_STALL_MS: i64 = 60_000;
+
+/// How long `main` waits for the tokio runtime -- in particular its
+/// blocking pool, where the NFQUEUE worker lives -- to wind down before
+/// abandoning it and letting the process exit anyway.
+///
+/// The worker observes its stop flag within milliseconds, so this grace is
+/// never spent in practice; it exists so that a *wedged* blocking thread
+/// can never hold the process hostage the way a plain `Runtime` drop
+/// (which waits forever) used to.
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "colony-firewalld", version, about)]
@@ -43,8 +55,26 @@ struct Args {
     dry_run: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Owns the runtime explicitly instead of using `#[tokio::main]`.
+///
+/// `#[tokio::main]` drops the `Runtime` when the async body returns, and
+/// `Runtime::drop` shuts the blocking pool down with *no* timeout: it waits
+/// forever for every blocking thread to return. The NFQUEUE worker is one
+/// of those threads, so anything that kept it from returning turned every
+/// daemon stop into a hang until systemd's `TimeoutStopSec` fired and
+/// SIGKILLed us. Driving the runtime by hand lets `shutdown_timeout` put a
+/// hard ceiling on that: whatever the worker is doing, the process exits.
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let filter = if args.debug {
@@ -109,12 +139,11 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("starting IPC server")?;
 
-    let (mut nfq_handle, last_activity) = if args.dry_run {
+    let mut nfq = if args.dry_run {
         info!("--dry-run set: skipping NFQUEUE bind");
-        (
-            tokio::spawn(async { std::future::pending::<anyhow::Result<()>>().await }),
-            Arc::new(AtomicI64::new(nfqueue::unix_ms())),
-        )
+        nfqueue::NfqHandles::inert(tokio::spawn(async {
+            std::future::pending::<anyhow::Result<()>>().await
+        }))
     } else {
         nfqueue::spawn(
             &cfg.nfqueue,
@@ -158,19 +187,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Watchdog heartbeat. sd_notify::notify() no-ops without
     // $NOTIFY_SOCKET, so this runs harmlessly outside systemd too. The
-    // worker stamps `last_activity` once per loop iteration; a negative
-    // stamp means it is parked in a blocking kernel recv (healthy for
-    // arbitrarily long on an idle system), a positive stamp older than
-    // WORKER_STALL_MS means it wedged mid-iteration: withhold WATCHDOG=1
-    // so systemd's WatchdogSec kills and restarts the daemon.
-    let wd_activity = last_activity.clone();
+    // worker stamps `last_activity` once per loop iteration and no
+    // iteration blocks for more than a few milliseconds, so a stamp older
+    // than WORKER_STALL_MS means it wedged: withhold WATCHDOG=1 so
+    // systemd's WatchdogSec kills and restarts the daemon.
+    let wd_activity = nfq.last_activity.clone();
     let wd_dry_run = args.dry_run;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             tick.tick().await;
             let stamp = wd_activity.load(Ordering::Relaxed);
-            let healthy = wd_dry_run || stamp < 0 || nfqueue::unix_ms() - stamp < WORKER_STALL_MS;
+            let healthy = wd_dry_run || nfqueue::unix_ms() - stamp < WORKER_STALL_MS;
             if healthy {
                 if let Err(e) = sd_notify::notify(&["WATCHDOG=1"]) {
                     tracing::warn!("sd_notify WATCHDOG=1 failed: {e}");
@@ -203,35 +231,42 @@ async fn main() -> anyhow::Result<()> {
 
     // SIGINT (foreground ^C) and SIGTERM (systemd stop) both take the
     // graceful shutdown path below. SIGHUP reloads the shared default
-    // policy and re-arms.
-    loop {
+    // policy and re-arms. A crashing task carries its error out of the loop
+    // rather than returning straight away, so the shutdown sequence below
+    // (stop the worker, flush hits, unlink the socket) runs on that path
+    // too.
+    let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             r = &mut ipc_handle => {
-                r.context("ipc task crashed")?;
-                break;
+                break r.context("ipc task crashed");
             }
-            r = &mut nfq_handle => {
-                r.context("nfqueue task crashed")?.context("nfqueue worker failed")?;
-                break;
+            r = &mut nfq.task => {
+                break r
+                    .context("nfqueue task crashed")
+                    .and_then(|inner| inner.context("nfqueue worker failed"));
             }
             r = &mut flush_handle => {
-                r.context("hit-flush task crashed")?;
-                break;
+                break r.context("hit-flush task crashed");
             }
             _ = sigint.recv() => {
                 info!("SIGINT received, flushing hits and shutting down");
-                break;
+                break Ok(());
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received, flushing hits and shutting down");
-                break;
+                break Ok(());
             }
             _ = sighup.recv() => {
                 info!("SIGHUP received, reloading config");
                 reload_policy(&args.config, &policy);
             }
         }
-    }
+    };
+
+    // First, before any of the slower cleanup: tell the NFQUEUE worker to
+    // leave its loop, so its blocking thread is already on the way out by
+    // the time `main` shuts the runtime down.
+    nfq.request_stop();
 
     let _ = sd_notify::notify(&["STOPPING=1"]);
     let deltas = engine.drain_hits();
@@ -249,7 +284,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    outcome
 }
 
 /// SIGHUP handler: re-reads the config file and swaps the shared default

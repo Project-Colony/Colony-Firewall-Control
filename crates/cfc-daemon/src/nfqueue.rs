@@ -1,10 +1,12 @@
 //! NFQUEUE intercept worker.
 //!
-//! A dedicated blocking thread owns the [`nfq::Queue`] exclusively and runs
+//! A dedicated blocking thread owns the packet queue exclusively and runs
 //! [`Worker::run`]. Per-packet decision logic lives in the pure
 //! [`handle_packet`] pipeline (parse -> self-DNS bypass -> process
 //! attribution -> hostname attach -> rule evaluation), which is unit-tested
-//! without root through the [`ProcessResolver`] / [`HostCache`] seams.
+//! without root through the [`ProcessResolver`] / [`HostCache`] seams; the
+//! loop wrapped around it -- prompt dedup, verdict fan-out, recv error
+//! budget, shutdown -- is unit-tested through the [`PacketQueue`] seam.
 //!
 //! Prompting is asynchronous: packets awaiting a user verdict are parked in
 //! the worker's `waiters` table while the rest of the datapath keeps
@@ -18,6 +20,33 @@
 //! worker --PromptRequest (tokio mpsc)--> prompt router (async)
 //! worker <--PromptVerdict (std mpsc)---- prompt router
 //! ```
+//!
+//! # Recv mode, and why the worker never parks indefinitely
+//!
+//! The queue is kept in NONBLOCKING mode for the worker's whole life and
+//! every idle iteration waits at most [`RECV_POLL_INTERVAL`] on the verdict
+//! channel. That is a deliberate change from the earlier design, where an
+//! idle worker parked in a blocking kernel `recv()`:
+//!
+//! - A thread parked in a blocking `recv()` cannot be woken from outside.
+//!   `nfq` 0.2 keeps the netlink socket's descriptor private (no
+//!   `AsRawFd`, no `SO_RCVTIMEO` setter), so the queue can neither be
+//!   `poll()`ed with a timeout nor shut down; and closing a descriptor
+//!   another thread is blocked on is unsound anyway (the number is free
+//!   for reuse the moment it is closed).
+//! - A worker that cannot be woken never observes [`Worker::stop`], never
+//!   returns, and tokio's blocking pool then refuses to shut down -- which
+//!   is precisely the 90-second `TimeoutStopSec` hang on every daemon stop
+//!   that this replaces.
+//!
+//! The price is that while the worker is idle the first packet of an
+//! intercepted flow can wait up to one [`RECV_POLL_INTERVAL`] (mean: half
+//! that) in the kernel queue, and that the idle worker wakes at that
+//! cadence. It is the same cadence the loop already paid whenever a prompt
+//! was outstanding, and single-digit milliseconds on connection setup is a
+//! far better trade than a minute and a half on every restart. If `nfq`
+//! ever exposes the netlink fd, move the idle wait to a `poll()` on it:
+//! that buys back the zero added latency *and* keeps the bounded stop.
 
 use crate::config::NfqConfig;
 use crate::decision::{Decision, Engine};
@@ -32,7 +61,7 @@ use nfq::{Message, Queue, Verdict as NfqVerdict};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,9 +73,14 @@ use tracing::{debug, error, info, trace, warn};
 /// the daemon exits non-zero (transient errors reset the count).
 const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 100;
 
-/// How long the worker waits on the verdict channel between nonblocking
-/// recv attempts while prompts are outstanding.
-const VERDICT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Backoff after a hard `recv` error, so a permanently broken socket drains
+/// the error budget over ~25s instead of spinning a core.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(250);
+
+/// How long an idle iteration waits on the verdict channel before trying
+/// the queue again. Bounds both the worker's shutdown latency and the extra
+/// latency an intercepted packet can pick up; see the module docs.
+const RECV_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Coarse wall-clock unix milliseconds for the watchdog stamps. Only
 /// differences are compared, so occasional NTP steps are harmless at the
@@ -89,9 +123,108 @@ pub struct ObservedConnection {
     pub verdict: Verdict,
 }
 
-/// Binds the queue and starts the worker thread. On success, also returns
-/// the worker's watchdog liveness cell (see [`Worker::last_activity`]) for
-/// main's WATCHDOG=1 heartbeat task.
+/// One packet taken off the queue, as the worker needs to see it.
+///
+/// Deliberately borrow-based: `payload` hands back the buffer the message
+/// already owns, so the datapath never copies packet bytes.
+trait PacketMessage {
+    fn payload(&self) -> &[u8];
+    /// Socket owner from NFQA_UID, when the kernel reported it.
+    fn uid(&self) -> Option<u32>;
+    /// Socket group from NFQA_GID, when the kernel reported it.
+    fn gid(&self) -> Option<u32>;
+    fn set_verdict(&mut self, verdict: NfqVerdict);
+}
+
+/// The worker's view of the kernel queue.
+///
+/// Implemented for [`nfq::Queue`] as a pure forwarding impl with no
+/// behaviour of its own, and by a scripted fake in the tests -- which is
+/// what makes [`Worker::run`], the prompt-dedup state machine and the recv
+/// error budget testable without root or a live NFQUEUE.
+trait PacketQueue {
+    type Msg: PacketMessage;
+
+    /// `true` puts the queue in nonblocking mode: `recv` then reports
+    /// [`std::io::ErrorKind::WouldBlock`] instead of parking when the queue
+    /// is empty.
+    fn set_nonblocking(&mut self, nonblocking: bool);
+    fn recv(&mut self) -> std::io::Result<Self::Msg>;
+    /// Hands the message's verdict back to the kernel, consuming it.
+    fn verdict(&mut self, msg: Self::Msg) -> std::io::Result<()>;
+}
+
+impl PacketMessage for Message {
+    fn payload(&self) -> &[u8] {
+        self.get_payload()
+    }
+
+    fn uid(&self) -> Option<u32> {
+        self.get_uid()
+    }
+
+    fn gid(&self) -> Option<u32> {
+        self.get_gid()
+    }
+
+    fn set_verdict(&mut self, verdict: NfqVerdict) {
+        Message::set_verdict(self, verdict);
+    }
+}
+
+impl PacketQueue for Queue {
+    type Msg = Message;
+
+    fn set_nonblocking(&mut self, nonblocking: bool) {
+        Queue::set_nonblocking(self, nonblocking);
+    }
+
+    fn recv(&mut self) -> std::io::Result<Message> {
+        Queue::recv(self)
+    }
+
+    fn verdict(&mut self, msg: Message) -> std::io::Result<()> {
+        Queue::verdict(self, msg)
+    }
+}
+
+/// What [`spawn`] hands back to `main`.
+pub struct NfqHandles {
+    /// Resolves when the worker leaves its loop: `Ok` on a requested stop,
+    /// `Err` once the recv error budget is exhausted.
+    pub task: JoinHandle<anyhow::Result<()>>,
+    /// Watchdog liveness cell (see [`Worker::last_activity`]) for main's
+    /// WATCHDOG=1 heartbeat task.
+    pub last_activity: Arc<AtomicI64>,
+    /// Shutdown request, observed at the top of every loop iteration.
+    stop: Arc<AtomicBool>,
+}
+
+impl NfqHandles {
+    /// Handles for a daemon that never bound a queue (`--dry-run`): the
+    /// caller supplies whatever task stands in for the datapath, and the
+    /// liveness stamp is fixed at startup (main skips the staleness check
+    /// entirely in dry-run mode).
+    pub fn inert(task: JoinHandle<anyhow::Result<()>>) -> Self {
+        Self {
+            task,
+            last_activity: Arc::new(AtomicI64::new(unix_ms())),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Asks the worker to leave its loop. Returns immediately; the worker
+    /// notices within one [`RECV_POLL_INTERVAL`] plus whatever packet it is
+    /// mid-way through.
+    ///
+    /// `Relaxed` is enough: the flag carries no data, and the only thing
+    /// that must happen-before anything is the worker's own return.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Binds the queue and starts the worker thread.
 pub fn spawn(
     cfg: &NfqConfig,
     engine: Engine,
@@ -100,7 +233,7 @@ pub fn spawn(
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
     dns_cache: DnsCache,
-) -> anyhow::Result<(JoinHandle<anyhow::Result<()>>, Arc<AtomicI64>)> {
+) -> anyhow::Result<NfqHandles> {
     let queue_num = cfg.queue_num;
     info!(queue_num, "opening NFQUEUE");
 
@@ -155,6 +288,7 @@ pub fn spawn(
     let rejecter = Rejecter::open();
 
     let last_activity = Arc::new(AtomicI64::new(unix_ms()));
+    let stop = Arc::new(AtomicBool::new(false));
     let worker = Worker {
         queue,
         engine,
@@ -163,22 +297,29 @@ pub fn spawn(
         verdict_rx,
         observed_tx,
         stats,
-        dns_cache,
+        dns: Box::new(dns_cache),
+        resolver: Box::new(ProcfsResolver),
         waiters: HashMap::new(),
         pending_flows: HashMap::new(),
         next_prompt_id: 1,
-        nonblocking: false,
+        verdict_channel_open: true,
+        tuning: Tuning::default(),
+        stop: stop.clone(),
         last_activity: last_activity.clone(),
     };
     let blocking = tokio::task::spawn_blocking(move || worker.run());
 
-    let handle = tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         match blocking.await {
             Ok(result) => result,
             Err(e) => Err(anyhow::anyhow!("NFQUEUE blocking task panicked: {e}")),
         }
     });
-    Ok((handle, last_activity))
+    Ok(NfqHandles {
+        task,
+        last_activity,
+        stop,
+    })
 }
 
 /// Identity of a flow for prompt dedup: one outstanding prompt per
@@ -218,14 +359,34 @@ impl FlowKey {
 }
 
 /// Per-prompt bookkeeping on the worker thread.
-struct PendingPrompt {
+struct PendingPrompt<M> {
     flow: FlowKey,
     connection: Connection,
     process: Process,
     /// Every packet parked on this prompt; all get the same verdict.
-    packets: Vec<Message>,
+    packets: Vec<M>,
     /// Applied if the router disappears before answering.
     fallback: Verdict,
+}
+
+/// Loop timings. Constant in production; the tests shrink them so that
+/// draining a hundred-error budget or waiting out a poll cadence costs no
+/// wall-clock.
+#[derive(Debug, Clone, Copy)]
+struct Tuning {
+    poll_interval: Duration,
+    error_backoff: Duration,
+    max_consecutive_recv_errors: u32,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            poll_interval: RECV_POLL_INTERVAL,
+            error_backoff: RECV_ERROR_BACKOFF,
+            max_consecutive_recv_errors: MAX_CONSECUTIVE_RECV_ERRORS,
+        }
+    }
 }
 
 /// State owned by the NFQUEUE worker thread.
@@ -237,14 +398,14 @@ struct PendingPrompt {
 /// - `pending_flows` and `waiters` form a bijection: each waiter's `flow`
 ///   maps back to its prompt id and vice versa. Both entries are created
 ///   together in [`Worker::park_for_prompt`] and removed together in
-///   [`Worker::resolve_prompt`].
-/// - The queue socket is in blocking mode iff `waiters` is empty
-///   ([`Worker::sync_recv_mode`]): the normal path pays zero polling
-///   latency, and while prompts are outstanding the loop alternates
-///   nonblocking recv with short verdict-channel waits so neither packets
-///   nor verdicts can stall the other.
-struct Worker {
-    queue: Queue,
+///   [`Worker::resolve_prompt`]. A violation is repaired and logged, never
+///   panicked on: this state machine runs *on* the datapath.
+/// - The queue socket is nonblocking for the worker's whole life, so no
+///   iteration can park for longer than `tuning.poll_interval` and the
+///   stop flag is always observed within that bound (see the module docs
+///   for why the earlier blocking-when-idle mode had to go).
+struct Worker<Q: PacketQueue> {
+    queue: Q,
     engine: Engine,
     /// Injects the TCP RST / ICMP port-unreachable that makes
     /// [`Action::Reject`] differ from [`Action::Deny`]. Inert (drop-only)
@@ -254,92 +415,110 @@ struct Worker {
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
-    dns_cache: DnsCache,
-    waiters: HashMap<u64, PendingPrompt>,
+    /// Reverse-DNS / self-identification seam; [`DnsCache`] in production.
+    dns: Box<dyn HostCache + Send>,
+    /// Process attribution seam; [`ProcfsResolver`] in production.
+    resolver: Box<dyn ProcessResolver + Send>,
+    waiters: HashMap<u64, PendingPrompt<Q::Msg>>,
     pending_flows: HashMap<FlowKey, u64>,
     next_prompt_id: u64,
-    /// Mirrors the queue socket's recv mode (nfq has no getter).
-    nonblocking: bool,
-    /// Watchdog liveness cell shared with main's heartbeat task. Positive
-    /// value: last unix-ms the worker was busy in its loop (a stale
-    /// positive stamp means the worker wedged mid-iteration and the
-    /// WATCHDOG=1 heartbeat is withheld). Negative value: parked in a
-    /// blocking kernel `recv` since `-value`, which is healthy for
-    /// arbitrarily long on an idle system.
+    /// Cleared once the router hangs up. The idle path must stop calling
+    /// `recv_timeout` after that: a disconnected channel returns instantly,
+    /// which would turn the idle wait into a busy loop.
+    verdict_channel_open: bool,
+    tuning: Tuning,
+    /// Set by main's shutdown path; observed at the top of every iteration.
+    stop: Arc<AtomicBool>,
+    /// Watchdog liveness cell shared with main's heartbeat task: the
+    /// unix-ms at which the loop last turned. Since no iteration blocks for
+    /// longer than `tuning.poll_interval`, a stale stamp means the worker
+    /// wedged and main withholds the WATCHDOG=1 heartbeat.
     last_activity: Arc<AtomicI64>,
 }
 
-impl Worker {
+impl<Q: PacketQueue> Worker<Q> {
     fn run(mut self) -> anyhow::Result<()> {
+        // Everything below assumes recv never parks indefinitely; establish
+        // that here rather than trusting the caller to have done it.
+        self.queue.set_nonblocking(true);
+
         let mut consecutive_errors: u32 = 0;
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                info!("stop requested; NFQUEUE worker leaving its recv loop");
+                return Ok(());
+            }
             // Watchdog heartbeat source: one stamp per iteration. main's
             // heartbeat task withholds WATCHDOG=1 once this goes stale.
-            self.stamp_activity(false);
+            self.stamp_activity();
             self.drain_verdicts();
-            self.sync_recv_mode();
 
-            // A blocking recv (no prompts outstanding) legitimately parks
-            // until the next packet arrives -- possibly minutes on an idle
-            // system. Mark the parked state so the watchdog can tell "no
-            // traffic" from "wedged". The nonblocking path returns within
-            // ~VERDICT_POLL_INTERVAL and needs no marker.
-            if !self.nonblocking {
-                self.stamp_activity(true);
-            }
-            let received = self.queue.recv();
-            self.stamp_activity(false);
-
-            match received {
+            match self.queue.recv() {
                 Ok(msg) => {
                     consecutive_errors = 0;
                     self.handle_message(msg);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Nonblocking mode and no packet ready: wait a short
-                    // beat for a verdict instead of spinning.
-                    match self.verdict_rx.recv_timeout(VERDICT_POLL_INTERVAL) {
-                        Ok(pv) => self.resolve_prompt(pv),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => self.flush_waiters_disconnected(),
-                    }
-                }
+                // No packet ready: spend the beat waiting for a verdict.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.idle_wait(),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     consecutive_errors += 1;
                     error!("NFQUEUE recv error ({consecutive_errors} consecutive): {e}");
-                    if consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                    if consecutive_errors >= self.tuning.max_consecutive_recv_errors {
                         return Err(e).context(format!(
                             "NFQUEUE recv failed {consecutive_errors} times in a row"
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(250));
+                    std::thread::sleep(self.tuning.error_backoff);
                 }
             }
         }
     }
 
-    /// Stamps the watchdog cell (see the `last_activity` field docs):
-    /// `parked == false` stores `+now_ms` (busy in the loop),
-    /// `parked == true` stores `-now_ms` (about to block in a kernel recv).
-    fn stamp_activity(&self, parked: bool) {
-        let now = unix_ms();
-        self.last_activity
-            .store(if parked { -now } else { now }, Ordering::Relaxed);
+    /// Stamps the watchdog cell with "the loop turned just now".
+    fn stamp_activity(&self) {
+        self.last_activity.store(unix_ms(), Ordering::Relaxed);
+    }
+
+    /// The queue had nothing ready. Wait a short beat on the verdict
+    /// channel instead of spinning; this is also what bounds how long the
+    /// stop flag can go unobserved.
+    fn idle_wait(&mut self) {
+        if !self.verdict_channel_open {
+            // Nothing left to wait for, and `recv_timeout` on a hung-up
+            // channel returns instantly: pace the loop by hand.
+            std::thread::sleep(self.tuning.poll_interval);
+            return;
+        }
+        match self.verdict_rx.recv_timeout(self.tuning.poll_interval) {
+            Ok(pv) => self.resolve_prompt(pv),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => self.close_verdict_channel(),
+        }
     }
 
     /// Drains every verdict the router has produced so far.
     fn drain_verdicts(&mut self) {
+        if !self.verdict_channel_open {
+            return;
+        }
         loop {
             match self.verdict_rx.try_recv() {
                 Ok(pv) => self.resolve_prompt(pv),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.flush_waiters_disconnected();
+                    self.close_verdict_channel();
                     return;
                 }
             }
         }
+    }
+
+    /// The router is gone for good: remember it (so the idle path stops
+    /// polling a dead channel) and unstrand whatever was parked.
+    fn close_verdict_channel(&mut self) {
+        self.verdict_channel_open = false;
+        self.flush_waiters_disconnected();
     }
 
     /// The router side of the verdict channel is gone; no pending prompt
@@ -357,16 +536,6 @@ impl Worker {
         for prompt_id in ids {
             let verdict = self.waiters[&prompt_id].fallback;
             self.resolve_prompt(PromptVerdict { prompt_id, verdict });
-        }
-    }
-
-    /// Blocking recv when no prompts are outstanding (zero-latency normal
-    /// path); nonblocking + short verdict polls otherwise.
-    fn sync_recv_mode(&mut self) {
-        let want = !self.waiters.is_empty();
-        if want != self.nonblocking {
-            self.queue.set_nonblocking(want);
-            self.nonblocking = want;
         }
     }
 
@@ -400,18 +569,18 @@ impl Worker {
         });
     }
 
-    fn handle_message(&mut self, msg: Message) {
+    fn handle_message(&mut self, msg: Q::Msg) {
         let meta = PacketMeta {
-            uid: msg.get_uid(),
-            gid: msg.get_gid(),
+            uid: msg.uid(),
+            gid: msg.gid(),
         };
         let deps = PipelineDeps {
             engine: &self.engine,
             stats: &self.stats,
-            dns: &self.dns_cache,
-            resolver: &ProcfsResolver,
+            dns: self.dns.as_ref(),
+            resolver: self.resolver.as_ref(),
         };
-        match handle_packet(msg.get_payload(), &meta, &deps) {
+        match handle_packet(msg.payload(), &meta, &deps) {
             PacketOutcome::Silent(verdict) => self.send_verdict(msg, verdict),
             PacketOutcome::Deliver {
                 connection,
@@ -439,23 +608,31 @@ impl Worker {
     /// or closed), the fallback applies immediately.
     fn park_for_prompt(
         &mut self,
-        msg: Message,
+        msg: Q::Msg,
         connection: Connection,
         process: Process,
         fallback: Verdict,
     ) {
         let flow = FlowKey::for_flow(&connection, &process);
         if let Some(&prompt_id) = self.pending_flows.get(&flow) {
-            trace!(
+            if let Some(pending) = self.waiters.get_mut(&prompt_id) {
+                trace!(
+                    prompt_id,
+                    "flow already prompting; parking packet on existing prompt"
+                );
+                pending.packets.push(msg);
+                return;
+            }
+            // The waiters/pending_flows bijection documented on [`Worker`]
+            // was violated: a flow points at a prompt that no longer
+            // exists. Killing the worker thread over it would take the
+            // whole datapath down, so drop the stale mapping and let the
+            // packet open a fresh prompt below.
+            error!(
                 prompt_id,
-                "flow already prompting; parking packet on existing prompt"
+                "pending_flows entry without matching waiters entry; re-prompting flow"
             );
-            self.waiters
-                .get_mut(&prompt_id)
-                .expect("pending_flows entry without matching waiters entry")
-                .packets
-                .push(msg);
-            return;
+            self.pending_flows.remove(&flow);
         }
 
         let prompt_id = self.next_prompt_id;
@@ -502,7 +679,7 @@ impl Worker {
     /// unreachable) so the app fails immediately instead of retransmitting
     /// until its own timeout. The injection is best-effort: if it can't be
     /// sent the packet is still dropped, i.e. Reject degrades to Deny.
-    fn apply_action(&mut self, msg: Message, action: Action) {
+    fn apply_action(&mut self, msg: Q::Msg, action: Action) {
         if action == Action::Reject {
             self.inject_refusal(&msg);
         }
@@ -513,8 +690,8 @@ impl Worker {
     /// because the refusal depends on per-segment fields the pipeline's
     /// [`Connection`] does not carry - TCP sequence numbers and the bytes
     /// quoted back in an ICMP error.
-    fn inject_refusal(&self, msg: &Message) {
-        let payload = msg.get_payload();
+    fn inject_refusal(&self, msg: &Q::Msg) {
+        let payload = msg.payload();
         match packet::parse(payload, Direction::Outbound) {
             Ok(conn) => {
                 let outcome = self.rejecter.reject(&conn, payload);
@@ -524,7 +701,7 @@ impl Worker {
         }
     }
 
-    fn send_verdict(&mut self, mut msg: Message, verdict: NfqVerdict) {
+    fn send_verdict(&mut self, mut msg: Q::Msg, verdict: NfqVerdict) {
         msg.set_verdict(verdict);
         if let Err(e) = self.queue.verdict(msg) {
             warn!("setting NFQUEUE verdict failed: {e}");
@@ -744,7 +921,10 @@ mod tests {
     use super::*;
     use crate::config::DefaultPolicy;
     use cfc_core::{Rule, RuleScope, RuleSet};
+    use std::collections::VecDeque;
     use std::net::Ipv4Addr;
+    use std::sync::Mutex;
+    use std::time::Instant;
 
     const IPPROTO_TCP: u8 = 6;
 
@@ -1104,5 +1284,572 @@ mod tests {
             FlowKey::for_flow(&conn, &Process::unknown(7)),
             FlowKey::for_flow(&conn, &Process::unknown(8))
         );
+    }
+
+    // ---- Worker loop, driven through the PacketQueue seam ----
+    //
+    // These exercise the parts the pure pipeline tests above cannot reach:
+    // the recv loop itself, the prompt-dedup state machine, the recv error
+    // budget, the verdict back-channel and shutdown. No root, no NFQUEUE,
+    // no /proc and no DNS -- the queue, the process resolver and the host
+    // cache are all stubs.
+
+    /// A packet from [`FakeQueue`]: an owned payload plus a slot for the
+    /// verdict the worker sets on it.
+    #[derive(Debug, Clone)]
+    struct FakeMsg {
+        id: u32,
+        payload: Vec<u8>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        verdict: Option<NfqVerdict>,
+    }
+
+    impl FakeMsg {
+        fn new(id: u32, payload: Vec<u8>) -> Self {
+            Self {
+                id,
+                payload,
+                uid: None,
+                gid: None,
+                verdict: None,
+            }
+        }
+    }
+
+    impl PacketMessage for FakeMsg {
+        fn payload(&self) -> &[u8] {
+            &self.payload
+        }
+
+        fn uid(&self) -> Option<u32> {
+            self.uid
+        }
+
+        fn gid(&self) -> Option<u32> {
+            self.gid
+        }
+
+        fn set_verdict(&mut self, verdict: NfqVerdict) {
+            self.verdict = Some(verdict);
+        }
+    }
+
+    /// Everything the tests want to know about what the worker did to the
+    /// queue. The worker consumes the queue by value, so this lives behind
+    /// an `Arc` the harness keeps a handle to.
+    #[derive(Default)]
+    struct QueueLog {
+        /// (packet id, verdict), in the order the worker verdicted them.
+        verdicts: Vec<(u32, NfqVerdict)>,
+        /// Every `set_nonblocking` argument, in order.
+        modes: Vec<bool>,
+        /// recv calls, so a test can tell a turning loop from a stuck one.
+        recv_calls: u64,
+    }
+
+    struct FakeQueue {
+        /// Scripted recv results, consumed front to back. Once exhausted
+        /// every recv reports WouldBlock, exactly like an idle queue.
+        script: VecDeque<std::io::Result<FakeMsg>>,
+        log: Arc<Mutex<QueueLog>>,
+    }
+
+    impl PacketQueue for FakeQueue {
+        type Msg = FakeMsg;
+
+        fn set_nonblocking(&mut self, nonblocking: bool) {
+            self.log.lock().unwrap().modes.push(nonblocking);
+        }
+
+        fn recv(&mut self) -> std::io::Result<FakeMsg> {
+            self.log.lock().unwrap().recv_calls += 1;
+            self.script
+                .pop_front()
+                .unwrap_or_else(|| Err(std::io::ErrorKind::WouldBlock.into()))
+        }
+
+        fn verdict(&mut self, msg: FakeMsg) -> std::io::Result<()> {
+            let verdict = msg.verdict.expect("worker verdicted without a verdict");
+            self.log.lock().unwrap().verdicts.push((msg.id, verdict));
+            Ok(())
+        }
+    }
+
+    /// Fast loop timings: no test should pay a real 250 ms error backoff or
+    /// wait out a hundred-deep error budget.
+    fn test_tuning() -> Tuning {
+        Tuning {
+            poll_interval: Duration::from_millis(1),
+            error_backoff: Duration::ZERO,
+            max_consecutive_recv_errors: 3,
+        }
+    }
+
+    fn recv_error() -> std::io::Error {
+        std::io::Error::from_raw_os_error(libc::ENOSPC)
+    }
+
+    /// A [`Worker`] over a scripted queue, plus every channel end and log a
+    /// test needs to observe it.
+    struct LoopHarness {
+        worker: Option<Worker<FakeQueue>>,
+        log: Arc<Mutex<QueueLog>>,
+        stop: Arc<AtomicBool>,
+        stats: Stats,
+        /// `Option` so a test can hang up on the worker by dropping it.
+        verdict_tx: Option<VerdictTx>,
+        prompt_rx: mpsc::Receiver<PromptRequest>,
+        observed_rx: broadcast::Receiver<ObservedConnection>,
+    }
+
+    impl LoopHarness {
+        fn new(
+            script: Vec<std::io::Result<FakeMsg>>,
+            rules: Vec<Rule>,
+            policy: DefaultPolicy,
+        ) -> Self {
+            let log = Arc::new(Mutex::new(QueueLog::default()));
+            let (prompt_tx, prompt_rx) = mpsc::channel(16);
+            let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+            let (observed_tx, observed_rx) = broadcast::channel(16);
+            let stats = Stats::new();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker = Worker {
+                queue: FakeQueue {
+                    script: script.into(),
+                    log: log.clone(),
+                },
+                engine: Engine::new(RuleSet { rules }, Arc::new(std::sync::RwLock::new(policy))),
+                rejecter: Rejecter::open(),
+                prompt_tx,
+                verdict_rx,
+                observed_tx,
+                stats: stats.clone(),
+                dns: Box::new(StubDns {
+                    self_pid: None,
+                    host: None,
+                }),
+                resolver: Box::new(StubResolver {
+                    pid: Some(4242),
+                    process: test_process(4242, "/usr/bin/curl"),
+                }),
+                waiters: HashMap::new(),
+                pending_flows: HashMap::new(),
+                next_prompt_id: 1,
+                verdict_channel_open: true,
+                tuning: test_tuning(),
+                stop: stop.clone(),
+                last_activity: Arc::new(AtomicI64::new(unix_ms())),
+            };
+            Self {
+                worker: Some(worker),
+                log,
+                stop,
+                stats,
+                verdict_tx: Some(verdict_tx),
+                prompt_rx,
+                observed_rx,
+            }
+        }
+
+        fn with_tuning(mut self, tuning: Tuning) -> Self {
+            self.worker().tuning = tuning;
+            self
+        }
+
+        /// The not-yet-started worker, for tests that drive one method
+        /// instead of the whole loop.
+        fn worker(&mut self) -> &mut Worker<FakeQueue> {
+            self.worker.as_mut().expect("worker already started")
+        }
+
+        /// Runs the loop on its own thread. The returned channel yields the
+        /// loop's result, which lets tests put a *bound* on shutdown
+        /// instead of blocking forever in `JoinHandle::join`.
+        fn start(&mut self) -> Receiver<anyhow::Result<()>> {
+            let worker = self.worker.take().expect("worker already started");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done_tx.send(worker.run());
+            });
+            done_rx
+        }
+
+        fn verdicts(&self) -> Vec<(u32, NfqVerdict)> {
+            self.log.lock().unwrap().verdicts.clone()
+        }
+
+        fn modes(&self) -> Vec<bool> {
+            self.log.lock().unwrap().modes.clone()
+        }
+
+        fn recv_calls(&self) -> u64 {
+            self.log.lock().unwrap().recv_calls
+        }
+
+        fn send_verdict(&self, prompt_id: u64, verdict: Verdict) {
+            self.verdict_tx
+                .as_ref()
+                .expect("verdict channel dropped")
+                .send(PromptVerdict { prompt_id, verdict })
+                .expect("worker still listening");
+        }
+
+        /// Asks the loop to stop and asserts it does so promptly. The
+        /// timeout is generous on purpose: the point is "bounded", not "in
+        /// exactly N ms", so a loaded machine can't make this flake.
+        fn stop_and_expect_ok(&self, done: &Receiver<anyhow::Result<()>>) {
+            self.stop.store(true, Ordering::Relaxed);
+            let result = done
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker left its loop after the stop flag was set");
+            result.expect("a requested stop is not an error");
+        }
+    }
+
+    /// Polls until `cond` holds. Returns whether it ever did.
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// Waits for the worker to dispatch a prompt.
+    fn next_prompt(rx: &mut mpsc::Receiver<PromptRequest>) -> Option<PromptRequest> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(req) = rx.try_recv() {
+                return Some(req);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        None
+    }
+
+    #[test]
+    fn loop_drives_a_rule_hit_packet_to_a_verdict() {
+        let mut h = LoopHarness::new(
+            vec![Ok(FakeMsg::new(7, tcp_packet(443)))],
+            vec![allow_port_rule(443)],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        assert!(wait_until(|| h.verdicts().len() == 1), "packet verdicted");
+        assert_eq!(h.verdicts(), vec![(7, NfqVerdict::Accept)]);
+        assert_eq!(h.stats.connections_allowed(), 1);
+
+        let observed = h.observed_rx.try_recv().expect("observation published");
+        assert_eq!(observed.verdict.action, Action::Allow);
+
+        h.stop_and_expect_ok(&done);
+    }
+
+    #[test]
+    fn loop_parks_a_prompt_and_releases_it_on_the_verdict() {
+        let mut h = LoopHarness::new(
+            vec![Ok(FakeMsg::new(7, tcp_packet(443)))],
+            vec![],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        let req = next_prompt(&mut h.prompt_rx).expect("prompt dispatched");
+        assert_eq!(req.connection.dst_port, 443);
+        // Parked, not verdicted: the datapath keeps running around it.
+        assert!(h.verdicts().is_empty());
+        assert_eq!(h.stats.connections_total(), 0);
+
+        h.send_verdict(req.prompt_id, Verdict::default_allow());
+
+        assert!(
+            wait_until(|| h.verdicts().len() == 1),
+            "parked packet freed"
+        );
+        assert_eq!(h.verdicts(), vec![(7, NfqVerdict::Accept)]);
+        assert_eq!(h.stats.connections_allowed(), 1);
+        let observed = h.observed_rx.try_recv().expect("observation published");
+        assert_eq!(observed.verdict.action, Action::Allow);
+
+        h.stop_and_expect_ok(&done);
+    }
+
+    #[test]
+    fn two_packets_of_one_flow_share_a_prompt_and_both_get_verdicted() {
+        let mut h = LoopHarness::new(
+            vec![
+                Ok(FakeMsg::new(1, tcp_packet(443))),
+                Ok(FakeMsg::new(2, tcp_packet(443))),
+            ],
+            vec![],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        let req = next_prompt(&mut h.prompt_rx).expect("prompt dispatched");
+        // Both scripted packets consumed, plus at least one WouldBlock.
+        assert!(wait_until(|| h.recv_calls() >= 3), "both packets consumed");
+        assert!(
+            h.prompt_rx.try_recv().is_err(),
+            "the second packet rode the outstanding prompt"
+        );
+
+        h.send_verdict(req.prompt_id, Verdict::default_deny());
+
+        assert!(wait_until(|| h.verdicts().len() == 2), "both packets freed");
+        let mut got = h.verdicts();
+        got.sort_by_key(|(id, _)| *id);
+        assert_eq!(got, vec![(1, NfqVerdict::Drop), (2, NfqVerdict::Drop)]);
+        // One prompt is one logical connection, counted once.
+        assert_eq!(h.stats.connections_denied(), 1);
+
+        h.stop_and_expect_ok(&done);
+    }
+
+    #[test]
+    fn distinct_flows_get_distinct_prompts() {
+        let mut h = LoopHarness::new(
+            vec![
+                Ok(FakeMsg::new(1, tcp_packet(443))),
+                Ok(FakeMsg::new(2, tcp_packet(8443))),
+            ],
+            vec![],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        let a = next_prompt(&mut h.prompt_rx).expect("first prompt");
+        let b = next_prompt(&mut h.prompt_rx).expect("second prompt");
+        assert_ne!(a.prompt_id, b.prompt_id);
+
+        // Resolving one releases only its own packet.
+        h.send_verdict(a.prompt_id, Verdict::default_allow());
+        assert!(wait_until(|| h.verdicts().len() == 1), "one packet freed");
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+
+        h.send_verdict(b.prompt_id, Verdict::default_deny());
+        assert!(wait_until(|| h.verdicts().len() == 2), "other packet freed");
+        assert_eq!(h.verdicts()[1], (2, NfqVerdict::Drop));
+
+        h.stop_and_expect_ok(&done);
+    }
+
+    #[test]
+    fn queue_is_put_in_nonblocking_mode_once_and_stays_there() {
+        // The pre-shutdown design toggled the socket's recv mode with
+        // `waiters` emptiness; it is now nonblocking for the worker's whole
+        // life so that no iteration can park past the stop flag. See the
+        // module docs.
+        let mut h = LoopHarness::new(
+            vec![Ok(FakeMsg::new(1, tcp_packet(443)))],
+            vec![],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        // Run through both states: a prompt outstanding, then resolved.
+        let req = next_prompt(&mut h.prompt_rx).expect("prompt dispatched");
+        h.send_verdict(req.prompt_id, Verdict::default_allow());
+        assert!(wait_until(|| h.verdicts().len() == 1), "prompt resolved");
+        let calls = h.recv_calls();
+        assert!(
+            wait_until(|| h.recv_calls() > calls + 2),
+            "loop still turning"
+        );
+
+        h.stop_and_expect_ok(&done);
+        assert_eq!(h.modes(), vec![true]);
+    }
+
+    #[test]
+    fn recv_error_budget_gives_up_after_the_limit() {
+        let mut h = LoopHarness::new(
+            vec![Err(recv_error()), Err(recv_error()), Err(recv_error())],
+            vec![],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        let result = done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker returned");
+        let err = result.expect_err("budget exhausted");
+        assert!(
+            format!("{err:#}").contains("3 times in a row"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn recv_error_budget_resets_on_a_successful_recv() {
+        // Two errors, a good packet, two more errors: never three in a row,
+        // so the worker must still be running.
+        let mut h = LoopHarness::new(
+            vec![
+                Err(recv_error()),
+                Err(recv_error()),
+                Ok(FakeMsg::new(9, tcp_packet(443))),
+                Err(recv_error()),
+                Err(recv_error()),
+            ],
+            vec![allow_port_rule(443)],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        assert!(wait_until(|| h.verdicts().len() == 1), "packet verdicted");
+        assert_eq!(h.verdicts(), vec![(9, NfqVerdict::Accept)]);
+        assert!(
+            done.try_recv().is_err(),
+            "worker survived a reset error budget"
+        );
+
+        h.stop_and_expect_ok(&done);
+    }
+
+    #[test]
+    fn idle_wait_consumes_a_verdict_from_the_channel() {
+        // The WouldBlock path is where a verdict arriving while the queue
+        // is empty gets picked up; drive it directly so the test does not
+        // race `drain_verdicts` for the same message.
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+        h.worker().park_for_prompt(
+            FakeMsg::new(4, tcp_packet(443)),
+            conn_to(443, 1111),
+            test_process(4242, "/usr/bin/curl"),
+            Verdict::default_deny(),
+        );
+        let req = h.prompt_rx.try_recv().expect("prompt dispatched");
+        assert!(h.verdicts().is_empty());
+
+        h.send_verdict(req.prompt_id, Verdict::default_allow());
+        h.worker().idle_wait();
+
+        assert_eq!(h.verdicts(), vec![(4, NfqVerdict::Accept)]);
+        assert!(h.worker().waiters.is_empty());
+        assert!(h.worker().pending_flows.is_empty());
+    }
+
+    #[test]
+    fn verdict_channel_disconnect_applies_fallbacks() {
+        let mut h = LoopHarness::new(
+            vec![Ok(FakeMsg::new(3, tcp_packet(443)))],
+            vec![],
+            dp_deny(),
+        );
+        let done = h.start();
+
+        let _req = next_prompt(&mut h.prompt_rx).expect("prompt dispatched");
+        assert!(h.verdicts().is_empty());
+
+        // The router goes away without answering.
+        drop(h.verdict_tx.take());
+
+        assert!(wait_until(|| h.verdicts().len() == 1), "fallback applied");
+        assert_eq!(h.verdicts(), vec![(3, NfqVerdict::Drop)]);
+        assert_eq!(h.stats.connections_denied(), 1);
+
+        h.stop.store(true, Ordering::Relaxed);
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("worker left its loop")
+            .expect("a requested stop is not an error");
+    }
+
+    #[test]
+    fn idle_wait_paces_itself_once_the_router_has_hung_up() {
+        // A disconnected std channel makes `recv_timeout` return
+        // instantly, so without the `verdict_channel_open` latch the idle
+        // path would spin a core for the rest of the daemon's life.
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny()).with_tuning(Tuning {
+            poll_interval: Duration::from_millis(30),
+            ..test_tuning()
+        });
+        drop(h.verdict_tx.take());
+
+        // First call notices the hangup...
+        h.worker().idle_wait();
+        assert!(!h.worker().verdict_channel_open);
+
+        // ...after which the wait is paced by hand.
+        let started = Instant::now();
+        h.worker().idle_wait();
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "idle wait returned in {:?}, i.e. it is spinning",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_flag_ends_the_loop_while_it_is_idle() {
+        // The shutdown regression this guards: an idle worker used to park
+        // in a blocking kernel recv forever, so the runtime's blocking pool
+        // never shut down and the daemon hung until systemd SIGKILLed it.
+        // Production poll interval on purpose -- this asserts the real
+        // shutdown bound, not a test-tuned one.
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny()).with_tuning(Tuning::default());
+        let done = h.start();
+        assert!(wait_until(|| h.recv_calls() >= 3), "loop is idling");
+
+        let started = Instant::now();
+        h.stop.store(true, Ordering::Relaxed);
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("idle worker left its loop")
+            .expect("a requested stop is not an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_flag_ends_the_loop_with_prompts_outstanding() {
+        let mut h = LoopHarness::new(
+            vec![Ok(FakeMsg::new(1, tcp_packet(443)))],
+            vec![],
+            dp_deny(),
+        );
+        let done = h.start();
+        let _req = next_prompt(&mut h.prompt_rx).expect("prompt dispatched");
+
+        let started = Instant::now();
+        h.stop_and_expect_ok(&done);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stale_pending_flow_entry_reprompts_instead_of_panicking() {
+        // The waiters/pending_flows bijection is an invariant, not a
+        // guarantee: violating it used to `.expect()` and take the whole
+        // datapath thread down with it.
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+        let conn = conn_to(443, 1111);
+        let proc = test_process(4242, "/usr/bin/curl");
+        let flow = FlowKey::for_flow(&conn, &proc);
+        h.worker().pending_flows.insert(flow.clone(), 99);
+
+        h.worker().park_for_prompt(
+            FakeMsg::new(5, tcp_packet(443)),
+            conn,
+            proc,
+            Verdict::default_deny(),
+        );
+
+        let req = h.prompt_rx.try_recv().expect("flow re-prompted");
+        assert_eq!(req.prompt_id, 1);
+        assert_eq!(h.worker().pending_flows.get(&flow), Some(&1));
+        assert_eq!(h.worker().waiters.len(), 1);
+        assert!(h.verdicts().is_empty(), "the packet is parked, not dropped");
     }
 }

@@ -9,6 +9,17 @@
 //! answer, timeout sweeper, no-UI fast path, vanished-subscriber reclaim}
 //! sends the `PromptVerdict`. The `pending` set is the arbiter - whichever
 //! path removes the id first wins, the loser is ignored.
+//!
+//! # Uid-scoped delivery
+//!
+//! The transport is still a single broadcast, but a prompt is *addressed*:
+//! [`should_deliver`] decides, per subscriber, whether it may see a given
+//! prompt. `ipc.rs` applies it when handing events to a client stream; the
+//! router applies the very same predicate over its census of live
+//! subscriber uids ([`RouterInner::has_audience`]) so the "nobody is
+//! listening, answer with `no_ui_action` now" fast path stays truthful. One
+//! predicate, two call sites: they cannot drift into a state where a prompt
+//! is broadcast that no stream will ever deliver.
 
 use crate::config::DefaultPolicy;
 use crate::convert;
@@ -18,11 +29,41 @@ use crate::stats::Stats;
 use cfc_core::Verdict;
 use cfc_proto::v1 as pb;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, trace, warn};
+
+/// May the `StreamPrompts` subscriber running as `subscriber_uid` be shown
+/// a prompt about a process owned by `process_uid`?
+///
+/// Three cases, in the order they matter:
+///
+/// 1. **Root sees everything.** uid 0 already controls the machine, and the
+///    root CLI is the recovery path when no desktop session is up.
+/// 2. **Same owner.** A prompt about uid 1000's browser belongs to uid
+///    1000's session and nobody else's. This is the actual isolation:
+///    another logged-in user's UI is not handed the event at all, so it
+///    never learns the prompt id, and `SubmitVerdict`'s audience check
+///    refuses it even if the id were guessed.
+/// 3. **Unattributed traffic goes to everyone.** `process_uid == None`
+///    means /proc attribution failed (the process exited before it could be
+///    read). Deliberate trade-off: nobody can *claim* such a flow, so
+///    restricting it would mean no session ever gets asked and every
+///    unattributed connection would silently fall to `timeout_action` /
+///    `no_ui_action` - a fail-open-shaped regression in the exact case
+///    where a human should look. Prompting everyone is the lesser evil,
+///    and it is only reachable for flows the daemon could not attribute.
+///
+/// Note the consequence of (2) with no (1): on a host where the only UI
+/// runs as an ordinary user, prompts for *root-owned* processes (system
+/// daemons) are not delivered to it. They resolve by policy instead - see
+/// the fast path in [`PromptRouter::enqueue`]. Run a root subscriber (the
+/// CLI) if you want to be asked about system daemons.
+pub fn should_deliver(process_uid: Option<u32>, subscriber_uid: u32) -> bool {
+    subscriber_uid == 0 || process_uid.is_none_or(|owner| owner == subscriber_uid)
+}
 
 #[derive(Clone)]
 pub struct PromptRouter {
@@ -35,6 +76,13 @@ struct RouterInner {
     /// verdict.
     pending: Mutex<HashSet<u64>>,
     broadcast_tx: broadcast::Sender<pb::PromptEvent>,
+    /// Census of live `StreamPrompts` subscribers: peer uid -> how many
+    /// streams that uid has open. Maintained by [`PromptSubscription`],
+    /// which registers on creation and deregisters on drop, so it tracks
+    /// the broadcast receivers exactly as closely as
+    /// `broadcast_tx.receiver_count()` did - a stream whose client has gone
+    /// away is only noticed when the next send to it fails.
+    subscribers: Mutex<HashMap<u32, usize>>,
     default_policy: SharedPolicy,
     stats: Stats,
     /// Response path back to the NFQUEUE worker thread. std mpsc is
@@ -43,6 +91,31 @@ struct RouterInner {
 }
 
 impl RouterInner {
+    fn register(&self, uid: u32) {
+        *self.subscribers.lock().entry(uid).or_insert(0) += 1;
+    }
+
+    fn unregister(&self, uid: u32) {
+        let mut g = self.subscribers.lock();
+        if let Some(n) = g.get_mut(&uid) {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(&uid);
+            }
+        }
+    }
+
+    /// True when at least one live subscriber would actually be handed a
+    /// prompt about a process owned by `process_uid`. Same predicate as the
+    /// per-stream filter, so "the router broadcast it" and "some stream
+    /// will deliver it" mean the same thing.
+    fn has_audience(&self, process_uid: Option<u32>) -> bool {
+        self.subscribers
+            .lock()
+            .keys()
+            .any(|&uid| should_deliver(process_uid, uid))
+    }
+
     /// Copies the current shared policy. SIGHUP swaps it at runtime, so
     /// each read observes the latest reload (poisoning is unrecoverable
     /// only in theory: writers just store a Copy value, so recover it).
@@ -67,6 +140,7 @@ impl PromptRouter {
             inner: Arc::new(RouterInner {
                 pending: Mutex::new(HashSet::new()),
                 broadcast_tx,
+                subscribers: Mutex::new(HashMap::new()),
                 default_policy,
                 stats,
                 verdict_tx,
@@ -74,8 +148,19 @@ impl PromptRouter {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<pb::PromptEvent> {
-        self.inner.broadcast_tx.subscribe()
+    /// Subscribes the peer running as `peer_uid` to the prompt feed.
+    ///
+    /// The uid is the kernel-reported `SO_PEERCRED` uid of the client, not
+    /// anything the client said about itself; it decides which prompts the
+    /// subscription may see (see [`should_deliver`]) and is counted in the
+    /// router's census until the returned value is dropped.
+    pub fn subscribe(&self, peer_uid: u32) -> PromptSubscription {
+        self.inner.register(peer_uid);
+        PromptSubscription {
+            rx: self.inner.broadcast_tx.subscribe(),
+            inner: self.inner.clone(),
+            uid: peer_uid,
+        }
     }
 
     /// Resolves a pending prompt with the user's verdict. Returns false if
@@ -98,14 +183,26 @@ impl PromptRouter {
 
     fn enqueue(&self, req: PromptRequest) {
         let prompt_id = req.prompt_id;
+        let owner_uid = req.process.uid;
         // Read the shared policy at prompt-creation time so a SIGHUP
         // reload affects every subsequent prompt without a restart.
         let timeout = Duration::from_secs(self.inner.policy().prompt_timeout_secs as u64);
 
-        // If no UI is subscribed, the prompt would just expire to default.
-        // Cut the round-trip: answer immediately with no_ui_action.
-        if self.inner.broadcast_tx.receiver_count() == 0 {
-            trace!("no UI subscribers; answering with no_ui_action");
+        // If no UI *that may see this prompt* is subscribed, the prompt
+        // would just expire to default. Cut the round-trip: answer
+        // immediately with no_ui_action. Asking the census rather than
+        // `broadcast_tx.receiver_count()` is what keeps that honest now
+        // that delivery is uid-scoped: a prompt for uid 1001's process
+        // with only uid 1000's UI connected has no audience, and saying
+        // "no UI" is the truth for it - waiting out prompt_timeout_secs
+        // would stall the packet for nothing and then answer with the
+        // wrong knob (timeout_action instead of no_ui_action).
+        if !self.inner.has_audience(owner_uid) {
+            trace!(
+                prompt_id,
+                owner_uid = ?owner_uid,
+                "no UI subscriber may see this prompt; answering with no_ui_action"
+            );
             let _ = self.inner.verdict_tx.send(PromptVerdict {
                 prompt_id,
                 verdict: self.inner.no_ui_verdict(),
@@ -124,7 +221,7 @@ impl PromptRouter {
         self.inner.stats.prompts_inc();
 
         if self.inner.broadcast_tx.send(event).is_err() {
-            // All receivers vanished between the count check and the
+            // All receivers vanished between the census check and the
             // send. Reclaim and fall back.
             if self.inner.pending.lock().remove(&prompt_id) {
                 self.inner.stats.prompts_dec();
@@ -150,6 +247,35 @@ impl PromptRouter {
                 });
             }
         });
+    }
+}
+
+/// One client's view of the prompt feed.
+///
+/// Wraps the broadcast receiver together with the peer uid it belongs to,
+/// and keeps that uid in the router's subscriber census for exactly as long
+/// as it lives - so the router's "can anyone see this prompt?" question and
+/// the stream's "may I show this prompt?" answer are always about the same
+/// set of subscribers.
+pub struct PromptSubscription {
+    rx: broadcast::Receiver<pb::PromptEvent>,
+    inner: Arc<RouterInner>,
+    uid: u32,
+}
+
+impl PromptSubscription {
+    /// Next prompt on the feed - including ones this subscriber may not
+    /// see. Filtering is the caller's job ([`should_deliver`]); the
+    /// broadcast is shared, so every subscriber observes every event and
+    /// drops what is not addressed to it.
+    pub async fn recv(&mut self) -> Result<pb::PromptEvent, broadcast::error::RecvError> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for PromptSubscription {
+    fn drop(&mut self) {
+        self.inner.unregister(self.uid);
     }
 }
 
@@ -180,6 +306,8 @@ mod tests {
         Arc::new(std::sync::RwLock::new(dp))
     }
 
+    /// A prompt about an *unattributed* process (uid `None`), which every
+    /// subscriber may see.
     fn req(prompt_id: u64) -> PromptRequest {
         PromptRequest {
             prompt_id,
@@ -195,12 +323,124 @@ mod tests {
         }
     }
 
+    /// A prompt about a process owned by `uid`.
+    fn req_owned_by(prompt_id: u64, uid: u32) -> PromptRequest {
+        let mut r = req(prompt_id);
+        r.process.uid = Some(uid);
+        r
+    }
+
     fn user_allow() -> Verdict {
         Verdict {
             action: Action::Allow,
             source: VerdictSource::UserPrompt,
         }
     }
+
+    // -- delivery filter ----------------------------------------------------
+
+    #[test]
+    fn a_prompt_goes_to_the_session_that_owns_the_process() {
+        assert!(should_deliver(Some(1000), 1000));
+        assert!(!should_deliver(Some(1000), 1001));
+        assert!(!should_deliver(Some(1001), 1000));
+    }
+
+    #[test]
+    fn root_sees_every_prompt() {
+        for owner in [None, Some(0), Some(1000), Some(u32::MAX)] {
+            assert!(should_deliver(owner, 0), "root must see {owner:?}");
+        }
+    }
+
+    #[test]
+    fn a_root_owned_process_is_not_shown_to_an_ordinary_session() {
+        // The flip side of "root sees everything": a system daemon's
+        // prompt is not another user's business, so only a root subscriber
+        // is offered it. With no root UI it resolves by policy.
+        assert!(!should_deliver(Some(0), 1000));
+        assert!(should_deliver(Some(0), 0));
+    }
+
+    #[test]
+    fn unattributed_traffic_is_offered_to_everyone() {
+        // Deliberate: nobody owns it, so restricting it would mean nobody
+        // is ever asked about it.
+        assert!(should_deliver(None, 0));
+        assert!(should_deliver(None, 1000));
+        assert!(should_deliver(None, 65534));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_no_subscriber_may_see_is_answered_immediately() {
+        // The fast path must key off "can anyone see this?", not "is
+        // anyone connected?" - otherwise this prompt would stall for the
+        // whole timeout and then answer with the wrong policy knob.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stats = Stats::new();
+        let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
+        let _sub = router.subscribe(1000);
+
+        router.enqueue(req_owned_by(5, 1001));
+
+        let pv = rx.try_recv().expect("verdict should already be queued");
+        assert_eq!(pv.prompt_id, 5);
+        assert_eq!(pv.verdict.action, Action::Deny); // no_ui_action
+        assert_eq!(pv.verdict.source, VerdictSource::DefaultPolicy);
+        // It never became pending, so nothing can answer it late.
+        assert_eq!(stats.prompts_pending(), 0);
+        assert!(!router.submit("5", user_allow()));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_a_subscriber_may_see_is_broadcast() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stats = Stats::new();
+        let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
+        let mut sub = router.subscribe(1000);
+
+        router.enqueue(req_owned_by(6, 1000));
+
+        assert_eq!(sub.recv().await.unwrap().prompt_id, "6");
+        assert_eq!(stats.prompts_pending(), 1);
+        assert!(rx.try_recv().is_err(), "the UI owes us an answer");
+    }
+
+    #[tokio::test]
+    async fn a_root_subscriber_is_an_audience_for_every_prompt() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+        let mut sub = router.subscribe(0);
+
+        router.enqueue(req_owned_by(8, 1001));
+
+        assert_eq!(sub.recv().await.unwrap().prompt_id, "8");
+        assert!(rx.try_recv().is_err(), "root's UI owes us an answer");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_subscription_restores_the_no_ui_fast_path() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+
+        // Two windows for the same uid: the first drop must not deregister
+        // the session.
+        let sub_a = router.subscribe(1000);
+        let sub_b = router.subscribe(1000);
+        drop(sub_a);
+        router.enqueue(req_owned_by(1, 1000));
+        assert!(rx.try_recv().is_err(), "uid 1000 still has a UI open");
+
+        drop(sub_b);
+        router.enqueue(req_owned_by(2, 1000));
+        assert_eq!(
+            rx.try_recv().expect("no UI left; answer now").prompt_id,
+            2,
+            "the census must forget a closed subscription"
+        );
+    }
+
+    // -- resolution paths ---------------------------------------------------
 
     #[tokio::test]
     async fn no_ui_reject_policy_stays_reject() {
@@ -237,7 +477,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stats = Stats::new();
         let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
-        let mut sub = router.subscribe();
+        let mut sub = router.subscribe(1000);
 
         router.enqueue(req(1));
         let event = sub.recv().await.unwrap();
@@ -285,7 +525,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stats = Stats::new();
         let router = PromptRouter::new(shared(dp(1)), stats.clone(), tx);
-        let _sub = router.subscribe(); // keep a UI "connected"
+        let _sub = router.subscribe(1000); // keep a UI "connected"
 
         router.enqueue(req(9));
         assert_eq!(stats.prompts_pending(), 1);

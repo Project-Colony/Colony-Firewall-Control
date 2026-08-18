@@ -17,6 +17,32 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      - name: Resolve version and verify it matches the tag
+        id: version
+        run: |
+          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::could not extract version from Cargo.toml [workspace.package]"
+            exit 1
+          fi
+          # The release is named after the tag, but every asset filename is
+          # built from the Cargo version. A mismatch publishes "v0.3.0"
+          # containing colony-firewall-control-0.2.0-*.tar.zst. Refuse.
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "v${VERSION}" ]; then
+            echo "::error::tag ${{ github.ref_name }} does not match Cargo.toml [workspace.package] version ${VERSION} (expected tag v${VERSION}). Bump Cargo.toml or retag."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Releasing ${VERSION}"
+
+      # Same gates as check.yml, re-run here so a tag can never publish a
+      # tarball that the packaging channels cannot install from.
+      - name: Check version consistency (Cargo.toml / PKGBUILD / colony.json)
+        run: ./scripts/check-versions.sh
+
+      - name: Check release assets against pkg/colony.json
+        run: ./scripts/check-release-assets.sh
+
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
@@ -34,11 +60,7 @@ jobs:
       - name: Assemble tarball
         id: assemble
         run: |
-          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
-          if [ -z "${VERSION}" ]; then
-            echo "could not extract version from Cargo.toml" >&2
-            exit 1
-          fi
+          VERSION="${{ steps.version.outputs.version }}"
           NAME="colony-firewall-control-${VERSION}-linux-x86_64"
           STAGE="$(mktemp -d)/${NAME}"
           mkdir -p "${STAGE}"
@@ -48,39 +70,59 @@ jobs:
             target/release/colony-firewall \
             target/release/cfc \
             "${STAGE}/"
+
+          # Everything pkg/colony.json's postInstall installs. The tarball
+          # layout is FLAT: postInstall runs with the extracted directory
+          # as its working directory, so each file must be present under
+          # its own basename. scripts/check-release-assets.sh gates this
+          # list against the manifest on every push, so a file added to
+          # postInstall but not staged here fails CI instead of silently
+          # vanishing on the Colony channel.
           install -m644 \
             systemd/colony-firewalld.service \
+            systemd/colony-firewall-nft.service \
+            systemd/colony-firewall.sysusers \
             systemd/daemon.toml.sample \
             systemd/nftables-snippet.conf \
+            pkg/colony-firewall.desktop \
+            pkg/colony-firewall-autostart.desktop \
+            pkg/colony-firewall.svg \
             "${STAGE}/"
 
-          # Files from the packaging wave; guarded so this workflow works
-          # both before and after they land.
-          if [ -f systemd/colony-firewall-nft.service ]; then
-            install -m644 systemd/colony-firewall-nft.service "${STAGE}/"
-          fi
-          if [ -f pkg/colony-firewall.desktop ]; then
-            install -m644 pkg/colony-firewall.desktop "${STAGE}/"
-          fi
+          # Docs, for parity with what the AUR package puts in
+          # /usr/share/doc. `cfc status` points users at TROUBLESHOOTING.md
+          # by name, so it has to actually ship.
+          install -m644 \
+            README.md \
+            CHANGELOG.md \
+            LICENSE \
+            docs/ARCHITECTURE.md \
+            docs/HARDENING.md \
+            docs/TROUBLESHOOTING.md \
+            "${STAGE}/"
 
           tar --zstd -C "$(dirname "${STAGE}")" -cf "${NAME}.tar.zst" "${NAME}"
           sha256sum "${NAME}.tar.zst" > SHA256SUMS
 
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tarball=${NAME}.tar.zst" >> "${GITHUB_OUTPUT}"
+          tar --zstd -tf "${NAME}.tar.zst"
 
       - name: Extract release notes from CHANGELOG.md
         run: |
-          VERSION="${{ steps.assemble.outputs.version }}"
-          # Pull the "## [X.Y.Z]" section if it exists; otherwise fall back
-          # to the whole changelog.
+          VERSION="${{ steps.version.outputs.version }}"
           awk -v ver="${VERSION}" '
             $0 ~ ("^## \\[" ver "\\]") { in_section = 1; next }
             /^## \[/ { if (in_section) exit }
             in_section { print }
           ' CHANGELOG.md > RELEASE_BODY.md
           if [ ! -s RELEASE_BODY.md ]; then
-            echo "No CHANGELOG section for ${VERSION}; using the full changelog."
+            # On a tag this is fatal: falling back to the whole changelog
+            # publishes the previous release's notes under the new version.
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              echo "::error::CHANGELOG.md has no '## [${VERSION}]' section - refusing to publish a release with the wrong notes. Rename the [Unreleased] section to [${VERSION}]."
+              exit 1
+            fi
+            echo "::warning::No CHANGELOG section for ${VERSION}; using the full changelog."
             cp CHANGELOG.md RELEASE_BODY.md
           fi
 
@@ -88,34 +130,104 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           draft: true
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.assemble.outputs.version) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.assemble.outputs.version) }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.version) }}
           body_path: RELEASE_BODY.md
           files: |
             ${{ steps.assemble.outputs.tarball }}
             SHA256SUMS
 
-  # Validate pkg/PKGBUILD on Arch with makepkg --nobuild. Advisory only
-  # (continue-on-error): the PKGBUILD's source array points at a GitHub
-  # release tarball that only exists once the matching v* tag is pushed,
-  # so this can fail on workflow_dispatch runs or while the packaging
-  # wave is still in flight. Tighten once releases are established.
+  # Build pkg/PKGBUILD for real against the freshly pushed tag, and produce
+  # the AUR-submittable artifacts (PKGBUILD with real checksums + .SRCINFO).
+  #
+  # Hard gate, no continue-on-error: at tag time the source= URL
+  # (.../archive/v$pkgver.tar.gz) resolves, because GitHub generates the
+  # archive as soon as the tag exists. Skipped on workflow_dispatch, where
+  # there is no tag for the source array to point at.
   pkgbuild:
+    if: github.ref_type == 'tag'
+    # Sequenced after `build` so the draft release already exists when the
+    # AUR artifacts are attached to it, and so a broken build does not
+    # spend half an hour compiling twice.
+    needs: build
     runs-on: ubuntu-latest
     container: archlinux:base-devel
-    continue-on-error: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Validate PKGBUILD with makepkg --nobuild
+      - name: Install Arch build deps
         run: |
-          pacman -Syu --noconfirm --needed rust protobuf pkgconf
+          # Both makedepends and depends: without -s, makepkg aborts on any
+          # missing dependency rather than installing it. pacman-contrib
+          # provides updpkgsums.
+          pacman -Syu --noconfirm --needed \
+            rust protobuf pkgconf git \
+            nftables libxkbcommon wayland \
+            namcap pacman-contrib
+
+      - name: Prepare unprivileged build user
+        run: |
           useradd -m builder
           chown -R builder: .
-          cd pkg
-          runuser -u builder -- makepkg --nobuild --noconfirm
 
-      - name: namcap lint (optional)
+      - name: Verify pkgver matches the tag
         run: |
-          pacman -S --noconfirm --needed namcap || exit 0
-          namcap pkg/PKGBUILD || true
+          PKGVER="$(sed -n 's/^pkgver=//p' pkg/PKGBUILD | head -n1)"
+          if [ "${{ github.ref_name }}" != "v${PKGVER}" ]; then
+            echo "::error::pkg/PKGBUILD pkgver=${PKGVER} does not match tag ${{ github.ref_name }}"
+            exit 1
+          fi
+
+      - name: updpkgsums - replace the SKIP placeholder with real checksums
+        working-directory: pkg
+        run: |
+          runuser -u builder -- updpkgsums PKGBUILD
+          # A remote (non-VCS) source with sha256sums=('SKIP') is not
+          # acceptable AUR practice: it disables integrity checking of the
+          # release tarball entirely.
+          if grep -qE "^sha256sums=\(.*'SKIP'" PKGBUILD; then
+            echo "::error::pkg/PKGBUILD still has a SKIP checksum after updpkgsums"
+            exit 1
+          fi
+          grep -A2 '^sha256sums=' PKGBUILD
+
+      - name: Generate .SRCINFO
+        working-directory: pkg
+        run: runuser -u builder -- makepkg --printsrcinfo | tee .SRCINFO
+
+      - name: namcap the PKGBUILD
+        working-directory: pkg
+        run: |
+          namcap PKGBUILD | tee namcap.log
+          # Warnings are advisory; errors are not.
+          if grep -q ' E: ' namcap.log; then
+            echo "::error::namcap reported errors in pkg/PKGBUILD"
+            exit 1
+          fi
+
+      - name: Build the package (makepkg)
+        working-directory: pkg
+        run: |
+          # --nocheck: check() re-runs the workspace test suite, which the
+          # `test` job in check.yml already gates. Deps are preinstalled
+          # above, so -s is not needed (and makepkg cannot sudo here).
+          runuser -u builder -- makepkg --noconfirm --nocheck
+          ls -l ./*.pkg.tar.*
+
+      - name: namcap the built package
+        working-directory: pkg
+        run: |
+          namcap ./*.pkg.tar.* | tee namcap-pkg.log
+          if grep -q ' E: ' namcap-pkg.log; then
+            echo "::error::namcap reported errors in the built package"
+            exit 1
+          fi
+
+      - name: Attach AUR artifacts to the release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          files: |
+            pkg/PKGBUILD
+            pkg/.SRCINFO

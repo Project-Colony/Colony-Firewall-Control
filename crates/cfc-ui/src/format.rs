@@ -139,6 +139,44 @@ pub fn format_clock_ms(ms: i64) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
+/// Longest connection-failure detail rendered verbatim.
+///
+/// cfc-client's actionable messages end with the fix ("add your user to the
+/// colony-firewall group..."), so the clip has to be generous enough to keep
+/// the longest of them whole; past that we are looking at a runaway gRPC
+/// status, not advice.
+pub const CONNECTION_HINT_MAX: usize = 220;
+
+/// Normalizes a connection-failure detail for display.
+///
+/// Collapses the whitespace these messages carry from being written across
+/// source lines - both so the badge line does not gain stray gaps and so
+/// the status log's exact-text coalescing actually fires on repeats - then
+/// clips to `max_chars`.
+pub fn connection_hint(detail: &str, max_chars: usize) -> String {
+    let normalized = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let head: String = normalized.chars().take(max_chars).collect();
+    format!("{head}...")
+}
+
+/// The single status-log line for a failed connection.
+///
+/// Deterministic for a given detail, so a daemon that stays down coalesces
+/// into one counted entry instead of scrolling the log - and the reason
+/// (missing socket, group permissions, stale socket) is visible instead of
+/// being swallowed by a fixed "unreachable" string.
+pub fn unreachable_log_line(detail: &str) -> String {
+    let hint = connection_hint(detail, CONNECTION_HINT_MAX);
+    if hint.is_empty() {
+        "daemon unreachable, retrying...".to_string()
+    } else {
+        format!("daemon unreachable, retrying... - {hint}")
+    }
+}
+
 /// "resumes in 4m 32s" for a paused daemon, using the deadline the daemon
 /// actually reported rather than whatever the UI asked for.
 pub fn format_resume_in(resume_at_unix_ms: i64, now_ms: i64) -> String {
@@ -246,6 +284,65 @@ mod tests {
         assert_eq!(format_unix_ms(1_700_000_000_000), "2023-11-14 22:13");
         assert_eq!(format_clock_ms(0), "?");
         assert_eq!(format_clock_ms(1_700_000_000_000), "22:13:20");
+    }
+
+    #[test]
+    fn connection_hint_collapses_whitespace() {
+        assert_eq!(connection_hint("", 80), "");
+        assert_eq!(connection_hint("   \n  ", 80), "");
+        assert_eq!(
+            connection_hint("permission   denied\n on  /run/x", 80),
+            "permission denied on /run/x"
+        );
+    }
+
+    #[test]
+    fn connection_hint_clips_without_splitting_a_char() {
+        assert_eq!(connection_hint("abcdef", 3), "abc...");
+        // Multi-byte input must clip by character, not by byte.
+        let wide = "é".repeat(10);
+        assert_eq!(connection_hint(&wide, 4), format!("{}...", "é".repeat(4)));
+        assert_eq!(
+            connection_hint("abc", 3),
+            "abc",
+            "exactly at the cap is kept"
+        );
+    }
+
+    #[test]
+    fn unreachable_line_keeps_the_actionable_advice() {
+        // Verbatim shape of cfc_client::ClientError::PermissionDenied, the
+        // most likely first-run failure now that the socket is group-gated.
+        let detail = "permission denied on /run/colony-firewall/cfc.sock - add your user to \
+                      the colony-firewall group (sudo usermod -aG colony-firewall $USER) then \
+                      log out and back in, or run as root";
+        let line = unreachable_log_line(detail);
+        assert!(
+            line.starts_with("daemon unreachable, retrying... - "),
+            "{line}"
+        );
+        assert!(line.contains("colony-firewall group"), "{line}");
+        assert!(line.contains("usermod"), "{line}");
+    }
+
+    #[test]
+    fn unreachable_line_is_stable_so_retries_coalesce() {
+        let detail = "socket /run/x does not exist -\n  is colony-firewalld running?";
+        assert_eq!(unreachable_log_line(detail), unreachable_log_line(detail));
+        // Whitespace-only variation must not produce a second log entry.
+        assert_eq!(
+            unreachable_log_line(detail),
+            unreachable_log_line("socket /run/x does not exist - is colony-firewalld running?")
+        );
+    }
+
+    #[test]
+    fn unreachable_line_without_a_detail_falls_back() {
+        assert_eq!(unreachable_log_line(""), "daemon unreachable, retrying...");
+        assert_eq!(
+            unreachable_log_line("  "),
+            "daemon unreachable, retrying..."
+        );
     }
 
     #[test]

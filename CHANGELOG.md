@@ -6,6 +6,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] - 2026-08-18
+
 Four waves of correctness, security and usability work on top of the
 0.1.0 alpha. The short version: one unanswered prompt no longer stalls
 every new connection on the machine, the control socket is genuinely
@@ -115,8 +119,25 @@ and every verdict is written to a queryable log.
   everywhere, a declared MSRV of 1.88 with a CI gate, a release
   workflow, and a script that keeps the version consistent across
   `Cargo.toml`, the PKGBUILD and `colony.json`.
+- The Arch package is now built end to end on every push and pull
+  request: CI runs a full `makepkg` on the `-git` recipe pointed at the
+  checkout, so `build()`, `package()` and the install scriptlet are
+  exercised without needing a published tag, plus a static
+  `packaging-lint` gate (`bash -n`, sourceability,
+  `makepkg --printsrcinfo`, `namcap`, `shellcheck` on the scriptlet).
+- `scripts/check-release-assets.sh`: parses `pkg/colony.json`'s
+  `postInstall` commands and fails if any file they install is not staged
+  into the release tarball. Wired into `check.yml` and re-run by
+  `release.yml`.
+- The release workflow refuses to publish when the pushed tag does not
+  match the `Cargo.toml` version, or when `CHANGELOG.md` has no section
+  for it.
+- At tag time the release job runs `updpkgsums`, asserts the `SKIP`
+  checksum placeholder is gone, and attaches the AUR-ready `PKGBUILD`
+  and `.SRCINFO` to the draft release.
 - `docs/TROUBLESHOOTING.md`, a README "First run" section, and this
-  `CHANGELOG.md`.
+  `CHANGELOG.md`. The PKGBUILDs install `TROUBLESHOOTING.md` into
+  `/usr/share/doc/`, which is where `cfc status` tells users to look.
 
 ### Changed
 - `StatusResponse.connections_today` is now `connections_seen`. The
@@ -178,6 +199,26 @@ and every verdict is written to a queryable log.
 - The UI silently swallowed a rejected verdict; an already-expired
   prompt now says so.
 - An unattributed process was displayed as uid 0.
+- **The MSRV job was not gating anything.** It asked
+  `dtolnay/rust-toolchain` for 1.88, which only runs `rustup default`;
+  the repo's `rust-toolchain.toml` (`channel = "stable"`) outranks the
+  rustup default, so the job silently compiled with stable. It now pins
+  `RUSTUP_TOOLCHAIN` and asserts `rustc --version` really is the MSRV.
+- **The release tarball omitted three files `colony.json` installs**:
+  the sysusers fragment, the XDG autostart entry and the icon. On the
+  Colony store channel no `colony-firewall` group was created, so the
+  control socket stayed root-only - the exact symptom the group work was
+  meant to fix.
+- The README's manual install never installed
+  `colony-firewall-nft.service` or the nftables snippet, so First run
+  step 1 failed with "Unit colony-firewall-nft.service not found" for
+  anyone following it verbatim. Its Arch instructions pointed at the
+  release PKGBUILD, whose source tarball does not exist before a tag is
+  pushed.
+- `PKGBUILD-git`'s `pkgver()` returned an empty string before the first
+  tag: the `git describe | sed || fallback` pipeline reports sed's exit
+  status, never git's, so the fallback could not fire and `makepkg`
+  aborted with "pkgver is not allowed to be empty".
 
 ### Security
 - **Unattributed traffic could match root's rules.** A process the

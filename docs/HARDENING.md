@@ -201,9 +201,39 @@ membership grants the ability to allow or deny any traffic on this host,
 which is root-equivalent control over the firewall. This is not a
 multi-user privilege boundary - add only administrators of the machine.
 
-The one exception is prompt ownership: a prompt may only be answered by a
-peer whose `StreamPrompts` subscription actually received it, so one
-desktop session cannot answer another session's prompt. Root is exempt.
+**The one exception is prompt ownership.** A prompt is about a process,
+and that process has an owner uid. Delivery is scoped to it: a
+`StreamPrompts` subscription is handed a prompt only when the subscriber's
+peer uid matches the owner, and `SubmitVerdict` refuses a caller the prompt
+was not handed to. So another logged-in user's session is neither shown the
+prompt nor able to answer it - it never even learns the prompt id.
+
+Exactly what that does and does not promise:
+
+| Prompt is about a process owned by | Delivered to           | Answerable by          |
+|------------------------------------|------------------------|------------------------|
+| uid 1000                           | uid 1000, root         | uid 1000, root         |
+| uid 0 (a system daemon)            | root only              | root only              |
+| nobody - attribution failed        | every subscriber       | every subscriber that received it |
+
+Two deliberate consequences:
+
+- **Root is exempt on both counts** - it sees and may answer everything,
+  because uid 0 already controls the machine and the root CLI is the
+  recovery path when no session is up. The flip side is that a prompt for a
+  *root-owned* process is not shown to an ordinary user's UI. With no root
+  subscriber connected there is no audience for it, so the daemon answers
+  it immediately with `no_ui_action` rather than stalling the packet until
+  `prompt_timeout_secs` expires. Run the CLI as root if you want to be
+  asked about system daemons.
+- **Unattributed flows are offered to everyone.** When the process exited
+  before `/proc` could be read the daemon has no owner uid to match. It
+  prompts every session rather than none: nobody can claim such a flow, and
+  restricting it would mean these connections are silently resolved by
+  policy in exactly the case where a human should look.
+
+This is prompt-level isolation between sessions, not a privilege boundary:
+every group member can still write rules that affect the whole host.
 
 ## What hot-reloads and what needs a restart
 

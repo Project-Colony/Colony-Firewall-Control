@@ -32,18 +32,27 @@
 //!
 //! # Prompt ownership
 //!
-//! Prompts are broadcast to every `StreamPrompts` subscriber, so without
-//! extra bookkeeping any subscriber could answer any other subscriber's
-//! prompt. Each subscriber stream records `prompt_id -> peer uid` as it
-//! hands an event to its client ([`PromptAudience`]); `SubmitVerdict`
-//! requires the caller's uid to appear in that prompt's audience. Root may
-//! always answer.
+//! Prompts travel on one broadcast, but they are *addressed*. Two steps:
+//!
+//! 1. **Delivery is uid-scoped.** Each subscriber stream drops events it is
+//!    not entitled to see ([`should_deliver`]): a prompt goes to the
+//!    session that owns the process it is about, plus root (which sees
+//!    everything), plus - when the process could not be attributed at all -
+//!    everyone. So another user's UI never even learns the prompt id.
+//! 2. **Answers are checked against who was told.** A stream records
+//!    `prompt_id -> peer uid` as it hands an event to its client
+//!    ([`PromptAudience`]); `SubmitVerdict` requires the caller's uid to
+//!    appear in that prompt's audience. Root may always answer.
+//!
+//! Step 2 alone was bookkeeping without teeth - every subscriber received
+//! every prompt, so every subscriber was in every audience. Step 1 is what
+//! makes the recorded audience mean "the sessions this prompt was for".
 
 use crate::config::IpcConfig;
 use crate::convert;
 use crate::decision::{Engine, SharedPolicy};
 use crate::nfqueue::{ObservedConnection, PromptRequest, PromptTx};
-use crate::prompts::PromptRouter;
+use crate::prompts::{should_deliver, PromptRouter};
 use crate::stats::Stats;
 use crate::storage::{EventFilter, EventRow, RuleStore};
 use anyhow::Context;
@@ -265,13 +274,27 @@ impl Firewall for FirewallService {
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
         let peer = self.authorize(&req, Access::ReadOnly)?;
         let (tx, rx) = mpsc::channel(64);
-        let mut sub = self.router.subscribe();
+        let mut sub = self.router.subscribe(peer.uid);
         let audience = self.audience.clone();
         let uid = peer.uid;
         tokio::spawn(async move {
             loop {
                 match sub.recv().await {
                     Ok(event) => {
+                        // Addressing: the feed is shared, this stream is
+                        // not. Skip prompts about another session's
+                        // process, so this peer never learns the id and
+                        // never enters the prompt's audience. A prompt
+                        // with no process info at all (the router always
+                        // fills it in, so: never) counts as unattributed
+                        // rather than being dropped on the floor.
+                        let owner_uid = event.process.as_ref().and_then(|p| p.uid);
+                        if !should_deliver(owner_uid, uid) {
+                            if tx.is_closed() {
+                                break;
+                            }
+                            continue;
+                        }
                         // Record before handing the event over: this
                         // subscriber is about to learn the prompt id, so it
                         // must be entitled to answer it by the time it can.
@@ -1133,6 +1156,53 @@ mod tests {
         assert!(!a.allows(7, 1000));
         // Idempotent.
         a.forget(7);
+    }
+
+    /// What the per-subscriber task in [`FirewallService::stream_prompts`]
+    /// does to one broadcast event: skip it unless this peer may see it,
+    /// otherwise record the peer as entitled to answer.
+    fn deliver_to(audience: &PromptAudience, prompt_id: u64, owner_uid: Option<u32>, uid: u32) {
+        if should_deliver(owner_uid, uid) {
+            audience.record(prompt_id, uid);
+        }
+    }
+
+    #[test]
+    fn only_the_owning_session_enters_a_prompts_audience() {
+        // The gap this closes: before delivery was uid-scoped, every
+        // subscriber received every prompt and so ended up in every
+        // audience, which made the SubmitVerdict check vacuous.
+        let a = PromptAudience::default();
+        for uid in [0, 1000, 1001] {
+            deliver_to(&a, 7, Some(1000), uid);
+        }
+        assert!(a.allows(7, 1000), "the owner was shown the prompt");
+        assert!(a.allows(7, 0), "root sees everything");
+        assert!(
+            !a.allows(7, 1001),
+            "another session never received it, so it may not answer it"
+        );
+    }
+
+    #[test]
+    fn unattributed_prompts_admit_every_session() {
+        let a = PromptAudience::default();
+        for uid in [0, 1000, 1001] {
+            deliver_to(&a, 7, None, uid);
+        }
+        for uid in [0, 1000, 1001] {
+            assert!(a.allows(7, uid), "uid {uid} was shown an unowned prompt");
+        }
+    }
+
+    #[test]
+    fn a_root_owned_prompt_admits_only_root() {
+        let a = PromptAudience::default();
+        for uid in [0, 1000] {
+            deliver_to(&a, 7, Some(0), uid);
+        }
+        assert!(a.allows(7, 0));
+        assert!(!a.allows(7, 1000));
     }
 
     #[test]

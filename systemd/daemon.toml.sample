@@ -122,10 +122,20 @@ max_rows = 100000
 # grants the ability to allow or deny any traffic on this host. This is not
 # a multi-user privilege boundary - add only administrators of this machine.
 #
-# One exception to "any group member can do anything": prompt answers. A
-# prompt may only be answered by a peer whose StreamPrompts subscription
-# actually received it (root excepted), so one desktop session cannot
-# answer another session's prompt.
+# One exception to "any group member can do anything": prompt answers.
+# Prompts are addressed by the uid that owns the process they are about.
+# A StreamPrompts subscription is only handed a prompt when the subscriber's
+# uid matches that owner, and only a peer a prompt was actually handed to
+# may answer it - so one desktop session is neither shown nor able to answer
+# another session's prompt. Two caveats, both deliberate:
+#
+#   - uid 0 is exempt on both counts: root sees and may answer everything.
+#     A prompt for a root-owned process (a system daemon) therefore reaches
+#     only root subscribers; with no root UI connected it is resolved by
+#     [default_policy] no_ui_action instead of being shown to a user.
+#   - A flow the daemon could not attribute to any uid (the process exited
+#     before /proc could be read) is offered to every session, because
+#     nobody owns it and restricting it would mean nobody is ever asked.
 #
 # If the group does not exist the daemon does NOT fail to start: it warns,
 # leaves the socket root-only (0600), and only the root CLI can connect.

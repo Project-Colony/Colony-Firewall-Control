@@ -25,8 +25,12 @@ service Firewall {
   // Daemon status / stats.
   rpc GetStatus(StatusRequest) returns (StatusResponse);
 
-  // Temporarily allow all flows without consulting rules. The daemon stays
-  // running, just short-circuits NFQUEUE to ACCEPT for every packet.
+  // Temporarily stop *prompting*. Rules are still evaluated and still
+  // apply - a deny rule keeps denying while paused; what changes is that a
+  // flow no rule matched is allowed straight through instead of raising a
+  // prompt. A pause always ends by itself: duration_secs (or the daemon's
+  // [pause] default_secs when 0) is clamped to at most 24h, and the
+  // response reports the resume deadline.
   rpc SetPaused(SetPausedRequest) returns (SetPausedResponse);
 
   // Persisted verdict/audit log, newest first. Read-only.

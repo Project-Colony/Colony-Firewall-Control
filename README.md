@@ -88,33 +88,68 @@ More docs:
 
 ### Arch Linux
 
-Not on the AUR yet. An AUR-ready PKGBUILD ships in `pkg/` for building
-locally in the meantime:
+Not on the AUR yet. Two recipes ship in `pkg/`; the `-git` one works
+today, without a published release:
 
 ```sh
-cp pkg/PKGBUILD ./
-makepkg -si
+mkdir -p /tmp/cfc-build
+cp pkg/PKGBUILD-git /tmp/cfc-build/PKGBUILD
+cp pkg/colony-firewall-control.install /tmp/cfc-build/
+cd /tmp/cfc-build && makepkg -si
 ```
+
+`pkg/PKGBUILD` is the AUR release recipe instead: it builds from the
+`v$pkgver` GitHub tag tarball, so it only resolves once that tag is
+pushed, and its checksums have to be filled in with `updpkgsums` first.
+See [pkg/README.md](pkg/README.md) for the submission procedure.
+
+Either package installs everything - both units, the sysusers fragment,
+the nftables snippet, the desktop entry and icon, completions and man
+pages - and prints the first-run steps on install.
 
 ### Manual
 
 ```sh
 cargo build --workspace --release
 
+# Binaries
 sudo install -Dm755 target/release/colony-firewalld /usr/bin/colony-firewalld
 sudo install -Dm755 target/release/colony-firewall  /usr/bin/colony-firewall
 sudo install -Dm755 target/release/cfc              /usr/bin/cfc
-sudo install -Dm644 systemd/colony-firewalld.service /usr/lib/systemd/system/
+
+# Both units. colony-firewall-nft.service is what First run step 1
+# enables; without it that step fails with "Unit ... not found".
+sudo install -Dm644 systemd/colony-firewalld.service \
+     /usr/lib/systemd/system/colony-firewalld.service
+sudo install -Dm644 systemd/colony-firewall-nft.service \
+     /usr/lib/systemd/system/colony-firewall-nft.service
+
+# The ruleset colony-firewall-nft.service loads. The unit hardcodes this
+# path, so it is not optional either.
+sudo install -Dm644 systemd/nftables-snippet.conf \
+     /usr/share/colony-firewall/nftables-snippet.conf
+
+# Config, and the group that gates the control socket
 sudo install -Dm644 systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
 sudo install -Dm644 systemd/colony-firewall.sysusers \
      /usr/lib/sysusers.d/colony-firewall.conf
 sudo systemd-sysusers
+
+# Desktop integration: launcher, autostart entry (so prompts reach you in
+# every session) and icon. Skip on a headless box.
+sudo install -Dm644 pkg/colony-firewall.desktop \
+     /usr/share/applications/colony-firewall.desktop
+sudo install -Dm644 pkg/colony-firewall-autostart.desktop \
+     /etc/xdg/autostart/colony-firewall.desktop
+sudo install -Dm644 pkg/colony-firewall.svg \
+     /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now colony-firewalld
 
 # The control socket is root:colony-firewall 0660. Join the group, then
 # log out and back in, or the GUI and cfc get "permission denied".
-sudo usermod -aG colony-firewall $USER
+sudo usermod -aG colony-firewall "$USER"
 ```
 
 Installing only puts the binaries and daemon in place - no traffic is
@@ -126,8 +161,8 @@ A fresh install has **zero rules**: once enforcement is on, every new
 outbound connection prompts (or falls back to the profile default). Do
 these three things, in order:
 
-**1. Enable enforcement persistently.** This release adds a companion
-unit that loads the nftables ruleset at boot and removes it on stop:
+**1. Enable enforcement persistently.** A companion unit loads the
+nftables ruleset at boot and removes it on stop:
 
 ```sh
 sudo systemctl enable --now colony-firewall-nft.service
@@ -138,15 +173,20 @@ survive a reboot; after restarting, the daemon runs while enforcing
 nothing:
 
 ```sh
-sudo nft -f systemd/nftables-snippet.conf
+sudo nft -f /usr/share/colony-firewall/nftables-snippet.conf   # installed
+sudo nft -f systemd/nftables-snippet.conf                      # from a checkout
 ```
 
 **2. Seed the starter rules** so always-on system services keep working
 without prompting:
 
 ```sh
-cfc rules bootstrap-defaults
+sudo cfc rules bootstrap-defaults
 ```
+
+(`sudo` because group membership from `usermod -aG colony-firewall` only
+takes effect in a new login session. After logging out and back in, plain
+`cfc` works.)
 
 This installs six allow rules - systemd-resolved DNS (:53),
 systemd-timesyncd and chronyd NTP (:123/udp), pacman and paru HTTPS
@@ -323,6 +363,10 @@ cargo run -p cfc-ui     # in another terminal
 
 Two honest caveats:
 
+- The Arch package is built end to end on every push (`makepkg` on the
+  `-git` recipe), but it has never been published to the AUR, so the
+  release recipe's tag tarball and checksums are only exercised at tag
+  time.
 - The end-to-end test in CI drives a `--dry-run` daemon, so it proves the
   gRPC and CLI surface, not that a packet is really dropped. Verifying a
   live DROP/ACCEPT still means loading the nftables snippet on a real

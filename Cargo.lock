@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cfc-client",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cfc-core",
@@ -701,7 +701,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ipnet",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cfc-client",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "serde",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cfc-client",
