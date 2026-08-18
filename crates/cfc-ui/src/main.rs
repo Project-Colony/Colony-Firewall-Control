@@ -109,6 +109,62 @@ pub struct RuleEditor {
     pub created_at_unix_ms: i64,
     pub hit_count: u64,
     pub enabled: bool,
+    /// Scope predicates this editor has no widget for, carried through
+    /// untouched.
+    ///
+    /// `cfc rules add --uid`, an imported opensnitch ruleset, or a
+    /// checksum-pinned rule can all set these. Rebuilding the scope from
+    /// the visible fields alone would silently *widen* such a rule on
+    /// save: a deny scoped to one uid would start matching every user,
+    /// and a sha256-pinned allow would lose its binary pin.
+    pub carried_scope: CarriedScope,
+}
+
+/// Scope predicates preserved verbatim across an edit (see
+/// [`RuleEditor::carried_scope`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CarriedScope {
+    pub exe_sha256: String,
+    pub parent_exe: String,
+    pub uid: u32,
+    pub has_uid: bool,
+}
+
+impl CarriedScope {
+    fn from_scope(scope: Option<&proto::RuleScope>) -> Self {
+        match scope {
+            Some(s) => Self {
+                exe_sha256: s.exe_sha256.clone(),
+                parent_exe: s.parent_exe.clone(),
+                uid: s.uid,
+                has_uid: s.has_uid,
+            },
+            None => Self::default(),
+        }
+    }
+
+    /// True when the rule carries a constraint the editor cannot show, so
+    /// the view can tell the user rather than let them assume the visible
+    /// fields are the whole rule.
+    pub fn is_set(&self) -> bool {
+        self.has_uid || !self.exe_sha256.is_empty() || !self.parent_exe.is_empty()
+    }
+
+    /// One-line human summary of the hidden predicates, for that notice.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.has_uid {
+            parts.push(format!("uid {}", self.uid));
+        }
+        if !self.parent_exe.is_empty() {
+            parts.push(format!("parent {}", self.parent_exe));
+        }
+        if !self.exe_sha256.is_empty() {
+            let short: String = self.exe_sha256.chars().take(12).collect();
+            parts.push(format!("sha256 {short}..."));
+        }
+        parts.join(", ")
+    }
 }
 
 impl Default for RuleEditor {
@@ -127,6 +183,7 @@ impl Default for RuleEditor {
             created_at_unix_ms: 0,
             hit_count: 0,
             enabled: true,
+            carried_scope: CarriedScope::default(),
         }
     }
 }
@@ -155,6 +212,7 @@ impl RuleEditor {
             created_at_unix_ms: rule.created_at_unix_ms,
             hit_count: rule.hit_count,
             enabled: rule.enabled,
+            carried_scope: CarriedScope::from_scope(scope),
         }
     }
 
@@ -1297,12 +1355,15 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         return Err("a saved rule needs \"Until restart\" or \"Always\"".into());
     }
 
-    // Need at least one scope predicate, else the rule would match everything.
+    // Need at least one scope predicate, else the rule would match
+    // everything. Carried predicates count: a uid-only rule created from
+    // the CLI is narrow, and refusing to save it would make it uneditable.
     let scope_empty = ed.exe.trim().is_empty()
         && ed.dst_host.trim().is_empty()
         && dst_net.is_empty()
         && dst_port.is_none()
-        && ed.protocol.is_none();
+        && ed.protocol.is_none()
+        && !ed.carried_scope.is_set();
     if scope_empty {
         return Err(
             "rule must restrict at least one of: exe, dst-host, dst-net, dst-port, protocol".into(),
@@ -1311,10 +1372,12 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
 
     let scope = proto::RuleScope {
         exe_path: ed.exe.trim().to_string(),
-        exe_sha256: String::new(),
-        parent_exe: String::new(),
-        uid: 0,
-        has_uid: false,
+        // Not editable here, so preserved rather than dropped: rebuilding
+        // the scope from the visible fields alone would widen the rule.
+        exe_sha256: ed.carried_scope.exe_sha256.clone(),
+        parent_exe: ed.carried_scope.parent_exe.clone(),
+        uid: ed.carried_scope.uid,
+        has_uid: ed.carried_scope.has_uid,
         dst_host: ed.dst_host.trim().to_string(),
         dst_net: dst_net.to_string(),
         dst_port: dst_port.map(u32::from).unwrap_or(0),
@@ -1459,6 +1522,75 @@ mod tests {
             created_at_unix_ms: 1_700_000_000_000,
             hit_count: 42,
         }
+    }
+
+    /// A rule narrowed by predicates the editor has no widget for — the
+    /// shape `cfc rules add --uid` and opensnitch imports produce.
+    fn rule_with_hidden_scope() -> proto::RuleInfo {
+        proto::RuleInfo {
+            scope: Some(proto::RuleScope {
+                exe_path: "/usr/bin/curl".into(),
+                exe_sha256: "abc123def456abc123def456abc123def456abc123def456".into(),
+                parent_exe: "/usr/bin/bash".into(),
+                uid: 1000,
+                has_uid: true,
+                ..Default::default()
+            }),
+            ..existing_rule()
+        }
+    }
+
+    #[test]
+    fn editing_keeps_scope_predicates_the_editor_cannot_show() {
+        // Dropping these would WIDEN the rule: a deny scoped to one uid
+        // would start matching every user on the host, and a checksum-
+        // pinned allow would lose its binary pin.
+        let original = rule_with_hidden_scope();
+        let mut ed = RuleEditor::from_existing(&original);
+        ed.dst_port = "8443".into(); // the user changes only the port
+
+        let sent = build_rule_from_editor(&ed).expect("valid");
+        let scope = sent.scope.expect("scope");
+        let orig = original.scope.unwrap();
+        assert_eq!(scope.uid, orig.uid);
+        assert!(scope.has_uid);
+        assert_eq!(scope.exe_sha256, orig.exe_sha256);
+        assert_eq!(scope.parent_exe, orig.parent_exe);
+        assert_eq!(scope.dst_port, 8443, "the intended edit still applies");
+    }
+
+    #[test]
+    fn a_rule_scoped_only_by_hidden_predicates_is_still_editable() {
+        // Validation must count carried predicates, else a uid-only rule
+        // could never be saved from the GUI at all.
+        let uid_only = proto::RuleInfo {
+            scope: Some(proto::RuleScope {
+                uid: 1000,
+                has_uid: true,
+                ..Default::default()
+            }),
+            ..existing_rule()
+        };
+        let ed = RuleEditor::from_existing(&uid_only);
+        assert!(ed.carried_scope.is_set());
+        assert!(build_rule_from_editor(&ed).is_ok());
+
+        // A genuinely empty scope is still refused.
+        let empty = RuleEditor {
+            name: "everything".into(),
+            ..RuleEditor::default()
+        };
+        assert!(build_rule_from_editor(&empty).is_err());
+    }
+
+    #[test]
+    fn hidden_scope_summary_names_each_predicate() {
+        let ed = RuleEditor::from_existing(&rule_with_hidden_scope());
+        let summary = ed.carried_scope.summary();
+        assert!(summary.contains("uid 1000"), "{summary}");
+        assert!(summary.contains("/usr/bin/bash"), "{summary}");
+        assert!(summary.contains("sha256 abc123def456"), "{summary}");
+        assert!(!CarriedScope::default().is_set());
     }
 
     #[test]

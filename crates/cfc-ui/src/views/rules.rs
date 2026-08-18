@@ -389,6 +389,25 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
         None => Space::new().into(),
     };
 
+    // This rule restricts more than the fields above can show. Saving keeps
+    // those predicates, but the user should know they are there rather than
+    // read the visible fields as the whole rule.
+    let carried: Element<'_, Message> = if ed.carried_scope.is_set() {
+        container(
+            text(format!(
+                "also restricted to {} - kept on save, edit with cfc",
+                ed.carried_scope.summary()
+            ))
+            .size(11),
+        )
+        .padding(6)
+        .width(Length::Fill)
+        .style(crate::theme::banner_warn)
+        .into()
+    } else {
+        Space::new().into()
+    };
+
     container(scrollable(
         column![
             title,
@@ -399,6 +418,7 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
             host_field,
             net_field,
             port_field,
+            carried,
             validation,
         ]
         .spacing(10)

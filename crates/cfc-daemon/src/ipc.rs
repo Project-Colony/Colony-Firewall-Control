@@ -419,8 +419,13 @@ impl Firewall for FirewallService {
             .into_inner()
             .rule
             .ok_or_else(|| Status::invalid_argument("rule required"))?;
-        let rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
+        let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
         convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
+        // hit_count and created_at belong to the daemon: a client editing a
+        // rule must not be able to rewrite its history, deliberately or (as
+        // every read-modify-write client did) by echoing back a count that
+        // already included an unflushed delta.
+        self.engine.preserve_server_owned(&mut rule);
         self.store
             .upsert(&rule)
             .map_err(|e| Status::internal(format!("storage: {e}")))?;

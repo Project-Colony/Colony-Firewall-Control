@@ -88,6 +88,28 @@ impl Engine {
         Verdict::from_policy(no_ui_action)
     }
 
+    /// Restores the fields the daemon owns onto an incoming rule.
+    ///
+    /// `hit_count` and `created_at` are daemon state, not something a
+    /// client gets to set on an existing rule. Every client does a
+    /// read-modify-write (the GUI's edit and enable/disable buttons, `cfc
+    /// rules enable|disable`, `cfc rules import`), and what it read back
+    /// was the persisted count *plus* the not-yet-flushed delta. Echoing
+    /// that in the upsert stored the delta, while the delta itself stayed
+    /// pending and got added again at the next flush — so every toggle
+    /// inflated the count. Taking the daemon's own values makes the
+    /// round-trip lossless no matter what the client sends.
+    ///
+    /// A rule id the daemon does not know is left untouched: it is a new
+    /// rule, and `convert::rule_from_pb` stamps its creation time.
+    pub fn preserve_server_owned(&self, rule: &mut Rule) {
+        let rules = self.inner.rules.read();
+        if let Some(existing) = rules.rules.iter().find(|r| r.id == rule.id) {
+            rule.hit_count = existing.hit_count;
+            rule.created_at = existing.created_at;
+        }
+    }
+
     pub fn upsert_rule(&self, rule: Rule) {
         let mut rs = self.inner.rules.write();
         if let Some(existing) = rs.rules.iter_mut().find(|r| r.id == rule.id) {
@@ -380,6 +402,52 @@ mod tests {
         // Mutating the snapshot must not affect the engine.
         drop(snap);
         assert_eq!(engine.snapshot().rules.len(), 2);
+    }
+
+    #[test]
+    fn upsert_cannot_inflate_the_hit_count_of_an_existing_rule() {
+        // Every client does a read-modify-write: it reads a rule (count =
+        // persisted + unflushed delta), flips a field, sends it back. If
+        // the daemon stored that echoed count, the delta would land twice
+        // -- once now, once at the next flush.
+        let rule = allow_port_rule(443);
+        let id = rule.id;
+        let mut rs = RuleSet::default();
+        rs.rules.push(rule);
+        let engine = Engine::new(rs, shared(dp_allow()));
+
+        engine.evaluate(&conn(443), &proc("/usr/bin/curl"));
+        engine.evaluate(&conn(443), &proc("/usr/bin/curl"));
+
+        // What a client would read back, then echo in an upsert.
+        let mut echoed = engine.snapshot().rules[0].clone();
+        assert_eq!(echoed.hit_count, 2);
+        echoed.enabled = false;
+        let forged_created_at = echoed.created_at;
+
+        engine.preserve_server_owned(&mut echoed);
+        assert_eq!(
+            echoed.hit_count, 0,
+            "the delta is still pending, not stored"
+        );
+        assert_eq!(echoed.created_at, forged_created_at);
+        engine.upsert_rule(echoed);
+
+        // The toggle applied, and the two hits are still counted exactly once.
+        let deltas = engine.drain_hits();
+        assert_eq!(deltas.get(&id).copied().unwrap_or(0), 2);
+        assert_eq!(engine.snapshot().rules[0].hit_count, 2);
+        assert!(!engine.snapshot().rules[0].enabled);
+    }
+
+    #[test]
+    fn preserve_server_owned_leaves_an_unknown_rule_alone() {
+        let engine = Engine::new(RuleSet::default(), shared(dp_allow()));
+        let mut fresh = allow_port_rule(80);
+        let before = fresh.clone();
+        engine.preserve_server_owned(&mut fresh);
+        assert_eq!(fresh.created_at, before.created_at);
+        assert_eq!(fresh.hit_count, before.hit_count);
     }
 
     #[test]
