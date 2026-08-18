@@ -1,19 +1,42 @@
 //! Colony Firewall Control - UI entry point.
 
+mod format;
+mod session_stats;
+mod status_log;
 mod streams;
 mod theme;
 mod views;
 
 use cfc_client::{proto, Client};
+use iced::keyboard;
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{Element, Length, Subscription, Task};
+use session_stats::SessionStats;
+use status_log::StatusLog;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
+use views::live::VerdictFilter;
+use views::rules::RuleSort;
 
 const SOCKET_PATH: &str = "/run/colony-firewall/cfc.sock";
 const LIVE_CAP: usize = 500;
+
+/// Consecutive failed status polls before the daemon is declared gone. One
+/// failure is a hiccup; two in a row (4s) is a dead socket.
+const STATUS_FAILURES_BEFORE_DEAD: u32 = 2;
+
+/// Refresh the rule list on every Nth status tick so hit counts stay live
+/// without hammering the daemon (5 x 2s = every 10s).
+const RULES_REFRESH_EVERY_TICKS: u32 = 5;
+
+/// How long the Delete button stays armed waiting for the confirm click.
+const DELETE_CONFIRM_MS: i64 = 3_000;
+
+/// Cadence of the countdown tick while prompts are pending. Fast enough for
+/// a smooth bar, slow enough to stay off the CPU when nothing is pending.
+const DEADLINE_TICK_MS: u64 = 400;
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -38,9 +61,30 @@ pub struct App {
     pub live: VecDeque<LiveEntry>,
     pub prompts: Vec<PromptCard>,
     pub status: Option<proto::StatusResponse>,
-    pub last_error: Option<String>,
+    pub log: StatusLog,
     pub editor: Option<RuleEditor>,
     pub rules_filter: String,
+    pub rules_sort: RuleSort,
+    /// Rule id whose Delete button is armed, plus when it was armed.
+    pub pending_delete: Option<(String, i64)>,
+    pub live_filter: String,
+    pub live_verdict: VerdictFilter,
+    /// Snapshot rendered while the feed is paused. The buffer behind it
+    /// keeps filling, so nothing is lost.
+    pub live_frozen: Option<Vec<LiveEntry>>,
+    pub live_new: usize,
+    pub session: SessionStats,
+    /// Consecutive `StatusLoaded(Err)` since the last success.
+    pub status_failures: u32,
+    pub status_ticks: u32,
+    /// Failed reconnect attempts, feeding the backoff.
+    pub retry_attempts: u32,
+    pub retry_at_ms: Option<i64>,
+    /// Set when a gRPC stream drops; the badge shows "reconnecting" instead
+    /// of the footer being rewritten every two seconds.
+    pub stream_trouble: bool,
+    /// Cached wall clock, refreshed on every tick so views stay pure.
+    pub now_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +142,37 @@ impl RuleEditor {
             validation: None,
         }
     }
+
+    /// Seeds the editor from an observed flow (live feed "make rule").
+    /// Prefers the hostname, like the prompt card does.
+    pub fn from_observed(
+        exe: &str,
+        dst_host: &str,
+        dst_ip: &str,
+        dst_port: u32,
+        protocol: i32,
+    ) -> Self {
+        let protocol = proto::Protocol::try_from(protocol)
+            .ok()
+            .filter(|p| !matches!(p, proto::Protocol::Unspecified));
+        Self {
+            name: String::new(),
+            exe: exe.to_string(),
+            dst_host: dst_host.to_string(),
+            dst_net: if dst_host.is_empty() {
+                format::host_cidr(dst_ip)
+            } else {
+                String::new()
+            },
+            dst_port: if dst_port == 0 {
+                String::new()
+            } else {
+                dst_port.to_string()
+            },
+            protocol,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +183,34 @@ pub struct LiveEntry {
 #[derive(Debug, Clone)]
 pub struct PromptCard {
     pub event: proto::PromptEvent,
+    /// Wall clock at which the daemon answers this prompt itself. 0 means
+    /// the daemon attached no deadline.
+    pub deadline_unix_ms: i64,
+    /// Persistence the scope buttons will use. `Once` cannot be persisted
+    /// (the daemon rejects it), so it disables them.
+    pub duration: proto::Duration,
+    pub details_open: bool,
+}
+
+impl PromptCard {
+    fn new(event: proto::PromptEvent) -> Self {
+        Self {
+            deadline_unix_ms: event.deadline_unix_ms,
+            event,
+            // Least surprising default: answer this flow only.
+            duration: proto::Duration::Once,
+            details_open: false,
+        }
+    }
+
+    /// A scope is only sent when the chosen duration can actually be
+    /// persisted; `Once` answers the prompt and nothing more.
+    pub fn persistable(&self) -> bool {
+        !matches!(
+            self.duration,
+            proto::Duration::Once | proto::Duration::Unspecified
+        )
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -136,10 +239,19 @@ pub enum Message {
     RuleDeleted(Result<(String, bool), String>),
     StatusLoaded(Result<proto::StatusResponse, String>),
     StatusTick,
+    /// Fast tick, alive only while prompts are pending.
+    DeadlineTick,
+    /// Slow tick, alive only while disconnected; drives the backoff retry.
+    RetryTick,
     LiveEvent(proto::ConnectionEvent),
     LiveStreamEnded(String),
     PromptEvent(proto::PromptEvent),
     PromptStreamEnded(String),
+    PromptDuration {
+        prompt_id: String,
+        duration: proto::Duration,
+    },
+    TogglePromptDetails(String),
     SubmitVerdict {
         prompt_id: String,
         action: proto::Action,
@@ -152,6 +264,22 @@ pub enum Message {
     CloseEditor,
     ToggleRuleEnabled(String),
     RulesFilterChanged(String),
+    RulesSortBy(RuleSort),
+    LiveFilterChanged(String),
+    LiveVerdictFilter(VerdictFilter),
+    ToggleLivePause,
+    /// Opens the rule editor pre-filled from an observed connection.
+    MakeRuleFromEvent {
+        exe: String,
+        dst_host: String,
+        dst_ip: String,
+        dst_port: u32,
+        protocol: i32,
+    },
+    CopyText(String),
+    DismissLogEntry(usize),
+    DismissAllLog,
+    Key(KeyPress),
     TogglePaused,
     /// `(paused, resume_at_unix_ms)` as reported by the daemon.
     PausedSet(Result<(bool, i64), String>),
@@ -167,10 +295,29 @@ pub enum Message {
     RuleSaved(Result<String, String>),
 }
 
+/// Raw key press forwarded from the subscription. The decision of what a
+/// key means needs App state (newest prompt, editor open), so it is taken
+/// in `update` rather than in the subscription closure.
+#[derive(Debug, Clone)]
+pub struct KeyPress {
+    pub key: keyboard::Key,
+    pub modifiers: keyboard::Modifiers,
+}
+
 #[derive(Debug, Clone)]
 pub struct HandshakeData {
     pub status: proto::StatusResponse,
     pub rules: Vec<proto::RuleInfo>,
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Reconnect delay after `attempt` consecutive failures: 3s, 4s, then 5s
+/// forever. Bounded so a daemon restart is picked up promptly.
+pub fn backoff_secs(attempt: u32) -> i64 {
+    (3 + i64::from(attempt)).min(5)
 }
 
 impl App {
@@ -183,9 +330,22 @@ impl App {
             live: VecDeque::with_capacity(LIVE_CAP),
             prompts: Vec::new(),
             status: None,
-            last_error: None,
+            log: StatusLog::default(),
             editor: None,
             rules_filter: String::new(),
+            rules_sort: RuleSort::default(),
+            pending_delete: None,
+            live_filter: String::new(),
+            live_verdict: VerdictFilter::All,
+            live_frozen: None,
+            live_new: 0,
+            session: SessionStats::default(),
+            status_failures: 0,
+            status_ticks: 0,
+            retry_attempts: 0,
+            retry_at_ms: None,
+            stream_trouble: false,
+            now_ms: now_ms(),
         };
         let socket = app.socket_path.clone();
         (
@@ -198,6 +358,73 @@ impl App {
         "Colony Firewall Control".to_string()
     }
 
+    fn connected(&self) -> bool {
+        matches!(self.daemon, DaemonState::Connected)
+    }
+
+    fn connect_task(&mut self) -> Task<Message> {
+        self.daemon = DaemonState::Connecting;
+        self.retry_at_ms = None;
+        let socket = self.socket_path.clone();
+        Task::perform(handshake(socket), Message::HandshakeDone)
+    }
+
+    /// Moves to `Failed` and arms the backoff retry. Coalesced into one log
+    /// line so a daemon that stays down does not scroll anything away.
+    fn mark_failed(&mut self, detail: String) {
+        let was_connected = self.connected();
+        self.daemon = DaemonState::Failed(detail);
+        self.status_failures = 0;
+        self.stream_trouble = false;
+        let delay = backoff_secs(self.retry_attempts);
+        self.retry_attempts = self.retry_attempts.saturating_add(1);
+        self.retry_at_ms = Some(self.now_ms + delay * 1000);
+        self.log
+            .warn("daemon unreachable, retrying...", self.now_ms);
+        if was_connected {
+            info!("lost connection to daemon");
+        }
+    }
+
+    /// Per-tick maintenance that does not touch the network: expire log
+    /// entries, expire the armed delete, and retire prompts the daemon has
+    /// already answered on its own.
+    fn housekeeping(&mut self) {
+        self.log.prune(self.now_ms);
+
+        if let Some((_, armed_at)) = &self.pending_delete {
+            if self.now_ms.saturating_sub(*armed_at) > DELETE_CONFIRM_MS {
+                self.pending_delete = None;
+            }
+        }
+
+        let timeout_action = self
+            .status
+            .as_ref()
+            .map(|s| s.timeout_action)
+            .unwrap_or(proto::Action::Unspecified as i32);
+
+        let now = self.now_ms;
+        let mut expired: Vec<String> = Vec::new();
+        self.prompts.retain(|p| {
+            if format::is_expired(p.deadline_unix_ms, now) {
+                expired.push(prompt_label(&p.event));
+                false
+            } else {
+                true
+            }
+        });
+        for label in expired {
+            self.log.warn(
+                format!(
+                    "{label}: prompt expired -> {} by default",
+                    format::fallback_past(timeout_action)
+                ),
+                now,
+            );
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::TabSelected(t) => {
@@ -205,22 +432,23 @@ impl App {
                 Task::none()
             }
             Message::Reconnect => {
-                self.daemon = DaemonState::Connecting;
-                self.last_error = None;
-                let socket = self.socket_path.clone();
-                Task::perform(handshake(socket), Message::HandshakeDone)
+                self.retry_attempts = 0;
+                self.connect_task()
             }
             Message::HandshakeDone(Ok(data)) => {
                 self.daemon = DaemonState::Connected;
                 self.status = Some(data.status);
                 self.rules = data.rules;
-                self.last_error = None;
+                self.status_failures = 0;
+                self.retry_attempts = 0;
+                self.retry_at_ms = None;
+                self.stream_trouble = false;
+                self.log.prune(self.now_ms);
                 info!("connected to daemon");
                 Task::none()
             }
             Message::HandshakeDone(Err(e)) => {
-                self.daemon = DaemonState::Failed(e.clone());
-                self.last_error = Some(e);
+                self.mark_failed(e);
                 Task::none()
             }
             Message::RulesLoaded(Ok(rules)) => {
@@ -228,53 +456,136 @@ impl App {
                 Task::none()
             }
             Message::RulesLoaded(Err(e)) => {
-                self.last_error = Some(e);
+                self.log
+                    .warn(format!("listing rules failed: {e}"), self.now_ms);
                 Task::none()
             }
             Message::DeleteRule(id) => {
+                // Two-step: the first click arms, the second (within
+                // DELETE_CONFIRM_MS) actually deletes.
+                let armed = self.pending_delete.as_ref().is_some_and(|(pending, at)| {
+                    *pending == id && self.now_ms.saturating_sub(*at) <= DELETE_CONFIRM_MS
+                });
+                if !armed {
+                    self.pending_delete = Some((id, self.now_ms));
+                    return Task::none();
+                }
+                self.pending_delete = None;
                 let socket = self.socket_path.clone();
                 Task::perform(delete_rule(socket, id), Message::RuleDeleted)
             }
             Message::RuleDeleted(Ok((id, true))) => {
                 self.rules.retain(|r| r.id != id);
+                self.log.info("rule deleted", self.now_ms);
                 Task::none()
             }
-            Message::RuleDeleted(Ok((_, false))) => Task::none(),
+            Message::RuleDeleted(Ok((_, false))) => {
+                self.log
+                    .warn("rule was already gone on the daemon", self.now_ms);
+                Task::none()
+            }
             Message::RuleDeleted(Err(e)) => {
-                self.last_error = Some(e);
+                self.log.error(format!("delete failed: {e}"), self.now_ms);
                 Task::none()
             }
             Message::StatusLoaded(Ok(s)) => {
                 self.status = Some(s);
+                self.status_failures = 0;
+                self.stream_trouble = false;
                 Task::none()
             }
-            Message::StatusLoaded(Err(_)) => Task::none(),
+            Message::StatusLoaded(Err(e)) => {
+                // A single miss is a hiccup; two in a row means the daemon
+                // is gone and the "connected" badge would be a lie.
+                self.status_failures = self.status_failures.saturating_add(1);
+                if self.status_failures >= STATUS_FAILURES_BEFORE_DEAD {
+                    self.mark_failed(e);
+                }
+                Task::none()
+            }
             Message::StatusTick => {
-                if matches!(self.daemon, DaemonState::Connected) {
-                    let socket = self.socket_path.clone();
-                    Task::perform(fetch_status(socket), Message::StatusLoaded)
-                } else {
-                    Task::none()
+                self.now_ms = now_ms();
+                self.housekeeping();
+                if !self.connected() {
+                    return Task::none();
+                }
+                self.status_ticks = self.status_ticks.wrapping_add(1);
+                let mut tasks = vec![Task::perform(
+                    fetch_status(self.socket_path.clone()),
+                    Message::StatusLoaded,
+                )];
+                if self.status_ticks.is_multiple_of(RULES_REFRESH_EVERY_TICKS) {
+                    tasks.push(Task::perform(
+                        fetch_rules(self.socket_path.clone()),
+                        Message::RulesLoaded,
+                    ));
+                }
+                Task::batch(tasks)
+            }
+            Message::DeadlineTick => {
+                self.now_ms = now_ms();
+                self.housekeeping();
+                Task::none()
+            }
+            Message::RetryTick => {
+                self.now_ms = now_ms();
+                self.housekeeping();
+                match self.retry_at_ms {
+                    Some(at) if self.now_ms >= at => self.connect_task(),
+                    _ => Task::none(),
                 }
             }
             Message::LiveEvent(ev) => {
+                self.stream_trouble = false;
+                self.session.record(&ev);
                 self.live.push_front(LiveEntry { event: ev });
                 while self.live.len() > LIVE_CAP {
                     self.live.pop_back();
                 }
+                if self.live_frozen.is_some() {
+                    self.live_new = self.live_new.saturating_add(1);
+                }
                 Task::none()
             }
             Message::LiveStreamEnded(e) => {
-                self.last_error = Some(format!("live stream ended: {e}"));
+                // streams.rs reconnects on its own every couple of seconds;
+                // surface it once as connection state, not as footer spam.
+                self.stream_trouble = true;
+                info!("live stream interrupted: {e}");
                 Task::none()
             }
             Message::PromptEvent(ev) => {
                 notify_prompt(&ev);
-                self.prompts.push(PromptCard { event: ev });
+                self.stream_trouble = false;
+                self.prompts.push(PromptCard::new(ev));
                 Task::none()
             }
             Message::PromptStreamEnded(e) => {
-                self.last_error = Some(format!("prompt stream ended: {e}"));
+                self.stream_trouble = true;
+                info!("prompt stream interrupted: {e}");
+                Task::none()
+            }
+            Message::PromptDuration {
+                prompt_id,
+                duration,
+            } => {
+                if let Some(card) = self
+                    .prompts
+                    .iter_mut()
+                    .find(|p| p.event.prompt_id == prompt_id)
+                {
+                    card.duration = duration;
+                }
+                Task::none()
+            }
+            Message::TogglePromptDetails(prompt_id) => {
+                if let Some(card) = self
+                    .prompts
+                    .iter_mut()
+                    .find(|p| p.event.prompt_id == prompt_id)
+                {
+                    card.details_open = !card.details_open;
+                }
                 Task::none()
             }
             Message::SubmitVerdict {
@@ -290,9 +601,24 @@ impl App {
                     Message::VerdictSubmitted,
                 )
             }
-            Message::VerdictSubmitted(Ok(_)) => Task::none(),
+            Message::VerdictSubmitted(Ok((_, true))) => {
+                // A verdict may have persisted a rule; refresh so the Rules
+                // tab shows it now rather than after some unrelated action.
+                let socket = self.socket_path.clone();
+                Task::perform(fetch_rules(socket), Message::RulesLoaded)
+            }
+            Message::VerdictSubmitted(Ok((_, false))) => {
+                // The daemon had already answered this prompt itself. The
+                // old code swallowed this, so the user believed they had
+                // allowed something the timeout had actually decided.
+                self.log.error(
+                    "prompt already expired - the daemon answered it",
+                    self.now_ms,
+                );
+                Task::none()
+            }
             Message::VerdictSubmitted(Err(e)) => {
-                self.last_error = Some(e);
+                self.log.error(format!("verdict failed: {e}"), self.now_ms);
                 Task::none()
             }
             Message::OpenEditor => {
@@ -322,6 +648,51 @@ impl App {
                 self.rules_filter = s;
                 Task::none()
             }
+            Message::RulesSortBy(sort) => {
+                self.rules_sort = sort;
+                Task::none()
+            }
+            Message::LiveFilterChanged(s) => {
+                self.live_filter = s;
+                Task::none()
+            }
+            Message::LiveVerdictFilter(v) => {
+                self.live_verdict = v;
+                Task::none()
+            }
+            Message::ToggleLivePause => {
+                if self.live_frozen.is_some() {
+                    self.live_frozen = None;
+                    self.live_new = 0;
+                } else {
+                    self.live_frozen = Some(self.live.iter().cloned().collect());
+                    self.live_new = 0;
+                }
+                Task::none()
+            }
+            Message::MakeRuleFromEvent {
+                exe,
+                dst_host,
+                dst_ip,
+                dst_port,
+                protocol,
+            } => {
+                self.editor = Some(RuleEditor::from_observed(
+                    &exe, &dst_host, &dst_ip, dst_port, protocol,
+                ));
+                self.tab = Tab::Rules;
+                Task::none()
+            }
+            Message::CopyText(s) => iced::clipboard::write(s),
+            Message::DismissLogEntry(i) => {
+                self.log.dismiss(i);
+                Task::none()
+            }
+            Message::DismissAllLog => {
+                self.log.clear();
+                Task::none()
+            }
+            Message::Key(kp) => self.handle_key(kp),
             Message::TogglePaused => {
                 let current = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
                 let socket = self.socket_path.clone();
@@ -332,10 +703,21 @@ impl App {
                     s.paused = paused;
                     s.resume_at_unix_ms = resume_at_unix_ms;
                 }
+                if paused {
+                    self.log.warn(
+                        format!(
+                            "enforcement paused - {}",
+                            format::format_resume_in(resume_at_unix_ms, self.now_ms)
+                        ),
+                        self.now_ms,
+                    );
+                } else {
+                    self.log.info("enforcement resumed", self.now_ms);
+                }
                 Task::none()
             }
             Message::PausedSet(Err(e)) => {
-                self.last_error = Some(e);
+                self.log.error(format!("pause failed: {e}"), self.now_ms);
                 Task::none()
             }
             Message::EditorName(s) => {
@@ -411,10 +793,74 @@ impl App {
                 if let Some(ed) = &mut self.editor {
                     ed.validation = Some(e.clone());
                 }
-                self.last_error = Some(e);
-                Task::none()
+                self.log
+                    .error(format!("saving rule failed: {e}"), self.now_ms);
+                // The optimistic enable/disable toggle may now disagree
+                // with the daemon; re-read the truth.
+                let socket = self.socket_path.clone();
+                Task::perform(fetch_rules(socket), Message::RulesLoaded)
             }
         }
+    }
+
+    /// Keyboard shortcuts. The subscription only delivers key presses no
+    /// widget consumed, so a focused text input still swallows its own
+    /// typing.
+    fn handle_key(&mut self, kp: KeyPress) -> Task<Message> {
+        use keyboard::key::Named;
+
+        // While the editor is open only Esc/Enter apply - everything else
+        // would fire under the user's fingers mid-form.
+        if self.editor.is_some() {
+            return match kp.key {
+                keyboard::Key::Named(Named::Escape) => self.update(Message::CloseEditor),
+                keyboard::Key::Named(Named::Enter) => self.update(Message::SaveRule),
+                _ => Task::none(),
+            };
+        }
+
+        match kp.key {
+            keyboard::Key::Named(Named::Escape) => {
+                // Nothing to close: clear whatever is nagging in the footer.
+                self.pending_delete = None;
+                self.log.clear();
+                Task::none()
+            }
+            keyboard::Key::Character(ref c) => {
+                let shift = kp.modifiers.shift();
+                match c.to_lowercase().as_str() {
+                    "a" => self.answer_newest(proto::Action::Allow, shift),
+                    "d" => self.answer_newest(proto::Action::Deny, shift),
+                    "1" => self.update(Message::TabSelected(Tab::Prompts)),
+                    "2" => self.update(Message::TabSelected(Tab::Rules)),
+                    "3" => self.update(Message::TabSelected(Tab::Live)),
+                    "4" => self.update(Message::TabSelected(Tab::Stats)),
+                    _ => Task::none(),
+                }
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// Answers the most recent prompt. `persist` uses the scope currently
+    /// selected on that card; with `Once` selected there is nothing to
+    /// persist, so it degrades to a plain one-shot answer.
+    fn answer_newest(&mut self, action: proto::Action, persist: bool) -> Task<Message> {
+        let Some(card) = self.prompts.last() else {
+            return Task::none();
+        };
+        let prompt_id = card.event.prompt_id.clone();
+        let (scope, duration) = if persist && card.persistable() {
+            (views::prompts::exe_scope(&card.event), card.duration)
+        } else {
+            (None, proto::Duration::Once)
+        };
+        self.update(Message::SubmitVerdict {
+            prompt_id,
+            action,
+            scope,
+            duration,
+        })
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -423,10 +869,23 @@ impl App {
         let sidebar = self.sidebar();
         let header = self.header_bar(paused);
         let body: Element<'_, Message> = match self.tab {
-            Tab::Prompts => views::prompts::view(&self.prompts),
-            Tab::Rules => views::rules::view(&self.rules, &self.rules_filter, self.editor.as_ref()),
-            Tab::Live => views::live::view(&self.live),
-            Tab::Stats => views::stats::view(self.status.as_ref()),
+            Tab::Prompts => views::prompts::view(&self.prompts, self.status.as_ref(), self.now_ms),
+            Tab::Rules => views::rules::view(views::rules::ListArgs {
+                rules: &self.rules,
+                filter: &self.rules_filter,
+                editor: self.editor.as_ref(),
+                sort: self.rules_sort,
+                pending_delete: self.pending_delete.as_ref(),
+                now_ms: self.now_ms,
+            }),
+            Tab::Live => views::live::view(views::live::ListArgs {
+                live: &self.live,
+                frozen: self.live_frozen.as_deref(),
+                filter: &self.live_filter,
+                verdict: self.live_verdict,
+                new_while_paused: self.live_new,
+            }),
+            Tab::Stats => views::stats::view(self.status.as_ref(), &self.session, self.now_ms),
         };
 
         let body_card = container(body)
@@ -435,23 +894,61 @@ impl App {
             .height(Length::Fill)
             .style(theme::card);
 
-        let footer: Element<'_, Message> = if let Some(err) = &self.last_error {
-            container(text(format!("⚠  {err}")).size(11))
-                .padding([6, 12])
-                .width(Length::Fill)
-                .style(theme::footer_bar)
-                .into()
-        } else {
-            Space::new().into()
-        };
-
         let main_panel = column![
             header,
             container(body_card).padding([10, 12]).height(Length::Fill),
-            footer,
+            self.status_area(),
         ];
 
         row![sidebar, main_panel].into()
+    }
+
+    /// The status ring: newest first, each line individually dismissable.
+    fn status_area(&self) -> Element<'_, Message> {
+        if self.log.is_empty() {
+            return Space::new().into();
+        }
+
+        let mut lines: Vec<Element<'_, Message>> = Vec::with_capacity(self.log.len() + 1);
+        for (i, entry) in self.log.iter().enumerate() {
+            lines.push(
+                row![
+                    text(format!(
+                        "{} {} {}",
+                        entry.severity.glyph(),
+                        format::format_clock_ms(entry.at_ms),
+                        entry.display()
+                    ))
+                    .size(11),
+                    Space::new().width(Length::Fill),
+                    button(text("×").size(11))
+                        .padding([0, 6])
+                        .on_press(Message::DismissLogEntry(i))
+                        .style(theme::subtle_icon),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into(),
+            );
+        }
+        if self.log.len() > 1 {
+            lines.push(
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("dismiss all").size(10))
+                        .padding([0, 6])
+                        .on_press(Message::DismissAllLog)
+                        .style(theme::subtle_icon),
+                ]
+                .into(),
+            );
+        }
+
+        container(column(lines).spacing(2))
+            .padding([6, 12])
+            .width(Length::Fill)
+            .style(theme::footer_bar)
+            .into()
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
@@ -467,12 +964,21 @@ impl App {
         ]
         .spacing(0);
 
+        let hints = column![
+            text("1-4  switch tab").size(9),
+            text("A / D  answer newest").size(9),
+            text("Shift+A / D  + persist").size(9),
+        ]
+        .spacing(1)
+        .padding([6, 16]);
+
         let inner = column![
             title_block,
             divider(),
             nav,
             Space::new().height(Length::Fill),
-            container(text(format!("v{}", env!("CARGO_PKG_VERSION"))).size(10)).padding([10, 16]),
+            hints,
+            container(text(format!("v{}", env!("CARGO_PKG_VERSION"))).size(10)).padding([6, 16]),
         ]
         .height(Length::Fill);
 
@@ -490,6 +996,8 @@ impl App {
                 DaemonState::Connected => {
                     if paused {
                         ("● paused", theme::badge_warn)
+                    } else if self.stream_trouble {
+                        ("● reconnecting", theme::badge_warn)
                     } else {
                         ("● connected", theme::badge_ok)
                     }
@@ -501,7 +1009,19 @@ impl App {
             .padding([3, 10])
             .style(badge_style);
 
-        let pause_btn: Element<'_, Message> = if matches!(self.daemon, DaemonState::Connected) {
+        // Enforcement can be off while the socket is perfectly healthy;
+        // that deserves its own badge, not a green "connected".
+        let enforcing_badge: Element<'_, Message> = match &self.status {
+            Some(s) if self.connected() && !s.enforcing => {
+                container(text("⚠ not enforcing").size(11))
+                    .padding([3, 10])
+                    .style(theme::badge_err)
+                    .into()
+            }
+            _ => Space::new().into(),
+        };
+
+        let pause_btn: Element<'_, Message> = if self.connected() {
             if paused {
                 button(text("Resume").size(12))
                     .padding([4, 14])
@@ -520,11 +1040,20 @@ impl App {
         };
 
         let reconnect: Element<'_, Message> = match &self.daemon {
-            DaemonState::Failed(_) => button(text("Reconnect").size(12))
-                .padding([4, 14])
-                .on_press(Message::Reconnect)
-                .style(iced::widget::button::primary)
-                .into(),
+            DaemonState::Failed(_) => {
+                let label = match self
+                    .retry_at_ms
+                    .and_then(|at| format::remaining_secs(at, self.now_ms).filter(|s| *s > 0))
+                {
+                    Some(s) => format!("Reconnect ({s}s)"),
+                    None => "Reconnect".to_string(),
+                };
+                button(text(label).size(12))
+                    .padding([4, 14])
+                    .on_press(Message::Reconnect)
+                    .style(iced::widget::button::primary)
+                    .into()
+            }
             _ => Space::new().into(),
         };
 
@@ -538,6 +1067,7 @@ impl App {
         let inner = row![
             text(title_text).size(18),
             Space::new().width(Length::Fill),
+            enforcing_badge,
             badge,
             pause_btn,
             reconnect,
@@ -557,16 +1087,52 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let mut subs = Vec::new();
+        let mut subs = vec![keyboard::listen().filter_map(|event| match event {
+            keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                Some(Message::Key(KeyPress { key, modifiers }))
+            }
+            _ => None,
+        })];
 
-        if matches!(self.daemon, DaemonState::Connected) {
+        if self.connected() {
             subs.push(iced::time::every(Duration::from_secs(2)).map(|_| Message::StatusTick));
+            // Countdown cadence, only while there is something to count down.
+            if !self.prompts.is_empty() {
+                subs.push(
+                    iced::time::every(Duration::from_millis(DEADLINE_TICK_MS))
+                        .map(|_| Message::DeadlineTick),
+                );
+            }
             subs.push(streams::live_subscription(self.socket_path.clone()));
             subs.push(streams::prompts_subscription(self.socket_path.clone()));
+        } else {
+            // Drives the backoff retry from both Connecting and Failed.
+            subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::RetryTick));
         }
 
         Subscription::batch(subs)
     }
+}
+
+/// Short "curl -> example.com:443" used in log lines about a prompt.
+fn prompt_label(ev: &proto::PromptEvent) -> String {
+    let proc = ev
+        .process
+        .as_ref()
+        .map(cfc_client::convert::process_display)
+        .unwrap_or_else(|| "unknown".into());
+    let dest = ev
+        .connection
+        .as_ref()
+        .map(|c| {
+            format!(
+                "{}:{}",
+                format::dest_key(&c.dst_host, &c.dst_ip),
+                c.dst_port
+            )
+        })
+        .unwrap_or_else(|| "?".into());
+    format!("{proc} -> {dest}")
 }
 
 fn nav_item<'a>(label: &'a str, this: Tab, current: Tab, badge: usize) -> Element<'a, Message> {
@@ -672,6 +1238,15 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
             .map_err(|e| format!("dst-net invalid: {e}"))?;
     }
 
+    // The daemon rejects a persisted Once rule outright; catch it here so
+    // the user gets a sentence instead of a gRPC status.
+    if matches!(
+        ed.duration,
+        proto::Duration::Once | proto::Duration::Unspecified
+    ) {
+        return Err("a saved rule needs \"Until restart\" or \"Always\"".into());
+    }
+
     // Need at least one scope predicate, else the rule would match everything.
     let scope_empty = ed.exe.trim().is_empty()
         && ed.dst_host.trim().is_empty()
@@ -730,8 +1305,14 @@ fn notify_prompt(ev: &proto::PromptEvent) {
         Some(p) => (cfc_client::convert::process_display(p), p.pid),
         None => ("unknown".to_string(), 0),
     };
+    // Name the host when the daemon resolved one - "93.184.216.34:443" is
+    // not something anyone can make a decision about.
     let target = match ev.connection.as_ref() {
-        Some(c) => format!("{}:{}", c.dst_ip, c.dst_port),
+        Some(c) => format!(
+            "{}:{}",
+            format::dest_key(&c.dst_host, &c.dst_ip),
+            c.dst_port
+        ),
         None => "?".to_string(),
     };
     let body = format!("{process_name} (pid {pid}) -> {target}");
@@ -741,4 +1322,81 @@ fn notify_prompt(ev: &proto::PromptEvent) {
         .icon("network-firewall")
         .timeout(notify_rust::Timeout::Milliseconds(8000))
         .show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_bounded_between_three_and_five_seconds() {
+        assert_eq!(backoff_secs(0), 3);
+        assert_eq!(backoff_secs(1), 4);
+        assert_eq!(backoff_secs(2), 5);
+        assert_eq!(backoff_secs(50), 5);
+        assert_eq!(backoff_secs(u32::MAX), 5);
+    }
+
+    fn editor_with_scope() -> RuleEditor {
+        RuleEditor {
+            exe: "/usr/bin/curl".into(),
+            ..RuleEditor::default()
+        }
+    }
+
+    #[test]
+    fn editor_rejects_a_persisted_once_rule() {
+        let mut ed = editor_with_scope();
+        ed.duration = proto::Duration::Once;
+        let err = build_rule_from_editor(&ed).unwrap_err();
+        assert!(err.contains("Until restart"), "{err}");
+    }
+
+    #[test]
+    fn editor_requires_at_least_one_predicate() {
+        let ed = RuleEditor::default();
+        assert!(build_rule_from_editor(&ed).is_err());
+    }
+
+    #[test]
+    fn editor_builds_a_persistable_rule() {
+        let rule = build_rule_from_editor(&editor_with_scope()).unwrap();
+        assert_eq!(rule.duration, proto::Duration::Always as i32);
+        assert_eq!(rule.scope.unwrap().exe_path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn observed_seed_prefers_host_over_cidr() {
+        let ed = RuleEditor::from_observed("/bin/x", "example.com", "1.2.3.4", 443, 1);
+        assert_eq!(ed.dst_host, "example.com");
+        assert!(ed.dst_net.is_empty(), "host rules should not pin the IP");
+        assert_eq!(ed.dst_port, "443");
+
+        let ed = RuleEditor::from_observed("/bin/x", "", "2001:db8::1", 0, 0);
+        assert_eq!(ed.dst_net, "2001:db8::1/128");
+        assert!(ed.dst_port.is_empty());
+        assert!(ed.protocol.is_none());
+    }
+
+    #[test]
+    fn once_prompts_are_never_persistable() {
+        let mut card = PromptCard::new(proto::PromptEvent::default());
+        assert!(!card.persistable());
+        card.duration = proto::Duration::Unspecified;
+        assert!(!card.persistable());
+        card.duration = proto::Duration::UntilRestart;
+        assert!(card.persistable());
+        card.duration = proto::Duration::Always;
+        assert!(card.persistable());
+    }
+
+    #[test]
+    fn prompt_card_captures_the_daemon_deadline() {
+        let ev = proto::PromptEvent {
+            prompt_id: "7".into(),
+            deadline_unix_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        assert_eq!(PromptCard::new(ev).deadline_unix_ms, 1_700_000_000_000);
+    }
 }

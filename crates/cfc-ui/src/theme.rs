@@ -3,7 +3,7 @@
 //! Parchment background + burgundy accents, matching the Colony app
 //! aesthetic (DNS-345 Colony Edition, Grape, SAM).
 
-use iced::widget::{button, container};
+use iced::widget::{button, container, progress_bar};
 use iced::{theme::Palette, Background, Border, Color, Shadow, Theme, Vector};
 
 pub const PARCHMENT_BG: Color = Color::from_rgb(
@@ -26,7 +26,6 @@ pub const PARCHMENT_TEXT: Color = Color::from_rgb(
     0x1d as f32 / 255.0,
     0x0e as f32 / 255.0,
 );
-#[allow(dead_code)]
 pub const PARCHMENT_MUTED: Color = Color::from_rgb(
     0x6e as f32 / 255.0,
     0x5a as f32 / 255.0,
@@ -187,7 +186,140 @@ pub fn badge_err(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Sub-panel inside the body card (top-N tables, prompt cards).
+pub fn panel(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(PARCHMENT_DARK)),
+        border: Border {
+            color: HAIRLINE,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: Some(PARCHMENT_TEXT),
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// Full-width warning strip - "the daemon is running but not enforcing".
+pub fn banner_warn(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(
+            0xb8 as f32 / 255.0,
+            0x73 as f32 / 255.0,
+            0x33 as f32 / 255.0,
+            0.18,
+        ))),
+        border: Border {
+            color: AMBER,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: Some(PARCHMENT_TEXT),
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// Full-width danger strip - enforcement is silently not happening.
+pub fn banner_err(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(
+            0x80 as f32 / 255.0,
+            0x1f as f32 / 255.0,
+            0x2c as f32 / 255.0,
+            0.14,
+        ))),
+        border: Border {
+            color: BURGUNDY,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: Some(BURGUNDY_DARK),
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// Live-feed row tint for a blocked flow, so denies read at a glance.
+pub fn row_denied(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(
+            0x80 as f32 / 255.0,
+            0x1f as f32 / 255.0,
+            0x2c as f32 / 255.0,
+            0.07,
+        ))),
+        border: Border::default(),
+        text_color: Some(PARCHMENT_TEXT),
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// Prompt countdown - burgundy bar draining over parchment.
+pub fn countdown_bar(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(PARCHMENT_DARKER),
+        bar: Background::Color(BURGUNDY),
+        border: Border {
+            color: HAIRLINE,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+    }
+}
+
+/// Same bar, amber, for the last few seconds before the daemon decides.
+pub fn countdown_bar_urgent(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(PARCHMENT_DARKER),
+        bar: Background::Color(AMBER),
+        border: Border {
+            color: AMBER,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+    }
+}
+
 // --- Button styles -----------------------------------------------------------
+
+/// Clickable column header. Reads as a label until hovered.
+pub fn column_header(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(Background::Color(PARCHMENT_DARKER)),
+            _ => None,
+        },
+        text_color: PARCHMENT_TEXT,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 3.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// Borderless icon button (copy affordance, log dismiss).
+pub fn subtle_icon(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(Background::Color(PARCHMENT_DARKER)),
+            _ => None,
+        },
+        text_color: PARCHMENT_MUTED,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 3.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
 
 /// Sidebar nav item, inactive. Hover lightens. No border, no bg by default.
 pub fn nav_item_inactive(_theme: &Theme, status: button::Status) -> button::Style {

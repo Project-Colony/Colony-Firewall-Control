@@ -1,0 +1,1314 @@
+//! `cfc rules ...`: CRUD, import/export and id resolution.
+
+use crate::error::{CliError, CliResult};
+use crate::output::{self, OutputFormat};
+use anyhow::Context;
+use cfc_client::{convert, proto, Client};
+use std::path::PathBuf;
+
+// ---------------------------------------------------------------------------
+// Id / name resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResolveError {
+    NotFound,
+    /// More than one rule matched. Carries `(id, name)` for every
+    /// candidate so the caller can print something actionable.
+    Ambiguous(Vec<(String, String)>),
+}
+
+/// Finds the rule a user meant by `needle`.
+///
+/// Accepted, in order of decreasing specificity: the full id, an exact
+/// name, a unique id prefix, a unique case-insensitive name. Typing 36
+/// characters of UUID to toggle a rule is not ergonomics.
+pub fn resolve_rule<'a>(
+    rules: &'a [proto::RuleInfo],
+    needle: &str,
+) -> Result<&'a proto::RuleInfo, ResolveError> {
+    if needle.is_empty() {
+        return Err(ResolveError::NotFound);
+    }
+
+    if let Some(r) = rules.iter().find(|r| r.id == needle) {
+        return Ok(r);
+    }
+
+    let exact_name: Vec<&proto::RuleInfo> = rules.iter().filter(|r| r.name == needle).collect();
+    if let Some(one) = single(&exact_name) {
+        return Ok(one);
+    }
+    if exact_name.len() > 1 {
+        return Err(ambiguous(&exact_name));
+    }
+
+    let prefix: Vec<&proto::RuleInfo> = rules.iter().filter(|r| r.id.starts_with(needle)).collect();
+    if let Some(one) = single(&prefix) {
+        return Ok(one);
+    }
+    if prefix.len() > 1 {
+        return Err(ambiguous(&prefix));
+    }
+
+    let lower = needle.to_lowercase();
+    let by_name: Vec<&proto::RuleInfo> = rules
+        .iter()
+        .filter(|r| r.name.to_lowercase() == lower)
+        .collect();
+    if let Some(one) = single(&by_name) {
+        return Ok(one);
+    }
+    if by_name.len() > 1 {
+        return Err(ambiguous(&by_name));
+    }
+
+    Err(ResolveError::NotFound)
+}
+
+fn single<'a>(matches: &[&'a proto::RuleInfo]) -> Option<&'a proto::RuleInfo> {
+    match matches {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+fn ambiguous(matches: &[&proto::RuleInfo]) -> ResolveError {
+    ResolveError::Ambiguous(
+        matches
+            .iter()
+            .map(|r| (r.id.clone(), r.name.clone()))
+            .collect(),
+    )
+}
+
+/// Resolution against the live daemon, with the CLI's exit-code mapping:
+/// nothing matched is exit 3, an ambiguous match is a runtime error.
+async fn resolve_via_daemon(
+    client: &mut Client,
+    needle: &str,
+) -> Result<proto::RuleInfo, CliError> {
+    let rules = client.list_rules().await?;
+    match resolve_rule(&rules, needle) {
+        Ok(r) => Ok(r.clone()),
+        Err(ResolveError::NotFound) => Err(CliError::not_found(format!(
+            "no rule matching {needle:?} (try an id, an id prefix, or a rule name)"
+        ))),
+        Err(ResolveError::Ambiguous(candidates)) => {
+            let list = candidates
+                .iter()
+                .map(|(id, name)| format!("\n  {id}  {name}"))
+                .collect::<String>();
+            Err(CliError::runtime(format!(
+                "{needle:?} matches {} rules:{list}",
+                candidates.len()
+            )))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+pub async fn list(client: &mut Client, format: OutputFormat) -> CliResult {
+    let rules = client.list_rules().await?;
+    if format.is_json() {
+        return output::print_json(&proto_rules_to_export(&rules));
+    }
+    if rules.is_empty() {
+        println!("(no rules)");
+        return Ok(());
+    }
+
+    let name_w = rules
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 32);
+    println!(
+        "{:<8}  {:<3}  {:<13}  {:>5}  {:<name_w$}  rule",
+        "id", "on", "duration", "hits", "name"
+    );
+    for r in &rules {
+        println!(
+            "{:<8}  {:<3}  {:<13}  {:>5}  {:<name_w$}  {}",
+            short_id(&r.id),
+            if r.enabled { "yes" } else { "no" },
+            convert::duration_label(r.duration),
+            r.hit_count,
+            output::truncate(&r.name, name_w),
+            convert::rule_summary(r)
+        );
+    }
+    Ok(())
+}
+
+pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> CliResult {
+    let rule = resolve_via_daemon(client, needle).await?;
+    if format.is_json() {
+        return output::print_json(&RuleDetail::from_proto(&rule));
+    }
+    let scope = rule.scope.clone().unwrap_or_default();
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    println!("id           {}", rule.id);
+    println!("name         {}", rule.name);
+    println!("enabled      {}", if rule.enabled { "yes" } else { "no" });
+    println!("action       {}", convert::action_label(rule.action));
+    println!("duration     {}", convert::duration_label(rule.duration));
+    println!(
+        "created      {}",
+        if rule.created_at_unix_ms > 0 {
+            output::local_datetime(rule.created_at_unix_ms)
+        } else {
+            "-".into()
+        }
+    );
+    println!("hits         {}", rule.hit_count);
+    println!("summary      {}", convert::rule_summary(&rule));
+    println!("scope:");
+    println!("  exe        {}", dash(&scope.exe_path));
+    println!("  sha256     {}", dash(&scope.exe_sha256));
+    println!("  parent-exe {}", dash(&scope.parent_exe));
+    println!(
+        "  uid        {}",
+        if scope.has_uid {
+            scope.uid.to_string()
+        } else {
+            "-".into()
+        }
+    );
+    println!("  dst-host   {}", dash(&scope.dst_host));
+    println!("  dst-net    {}", dash(&scope.dst_net));
+    println!(
+        "  dst-port   {}",
+        if scope.has_dst_port {
+            scope.dst_port.to_string()
+        } else {
+            "-".into()
+        }
+    );
+    println!(
+        "  protocol   {}",
+        if scope.has_protocol {
+            convert::protocol_label(scope.protocol).to_string()
+        } else {
+            "-".into()
+        }
+    );
+    Ok(())
+}
+
+pub async fn remove(client: &mut Client, needle: &str, format: OutputFormat) -> CliResult {
+    let rule = resolve_via_daemon(client, needle).await?;
+    let deleted = client.delete_rule(&rule.id).await?;
+    if !deleted {
+        // The rule was listed a moment ago, so this is a race with another
+        // client rather than a typo - still "not found" for the caller.
+        return Err(CliError::not_found(format!(
+            "rule {} disappeared before it could be deleted",
+            rule.id
+        )));
+    }
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({
+            "deleted": true, "id": rule.id, "name": rule.name,
+        }));
+    }
+    println!("deleted {} ({})", rule.id, rule.name);
+    Ok(())
+}
+
+/// `enable` / `disable` / `toggle` share one path: read, decide the target
+/// state, write only when it differs. Idempotent by construction.
+pub async fn set_enabled(
+    client: &mut Client,
+    needle: &str,
+    target: Option<bool>,
+    format: OutputFormat,
+) -> CliResult {
+    let mut rule = resolve_via_daemon(client, needle).await?;
+    let was = rule.enabled;
+    let want = target.unwrap_or(!was);
+
+    if want != was {
+        rule.enabled = want;
+        client.upsert_rule(rule.clone()).await?;
+    }
+
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({
+            "id": rule.id,
+            "name": rule.name,
+            "was_enabled": was,
+            "enabled": want,
+            "changed": want != was,
+        }));
+    }
+    let label = |b: bool| if b { "enabled" } else { "disabled" };
+    if want == was {
+        println!("{} ({}): already {}", rule.id, rule.name, label(was));
+    } else {
+        println!(
+            "{} ({}): {} -> {}",
+            rule.id,
+            rule.name,
+            label(was),
+            label(want)
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AddArgs {
+    /// Human-readable rule name.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Verdict to apply when the rule matches.
+    #[arg(long, value_enum, default_value_t = ActionArg::Allow)]
+    pub action: ActionArg,
+
+    /// How long to keep the rule.
+    #[arg(long, value_enum, default_value_t = DurationArg::Always)]
+    pub duration: DurationArg,
+
+    /// Match flows from this executable path.
+    #[arg(long)]
+    pub exe: Option<PathBuf>,
+
+    /// Match flows owned by this uid.
+    #[arg(long)]
+    pub uid: Option<u32>,
+
+    /// Match flows whose dst hostname equals this string.
+    #[arg(long = "dst-host")]
+    pub dst_host: Option<String>,
+
+    /// Match flows whose dst IP falls in this CIDR (e.g. 192.0.2.0/24).
+    #[arg(long = "dst-net")]
+    pub dst_net: Option<String>,
+
+    /// Match flows targeting this destination port.
+    #[arg(long = "dst-port")]
+    pub dst_port: Option<u16>,
+
+    /// Match flows of this protocol.
+    #[arg(long, value_enum)]
+    pub protocol: Option<ProtocolArg>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ActionArg {
+    Allow,
+    Deny,
+    Reject,
+}
+
+impl ActionArg {
+    pub fn to_proto(self) -> proto::Action {
+        match self {
+            ActionArg::Allow => proto::Action::Allow,
+            ActionArg::Deny => proto::Action::Deny,
+            ActionArg::Reject => proto::Action::Reject,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum DurationArg {
+    Once,
+    UntilRestart,
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ProtocolArg {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl ProtocolArg {
+    fn to_proto(self) -> proto::Protocol {
+        match self {
+            ProtocolArg::Tcp => proto::Protocol::Tcp,
+            ProtocolArg::Udp => proto::Protocol::Udp,
+            ProtocolArg::Icmp => proto::Protocol::Icmp,
+        }
+    }
+}
+
+pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> CliResult {
+    if let Some(net) = &args.dst_net {
+        net.parse::<ipnet::IpNet>()
+            .with_context(|| format!("--dst-net {net} is not a valid CIDR"))?;
+    }
+
+    let duration = match args.duration {
+        DurationArg::Once => proto::Duration::Once,
+        DurationArg::UntilRestart => proto::Duration::UntilRestart,
+        DurationArg::Always => proto::Duration::Always,
+    };
+
+    let scope = proto::RuleScope {
+        exe_path: args
+            .exe
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        exe_sha256: String::new(),
+        parent_exe: String::new(),
+        uid: args.uid.unwrap_or(0),
+        has_uid: args.uid.is_some(),
+        dst_host: args.dst_host.clone().unwrap_or_default(),
+        dst_net: args.dst_net.clone().unwrap_or_default(),
+        dst_port: args.dst_port.map(u32::from).unwrap_or(0),
+        has_dst_port: args.dst_port.is_some(),
+        protocol: args.protocol.map(|p| p.to_proto() as i32).unwrap_or(0),
+        has_protocol: args.protocol.is_some(),
+    };
+
+    let name = args.name.unwrap_or_else(|| "cli-added".into());
+    let rule = proto::RuleInfo {
+        id: String::new(),
+        name: name.clone(),
+        enabled: true,
+        action: args.action.to_proto() as i32,
+        duration: duration as i32,
+        scope: Some(scope),
+        created_at_unix_ms: 0,
+        hit_count: 0,
+    };
+
+    let id = client.upsert_rule(rule).await?;
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({ "id": id, "name": name }));
+    }
+    println!("added rule {id}");
+    Ok(())
+}
+
+pub async fn export(client: &mut Client, out: Option<PathBuf>) -> CliResult {
+    let rules = client.list_rules().await?;
+    let json =
+        serde_json::to_string_pretty(&proto_rules_to_export(&rules)).context("serialising JSON")?;
+    match out {
+        Some(path) => {
+            std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
+pub async fn import(
+    client: &mut Client,
+    file: Option<PathBuf>,
+    replace: bool,
+    format: OutputFormat,
+) -> CliResult {
+    let json = match file {
+        Some(p) => {
+            std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?
+        }
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading stdin")?;
+            buf
+        }
+    };
+
+    let rules: Vec<ExportedRule> = serde_json::from_str(&json).context("parsing JSON")?;
+
+    if replace {
+        let existing = client.list_rules().await?;
+        for r in existing {
+            let _ = client.delete_rule(&r.id).await;
+        }
+    }
+
+    let mut added = 0u32;
+    for r in rules {
+        let pb = r.into_proto();
+        client.upsert_rule(pb).await?;
+        added += 1;
+    }
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({ "imported": added }));
+    }
+    println!("imported {added} rules");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Export / import format
+// ---------------------------------------------------------------------------
+
+/// Format for `cfc rules export` / `import` and `rules list --json`.
+/// Wire-compatible with the in-process Rule type but stable across daemon
+/// versions.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExportedRule {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub action: String,
+    #[serde(default = "default_duration")]
+    pub duration: String,
+    #[serde(default)]
+    pub scope: ExportedScope,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExportedScope {
+    #[serde(default)]
+    pub exe_path: Option<String>,
+    #[serde(default)]
+    pub exe_sha256: Option<String>,
+    #[serde(default)]
+    pub parent_exe: Option<String>,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub dst_host: Option<String>,
+    #[serde(default)]
+    pub dst_net: Option<String>,
+    #[serde(default)]
+    pub dst_port: Option<u16>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+}
+
+/// `rules show --json`: the export shape plus the read-only bookkeeping
+/// fields, which import must never carry.
+#[derive(Debug, serde::Serialize)]
+pub struct RuleDetail {
+    #[serde(flatten)]
+    pub rule: ExportedRule,
+    pub hit_count: u64,
+    pub created_at_unix_ms: i64,
+    pub created_at: Option<String>,
+    pub summary: String,
+}
+
+impl RuleDetail {
+    pub fn from_proto(r: &proto::RuleInfo) -> Self {
+        Self {
+            rule: exported_rule(r),
+            hit_count: r.hit_count,
+            created_at_unix_ms: r.created_at_unix_ms,
+            created_at: output::rfc3339(r.created_at_unix_ms),
+            summary: convert::rule_summary(r),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_duration() -> String {
+    "always".to_string()
+}
+
+impl ExportedRule {
+    pub fn into_proto(self) -> proto::RuleInfo {
+        let action = match self.action.to_ascii_lowercase().as_str() {
+            "deny" => proto::Action::Deny,
+            "reject" => proto::Action::Reject,
+            _ => proto::Action::Allow,
+        };
+        let duration = match self.duration.to_ascii_lowercase().as_str() {
+            "once" => proto::Duration::Once,
+            "until-restart" | "until_restart" => proto::Duration::UntilRestart,
+            _ => proto::Duration::Always,
+        };
+        let protocol_idx =
+            self.scope
+                .protocol
+                .as_deref()
+                .map(|p| match p.to_ascii_lowercase().as_str() {
+                    "tcp" => proto::Protocol::Tcp as i32,
+                    "udp" => proto::Protocol::Udp as i32,
+                    "icmp" => proto::Protocol::Icmp as i32,
+                    _ => 0,
+                });
+        let scope = proto::RuleScope {
+            exe_path: self.scope.exe_path.unwrap_or_default(),
+            exe_sha256: self.scope.exe_sha256.unwrap_or_default(),
+            parent_exe: self.scope.parent_exe.unwrap_or_default(),
+            uid: self.scope.uid.unwrap_or(0),
+            has_uid: self.scope.uid.is_some(),
+            dst_host: self.scope.dst_host.unwrap_or_default(),
+            dst_net: self.scope.dst_net.unwrap_or_default(),
+            dst_port: self.scope.dst_port.map(u32::from).unwrap_or(0),
+            has_dst_port: self.scope.dst_port.is_some(),
+            protocol: protocol_idx.unwrap_or(0),
+            has_protocol: protocol_idx.is_some(),
+        };
+        proto::RuleInfo {
+            id: self.id,
+            name: self.name,
+            enabled: self.enabled,
+            action: action as i32,
+            duration: duration as i32,
+            scope: Some(scope),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        }
+    }
+}
+
+pub fn exported_rule(r: &proto::RuleInfo) -> ExportedRule {
+    let scope = r.scope.as_ref();
+    let opt_string = |s: &str| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    };
+    ExportedRule {
+        id: r.id.clone(),
+        name: r.name.clone(),
+        enabled: r.enabled,
+        action: convert::action_label(r.action).to_string(),
+        duration: convert::duration_label(r.duration).to_string(),
+        scope: ExportedScope {
+            exe_path: scope.and_then(|s| opt_string(&s.exe_path)),
+            exe_sha256: scope.and_then(|s| opt_string(&s.exe_sha256)),
+            parent_exe: scope.and_then(|s| opt_string(&s.parent_exe)),
+            uid: scope.and_then(|s| s.has_uid.then_some(s.uid)),
+            dst_host: scope.and_then(|s| opt_string(&s.dst_host)),
+            dst_net: scope.and_then(|s| opt_string(&s.dst_net)),
+            dst_port: scope.and_then(|s| s.has_dst_port.then_some(s.dst_port as u16)),
+            protocol: scope
+                .and_then(|s| s.has_protocol.then_some(s.protocol))
+                .map(|p| convert::protocol_label(p).to_string()),
+        },
+    }
+}
+
+pub fn proto_rules_to_export(rules: &[proto::RuleInfo]) -> Vec<ExportedRule> {
+    rules.iter().map(exported_rule).collect()
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+// ---------------------------------------------------------------------------
+// opensnitch import
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct OsnRule {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_allow_str")]
+    action: String,
+    #[serde(default = "default_duration")]
+    duration: String,
+    #[serde(default)]
+    operator: Option<OsnOperator>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[serde(tag = "type")]
+enum OsnOperator {
+    Simple(OsnSimple),
+    Regexp(OsnSimple),
+    List(OsnList),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OsnSimple {
+    operand: String,
+    #[serde(default)]
+    data: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OsnList {
+    #[serde(default)]
+    #[allow(dead_code)]
+    operand: String,
+    #[serde(default)]
+    list: Vec<OsnOperator>,
+}
+
+fn default_allow_str() -> String {
+    "allow".into()
+}
+
+pub async fn import_opensnitch(
+    client: &mut Client,
+    path: PathBuf,
+    replace: bool,
+    format: OutputFormat,
+) -> CliResult {
+    let files: Vec<PathBuf> = if path.is_dir() {
+        std::fs::read_dir(&path)
+            .with_context(|| format!("reading dir {}", path.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect()
+    } else {
+        vec![path.clone()]
+    };
+
+    if files.is_empty() {
+        return Err(CliError::runtime(format!(
+            "no .json files found under {}",
+            path.display()
+        )));
+    }
+
+    if replace {
+        let existing = client.list_rules().await?;
+        for r in existing {
+            let _ = client.delete_rule(&r.id).await;
+        }
+    }
+
+    let mut imported = 0u32;
+    let mut skipped = 0u32;
+    for file in &files {
+        let json =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let osn: OsnRule = match serde_json::from_str(&json) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skip {}: parse error: {e}", file.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        match convert_opensnitch(file, osn) {
+            Ok(rule) => {
+                client.upsert_rule(rule).await?;
+                imported += 1;
+            }
+            Err(e) => {
+                eprintln!("skip {}: {e}", file.display());
+                skipped += 1;
+            }
+        }
+    }
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({
+            "imported": imported, "skipped": skipped,
+        }));
+    }
+    println!("imported {imported} rules ({skipped} skipped)");
+    Ok(())
+}
+
+fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<proto::RuleInfo> {
+    let action = match osn.action.to_ascii_lowercase().as_str() {
+        "deny" | "drop" => proto::Action::Deny,
+        "reject" => proto::Action::Reject,
+        _ => proto::Action::Allow,
+    };
+    let duration = match osn.duration.to_ascii_lowercase().as_str() {
+        "once" => proto::Duration::Once,
+        "until restart" | "until-restart" | "restart" => proto::Duration::UntilRestart,
+        _ => proto::Duration::Always,
+    };
+
+    let mut scope = proto::RuleScope::default();
+    if let Some(op) = osn.operator {
+        apply_operator(&op, &mut scope)?;
+    }
+
+    let scope_empty = scope.exe_path.is_empty()
+        && scope.dst_host.is_empty()
+        && scope.dst_net.is_empty()
+        && !scope.has_dst_port
+        && !scope.has_protocol
+        && !scope.has_uid;
+    if scope_empty {
+        anyhow::bail!("no convertible predicates");
+    }
+
+    let name = osn.name.unwrap_or_else(|| {
+        file.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "opensnitch-import".into())
+    });
+
+    Ok(proto::RuleInfo {
+        id: String::new(),
+        name,
+        enabled: osn.enabled,
+        action: action as i32,
+        duration: duration as i32,
+        scope: Some(scope),
+        created_at_unix_ms: 0,
+        hit_count: 0,
+    })
+}
+
+fn apply_operator(op: &OsnOperator, scope: &mut proto::RuleScope) -> anyhow::Result<()> {
+    match op {
+        OsnOperator::Simple(s) | OsnOperator::Regexp(s) => apply_simple(s, scope),
+        OsnOperator::List(l) => {
+            for sub in &l.list {
+                apply_operator(sub, scope)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<()> {
+    match s.operand.as_str() {
+        "process.path" => scope.exe_path = s.data.clone(),
+        "process.hash.sha256" => scope.exe_sha256 = s.data.clone(),
+        "user.id" => {
+            if let Ok(uid) = s.data.parse::<u32>() {
+                scope.uid = uid;
+                scope.has_uid = true;
+            }
+        }
+        "dest.host" | "dest.domain" => scope.dst_host = s.data.clone(),
+        "dest.ip" => {
+            // single IP -> /32 or /128
+            if s.data.contains(':') {
+                scope.dst_net = format!("{}/128", s.data);
+            } else {
+                scope.dst_net = format!("{}/32", s.data);
+            }
+        }
+        "dest.network" => scope.dst_net = s.data.clone(),
+        "dest.port" => {
+            if let Ok(port) = s.data.parse::<u32>() {
+                scope.dst_port = port;
+                scope.has_dst_port = true;
+            }
+        }
+        "protocol" => {
+            let proto = match s.data.to_ascii_uppercase().as_str() {
+                "TCP" => Some(proto::Protocol::Tcp as i32),
+                "UDP" => Some(proto::Protocol::Udp as i32),
+                "ICMP" => Some(proto::Protocol::Icmp as i32),
+                _ => None,
+            };
+            if let Some(p) = proto {
+                scope.protocol = p;
+                scope.has_protocol = true;
+            }
+        }
+        // Operands we don't yet support: process.command, process.id,
+        // iface.in/out. Silently skip them.
+        _ => {}
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// bootstrap defaults
+// ---------------------------------------------------------------------------
+
+struct DefaultRule {
+    name: &'static str,
+    exe: Option<&'static str>,
+    dst_host: Option<&'static str>,
+    dst_port: Option<u16>,
+    protocol: Option<proto::Protocol>,
+}
+
+fn default_rules() -> Vec<DefaultRule> {
+    vec![
+        // DNS - systemd-resolved owns the stub
+        DefaultRule {
+            name: "default-systemd-resolved-dns",
+            exe: Some("/usr/lib/systemd/systemd-resolved"),
+            dst_host: None,
+            dst_port: Some(53),
+            protocol: None,
+        },
+        // NTP - timesyncd or chrony
+        DefaultRule {
+            name: "default-systemd-timesyncd",
+            exe: Some("/usr/lib/systemd/systemd-timesyncd"),
+            dst_host: None,
+            dst_port: Some(123),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        DefaultRule {
+            name: "default-chrony",
+            exe: Some("/usr/bin/chronyd"),
+            dst_host: None,
+            dst_port: Some(123),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        // Package managers - hit HTTPS mirrors
+        DefaultRule {
+            name: "default-pacman-https",
+            exe: Some("/usr/bin/pacman"),
+            dst_host: None,
+            dst_port: Some(443),
+            protocol: Some(proto::Protocol::Tcp),
+        },
+        DefaultRule {
+            name: "default-paru-https",
+            exe: Some("/usr/bin/paru"),
+            dst_host: None,
+            dst_port: Some(443),
+            protocol: Some(proto::Protocol::Tcp),
+        },
+        // SSH client
+        DefaultRule {
+            name: "default-ssh-client",
+            exe: Some("/usr/bin/ssh"),
+            dst_host: None,
+            dst_port: Some(22),
+            protocol: Some(proto::Protocol::Tcp),
+        },
+    ]
+}
+
+pub async fn bootstrap_defaults(
+    client: &mut Client,
+    dry_run: bool,
+    format: OutputFormat,
+) -> CliResult {
+    let existing = client.list_rules().await?;
+    let existing_names: std::collections::HashSet<String> =
+        existing.iter().map(|r| r.name.clone()).collect();
+
+    let mut added = 0u32;
+    let mut skipped = 0u32;
+    let mut would_add: Vec<&'static str> = Vec::new();
+    for d in default_rules() {
+        if existing_names.contains(d.name) {
+            skipped += 1;
+            continue;
+        }
+        if dry_run {
+            if !format.is_json() {
+                println!("would add: {}", d.name);
+            }
+            would_add.push(d.name);
+            added += 1;
+            continue;
+        }
+
+        let scope = proto::RuleScope {
+            exe_path: d.exe.unwrap_or("").to_string(),
+            exe_sha256: String::new(),
+            parent_exe: String::new(),
+            uid: 0,
+            has_uid: false,
+            dst_host: d.dst_host.unwrap_or("").to_string(),
+            dst_net: String::new(),
+            dst_port: d.dst_port.map(u32::from).unwrap_or(0),
+            has_dst_port: d.dst_port.is_some(),
+            protocol: d.protocol.map(|p| p as i32).unwrap_or(0),
+            has_protocol: d.protocol.is_some(),
+        };
+        let rule = proto::RuleInfo {
+            id: String::new(),
+            name: d.name.to_string(),
+            enabled: true,
+            action: proto::Action::Allow as i32,
+            duration: proto::Duration::Always as i32,
+            scope: Some(scope),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        };
+        client.upsert_rule(rule).await?;
+        if !format.is_json() {
+            println!("added: {}", d.name);
+        }
+        would_add.push(d.name);
+        added += 1;
+    }
+
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({
+            "dry_run": dry_run,
+            "added": added,
+            "already_present": skipped,
+            "rules": would_add,
+        }));
+    }
+    println!(
+        "{}: {added} added, {skipped} already present",
+        if dry_run { "dry-run" } else { "done" }
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn rule(id: &str, name: &str) -> proto::RuleInfo {
+        proto::RuleInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            enabled: true,
+            action: proto::Action::Allow as i32,
+            duration: proto::Duration::Always as i32,
+            scope: Some(proto::RuleScope::default()),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        }
+    }
+
+    fn sample() -> Vec<proto::RuleInfo> {
+        vec![
+            rule("1f0a5c7e-1111-4000-8000-000000000001", "allow-pacman"),
+            rule("1f0a9999-2222-4000-8000-000000000002", "allow-ssh"),
+            rule("abcd0000-3333-4000-8000-000000000003", "Allow-SSH-Alt"),
+        ]
+    }
+
+    #[test]
+    fn full_id_wins() {
+        let rules = sample();
+        let r = resolve_rule(&rules, "1f0a5c7e-1111-4000-8000-000000000001").unwrap();
+        assert_eq!(r.name, "allow-pacman");
+    }
+
+    #[test]
+    fn unique_prefix_resolves() {
+        let rules = sample();
+        assert_eq!(resolve_rule(&rules, "1f0a5").unwrap().name, "allow-pacman");
+        assert_eq!(resolve_rule(&rules, "abcd").unwrap().name, "Allow-SSH-Alt");
+    }
+
+    #[test]
+    fn ambiguous_prefix_lists_candidates() {
+        let rules = sample();
+        match resolve_rule(&rules, "1f0a") {
+            Err(ResolveError::Ambiguous(c)) => {
+                assert_eq!(c.len(), 2);
+                assert!(c.iter().any(|(_, n)| n == "allow-pacman"));
+                assert!(c.iter().any(|(_, n)| n == "allow-ssh"));
+            }
+            other => panic!("expected ambiguity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_name_resolves() {
+        let rules = sample();
+        assert!(resolve_rule(&rules, "allow-pacman")
+            .unwrap()
+            .id
+            .starts_with("1f0a5c7e"));
+    }
+
+    #[test]
+    fn case_insensitive_name_is_a_last_resort() {
+        let rules = sample();
+        // "ALLOW-SSH-ALT" only matches case-insensitively.
+        assert_eq!(
+            resolve_rule(&rules, "ALLOW-SSH-ALT").unwrap().name,
+            "Allow-SSH-Alt"
+        );
+    }
+
+    #[test]
+    fn exact_name_beats_a_case_insensitive_one() {
+        let rules = vec![rule("aaaa1111", "Web"), rule("bbbb2222", "web")];
+        assert_eq!(resolve_rule(&rules, "web").unwrap().id, "bbbb2222");
+    }
+
+    #[test]
+    fn duplicate_names_are_ambiguous() {
+        let rules = vec![rule("aaaa1111", "dup"), rule("bbbb2222", "dup")];
+        assert!(matches!(
+            resolve_rule(&rules, "dup"),
+            Err(ResolveError::Ambiguous(_))
+        ));
+    }
+
+    #[test]
+    fn nothing_matching_is_not_found() {
+        let rules = sample();
+        assert_eq!(resolve_rule(&rules, "zzz"), Err(ResolveError::NotFound));
+        assert_eq!(resolve_rule(&rules, ""), Err(ResolveError::NotFound));
+        assert_eq!(resolve_rule(&[], "anything"), Err(ResolveError::NotFound));
+    }
+
+    #[test]
+    fn short_ids_are_prefix_resolvable() {
+        let rules = sample();
+        let short = short_id(&rules[0].id);
+        assert_eq!(short, "1f0a5c7e");
+        // What `rules list` prints must be enough to act on.
+        assert_eq!(resolve_rule(&rules, &short).unwrap().name, "allow-pacman");
+        assert_eq!(short_id("abc"), "abc");
+    }
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+
+    #[test]
+    fn export_round_trips_through_json() {
+        let scope = proto::RuleScope {
+            exe_path: "/usr/bin/curl".into(),
+            exe_sha256: String::new(),
+            parent_exe: String::new(),
+            uid: 1000,
+            has_uid: true,
+            dst_host: "example.com".into(),
+            dst_net: String::new(),
+            dst_port: 443,
+            has_dst_port: true,
+            protocol: proto::Protocol::Tcp as i32,
+            has_protocol: true,
+        };
+        let original = proto::RuleInfo {
+            id: "id-1".into(),
+            name: "curl-https".into(),
+            enabled: false,
+            action: proto::Action::Deny as i32,
+            duration: proto::Duration::UntilRestart as i32,
+            scope: Some(scope),
+            created_at_unix_ms: 1_700_000_000_000,
+            hit_count: 7,
+        };
+
+        let json = serde_json::to_string(&exported_rule(&original)).unwrap();
+        let back: ExportedRule = serde_json::from_str(&json).unwrap();
+        let pb = back.into_proto();
+
+        assert_eq!(pb.id, "id-1");
+        assert_eq!(pb.name, "curl-https");
+        assert!(!pb.enabled);
+        assert_eq!(pb.action, proto::Action::Deny as i32);
+        assert_eq!(pb.duration, proto::Duration::UntilRestart as i32);
+        let s = pb.scope.unwrap();
+        assert_eq!(s.exe_path, "/usr/bin/curl");
+        assert_eq!(s.uid, 1000);
+        assert!(s.has_uid);
+        assert_eq!(s.dst_host, "example.com");
+        assert_eq!(s.dst_port, 443);
+        assert!(s.has_dst_port);
+        assert_eq!(s.protocol, proto::Protocol::Tcp as i32);
+        // hit_count / created_at are daemon-owned and must not ride along.
+        assert_eq!(pb.hit_count, 0);
+        assert_eq!(pb.created_at_unix_ms, 0);
+    }
+
+    #[test]
+    fn unset_scope_fields_serialise_as_null() {
+        let pb = proto::RuleInfo {
+            id: "id-2".into(),
+            name: "bare".into(),
+            enabled: true,
+            action: proto::Action::Allow as i32,
+            duration: proto::Duration::Always as i32,
+            scope: Some(proto::RuleScope::default()),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        };
+        let v = serde_json::to_value(exported_rule(&pb)).unwrap();
+        assert_eq!(v["scope"]["exe_path"], serde_json::Value::Null);
+        assert_eq!(v["scope"]["uid"], serde_json::Value::Null);
+        assert_eq!(v["scope"]["dst_port"], serde_json::Value::Null);
+        assert_eq!(v["action"], "allow");
+        assert_eq!(v["duration"], "always");
+    }
+
+    #[test]
+    fn rule_detail_carries_bookkeeping_fields_flattened() {
+        let pb = proto::RuleInfo {
+            id: "id-3".into(),
+            name: "detail".into(),
+            enabled: true,
+            action: proto::Action::Reject as i32,
+            duration: proto::Duration::Always as i32,
+            scope: Some(proto::RuleScope::default()),
+            created_at_unix_ms: 1_700_000_000_000,
+            hit_count: 42,
+        };
+        let v = serde_json::to_value(RuleDetail::from_proto(&pb)).unwrap();
+        assert_eq!(v["id"], "id-3");
+        assert_eq!(v["action"], "reject");
+        assert_eq!(v["hit_count"], 42);
+        assert!(v["created_at"].as_str().unwrap().starts_with("2023-"));
+        assert!(v["summary"].as_str().unwrap().contains("reject"));
+    }
+}
+
+#[cfg(test)]
+mod opensnitch_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(json: &str) -> anyhow::Result<proto::RuleInfo> {
+        let osn: OsnRule = serde_json::from_str(json)?;
+        convert_opensnitch(Path::new("test.json"), osn)
+    }
+
+    #[test]
+    fn simple_process_path() {
+        let r = parse(
+            r#"{
+              "name": "firefox-https",
+              "enabled": true,
+              "action": "allow",
+              "duration": "always",
+              "operator": {
+                "type": "simple",
+                "operand": "process.path",
+                "data": "/usr/lib/firefox/firefox"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.name, "firefox-https");
+        assert_eq!(r.action, proto::Action::Allow as i32);
+        let scope = r.scope.unwrap();
+        assert_eq!(scope.exe_path, "/usr/lib/firefox/firefox");
+    }
+
+    #[test]
+    fn list_of_predicates() {
+        let r = parse(
+            r#"{
+              "name": "curl-443",
+              "enabled": true,
+              "action": "allow",
+              "duration": "always",
+              "operator": {
+                "type": "list",
+                "operand": "list",
+                "list": [
+                  {"type": "simple", "operand": "process.path", "data": "/usr/bin/curl"},
+                  {"type": "simple", "operand": "dest.port", "data": "443"},
+                  {"type": "simple", "operand": "protocol", "data": "TCP"}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        let scope = r.scope.unwrap();
+        assert_eq!(scope.exe_path, "/usr/bin/curl");
+        assert_eq!(scope.dst_port, 443);
+        assert!(scope.has_dst_port);
+        assert_eq!(scope.protocol, proto::Protocol::Tcp as i32);
+        assert!(scope.has_protocol);
+    }
+
+    #[test]
+    fn deny_action_recognized() {
+        let r = parse(
+            r#"{
+              "name": "block-evil",
+              "action": "deny",
+              "duration": "once",
+              "operator": {
+                "type": "simple",
+                "operand": "dest.host",
+                "data": "evil.example"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.action, proto::Action::Deny as i32);
+        assert_eq!(r.duration, proto::Duration::Once as i32);
+        assert_eq!(r.scope.unwrap().dst_host, "evil.example");
+    }
+
+    #[test]
+    fn dest_ip_becomes_cidr() {
+        let r = parse(
+            r#"{
+              "name": "block-ip",
+              "action": "deny",
+              "operator": {"type": "simple", "operand": "dest.ip", "data": "1.2.3.4"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.scope.unwrap().dst_net, "1.2.3.4/32");
+    }
+
+    #[test]
+    fn ipv6_dest_ip_becomes_128_cidr() {
+        let r = parse(
+            r#"{
+              "name": "block-v6",
+              "action": "deny",
+              "operator": {"type": "simple", "operand": "dest.ip", "data": "2001:db8::1"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.scope.unwrap().dst_net, "2001:db8::1/128");
+    }
+
+    #[test]
+    fn empty_rule_rejected() {
+        // No operator at all -> no convertible predicates -> error.
+        let err = parse(
+            r#"{
+              "name": "nothing",
+              "action": "allow"
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no convertible predicates"));
+    }
+
+    #[test]
+    fn unknown_operands_silently_skipped() {
+        // process.command isn't supported but the rule has a valid
+        // process.path too - the latter alone is enough.
+        let r = parse(
+            r#"{
+              "name": "mixed",
+              "action": "allow",
+              "operator": {
+                "type": "list",
+                "operand": "list",
+                "list": [
+                  {"type": "simple", "operand": "process.command", "data": "curl -s X"},
+                  {"type": "simple", "operand": "process.path", "data": "/usr/bin/curl"}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(r.scope.unwrap().exe_path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn regexp_type_treated_like_simple() {
+        let r = parse(
+            r#"{
+              "name": "rxp",
+              "action": "allow",
+              "operator": {"type": "regexp", "operand": "process.path", "data": "/usr/bin/.*"}
+            }"#,
+        )
+        .unwrap();
+        // We don't actually evaluate regex but the data lands in exe_path.
+        assert_eq!(r.scope.unwrap().exe_path, "/usr/bin/.*");
+    }
+}

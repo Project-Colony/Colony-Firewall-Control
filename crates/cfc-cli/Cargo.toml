@@ -23,7 +23,15 @@ prost = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
+# Completion + man generation live behind hidden subcommands so packaging
+# can produce them from the freshly built binary (see pkg/PKGBUILD).
+clap_complete = "4.6"
+clap_mangen = "0.3"
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+# Raw-mode single-keypress reads for `cfc prompts`. libc is already in the
+# dependency graph; a TTY crate would be a new one.
+libc = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
