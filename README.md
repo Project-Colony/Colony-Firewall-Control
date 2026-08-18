@@ -188,10 +188,14 @@ sudo cfc rules bootstrap-defaults
 takes effect in a new login session. After logging out and back in, plain
 `cfc` works.)
 
-This installs six allow rules - systemd-resolved DNS (:53),
-systemd-timesyncd and chronyd NTP (:123/udp), pacman and paru HTTPS
-mirrors (:443/tcp), and the SSH client (:22/tcp) - and is idempotent
-(already-present rules are skipped by name; `--dry-run` previews).
+This installs twelve allow rules - systemd-resolved DNS (:53),
+systemd-timesyncd and chronyd NTP (:123/udp), the DHCP clients (dhcpcd,
+NetworkManager and systemd-networkd, :67 and :547/udp), pacman and paru
+HTTPS mirrors (:443/tcp), and the SSH client (:22/tcp) - and is
+idempotent (already-present rules are skipped by name; `--dry-run`
+previews). The DHCP rules matter because filtering starts before the
+network is configured (see below): under a strict profile they are what
+lets the machine get a lease at boot with no UI connected yet.
 
 **3. Give prompts somewhere to go.** On a desktop, launch the GUI:
 
@@ -208,6 +212,17 @@ cfc prompts
 With no subscriber at all the daemon applies `no_ui_action` to every
 unmatched flow without asking anyone - silently allowed under
 `balanced`, silently denied under `strict`.
+
+**Boot behaviour.** Both units are ordered `Before=network-pre.target`,
+the systemd convention for firewalls: every network-configuration
+service (NetworkManager, systemd-networkd, dhcpcd) is
+`After=network-pre.target`, so the daemon and its nftables ruleset are
+in place before any interface is configured. There is no window at boot
+where the network is up but filtering is not - the same guarantee
+Windows' built-in firewall provides with its boot-time filters. During
+that early phase no UI is connected, so unmatched flows resolve via
+`no_ui_action`; the bootstrap DHCP/DNS/NTP rules are what keep a
+`strict` machine bootable.
 
 Then confirm it is really filtering:
 

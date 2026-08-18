@@ -884,6 +884,55 @@ fn default_rules() -> Vec<DefaultRule> {
             dst_port: Some(22),
             protocol: Some(proto::Protocol::Tcp),
         },
+        // DHCP clients. The units are ordered Before=network-pre.target,
+        // so filtering is live before any interface is configured: under a
+        // strict profile these rules are what lets the machine get a lease
+        // at boot, with no UI connected yet to answer prompts. (The very
+        // first DISCOVER goes over an AF_PACKET raw socket that bypasses
+        // netfilter anyway; these cover the routed unicast renewals, v4 on
+        // 67/udp and DHCPv6 on 547/udp.)
+        DefaultRule {
+            name: "default-dhcpcd",
+            exe: Some("/usr/bin/dhcpcd"),
+            dst_host: None,
+            dst_port: Some(67),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        DefaultRule {
+            name: "default-dhcpcd-v6",
+            exe: Some("/usr/bin/dhcpcd"),
+            dst_host: None,
+            dst_port: Some(547),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        DefaultRule {
+            name: "default-networkmanager-dhcp",
+            exe: Some("/usr/bin/NetworkManager"),
+            dst_host: None,
+            dst_port: Some(67),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        DefaultRule {
+            name: "default-networkmanager-dhcp6",
+            exe: Some("/usr/bin/NetworkManager"),
+            dst_host: None,
+            dst_port: Some(547),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        DefaultRule {
+            name: "default-networkd-dhcp",
+            exe: Some("/usr/lib/systemd/systemd-networkd"),
+            dst_host: None,
+            dst_port: Some(67),
+            protocol: Some(proto::Protocol::Udp),
+        },
+        DefaultRule {
+            name: "default-networkd-dhcp6",
+            exe: Some("/usr/lib/systemd/systemd-networkd"),
+            dst_host: None,
+            dst_port: Some(547),
+            protocol: Some(proto::Protocol::Udp),
+        },
     ]
 }
 

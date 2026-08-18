@@ -27,12 +27,19 @@ running" throughout - it subscribes the same way the GUI does.
 | balanced | Allow    | Allow    | 15s    | Daily-driver workstations (default)            |
 | strict   | Deny     | Deny     | 10s    | Lockdown posture, UI always present            |
 
-The danger with `strict` is bootstrap: if the daemon starts before your UI
-session is up, every outbound flow gets denied until you log in. Network
-managers retrying DNS will look like total network failure. **Only flip to
-strict after you have rules for every always-on system service**.
+The danger with `strict` is bootstrap: the units are ordered
+`Before=network-pre.target`, so filtering is live before any interface
+is configured and long before your UI session exists — under `strict`,
+every outbound flow with no matching rule is denied from the first
+instant of boot. That ordering is the point (there is no unfiltered
+window at boot), but it means DHCP, DNS and NTP need standing rules or
+the machine cannot even get a lease. Network managers retrying DNS will
+look like total network failure. **Only flip to strict after you have
+rules for every always-on system service**.
 
-`bootstrap-defaults` is intended to bridge that gap.
+`bootstrap-defaults` is intended to bridge exactly that gap: it seeds
+the DHCP clients (dhcpcd / NetworkManager / systemd-networkd), the
+resolved stub, NTP, package managers and ssh.
 
 ## What to allow first
 

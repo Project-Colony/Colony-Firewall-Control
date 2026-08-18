@@ -173,7 +173,8 @@ enum RulesCmd {
         replace: bool,
     },
     /// Install a small set of sensible starter rules: system DNS, NTP
-    /// (timesyncd/chrony), pacman/paru HTTPS, and the SSH client.
+    /// (timesyncd/chrony), DHCP clients (dhcpcd/NetworkManager/networkd),
+    /// pacman/paru HTTPS, and the SSH client.
     BootstrapDefaults {
         /// List what would be installed without writing anything.
         #[arg(long)]

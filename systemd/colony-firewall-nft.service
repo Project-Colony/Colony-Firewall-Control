@@ -18,7 +18,15 @@
 Description=Colony Firewall nftables NFQUEUE rules
 Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
 PartOf=colony-firewalld.service
-After=colony-firewalld.service network-pre.target
+# Wants (not Requires): enabling this unit pulls the daemon in, but a
+# daemon crash does not remove the table -- fail-closed stays fail-closed
+# while Restart=on-failure brings the daemon back.
+Wants=colony-firewalld.service
+# After the daemon (a fail-closed table with nobody on the queue would
+# drop everything), yet BEFORE network-pre.target like the daemon itself:
+# the ruleset is in the kernel before any interface is configured.
+After=colony-firewalld.service
+Before=network-pre.target
 Wants=network-pre.target
 
 [Service]

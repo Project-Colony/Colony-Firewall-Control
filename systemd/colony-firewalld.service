@@ -1,7 +1,15 @@
 [Unit]
 Description=Colony Firewall Control daemon
 Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
-After=network-pre.target
+# Ordered BEFORE network-pre.target, the systemd convention for firewalls:
+# every network-configuration service (NetworkManager, systemd-networkd,
+# dhcpcd, ...) is After=network-pre.target, so this daemon is up and
+# listening on the queue before any interface gets configured. There is
+# no window at boot where the network exists but filtering does not.
+# (During early boot no UI is connected yet, so unmatched flows resolve
+# via no_ui_action; `cfc rules bootstrap-defaults` covers DHCP, DNS and
+# NTP so a strict profile still boots.)
+Before=network-pre.target
 Wants=network-pre.target
 
 [Service]

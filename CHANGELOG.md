@@ -6,7 +6,23 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- The GUI honors `$CFC_SOCKET`, so it can be pointed at a daemon on a
+  non-default socket (a `--dry-run` instance, a test socket) without a
+  rebuild - the CLI already had `--socket` for this.
+- `bootstrap-defaults` now also seeds the DHCP clients (dhcpcd,
+  NetworkManager, systemd-networkd; v4 renewals on 67/udp and DHCPv6 on
+  547/udp). With enforcement starting before the network is configured,
+  these are what let a `strict` machine get a lease at boot.
+
+### Changed
+- **Filtering now starts before the network does.** Both units are
+  ordered `Before=network-pre.target` (the systemd firewall convention)
+  instead of after it: the daemon is listening on the queue and the
+  nftables table is loaded before NetworkManager, systemd-networkd or
+  dhcpcd configure a single interface. There is no window at boot where
+  the network is up but filtering is not. The nft unit also `Wants=` the
+  daemon, so enabling enforcement alone pulls the daemon in.
 
 ## [0.2.0] - 2026-08-18
 
