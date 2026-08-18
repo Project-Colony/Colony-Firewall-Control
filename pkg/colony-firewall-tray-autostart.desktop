@@ -1,0 +1,31 @@
+# Installed to /etc/xdg/autostart/colony-firewall-tray.desktop so the
+# tray icon (StatusNotifierItem) is present from login: daemon state at a
+# glance, quick pause/resume, and one click to the GUI.
+#
+# GNOME ships no StatusNotifierItem host of its own: install the
+# "AppIndicator and KStatusNotifierItem Support" shell extension or the
+# icon will not appear. KDE Plasma and most other desktops support SNI
+# natively. The tray keeps waiting in the background either way, so it
+# shows up as soon as a host does.
+#
+# GNOME n'inclut aucun hote StatusNotifierItem : installez l'extension
+# shell "AppIndicator and KStatusNotifierItem Support", sinon l'icone ne
+# s'affichera pas. KDE Plasma et la plupart des autres bureaux gerent SNI
+# nativement.
+#
+# Per-user override: copy this file to ~/.config/autostart/ and set
+# Hidden=true (or use your desktop's Startup Applications tool) to
+# disable autostart for one user without touching the system copy.
+#
+# OnlyShowIn is deliberately unset: autostart applies in all desktop
+# environments.
+[Desktop Entry]
+Type=Application
+Name=Colony Firewall Tray
+Comment=System tray icon for the Colony Firewall (pause, prompts, status)
+Comment[fr]=Icone de barre systeme pour le pare-feu Colony (pause, invites, etat)
+Exec=colony-firewall-tray
+Icon=colony-firewall
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

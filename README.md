@@ -34,6 +34,8 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 - **Hot policy reload** on `SIGHUP`, and a systemd `Type=notify` unit
   that reports ready only once it is actually filtering
 - Headless CLI (`cfc`) for status, rule CRUD, live feed, prompts and log
+- System-tray companion (`colony-firewall-tray`): status at a glance,
+  pending-prompt badge and notifications, quick pause/resume
 - JSON export / import for backup and machine-to-machine sync
 - opensnitch JSON import for one-shot migration
 - Named profiles: relaxed / balanced / strict (in `daemon.toml`)
@@ -63,7 +65,7 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 +--------------------------------------------------+
 ```
 
-Five workspace crates:
+Seven workspace crates:
 
 | Crate         | Role                                                     |
 |---------------|----------------------------------------------------------|
@@ -73,6 +75,7 @@ Five workspace crates:
 | `cfc-daemon`  | Privileged daemon                                        |
 | `cfc-ui`      | iced GUI                                                 |
 | `cfc-cli`     | Terminal control tool                                    |
+| `cfc-tray`    | System-tray companion (StatusNotifierItem)               |
 
 More docs:
 
@@ -116,6 +119,7 @@ cargo build --workspace --release
 sudo install -Dm755 target/release/colony-firewalld /usr/bin/colony-firewalld
 sudo install -Dm755 target/release/colony-firewall  /usr/bin/colony-firewall
 sudo install -Dm755 target/release/cfc              /usr/bin/cfc
+sudo install -Dm755 target/release/colony-firewall-tray /usr/bin/colony-firewall-tray
 
 # Both units. colony-firewall-nft.service is what First run step 1
 # enables; without it that step fails with "Unit ... not found".
@@ -143,6 +147,8 @@ sudo install -Dm644 pkg/colony-firewall-autostart.desktop \
      /etc/xdg/autostart/colony-firewall.desktop
 sudo install -Dm644 pkg/colony-firewall.svg \
      /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg
+sudo install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
+     /etc/xdg/autostart/colony-firewall-tray.desktop
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now colony-firewalld

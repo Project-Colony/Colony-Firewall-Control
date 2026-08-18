@@ -12,7 +12,7 @@
   "platforms": {
     "linux-x86_64": {
       "asset": "colony-firewall-control-0.2.0-linux-x86_64.tar.zst",
-      "binaries": ["colony-firewalld", "colony-firewall", "cfc"],
+      "binaries": ["colony-firewalld", "colony-firewall", "colony-firewall-tray", "cfc"],
       "installPath": "/usr/bin",
       "postInstall": [
         "install -d -m 0755 /etc/colony-firewall",
@@ -23,6 +23,7 @@
         "install -D -m 0644 nftables-snippet.conf /usr/share/colony-firewall/nftables-snippet.conf",
         "install -D -m 0644 colony-firewall.desktop /usr/share/applications/colony-firewall.desktop",
         "install -D -m 0644 colony-firewall-autostart.desktop /etc/xdg/autostart/colony-firewall.desktop",
+        "install -D -m 0644 colony-firewall-tray-autostart.desktop /etc/xdg/autostart/colony-firewall-tray.desktop",
         "install -D -m 0644 colony-firewall.svg /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
         "systemd-sysusers",
         "systemctl daemon-reload"
@@ -33,7 +34,7 @@
         "rm -f /usr/lib/systemd/system/colony-firewall-nft.service /usr/lib/systemd/system/colony-firewalld.service",
         "rm -f /usr/lib/sysusers.d/colony-firewall.conf",
         "rm -f /usr/share/colony-firewall/nftables-snippet.conf",
-        "rm -f /usr/share/applications/colony-firewall.desktop /etc/xdg/autostart/colony-firewall.desktop",
+        "rm -f /usr/share/applications/colony-firewall.desktop /etc/xdg/autostart/colony-firewall.desktop /etc/xdg/autostart/colony-firewall-tray.desktop",
         "rm -f /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
         "systemctl daemon-reload"
       ]

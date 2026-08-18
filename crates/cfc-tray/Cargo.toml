@@ -1,0 +1,25 @@
+[package]
+name = "cfc-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Colony Firewall Control - system tray icon (StatusNotifierItem)"
+
+[[bin]]
+name = "colony-firewall-tray"
+path = "src/main.rs"
+
+[dependencies]
+cfc-client = { path = "../cfc-client" }
+cfc-proto = { path = "../cfc-proto" }
+
+tokio = { workspace = true }
+
+ksni = { workspace = true }
+notify-rust = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

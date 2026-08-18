@@ -49,7 +49,7 @@ VirusTotal lookups - plus one end-to-end test that is still manual.
 - [x] Stats counter cards (read from GetStatus, 2s polling)
 - [x] Desktop notifications via notify-rust on new prompts
 - [x] Inline rule editor in Rules tab (name, action, duration, exe, host, net, port, protocol)
-- [ ] System tray icon (ksni) with quick toggle
+- [x] System tray icon (ksni): `colony-firewall-tray` — status, pending-prompt badge, pause/resume, opens the GUI
 
 ## Phase 3 - CLI [done]
 

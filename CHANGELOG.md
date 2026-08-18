@@ -7,6 +7,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `colony-firewall-tray`: a system-tray icon (StatusNotifierItem, so KDE
+  and most bars natively; GNOME needs the AppIndicator extension) in the
+  Windows Firewall Control mold. Shows enforcing / paused / unreachable
+  at a glance, flags waiting prompts (attention icon + a rate-limited
+  desktop notification), offers Pause 5 min / 30 min / 1 h / daemon
+  default and Resume, and opens the GUI on left-click. Autostarts with
+  the session; quitting the tray never touches the daemon.
 - The GUI honors `$CFC_SOCKET`, so it can be pointed at a daemon on a
   non-default socket (a `--dry-run` instance, a test socket) without a
   rebuild - the CLI already had `--socket` for this.

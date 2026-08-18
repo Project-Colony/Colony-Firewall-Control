@@ -68,6 +68,7 @@ jobs:
           install -m755 \
             target/release/colony-firewalld \
             target/release/colony-firewall \
+            target/release/colony-firewall-tray \
             target/release/cfc \
             "${STAGE}/"
 
@@ -86,6 +87,7 @@ jobs:
             systemd/nftables-snippet.conf \
             pkg/colony-firewall.desktop \
             pkg/colony-firewall-autostart.desktop \
+            pkg/colony-firewall-tray-autostart.desktop \
             pkg/colony-firewall.svg \
             "${STAGE}/"
 

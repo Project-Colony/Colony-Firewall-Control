@@ -58,9 +58,10 @@ package() {
     cd "$srcdir/$_srcname"
 
     # Binaries
-    install -Dm755 target/release/colony-firewalld "$pkgdir/usr/bin/colony-firewalld"
-    install -Dm755 target/release/colony-firewall  "$pkgdir/usr/bin/colony-firewall"
-    install -Dm755 target/release/cfc              "$pkgdir/usr/bin/cfc"
+    install -Dm755 target/release/colony-firewalld     "$pkgdir/usr/bin/colony-firewalld"
+    install -Dm755 target/release/colony-firewall      "$pkgdir/usr/bin/colony-firewall"
+    install -Dm755 target/release/colony-firewall-tray "$pkgdir/usr/bin/colony-firewall-tray"
+    install -Dm755 target/release/cfc                  "$pkgdir/usr/bin/cfc"
 
     # systemd units
     install -Dm644 systemd/colony-firewalld.service \
@@ -85,6 +86,8 @@ package() {
         "$pkgdir/usr/share/applications/colony-firewall.desktop"
     install -Dm644 pkg/colony-firewall-autostart.desktop \
         "$pkgdir/etc/xdg/autostart/colony-firewall.desktop"
+    install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
+        "$pkgdir/etc/xdg/autostart/colony-firewall-tray.desktop"
     install -Dm644 pkg/colony-firewall.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/colony-firewall.svg"
 
