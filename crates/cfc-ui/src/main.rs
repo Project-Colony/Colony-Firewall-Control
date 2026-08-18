@@ -396,10 +396,21 @@ pub fn backoff_secs(attempt: u32) -> i64 {
     (3 + i64::from(attempt)).min(5)
 }
 
+/// Control socket to connect to: `$CFC_SOCKET` when set, else the
+/// packaged default. The CLI has `--socket` for the same reason — pointing
+/// a client at a daemon running somewhere else (a `--dry-run` instance, a
+/// test socket in a temp dir) shouldn't require a rebuild.
+fn socket_path_from_env() -> PathBuf {
+    match std::env::var_os("CFC_SOCKET") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => PathBuf::from(SOCKET_PATH),
+    }
+}
+
 impl App {
     fn new() -> (Self, Task<Message>) {
         let app = Self {
-            socket_path: PathBuf::from(SOCKET_PATH),
+            socket_path: socket_path_from_env(),
             tab: Tab::Prompts,
             daemon: DaemonState::Connecting,
             rules: Vec::new(),
