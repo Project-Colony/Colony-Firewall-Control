@@ -1,4 +1,10 @@
 //! Conversions between `cfc_core` types and the gRPC schema in `cfc_proto`.
+//!
+//! Inbound conversions (`*_from_pb`) fail closed. A field the daemon does
+//! not recognise - an unset enum from a default-initialized client, or an
+//! integer from a newer/older schema - is an error, never a silently
+//! manufactured `Allow`. Callers map the `String` error to
+//! `Status::invalid_argument`.
 
 use cfc_core::{Action, Connection, Direction, Process, Protocol, Rule, RuleScope, Verdict};
 use cfc_proto::v1 as pb;
@@ -12,11 +18,35 @@ pub fn action_to_pb(a: Action) -> pb::Action {
     }
 }
 
-pub fn action_from_pb(a: i32) -> Action {
-    match pb::Action::try_from(a).unwrap_or(pb::Action::Unspecified) {
-        pb::Action::Allow | pb::Action::Unspecified => Action::Allow,
-        pb::Action::Deny => Action::Deny,
-        pb::Action::Reject => Action::Reject,
+/// Fail-closed: `ACTION_UNSPECIFIED` and any out-of-range integer are
+/// rejected rather than defaulted to `Allow`.
+pub fn action_from_pb(a: i32) -> Result<Action, String> {
+    match pb::Action::try_from(a) {
+        Ok(pb::Action::Allow) => Ok(Action::Allow),
+        Ok(pb::Action::Deny) => Ok(Action::Deny),
+        Ok(pb::Action::Reject) => Ok(Action::Reject),
+        Ok(pb::Action::Unspecified) | Err(_) => Err(format!("action unspecified/unknown: {a}")),
+    }
+}
+
+/// String form of an action as persisted in the `events` table and matched
+/// by [`crate::storage::EventFilter::action`]. Kept next to the enum so the
+/// writer and the query filter can never drift apart.
+pub fn action_db_str(a: Action) -> &'static str {
+    match a {
+        Action::Allow => "Allow",
+        Action::Deny => "Deny",
+        Action::Reject => "Reject",
+    }
+}
+
+/// Provenance label persisted alongside each event.
+pub fn verdict_source_db_str(s: &cfc_core::VerdictSource) -> &'static str {
+    match s {
+        cfc_core::VerdictSource::Rule(_) => "rule",
+        cfc_core::VerdictSource::UserPrompt => "user",
+        cfc_core::VerdictSource::DefaultPolicy => "default",
+        cfc_core::VerdictSource::Timeout => "timeout",
     }
 }
 
@@ -54,13 +84,28 @@ pub fn duration_to_pb(d: cfc_core::Duration) -> pb::Duration {
     }
 }
 
-pub fn duration_from_pb(d: i32) -> cfc_core::Duration {
+/// Fail-closed: `DURATION_UNSPECIFIED` and out-of-range integers are
+/// rejected rather than defaulted to the longest-lived `Always`.
+pub fn duration_from_pb(d: i32) -> Result<cfc_core::Duration, String> {
     use cfc_core::Duration as D;
-    match pb::Duration::try_from(d).unwrap_or(pb::Duration::Unspecified) {
-        pb::Duration::Once => D::Once,
-        pb::Duration::UntilRestart => D::UntilRestart,
-        _ => D::Always,
+    match pb::Duration::try_from(d) {
+        Ok(pb::Duration::Once) => Ok(D::Once),
+        Ok(pb::Duration::UntilRestart) => Ok(D::UntilRestart),
+        Ok(pb::Duration::Always) => Ok(D::Always),
+        Ok(pb::Duration::Unspecified) | Err(_) => Err(format!("duration unspecified/unknown: {d}")),
     }
+}
+
+/// `Once` is a one-shot answer to a single prompt, applied by the router as
+/// the packet's verdict. A persisted `Once` rule is meaningless: rule lookup
+/// treats it as never-expiring and storage purges it at the next start, so
+/// it silently becomes either "forever" or "gone". Reject it at the API
+/// boundary instead of persisting a lie.
+pub fn reject_unpersistable_duration(d: cfc_core::Duration) -> Result<(), String> {
+    if d == cfc_core::Duration::Once {
+        return Err("Once rules cannot be persisted".to_string());
+    }
+    Ok(())
 }
 
 pub fn connection_to_pb(c: &Connection) -> pb::ConnectionInfo {
@@ -81,11 +126,10 @@ pub fn process_to_pb(p: &Process) -> pb::ProcessInfo {
     pb::ProcessInfo {
         pid: p.pid,
         ppid: p.ppid.unwrap_or(0),
-        // TODO(wave3): proto optional uid. The pb ProcessInfo uid/gid are
-        // plain u32, so an unattributed process (None) flattens to 0 on the
-        // wire. This direction is display-only; rule matching never sees it.
-        uid: p.uid.unwrap_or(0),
-        gid: p.gid.unwrap_or(0),
+        // Explicit presence on the wire: an unattributed process stays
+        // absent rather than collapsing into "uid 0" (i.e. root).
+        uid: p.uid,
+        gid: p.gid,
         exe: p.exe.to_string_lossy().into_owned(),
         cmdline: p.cmdline.clone(),
         cwd: p
@@ -168,8 +212,8 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
         id,
         name: r.name.clone(),
         enabled: r.enabled,
-        action: action_from_pb(r.action),
-        duration: duration_from_pb(r.duration),
+        action: action_from_pb(r.action)?,
+        duration: duration_from_pb(r.duration)?,
         scope,
         created_at,
         hit_count: r.hit_count,
@@ -178,6 +222,76 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
 
 pub fn verdict_to_pb_action(v: &Verdict) -> pb::Action {
     action_to_pb(v.action)
+}
+
+/// Flattens a decided flow into the row shape persisted by
+/// [`crate::storage::RuleStore::insert_events`].
+pub fn event_row_from_observed(
+    conn: &Connection,
+    proc: &Process,
+    verdict: &Verdict,
+) -> crate::storage::EventRow {
+    crate::storage::EventRow {
+        id: 0,
+        ts_unix_ms: conn.timestamp.timestamp_millis(),
+        proto: Some(protocol_db_str(conn.protocol).to_string()),
+        src_ip: Some(conn.src_ip.to_string()),
+        src_port: Some(conn.src_port),
+        dst_ip: Some(conn.dst_ip.to_string()),
+        dst_port: Some(conn.dst_port),
+        dst_host: conn.dst_host.clone(),
+        exe: Some(proc.exe.to_string_lossy().into_owned()).filter(|e| !e.is_empty()),
+        pid: Some(proc.pid),
+        uid: proc.uid,
+        action: action_db_str(verdict.action).to_string(),
+        source: verdict_source_db_str(&verdict.source).to_string(),
+        rule_id: match verdict.source {
+            cfc_core::VerdictSource::Rule(id) => Some(id.to_string()),
+            _ => None,
+        },
+    }
+}
+
+/// Renders a persisted event back onto the wire.
+pub fn event_row_to_pb(row: &crate::storage::EventRow) -> pb::Event {
+    pb::Event {
+        ts_unix_ms: row.ts_unix_ms,
+        proto: row.proto.clone().unwrap_or_default(),
+        src_ip: row.src_ip.clone().unwrap_or_default(),
+        src_port: row.src_port.unwrap_or(0) as u32,
+        dst_ip: row.dst_ip.clone().unwrap_or_default(),
+        dst_port: row.dst_port.unwrap_or(0) as u32,
+        dst_host: row.dst_host.clone().unwrap_or_default(),
+        exe: row.exe.clone().unwrap_or_default(),
+        pid: row.pid.unwrap_or(0),
+        uid: row.uid,
+        // Rows written by older builds (or hand-edited ones) may carry an
+        // action string this build does not know; surface it as
+        // unspecified rather than dropping the row.
+        action: action_db_from_str(&row.action)
+            .map(|a| action_to_pb(a) as i32)
+            .unwrap_or(pb::Action::Unspecified as i32),
+        source: row.source.clone(),
+        rule_id: row.rule_id.clone().unwrap_or_default(),
+    }
+}
+
+fn protocol_db_str(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+        Protocol::Icmp => "icmp",
+        Protocol::Other(_) => "other",
+    }
+}
+
+fn action_db_from_str(s: &str) -> Option<Action> {
+    match s {
+        "Allow" => Some(Action::Allow),
+        "Deny" => Some(Action::Deny),
+        "Reject" => Some(Action::Reject),
+        _ => None,
+    }
 }
 
 fn empty_to_none(s: &str) -> Option<String> {
@@ -199,16 +313,73 @@ mod tests {
     fn action_roundtrip() {
         for a in [Action::Allow, Action::Deny, Action::Reject] {
             let pb = action_to_pb(a) as i32;
-            assert_eq!(action_from_pb(pb), a);
+            assert_eq!(action_from_pb(pb).unwrap(), a);
         }
     }
 
     #[test]
-    fn action_unspecified_maps_to_allow() {
-        // Defensive: an out-of-range / unspecified value should be the
-        // permissive default.
-        assert_eq!(action_from_pb(0), Action::Allow);
-        assert_eq!(action_from_pb(99), Action::Allow);
+    fn action_unspecified_and_unknown_are_rejected() {
+        // Inverted from the old behaviour on purpose: mapping an unset or
+        // version-skewed enum onto Allow let a default-initialized client
+        // manufacture ALLOW verdicts and rules. Both now fail closed.
+        let unspecified = action_from_pb(0).unwrap_err();
+        assert!(unspecified.contains('0'), "{unspecified}");
+        let unknown = action_from_pb(99).unwrap_err();
+        assert!(unknown.contains("99"), "{unknown}");
+        assert!(action_from_pb(-1).is_err());
+    }
+
+    #[test]
+    fn duration_unspecified_and_unknown_are_rejected() {
+        assert!(duration_from_pb(0).is_err());
+        assert!(duration_from_pb(99).is_err());
+        assert!(duration_from_pb(-1).is_err());
+    }
+
+    #[test]
+    fn once_duration_is_not_persistable() {
+        assert!(reject_unpersistable_duration(Duration::Once).is_err());
+        for d in [
+            Duration::UntilRestart,
+            Duration::Always,
+            Duration::Seconds(60),
+        ] {
+            assert!(reject_unpersistable_duration(d).is_ok());
+        }
+    }
+
+    #[test]
+    fn rule_from_pb_rejects_unspecified_action_and_duration() {
+        let mut pb = cfc_proto::v1::RuleInfo {
+            id: String::new(),
+            name: "x".into(),
+            enabled: true,
+            action: cfc_proto::v1::Action::Unspecified as i32,
+            duration: cfc_proto::v1::Duration::Always as i32,
+            scope: Some(cfc_proto::v1::RuleScope::default()),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        };
+        assert!(rule_from_pb(&pb).is_err());
+
+        pb.action = cfc_proto::v1::Action::Deny as i32;
+        pb.duration = cfc_proto::v1::Duration::Unspecified as i32;
+        assert!(rule_from_pb(&pb).is_err());
+
+        pb.duration = cfc_proto::v1::Duration::Always as i32;
+        assert!(rule_from_pb(&pb).is_ok());
+    }
+
+    #[test]
+    fn process_uid_absence_survives_the_wire() {
+        let mut p = cfc_core::Process::unknown(42);
+        assert_eq!(p.uid, None);
+        // Unattributed: absent, NOT uid 0.
+        assert_eq!(process_to_pb(&p).uid, None);
+        assert_eq!(process_to_pb(&p).gid, None);
+
+        p.uid = Some(0);
+        assert_eq!(process_to_pb(&p).uid, Some(0));
     }
 
     #[test]
@@ -221,18 +392,9 @@ mod tests {
 
     #[test]
     fn duration_roundtrip_common_cases() {
-        assert_eq!(
-            duration_from_pb(duration_to_pb(Duration::Once) as i32),
-            Duration::Once
-        );
-        assert_eq!(
-            duration_from_pb(duration_to_pb(Duration::UntilRestart) as i32),
-            Duration::UntilRestart
-        );
-        assert_eq!(
-            duration_from_pb(duration_to_pb(Duration::Always) as i32),
-            Duration::Always
-        );
+        for d in [Duration::Once, Duration::UntilRestart, Duration::Always] {
+            assert_eq!(duration_from_pb(duration_to_pb(d) as i32).unwrap(), d);
+        }
     }
 
     #[test]
@@ -240,7 +402,7 @@ mod tests {
         // We don't carry the Seconds variant on the wire; it round-trips
         // through "Always" by design.
         assert_eq!(
-            duration_from_pb(duration_to_pb(Duration::Seconds(60)) as i32),
+            duration_from_pb(duration_to_pb(Duration::Seconds(60)) as i32).unwrap(),
             Duration::Always
         );
     }
@@ -317,6 +479,76 @@ mod tests {
         assert_eq!(pb.src_port, 5555);
         assert_eq!(pb.dst_port, 443);
         assert_eq!(pb.protocol, cfc_proto::v1::Protocol::Tcp as i32);
+    }
+
+    #[test]
+    fn event_row_roundtrips_through_the_wire_shape() {
+        let mut conn = cfc_core::Connection::new(
+            Protocol::Udp,
+            Direction::Outbound,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5353,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            53,
+        );
+        conn.dst_host = Some("one.one.one.one".into());
+        let mut proc = cfc_core::Process::unknown(4242);
+        proc.exe = PathBuf::from("/usr/bin/dig");
+        proc.uid = Some(1000);
+        let rule_id = uuid::Uuid::new_v4();
+        let verdict = cfc_core::Verdict::deny_from_rule(rule_id);
+
+        let row = event_row_from_observed(&conn, &proc, &verdict);
+        assert_eq!(row.action, "Deny");
+        assert_eq!(row.source, "rule");
+        assert_eq!(row.rule_id.as_deref(), Some(rule_id.to_string().as_str()));
+        assert_eq!(row.proto.as_deref(), Some("udp"));
+        assert_eq!(row.uid, Some(1000));
+
+        let ev = event_row_to_pb(&row);
+        assert_eq!(ev.dst_port, 53);
+        assert_eq!(ev.dst_host, "one.one.one.one");
+        assert_eq!(ev.exe, "/usr/bin/dig");
+        assert_eq!(ev.pid, 4242);
+        assert_eq!(ev.uid, Some(1000));
+        assert_eq!(ev.action, cfc_proto::v1::Action::Deny as i32);
+    }
+
+    #[test]
+    fn event_row_keeps_unattributed_uid_absent() {
+        let conn = cfc_core::Connection::new(
+            Protocol::Tcp,
+            Direction::Outbound,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            1,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            2,
+        );
+        let proc = cfc_core::Process::unknown(7);
+        let row = event_row_from_observed(&conn, &proc, &cfc_core::Verdict::default_allow());
+        assert_eq!(row.uid, None);
+        assert_eq!(row.source, "default");
+        assert_eq!(row.rule_id, None);
+        assert_eq!(event_row_to_pb(&row).uid, None);
+    }
+
+    #[test]
+    fn event_row_to_pb_tolerates_unknown_action_strings() {
+        let row = crate::storage::EventRow {
+            action: "Something-Else".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            event_row_to_pb(&row).action,
+            cfc_proto::v1::Action::Unspecified as i32
+        );
+    }
+
+    #[test]
+    fn action_db_str_matches_the_filter_vocabulary() {
+        for a in [Action::Allow, Action::Deny, Action::Reject] {
+            assert_eq!(action_db_from_str(action_db_str(a)), Some(a));
+        }
     }
 
     // Helper that does an empty-id rule_from_pb (skips uuid parsing).

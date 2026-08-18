@@ -28,6 +28,9 @@ service Firewall {
   // Temporarily allow all flows without consulting rules. The daemon stays
   // running, just short-circuits NFQUEUE to ACCEPT for every packet.
   rpc SetPaused(SetPausedRequest) returns (SetPausedResponse);
+
+  // Persisted verdict/audit log, newest first. Read-only.
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
 }
 
 message SubscribeRequest {
@@ -75,8 +78,10 @@ message ConnectionInfo {
 message ProcessInfo {
   uint32 pid = 1;
   uint32 ppid = 2;
-  uint32 uid = 3;
-  uint32 gid = 4;
+  // Explicit presence: an unattributed process must read as "unknown", not
+  // as uid 0 / gid 0. The daemon-side core type is Option<u32>.
+  optional uint32 uid = 3;
+  optional uint32 gid = 4;
   string exe = 5;
   repeated string cmdline = 6;
   string cwd = 7;
@@ -138,13 +143,74 @@ message StatusResponse {
   uint64 connections_allowed = 6;
   uint64 connections_denied = 7;
   bool paused = 8;
+
+  // When `paused` is true, the wall-clock instant at which the daemon
+  // auto-resumes enforcing. 0 when not paused.
+  int64 resume_at_unix_ms = 9;
+
+  // Live default policy (reflects the last SIGHUP reload, not the value
+  // read at startup).
+  Action timeout_action = 10;
+  Action no_ui_action = 11;
+  uint32 prompt_timeout_secs = 12;
+
+  // Rule rows the last storage load could not deserialize. Non-zero means
+  // rules exist on disk that are NOT being enforced.
+  uint64 skipped_rules = 13;
+
+  // Best-effort "packets are actually reaching us" signal. False means the
+  // daemon is running but probably not in the packet path (nft/iptables
+  // rule not loaded), or it was started with --dry-run.
+  bool enforcing = 14;
 }
 
 message SetPausedRequest {
   bool paused = 1;
+  // How long the pause lasts before the daemon auto-resumes. 0 means "use
+  // the daemon's configured default" ([pause] default_secs). The daemon
+  // clamps this to its own maximum and reports the effective deadline in
+  // SetPausedResponse.resume_at_unix_ms.
+  uint32 duration_secs = 2;
 }
 message SetPausedResponse {
   bool paused = 1;
+  // Effective auto-resume instant. 0 when unpausing.
+  int64 resume_at_unix_ms = 2;
+}
+
+// One persisted verdict record (mirrors the daemon's `events` table).
+message Event {
+  int64 ts_unix_ms = 1;
+  string proto = 2;
+  string src_ip = 3;
+  uint32 src_port = 4;
+  string dst_ip = 5;
+  uint32 dst_port = 6;
+  string dst_host = 7;
+  string exe = 8;
+  uint32 pid = 9;
+  // Absent when the flow could not be attributed to a process.
+  optional uint32 uid = 10;
+  Action action = 11;
+  // Verdict provenance: "rule" | "user" | "default" | "timeout".
+  string source = 12;
+  string rule_id = 13;
+}
+
+message ListEventsRequest {
+  // 0 means the daemon's default page size; the daemon caps the maximum.
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Empty means no filter.
+  string exe_contains = 3;
+  // ACTION_UNSPECIFIED means no filter.
+  Action action_filter = 4;
+  // 0 means no lower bound.
+  int64 since_unix_ms = 5;
+}
+message ListEventsResponse {
+  repeated Event events = 1;
+  uint64 total_returned = 2;
 }
 
 enum Action {

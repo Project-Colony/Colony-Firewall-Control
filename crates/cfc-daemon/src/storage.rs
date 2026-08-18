@@ -29,8 +29,6 @@ pub struct RuleStore {
 ///
 /// `id` is assigned by the database; it is ignored by [`RuleStore::insert_events`]
 /// and populated by [`RuleStore::query_events`].
-// TODO(wave3): constructed by the daemon's event wiring; remove the allow then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventRow {
     pub id: i64,
@@ -50,8 +48,6 @@ pub struct EventRow {
 }
 
 /// Optional filters for [`RuleStore::query_events`]. All fields are ANDed.
-// TODO(wave3): constructed by the IPC event-query wiring; remove the allow then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct EventFilter {
     /// Keep events whose `exe` contains this substring.
@@ -137,8 +133,6 @@ impl RuleStore {
     /// skipped because their JSON failed to deserialize. Rows are never
     /// deleted for failing to parse; this count lets callers surface the
     /// problem (e.g. in `status`) instead of losing data silently.
-    // TODO(wave3): surfaced in status; remove the allow once wired.
-    #[allow(dead_code)]
     pub fn skipped_rules(&self) -> usize {
         self.skipped.load(Ordering::Relaxed)
     }
@@ -250,8 +244,6 @@ impl RuleStore {
 
     /// Inserts a batch of verdict events in a single transaction.
     /// `EventRow::id` is ignored; the database assigns ids.
-    // TODO(wave3): called by the daemon's event-persistence task; remove the allow then.
-    #[allow(dead_code)]
     pub fn insert_events(&self, batch: &[EventRow]) -> anyhow::Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -287,8 +279,6 @@ impl RuleStore {
     }
 
     /// Returns events newest-first, applying `filter`, then `limit`/`offset`.
-    // TODO(wave3): called by the IPC event-query handler; remove the allow then.
-    #[allow(dead_code)]
     pub fn query_events(
         &self,
         limit: u32,
@@ -342,8 +332,6 @@ impl RuleStore {
 
     /// Deletes the oldest events beyond `max_rows`, keeping the newest.
     /// Returns the number deleted.
-    // TODO(wave3): called by the daemon's event-persistence task; remove the allow then.
-    #[allow(dead_code)]
     pub fn prune_events(&self, max_rows: u32) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let n = conn.execute(

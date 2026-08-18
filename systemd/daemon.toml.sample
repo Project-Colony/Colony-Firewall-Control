@@ -47,3 +47,46 @@ default_secs = 600
 # Maximum number of verdict events kept in the database; the oldest beyond
 # this cap are pruned.
 max_rows = 100000
+
+[ipc]
+# Access control for the gRPC control socket (/run/colony-firewall/cfc.sock).
+#
+# TRUST MODEL
+# -----------
+# The daemon is root and drives the packet filter, so the control socket is
+# the whole attack surface. Two layers guard it:
+#
+#   1. The socket file. After bind the daemon chowns it to root:<group> and
+#      chmods it 0660, so the kernel refuses connect(2) to anyone outside
+#      the group. Group membership IS the credential - there is no in-band
+#      authentication, no per-user identity, no password.
+#   2. Peer credentials. Every connection carries SO_PEERCRED, and the
+#      daemon logs the calling uid/pid for every mutating RPC. Mutating
+#      RPCs (UpsertRule, DeleteRule, SetPaused, SubmitVerdict) need uid 0
+#      or a socket that is genuinely group-gated. Read-only RPCs
+#      (ListRules, GetStatus, ListEvents, StreamConnections, StreamPrompts)
+#      are open to any peer that got through layer 1.
+#
+# Say it plainly: EVERY MEMBER OF THIS GROUP IS FULLY TRUSTED. Membership
+# grants the ability to allow or deny any traffic on this host. This is not
+# a multi-user privilege boundary - add only administrators of this machine.
+#
+# One exception to "any group member can do anything": prompt answers. A
+# prompt may only be answered by a peer whose StreamPrompts subscription
+# actually received it (root excepted), so one desktop session cannot
+# answer another session's prompt.
+#
+# If the group does not exist the daemon does NOT fail to start: it warns,
+# leaves the socket root-only (0600), and only the root CLI can connect.
+# Create it with the shipped sysusers fragment
+# (/usr/lib/sysusers.d/colony-firewall.conf, then `systemd-sysusers`) or by
+# hand (`groupadd -r colony-firewall`), then
+# `usermod -aG colony-firewall <your-user>` and log back in.
+group = "colony-firewall"
+
+# Whether a non-root peer must reach the daemon through a genuinely
+# group-gated socket before it may change anything. Leave this true. Set it
+# to false only if you gate the socket some other way (e.g. filesystem
+# ACLs); with it false, any process that manages to connect can rewrite
+# your firewall rules.
+require_group = true

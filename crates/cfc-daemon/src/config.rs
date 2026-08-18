@@ -26,19 +26,14 @@ pub struct Config {
     /// Named preset that was requested, verbatim ("relaxed" | "balanced" |
     /// "strict"), kept for display/status purposes. Already applied to
     /// `default_policy` during resolution.
-    // TODO(wave3): read by status reporting; remove the allow once wired.
-    #[allow(dead_code)]
     pub profile: Option<String>,
 
     pub default_policy: DefaultPolicy,
     pub nfqueue: NfqConfig,
     pub storage: StorageConfig,
-    // TODO(wave2/3): consumed by the pause and event-persistence wiring;
-    // remove the allows once wired.
-    #[allow(dead_code)]
     pub pause: PauseConfig,
-    #[allow(dead_code)]
     pub events: EventsConfig,
+    pub ipc: IpcConfig,
 }
 
 impl Default for Config {
@@ -190,6 +185,32 @@ impl Default for EventsConfig {
     }
 }
 
+/// Access control for the gRPC control socket. See the module comment in
+/// `ipc.rs` for the full trust model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IpcConfig {
+    /// Unix group granted access to the control socket. After bind the
+    /// daemon chowns the socket to `root:<group>` and chmods it 0660, so
+    /// group membership *is* the access check.
+    pub group: String,
+    /// Require the socket to be group-gated before a non-root peer may
+    /// call a mutating RPC. When the group cannot be resolved the socket
+    /// stays root-only and non-root mutations are refused. Setting this to
+    /// false lets any peer that manages to connect mutate rules — only do
+    /// that if you gate the socket some other way (e.g. filesystem ACLs).
+    pub require_group: bool,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        Self {
+            group: "colony-firewall".to_string(),
+            require_group: true,
+        }
+    }
+}
+
 /// Raw on-disk shape. Only `[default_policy]` needs Option-per-field (it
 /// interacts with `profile`); the other sections carry their own defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -201,6 +222,7 @@ struct ConfigToml {
     storage: StorageConfig,
     pause: PauseConfig,
     events: EventsConfig,
+    ipc: IpcConfig,
 }
 
 impl ConfigToml {
@@ -225,6 +247,7 @@ impl ConfigToml {
             storage: self.storage,
             pause: self.pause,
             events: self.events,
+            ipc: self.ipc,
         }
     }
 }
@@ -263,6 +286,8 @@ mod tests {
         assert!(!cfg.nfqueue.fail_open);
         assert_eq!(cfg.pause.default_secs, 600);
         assert_eq!(cfg.events.max_rows, 100_000);
+        assert_eq!(cfg.ipc.group, "colony-firewall");
+        assert!(cfg.ipc.require_group);
         assert_eq!(
             cfg.storage.path,
             PathBuf::from("/var/lib/colony-firewall/rules.db")
@@ -360,6 +385,10 @@ mod tests {
 
             [events]
             max_rows = 5000
+
+            [ipc]
+            group = "wheel"
+            require_group = false
             "#,
         )
         .unwrap();
@@ -368,6 +397,13 @@ mod tests {
         assert!(cfg.nfqueue.fail_open);
         assert_eq!(cfg.pause.default_secs, 120);
         assert_eq!(cfg.events.max_rows, 5000);
+        assert_eq!(cfg.ipc.group, "wheel");
+        assert!(!cfg.ipc.require_group);
+
+        // A partial [ipc] section keeps per-field defaults.
+        let cfg = Config::from_toml_str("[ipc]\ngroup = \"wheel\"\n").unwrap();
+        assert_eq!(cfg.ipc.group, "wheel");
+        assert!(cfg.ipc.require_group);
 
         // Partial sections keep per-field defaults.
         let cfg = Config::from_toml_str("[nfqueue]\nqueue_num = 7\n").unwrap();
@@ -388,6 +424,8 @@ mod tests {
         assert!(!cfg.nfqueue.fail_open);
         assert_eq!(cfg.pause.default_secs, 600);
         assert_eq!(cfg.events.max_rows, 100_000);
+        assert_eq!(cfg.ipc.group, "colony-firewall");
+        assert!(cfg.ipc.require_group);
         assert_eq!(
             cfg.storage.path,
             PathBuf::from("/var/lib/colony-firewall/rules.db")

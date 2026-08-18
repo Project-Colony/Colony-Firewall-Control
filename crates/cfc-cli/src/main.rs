@@ -165,16 +165,38 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Live => cmd_live(&mut client).await?,
         Command::Pause => {
-            let paused = client.set_paused(true).await?;
-            println!("paused = {paused} (auto-resumes in 10 min)");
+            // duration_secs = 0: use the daemon's configured default. The
+            // daemon decides and reports the real deadline, so print that
+            // rather than guessing.
+            let resp = client.set_paused(true, 0).await?;
+            println!(
+                "paused = {} (auto-resumes {})",
+                resp.paused,
+                format_resume_at(resp.resume_at_unix_ms)
+            );
         }
         Command::Resume => {
-            let paused = client.set_paused(false).await?;
-            println!("paused = {paused}");
+            let resp = client.set_paused(false, 0).await?;
+            println!("paused = {}", resp.paused);
         }
     }
 
     Ok(())
+}
+
+/// Renders the daemon-reported auto-resume instant. The daemon owns the
+/// pause duration, so this never assumes a length.
+fn format_resume_at(resume_at_unix_ms: i64) -> String {
+    match chrono::DateTime::from_timestamp_millis(resume_at_unix_ms) {
+        Some(t) => {
+            let secs = (resume_at_unix_ms - chrono::Utc::now().timestamp_millis()).max(0) / 1000;
+            format!(
+                "at {} (in {secs}s)",
+                t.with_timezone(&chrono::Local).format("%H:%M:%S")
+            )
+        }
+        None => "at an unknown time".to_string(),
+    }
 }
 
 async fn cmd_status(client: &mut Client) -> anyhow::Result<()> {
@@ -182,6 +204,9 @@ async fn cmd_status(client: &mut Client) -> anyhow::Result<()> {
     println!("version          {}", s.version);
     println!("uptime           {}s", s.uptime_seconds);
     println!("paused           {}", if s.paused { "yes" } else { "no" });
+    if s.paused && s.resume_at_unix_ms > 0 {
+        println!("resumes          {}", format_resume_at(s.resume_at_unix_ms));
+    }
     println!("rules            {}", s.rules_count);
     println!("prompts pending  {}", s.prompts_pending);
     println!(

@@ -38,6 +38,18 @@ pub fn duration_label(d: i32) -> &'static str {
     }
 }
 
+/// Renders a process uid for display.
+///
+/// `None` means the daemon could not attribute the flow to a process. The
+/// proto carries explicit presence precisely so that case does not render
+/// as uid 0, i.e. as root.
+pub fn uid_label(uid: Option<u32>) -> String {
+    match uid {
+        Some(u) => u.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
 pub fn process_display(p: &pb::ProcessInfo) -> String {
     if p.exe.is_empty() {
         format!("pid:{}", p.pid)

@@ -98,12 +98,23 @@ impl Client {
         Ok(resp.into_inner().deleted)
     }
 
-    pub async fn set_paused(&mut self, paused: bool) -> Result<bool, ClientError> {
+    /// Pauses or resumes enforcement. `duration_secs = 0` asks the daemon
+    /// to use its configured default; the daemon clamps the value and
+    /// reports the effective deadline in `resume_at_unix_ms`, so callers
+    /// must read it from the response rather than assume one.
+    pub async fn set_paused(
+        &mut self,
+        paused: bool,
+        duration_secs: u32,
+    ) -> Result<proto::SetPausedResponse, ClientError> {
         let resp = self
             .inner
-            .set_paused(proto::SetPausedRequest { paused })
+            .set_paused(proto::SetPausedRequest {
+                paused,
+                duration_secs,
+            })
             .await?;
-        Ok(resp.into_inner().paused)
+        Ok(resp.into_inner())
     }
 
     pub async fn submit_verdict(

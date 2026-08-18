@@ -24,6 +24,7 @@ use crate::decision::{Decision, Engine};
 use crate::dns::DnsCache;
 use crate::packet;
 use crate::process_resolve;
+use crate::reject::Rejecter;
 use crate::stats::Stats;
 use anyhow::Context as _;
 use cfc_core::{Action, Connection, Direction, Process, Protocol, Verdict};
@@ -149,10 +150,15 @@ pub fn spawn(
         "NFQUEUE bound, entering recv loop"
     );
 
+    // Opened once here (never per packet) so a missing CAP_NET_RAW is
+    // reported exactly once at startup; see [`Rejecter`].
+    let rejecter = Rejecter::open();
+
     let last_activity = Arc::new(AtomicI64::new(unix_ms()));
     let worker = Worker {
         queue,
         engine,
+        rejecter,
         prompt_tx,
         verdict_rx,
         observed_tx,
@@ -240,6 +246,10 @@ struct PendingPrompt {
 struct Worker {
     queue: Queue,
     engine: Engine,
+    /// Injects the TCP RST / ICMP port-unreachable that makes
+    /// [`Action::Reject`] differ from [`Action::Deny`]. Inert (drop-only)
+    /// when raw sockets are unavailable.
+    rejecter: Rejecter,
     prompt_tx: PromptTx,
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
@@ -375,9 +385,11 @@ impl Worker {
         };
         self.pending_flows.remove(&pending.flow);
 
-        let nfq_verdict = nfq_verdict_for(pv.verdict.action);
         for msg in pending.packets {
-            self.send_verdict(msg, nfq_verdict);
+            // Per packet, not per prompt: a Reject response is derived from
+            // the individual segment (its sequence numbers, its source
+            // port), and parallel connections share one prompt.
+            self.apply_action(msg, pv.verdict.action);
         }
 
         record(&self.stats, pv.verdict.action);
@@ -406,7 +418,7 @@ impl Worker {
                 process,
                 verdict,
             } => {
-                self.send_verdict(msg, nfq_verdict_for(verdict.action));
+                self.apply_action(msg, verdict.action);
                 let _ = self.observed_tx.send(ObservedConnection {
                     connection,
                     process,
@@ -471,7 +483,7 @@ impl Worker {
                 // Router saturated or gone: apply the default policy now
                 // rather than stranding the packet.
                 trace!("prompt channel unavailable ({e}); applying fallback");
-                self.send_verdict(msg, nfq_verdict_for(fallback.action));
+                self.apply_action(msg, fallback.action);
                 record(&self.stats, fallback.action);
                 let _ = self.observed_tx.send(ObservedConnection {
                     connection,
@@ -479,6 +491,36 @@ impl Worker {
                     verdict: fallback,
                 });
             }
+        }
+    }
+
+    /// Applies a policy action to a queued packet.
+    ///
+    /// Deny and Reject both hand the kernel the same verdict (Drop) - they
+    /// differ only in what the application sees. Reject additionally
+    /// injects the refusal the peer would have sent (TCP RST / ICMP port
+    /// unreachable) so the app fails immediately instead of retransmitting
+    /// until its own timeout. The injection is best-effort: if it can't be
+    /// sent the packet is still dropped, i.e. Reject degrades to Deny.
+    fn apply_action(&mut self, msg: Message, action: Action) {
+        if action == Action::Reject {
+            self.inject_refusal(&msg);
+        }
+        self.send_verdict(msg, nfq_verdict_for(action));
+    }
+
+    /// Reparses this specific packet (cheap, and only on the Reject path)
+    /// because the refusal depends on per-segment fields the pipeline's
+    /// [`Connection`] does not carry - TCP sequence numbers and the bytes
+    /// quoted back in an ICMP error.
+    fn inject_refusal(&self, msg: &Message) {
+        let payload = msg.get_payload();
+        match packet::parse(payload, Direction::Outbound) {
+            Ok(conn) => {
+                let outcome = self.rejecter.reject(&conn, payload);
+                trace!(?outcome, dst = %conn.dst_ip, "reject response");
+            }
+            Err(e) => trace!("reject: unparseable packet ({e}); dropping only"),
         }
     }
 
@@ -680,8 +722,9 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
     }
 }
 
-/// Maps a policy action onto the kernel verdict. Reject currently maps to
-/// Drop (no RST/ICMP injection yet).
+/// Maps a policy action onto the kernel verdict. Reject shares Drop with
+/// Deny: the difference is the refusal [`Worker::apply_action`] injects
+/// alongside it, not the verdict itself.
 fn nfq_verdict_for(action: Action) -> NfqVerdict {
     match action {
         Action::Allow => NfqVerdict::Accept,

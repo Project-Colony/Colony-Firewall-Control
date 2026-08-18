@@ -153,7 +153,8 @@ pub enum Message {
     ToggleRuleEnabled(String),
     RulesFilterChanged(String),
     TogglePaused,
-    PausedSet(Result<bool, String>),
+    /// `(paused, resume_at_unix_ms)` as reported by the daemon.
+    PausedSet(Result<(bool, i64), String>),
     EditorName(String),
     EditorAction(proto::Action),
     EditorDuration(proto::Duration),
@@ -326,9 +327,10 @@ impl App {
                 let socket = self.socket_path.clone();
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
-            Message::PausedSet(Ok(paused)) => {
+            Message::PausedSet(Ok((paused, resume_at_unix_ms))) => {
                 if let Some(s) = &mut self.status {
                     s.paused = paused;
+                    s.resume_at_unix_ms = resume_at_unix_ms;
                 }
                 Task::none()
             }
@@ -624,9 +626,15 @@ async fn delete_rule(path: PathBuf, id: String) -> Result<(String, bool), String
     Ok((id, ok))
 }
 
-async fn set_paused(path: PathBuf, paused: bool) -> Result<bool, String> {
+/// Returns `(paused, resume_at_unix_ms)`. `duration_secs = 0` lets the
+/// daemon apply its configured default and report the real deadline.
+async fn set_paused(path: PathBuf, paused: bool) -> Result<(bool, i64), String> {
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
-    client.set_paused(paused).await.map_err(|e| e.to_string())
+    let resp = client
+        .set_paused(paused, 0)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((resp.paused, resp.resume_at_unix_ms))
 }
 
 async fn fetch_rules(path: PathBuf) -> Result<Vec<proto::RuleInfo>, String> {

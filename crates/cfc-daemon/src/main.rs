@@ -17,6 +17,7 @@ mod nfqueue;
 mod packet;
 mod process_resolve;
 mod prompts;
+mod reject;
 mod sd_notify;
 mod sock_diag;
 mod stats;
@@ -96,13 +97,24 @@ async fn main() -> anyhow::Result<()> {
     let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
     let router = prompts::PromptRouter::new(policy.clone(), stats.clone(), verdict_tx);
 
+    // Persist every decided flow into the events table. Subscribes to the
+    // live feed before the datapath starts so nothing is missed, and never
+    // blocks it (bounded queue + drop counting, see ipc.rs).
+    ipc::spawn_event_pipeline(store.clone(), &observed_tx, cfg.events.max_rows);
+
     let (mut ipc_handle, prompt_tx) = ipc::spawn(
-        socket_path.clone(),
+        ipc::IpcOptions {
+            socket_path: socket_path.clone(),
+            ipc: cfg.ipc.clone(),
+            pause_default_secs: cfg.pause.default_secs,
+            dry_run: args.dry_run,
+        },
         engine.clone(),
         store.clone(),
         observed_tx.clone(),
         router,
         stats.clone(),
+        policy.clone(),
     )
     .await
     .context("starting IPC server")?;
@@ -148,7 +160,9 @@ async fn main() -> anyhow::Result<()> {
                 Ok(_) => {}
                 Err(e) => tracing::warn!("expired-rule purge failed: {e}"),
             }
-            // TODO(wave3): also prune persisted events beyond [events] max_rows here.
+            // Persisted events are pruned to [events] max_rows by the
+            // event-writer task (ipc::spawn_event_pipeline), which owns
+            // that table's whole lifecycle.
         }
     });
 
@@ -266,6 +280,7 @@ fn reload_policy(path: &std::path::Path, policy: &decision::SharedPolicy) {
                 std::mem::replace(&mut *guard, new_cfg.default_policy)
             };
             info!(
+                profile = new_cfg.profile.as_deref().unwrap_or("<none>"),
                 old = ?old,
                 new = ?new_cfg.default_policy,
                 "default policy reloaded"
