@@ -105,6 +105,89 @@ use crate::dns::DnsCache;
 /// first release.
 pub const DEFAULT_OBJECT_PATH: &str = "/usr/lib/colony-firewall/cfc-ebpf.o";
 
+/// Why the ring-0 layer did not fully come up.
+///
+/// The machine-readable half of a note: [`Report::notes`] says it in prose for
+/// whoever is reading the journal, `Degrade` says it in a form [`Report::log`]
+/// can pick a severity from. The two are needed separately because the right
+/// severity depends on how the layer was asked for - "no object installed" is
+/// an ordinary fact under an automatic default and a misconfiguration under an
+/// explicit `enabled = true`.
+///
+/// `#[non_exhaustive]` on purpose. A future kernel or aya release can hand back
+/// an errno nobody here has classified, and the only correct response to that
+/// is a duller log line - never a change in what the daemon does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Degrade {
+    /// Nothing at `[ebpf] object_path`. By far the common case: a host whose
+    /// package did not ship the object.
+    ObjectMissing,
+    /// The file is there but could not be read - permissions, or I/O error.
+    ObjectUnreadable,
+    /// The file is there and readable, and we declined to hand it to `bpf(2)`
+    /// anyway. See `loader::vet_object`.
+    ObjectUntrusted,
+    /// `EPERM` / `EACCES`. No `CAP_BPF`, a seccomp filter that refuses
+    /// `bpf(2)` (Docker's default does), or an unraised `RLIMIT_MEMLOCK`.
+    /// Note that this is a *normal* condition in a container, not evidence
+    /// that anyone misconfigured anything.
+    NotPermitted,
+    /// `EINVAL` / `ENOTSUP` / `ENOSYS`. The kernel does not support something
+    /// the object needs. The honest "this machine cannot do ring 0" answer.
+    Unsupported,
+    /// The verifier walked the program and refused it. Unlike the others this
+    /// one is usually *our* bug meeting a newer kernel, so it is worth saying
+    /// loudly wherever it appears.
+    Rejected,
+    /// Something else went wrong. Deliberately not subdivided further.
+    Other,
+}
+
+impl Degrade {
+    /// A short stable token for the journal, so this can be grepped and
+    /// counted without parsing prose.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ObjectMissing => "object_missing",
+            Self::ObjectUnreadable => "object_unreadable",
+            Self::ObjectUntrusted => "object_untrusted",
+            Self::NotPermitted => "not_permitted",
+            Self::Unsupported => "unsupported",
+            Self::Rejected => "verifier_rejected",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One positive word for "is ring 0 doing anything on this host?".
+///
+/// Derived from the per-program flags rather than stored, so it cannot drift
+/// out of step with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ring0 {
+    /// Switched off; nothing was attempted.
+    #[default]
+    Off,
+    /// Attempted, and nothing came up.
+    Unavailable,
+    /// Some programs attached, some did not.
+    Partial,
+    /// All three attached.
+    Active,
+}
+
+impl Ring0 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Unavailable => "unavailable",
+            Self::Partial => "partial",
+            Self::Active => "active",
+        }
+    }
+}
+
 /// What actually came up. Reported once at startup and otherwise inert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -123,6 +206,19 @@ pub struct Report {
     pub ppid_offsets: bool,
     /// Human-readable notes: one line per thing that did not come up.
     pub notes: Vec<String>,
+    /// Why the layer is not fully up, when that is known well enough to say in
+    /// one word. `None` means either "it is fully up" or "the reason has no
+    /// classification", and callers must not read anything into which.
+    pub degrade: Option<Degrade>,
+    /// `(program, instructions the verifier walked)`, for programs that got as
+    /// far as being verified on a kernel that reports the count (>= 5.16).
+    ///
+    /// Recorded because it is a *budget*: the kernel allows 1,000,000 and
+    /// refuses at 1,000,001, and the DNS observer has already been on the
+    /// wrong side of that once. Surfacing it turns "a change made the program
+    /// more expensive" into something visible here, rather than into "it
+    /// stopped loading on someone else's kernel".
+    pub verified_insns: Vec<(String, u32)>,
 }
 
 impl Report {
@@ -136,9 +232,42 @@ impl Report {
         }
     }
 
+    /// Same, with the reason classified.
+    fn inert_because(
+        configured: bool,
+        compiled_in: bool,
+        degrade: Degrade,
+        note: impl Into<String>,
+    ) -> Self {
+        Self {
+            degrade: Some(degrade),
+            ..Self::inert(configured, compiled_in, note)
+        }
+    }
+
     /// True when at least one program is attached.
     pub fn any_active(&self) -> bool {
         self.exec_tracking || self.exit_tracking || self.dns_capture
+    }
+
+    /// How much of the ring-0 layer is live.
+    ///
+    /// Derived, never stored: a field would be one more thing to keep in step
+    /// with the three flags, and the whole point of this value is that an
+    /// operator can trust it.
+    pub fn ring0(&self) -> Ring0 {
+        if !self.configured {
+            return Ring0::Off;
+        }
+        match [self.exec_tracking, self.exit_tracking, self.dns_capture]
+            .into_iter()
+            .filter(|live| *live)
+            .count()
+        {
+            0 => Ring0::Unavailable,
+            3 => Ring0::Active,
+            _ => Ring0::Partial,
+        }
     }
 
     /// Names the attribution and hostname sources that are live, so the
@@ -160,11 +289,21 @@ impl Report {
                 tracing::debug!("eBPF: {note}");
             }
         }
+        for (program, insns) in &self.verified_insns {
+            // debug!, not info!: this is a number to reach for when something
+            // stopped loading, not something every boot needs to say out loud.
+            tracing::debug!(program, verified_insns = insns, "verifier accepted");
+        }
         tracing::info!(
             // Now that compiling the loader out is the unusual case, the
             // journal has to say which build this is: "no eBPF" and "eBPF that
             // could not load" look identical from the outside otherwise.
             compiled_in = self.compiled_in,
+            // One grep-able word for the whole layer, and one for why it is
+            // not more than that. Without these, answering "is ring 0 up on
+            // this fleet?" means parsing prose out of three separate flags.
+            ring0 = self.ring0().as_str(),
+            degrade = self.degrade.map(Degrade::as_str).unwrap_or("none"),
             exec_tracking = self.exec_tracking,
             exit_tracking = self.exit_tracking,
             dns_capture = self.dns_capture,
@@ -201,8 +340,11 @@ pub struct Runtime {
 /// Never returns an error: every failure mode is a note in the [`Report`].
 /// Must be called from inside a tokio runtime (it spawns the ring-buffer
 /// consumers).
-pub fn start(cfg: &EbpfConfig, dns: DnsCache) -> Runtime {
-    let table = proc_table::global();
+/// `table` is a parameter rather than [`proc_table::global`] so that a test can
+/// hand in an instance of its own. Asserting "a failed load did not mark the
+/// table live" against a process-wide `LazyLock` is an assertion about every
+/// other test in the binary as much as about this one.
+pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable) -> Runtime {
     if !cfg.enabled {
         return Runtime {
             report: Report::inert(
@@ -221,9 +363,10 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache) -> Runtime {
         // simply never wired to anything.
         let _ = (dns, table);
         Runtime {
-            report: Report::inert(
+            report: Report::inert_because(
                 true,
                 false,
+                Degrade::Unsupported,
                 "[ebpf] enabled = true but this build was compiled with \
                  --no-default-features, so it has no eBPF support; rebuild \
                  without that flag (the `ebpf` feature is on by default)",
@@ -233,11 +376,23 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache) -> Runtime {
 
     #[cfg(feature = "ebpf")]
     let runtime = {
-        let path = cfg
-            .object_path
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_OBJECT_PATH));
-        match loader::load_and_attach(&path, dns, table.clone()) {
+        // Who chose this file decides how much it has to prove.
+        let (path, trust) = match cfg.object_path.clone() {
+            // A human wrote this path into the config. That is a statement of
+            // trust about a specific file, and it is also the only way the
+            // developer workflow works at all: an object under `target/` is
+            // owned by whoever ran cargo, never by root. Say what is wrong
+            // with it and do as asked.
+            Some(p) => (p, loader::Trust::Warn),
+            // Nobody named a file. The daemon went to its own compiled-in path
+            // and is about to hand whatever it finds there to `bpf(2)` on its
+            // own initiative. Vet it: that decision has no human behind it.
+            None => (
+                std::path::PathBuf::from(DEFAULT_OBJECT_PATH),
+                loader::Trust::Refuse,
+            ),
+        };
+        match loader::load_and_attach(&path, dns, table.clone(), trust) {
             Ok((attached, report)) => {
                 table.set_live(report.exec_tracking);
                 Runtime {
@@ -246,10 +401,11 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache) -> Runtime {
                 }
             }
             Err(e) => Runtime {
-                report: Report::inert(
+                report: Report::inert_because(
                     true,
                     true,
-                    format!("load failed, continuing without it: {e:#}"),
+                    e.degrade,
+                    format!("load failed, continuing without it: {:#}", e.source),
                 ),
                 _attached: None,
             },
@@ -267,9 +423,10 @@ mod tests {
     fn a_disabled_config_produces_an_inert_report() {
         let cfg = EbpfConfig::default();
         assert!(!cfg.enabled, "[ebpf] must stay off by default");
-        let rt = start(&cfg, DnsCache::new());
+        let rt = start(&cfg, DnsCache::new(), proc_table::KernelProcTable::new());
         assert!(!rt.report.any_active());
         assert!(!rt.report.configured);
+        assert_eq!(rt.report.ring0(), Ring0::Off);
         assert_eq!(rt.report.compiled_in, cfg!(feature = "ebpf"));
         assert_eq!(rt.report.notes.len(), 1);
         // Logging a report must never panic, whatever is in it.
@@ -292,12 +449,32 @@ mod tests {
             enabled: true,
             object_path: Some(dir.path().join("cfc-ebpf.o")),
         };
-        let rt = start(&cfg, DnsCache::new());
+        // An instance, not `proc_table::global()`: the assertion below is about
+        // what *this* load did, and against the process-wide table it would be
+        // an assertion about every other test in the binary as well.
+        let table = proc_table::KernelProcTable::new();
+        let rt = start(&cfg, DnsCache::new(), table.clone());
         assert!(rt.report.configured);
         assert!(!rt.report.any_active(), "nothing can have attached");
+        assert_eq!(rt.report.ring0(), Ring0::Unavailable);
+        // The classification differs by build, and both answers are the honest
+        // one for their build: with the loader compiled in we went looking and
+        // found nothing; compiled out we never looked, and saying "the object
+        // is missing" would send whoever reads it to check a file that was
+        // never going to be read.
+        let expected = if cfg!(feature = "ebpf") {
+            Degrade::ObjectMissing
+        } else {
+            Degrade::Unsupported
+        };
+        assert_eq!(
+            rt.report.degrade,
+            Some(expected),
+            "an absent object is the ordinary case and must be classified as one"
+        );
         assert!(!rt.report.notes.is_empty(), "and it must say why");
         assert!(
-            !proc_table::global().is_live(),
+            !table.is_live(),
             "a failed load must not leave the table claiming to be live"
         );
     }

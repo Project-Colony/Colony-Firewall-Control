@@ -20,8 +20,145 @@ use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use super::{btf, cgroup, proc_table::KernelProcTable, Report};
+use super::{btf, cgroup, proc_table::KernelProcTable, Degrade, Report};
 use crate::dns::DnsCache;
+
+/// A load that did not happen, with the reason in a form [`Report::log`] can
+/// pick a severity from.
+#[derive(Debug)]
+pub(super) struct LoadError {
+    pub degrade: Degrade,
+    pub source: anyhow::Error,
+}
+
+impl LoadError {
+    fn new(degrade: Degrade, source: anyhow::Error) -> Self {
+        Self { degrade, source }
+    }
+}
+
+/// What to do about an object that fails [`vet_object`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Trust {
+    /// Say so and load it anyway. Correct when a human explicitly pointed the
+    /// daemon at this file: that is a statement of trust, and it is also the
+    /// only way the developer workflow works at all (an object under
+    /// `target/` is owned by whoever ran cargo, not by root).
+    Warn,
+    /// Refuse. Correct when nobody asked for this particular file - the daemon
+    /// found it at the default path and decided by itself to load it.
+    Refuse,
+}
+
+/// Whether a *directory* on the way to the object is safe.
+///
+/// Root-owned and not group/world-writable, or root-owned, world-writable and
+/// **sticky** - the `/tmp` shape, where a non-root user still cannot rename or
+/// remove root's files. Kept as a pure function so the policy can be tested
+/// exhaustively without needing root or a filesystem that can express every
+/// case.
+fn dir_is_safe(uid: u32, mode: u32) -> bool {
+    uid == 0 && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+/// Whether the object file itself is safe. No sticky exception: the bit means
+/// nothing on a regular file.
+fn file_is_safe(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
+/// Decides whether a file is one we are willing to hand to `bpf(2)`.
+///
+/// Not paranoia about `object_path` being attacker-*supplied* - it comes from a
+/// root-owned config file. It is about the file it points at being
+/// attacker-*replaceable*. A BPF object is kernel code: it is loaded with
+/// CAP_BPF, it runs on every exec and every ingress packet on the machine, and
+/// the process table it feeds is *preferred over `/proc`* when the daemon
+/// decides who a connection belongs to. A world-writable object, or one under a
+/// directory some ordinary user can rename, is a short path from "unprivileged
+/// local account" to "decides what the firewall believes".
+///
+/// Returns the offending path so the note can name it. Symlinks are resolved
+/// first: vetting the link and loading the target would check the wrong file.
+fn vet_object(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let real =
+        std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?;
+    let meta = std::fs::metadata(&real).with_context(|| format!("stat {}", real.display()))?;
+    if !meta.is_file() {
+        return Err(anyhow!("{} is not a regular file", real.display()));
+    }
+    if !file_is_safe(meta.uid(), meta.mode()) {
+        return Err(anyhow!(
+            "{} is uid {} mode {:o}; a BPF object must be root-owned and \
+             writable only by root",
+            real.display(),
+            meta.uid(),
+            meta.mode() & 0o7777,
+        ));
+    }
+    // Walk every ancestor: a safe file under a directory someone else can
+    // rename is not a safe file.
+    for dir in real.ancestors().skip(1) {
+        let m = std::fs::metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+        if !dir_is_safe(m.uid(), m.mode()) {
+            return Err(anyhow!(
+                "{} lies under {}, which is uid {} mode {:o}; a non-root user \
+                 could replace the object",
+                real.display(),
+                dir.display(),
+                m.uid(),
+                m.mode() & 0o7777,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Classifies a failure from `EbpfLoader::load` - parsing the ELF, creating
+/// maps, applying relocations.
+///
+/// `EACCES` here means the kernel refused the *syscall*, not a verifier
+/// verdict: no program has been submitted yet at this point.
+fn classify_load(err: &anyhow::Error) -> Degrade {
+    match errno_of(err) {
+        Some(libc::EPERM | libc::EACCES) => Degrade::NotPermitted,
+        // ENOTSUP and EOPNOTSUPP are the same number on Linux; naming both
+        // would be an unreachable pattern.
+        Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS) => Degrade::Unsupported,
+        _ => Degrade::Other,
+    }
+}
+
+/// Classifies a failure from `prog.load()`, which is where `BPF_PROG_LOAD`
+/// actually runs and therefore where the verifier actually speaks.
+///
+/// The important difference from [`classify_load`]: `BPF_PROG_LOAD` answers
+/// **`EACCES` when the verifier rejects the program** and `EPERM` when the
+/// caller lacks the capability. Folding those together would file our own bug
+/// meeting a newer kernel under "this container has no CAP_BPF" and hide the
+/// single most interesting failure this project can have.
+fn classify_verify(err: &anyhow::Error) -> Degrade {
+    match errno_of(err) {
+        Some(libc::EACCES | libc::E2BIG) => Degrade::Rejected,
+        Some(libc::EPERM) => Degrade::NotPermitted,
+        Some(libc::ENOTSUP | libc::ENOSYS) => Degrade::Unsupported,
+        // It reached the verifier, so an unclassified failure here is far more
+        // likely to be a rejection than a missing capability.
+        _ => Degrade::Rejected,
+    }
+}
+
+/// Digs the errno out of an error chain.
+///
+/// aya wraps syscall failures in typed errors whose `Display` has already lost
+/// the number, so the chain has to be walked down to the `io::Error`.
+fn errno_of(err: &anyhow::Error) -> Option<i32> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
 
 /// ELF symbol names of the three programs, as `llvm-readelf --symbols` reports
 /// them. aya keys `program_mut` on the symbol, not on the section.
@@ -62,18 +199,61 @@ pub(super) fn load_and_attach(
     object_path: &Path,
     dns: DnsCache,
     table: KernelProcTable,
-) -> anyhow::Result<(Attached, Report)> {
+    trust: Trust,
+) -> Result<(Attached, Report), LoadError> {
     let mut report = Report {
         configured: true,
         compiled_in: true,
         ..Report::default()
     };
 
-    let object = std::fs::read(object_path).with_context(|| {
-        format!(
-            "reading BPF object {} (build it with `cargo xtask build-ebpf` and \
-             install it there, or set [ebpf] object_path)",
-            object_path.display()
+    // Vet before read, so a file we would refuse is never even pulled into
+    // memory, and so the "not there at all" case is distinguishable from the
+    // "there but not ours" one.
+    if let Err(e) = vet_object(object_path) {
+        // `NotFound` from canonicalize is the ordinary "no object installed"
+        // case, not a trust failure, and it must stay that way: under an
+        // automatic default it is the single most common outcome on earth and
+        // logging it as a security event would be noise.
+        let missing = errno_of(&e) == Some(libc::ENOENT);
+        if missing {
+            return Err(LoadError::new(
+                Degrade::ObjectMissing,
+                e.context(format!(
+                    "no BPF object at {} (build it with `cargo xtask build-ebpf` \
+                     and install it there, or set [ebpf] object_path)",
+                    object_path.display()
+                )),
+            ));
+        }
+        match trust {
+            Trust::Refuse => {
+                return Err(LoadError::new(Degrade::ObjectUntrusted, e));
+            }
+            // Somebody pointed the daemon at this file on purpose. Say what is
+            // wrong with it and do as asked.
+            Trust::Warn => {
+                warn!("loading an unvetted BPF object because it was configured explicitly: {e:#}");
+                report
+                    .notes
+                    .push(format!("BPF object failed its ownership check: {e:#}"));
+            }
+        }
+    }
+
+    let object = std::fs::read(object_path).map_err(|e| {
+        let degrade = if e.kind() == std::io::ErrorKind::NotFound {
+            Degrade::ObjectMissing
+        } else {
+            Degrade::ObjectUnreadable
+        };
+        LoadError::new(
+            degrade,
+            anyhow::Error::new(e).context(format!(
+                "reading BPF object {} (build it with `cargo xtask build-ebpf` and \
+                 install it there, or set [ebpf] object_path)",
+                object_path.display()
+            )),
         )
     })?;
 
@@ -104,7 +284,18 @@ pub(super) fn load_and_attach(
     // The kernel's own BTF, used by aya to sanitize the object's BTF against
     // what this kernel supports. Optional: a kernel without it still loads
     // programs, it just gives worse verifier diagnostics.
-    let kernel_btf = Btf::from_sys_fs().ok();
+    let kernel_btf = match Btf::from_sys_fs() {
+        Ok(btf) => Some(btf),
+        Err(e) => {
+            // Was `.ok()`, which threw this away. It is not fatal - programs
+            // still load - but it is exactly the fact you want in the journal
+            // when a verifier rejection arrives with unhelpful diagnostics.
+            report.notes.push(format!(
+                "kernel BTF unavailable ({e}); verifier diagnostics will be poorer"
+            ));
+            None
+        }
+    };
     loader.btf(kernel_btf.as_ref());
     // Bound outside the `if` so the borrows outlive the loader.
     let (real_parent, tgid) = offsets.map(|o| (o.real_parent, o.tgid)).unwrap_or((0, 0));
@@ -119,33 +310,24 @@ pub(super) fn load_and_attach(
         );
     }
 
-    let mut bpf = loader.load(&object).with_context(|| {
-        format!(
-            "loading {} (needs CAP_BPF + CAP_PERFMON; on kernels < 5.8, CAP_SYS_ADMIN)",
-            object_path.display()
-        )
-    })?;
+    let mut bpf = loader
+        .load(&object)
+        .with_context(|| {
+            format!(
+                "loading {} (needs CAP_BPF + CAP_PERFMON; on kernels < 5.8, CAP_SYS_ADMIN)",
+                object_path.display()
+            )
+        })
+        .map_err(|e| LoadError::new(classify_load(&e), e))?;
 
     // --- attach, each independently ------------------------------------
 
-    match attach_tracepoint(&mut bpf, PROG_EXEC, "sched", "sched_process_exec") {
-        Ok(()) => report.exec_tracking = true,
-        Err(e) => report
-            .notes
-            .push(format!("sched_process_exec not attached: {e:#}")),
-    }
-    match attach_tracepoint(&mut bpf, PROG_EXIT, "sched", "sched_process_exit") {
-        Ok(()) => report.exit_tracking = true,
-        Err(e) => report
-            .notes
-            .push(format!("sched_process_exit not attached: {e:#}")),
-    }
-    match attach_dns(&mut bpf) {
-        Ok(()) => report.dns_capture = true,
-        Err(e) => report
-            .notes
-            .push(format!("cgroup_skb/ingress not attached: {e:#}")),
-    }
+    let r = attach_tracepoint(&mut bpf, PROG_EXEC, "sched", "sched_process_exec");
+    report.exec_tracking = record_attach(&mut report, PROG_EXEC, "sched_process_exec", r);
+    let r = attach_tracepoint(&mut bpf, PROG_EXIT, "sched", "sched_process_exit");
+    report.exit_tracking = record_attach(&mut report, PROG_EXIT, "sched_process_exit", r);
+    let r = attach_dns(&mut bpf);
+    report.dns_capture = record_attach(&mut report, PROG_DNS, "cgroup_skb/ingress", r);
 
     // Exec without exit tracking would let entries age out on the TTL alone,
     // which is a materially weaker pid-reuse story. Refuse the combination
@@ -257,22 +439,53 @@ pub(super) fn load_and_attach(
     Ok((Attached { _bpf: bpf, tasks }, report))
 }
 
+/// Folds one attach outcome into the report and says whether it is live.
+///
+/// The first classified failure wins `report.degrade` and later ones do not
+/// overwrite it: when three attaches fail it is almost always for one reason,
+/// and the first is the one that explains the rest.
+fn record_attach(
+    report: &mut Report,
+    program: &str,
+    what: &str,
+    result: anyhow::Result<Option<u32>>,
+) -> bool {
+    match result {
+        Ok(insns) => {
+            if let Some(n) = insns {
+                report.verified_insns.push((program.to_string(), n));
+            }
+            true
+        }
+        Err(e) => {
+            let degrade = classify_verify(&e);
+            report.notes.push(format!("{what} not attached: {e:#}"));
+            report.degrade.get_or_insert(degrade);
+            false
+        }
+    }
+}
+
+/// Returns the instruction count the verifier walked, when the kernel reports
+/// it (>= 5.16).
 fn attach_tracepoint(
     bpf: &mut Ebpf,
     name: &str,
     category: &str,
     event: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<u32>> {
     let prog: &mut TracePoint = bpf
         .program_mut(name)
         .ok_or_else(|| anyhow!("no program named `{name}` in the object"))?
         .try_into()
         .with_context(|| format!("`{name}` is not a tracepoint program"))?;
+    // This, not `EbpfLoader::load`, is where BPF_PROG_LOAD runs and where the
+    // verifier speaks. Classification of the error belongs to the caller.
     prog.load().context("verifier rejected the program")?;
-    log_verifier_cost(name, prog.info());
+    let insns = verifier_cost(name, prog.info());
     prog.attach(category, event)
         .with_context(|| format!("attaching to {category}:{event}"))?;
-    Ok(())
+    Ok(insns)
 }
 
 /// Logs how many instructions the verifier walked to accept a program.
@@ -282,24 +495,26 @@ fn attach_tracepoint(
 /// the wrong side of that (see `crates/cfc-ebpf/README.md`). Logging it turns
 /// "a change made the program more expensive" into something visible before it
 /// becomes "the program stopped loading on someone else's kernel".
-fn log_verifier_cost(name: &str, info: Result<aya::programs::ProgramInfo, ProgramError>) {
+fn verifier_cost(
+    name: &str,
+    info: Result<aya::programs::ProgramInfo, ProgramError>,
+) -> Option<u32> {
     match info {
         // `None` on kernels before 5.16, which do not report the count.
-        Ok(info) => debug!(
-            program = name,
-            verified_insns = info.verified_instruction_count().unwrap_or(0),
-            "verifier accepted the program"
-        ),
-        Err(e) => debug!(
-            program = name,
-            "verified instruction count unavailable: {e}"
-        ),
+        Ok(info) => info.verified_instruction_count(),
+        Err(e) => {
+            debug!(
+                program = name,
+                "verified instruction count unavailable: {e}"
+            );
+            None
+        }
     }
 }
 
 /// Attaches the DNS observer to the cgroup v2 root, which is what makes it
 /// system-wide: every task is in some descendant of it.
-fn attach_dns(bpf: &mut Ebpf) -> anyhow::Result<()> {
+fn attach_dns(bpf: &mut Ebpf) -> anyhow::Result<Option<u32>> {
     let root = cgroup::v2_root()
         .ok_or_else(|| anyhow!("no cgroup2 mount in /proc/mounts (unified hierarchy required)"))?;
     // Read-only is enough: the kernel wants the cgroup's fd as an attach
@@ -314,7 +529,7 @@ fn attach_dns(bpf: &mut Ebpf) -> anyhow::Result<()> {
         .try_into()
         .with_context(|| format!("`{PROG_DNS}` is not a cgroup_skb program"))?;
     prog.load().context("verifier rejected the program")?;
-    log_verifier_cost(PROG_DNS, prog.info());
+    let insns = verifier_cost(PROG_DNS, prog.info());
     prog.attach(
         dir.as_fd(),
         CgroupSkbAttachType::Ingress,
@@ -323,8 +538,26 @@ fn attach_dns(bpf: &mut Ebpf) -> anyhow::Result<()> {
         // failed to clean up would double every answer.
         CgroupAttachMode::Single,
     )
-    .with_context(|| format!("attaching cgroup_skb/ingress to {}", root.display()))?;
-    Ok(())
+    .map_err(|e| {
+        // `Single` on an already-claimed slot answers EEXIST. Left to the
+        // generic context below it reads as "no cgroup2", which sends whoever
+        // is debugging it to look at mounts instead of at the program that
+        // actually holds the slot.
+        let taken = anyhow::Error::new(e);
+        if errno_of(&taken) == Some(libc::EEXIST) {
+            taken.context(format!(
+                "another program already holds the exclusive cgroup_skb/ingress \
+                 slot on {}; observed DNS answers are unavailable while it does",
+                root.display()
+            ))
+        } else {
+            taken.context(format!(
+                "attaching cgroup_skb/ingress to {}",
+                root.display()
+            ))
+        }
+    })?;
+    Ok(insns)
 }
 
 /// Takes a ring-buffer map out of the object and starts a task that drains it.
@@ -394,6 +627,106 @@ fn decode<T: Copy>(bytes: &[u8]) -> Option<T> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // --- the object-trust policy ----------------------------------------
+    //
+    // Exercised as pure functions rather than through the filesystem: the
+    // interesting cases (root-owned, setgid, sticky) cannot all be created by
+    // a test running as an ordinary user, and a policy that is only checked on
+    // the machine that happens to be running the suite is not checked.
+
+    #[test]
+    fn only_root_owned_unwritable_files_are_trusted() {
+        assert!(
+            file_is_safe(0, 0o100644),
+            "root:root 0644 is the target case"
+        );
+        assert!(file_is_safe(0, 0o100600));
+        assert!(
+            !file_is_safe(1000, 0o100644),
+            "a user-owned object is not ours"
+        );
+        assert!(
+            !file_is_safe(0, 0o100664),
+            "group-writable lets the group swap it"
+        );
+        assert!(
+            !file_is_safe(0, 0o100666),
+            "world-writable lets anyone swap it"
+        );
+        // The sticky bit means nothing on a regular file and must not be
+        // mistaken for the directory exemption below.
+        assert!(!file_is_safe(0, 0o101666));
+    }
+
+    #[test]
+    fn sticky_root_directories_are_trusted_but_plain_writable_ones_are_not() {
+        assert!(dir_is_safe(0, 0o040755));
+        assert!(
+            dir_is_safe(0, 0o041777),
+            "/tmp: world-writable but sticky, so a non-root user still cannot \
+             rename root's files"
+        );
+        assert!(
+            !dir_is_safe(0, 0o040777),
+            "world-writable without sticky is a rename away from a swapped object"
+        );
+        assert!(
+            !dir_is_safe(1000, 0o040755),
+            "a user-owned parent is enough"
+        );
+        assert!(!dir_is_safe(0, 0o040775), "group-writable counts too");
+    }
+
+    #[test]
+    fn a_world_writable_object_is_refused_but_only_under_refuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cfc-ebpf.o");
+        std::fs::write(&path, b"not an ELF").expect("write");
+        // 0666 rather than relying on ownership: this test has to give the
+        // same answer whether the suite is run as root or as a user.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+
+        let refused = load_and_attach(
+            &path,
+            DnsCache::new(),
+            KernelProcTable::new(),
+            Trust::Refuse,
+        )
+        .err()
+        .expect("a world-writable object must not be loaded");
+        assert_eq!(refused.degrade, Degrade::ObjectUntrusted);
+
+        // Under `Warn` the same file gets past the check and fails later, on
+        // its own merits -- it is not an ELF. The point is that the trust
+        // check is what changed, and nothing else.
+        let warned = load_and_attach(&path, DnsCache::new(), KernelProcTable::new(), Trust::Warn)
+            .err()
+            .expect("`not an ELF` cannot load either way");
+        assert_ne!(
+            warned.degrade,
+            Degrade::ObjectUntrusted,
+            "Trust::Warn must have let it past the ownership check"
+        );
+    }
+
+    #[test]
+    fn an_absent_object_is_missing_not_untrusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Even under `Refuse`: "nobody installed the object" is the ordinary
+        // outcome on most hosts, and filing it as a trust failure would turn
+        // the commonest case on earth into a security-looking log line.
+        let e = load_and_attach(
+            &dir.path().join("absent.o"),
+            DnsCache::new(),
+            KernelProcTable::new(),
+            Trust::Refuse,
+        )
+        .err()
+        .expect("there is no object there");
+        assert_eq!(e.degrade, Degrade::ObjectMissing);
+    }
 
     #[test]
     fn decode_rejects_short_records() {
@@ -526,8 +859,12 @@ mod tests {
         });
         let table = KernelProcTable::new();
         let cache = DnsCache::new();
+        // `Trust::Warn`: the object under test lives in `target/`, owned by
+        // whoever ran cargo, which is exactly the case the ownership check is
+        // meant to refuse in production and must not refuse here.
         let (attached, report) =
-            load_and_attach(Path::new(&path), cache.clone(), table.clone()).expect("load");
+            load_and_attach(Path::new(&path), cache.clone(), table.clone(), Trust::Warn)
+                .expect("load");
         for note in &report.notes {
             println!("note: {note}");
         }

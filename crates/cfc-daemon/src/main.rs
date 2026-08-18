@@ -122,7 +122,11 @@ async fn run() -> anyhow::Result<()> {
     // Held for the daemon's lifetime: dropping it detaches the programs.
     // Every failure inside is a warning, never a reason not to filter - see
     // `cfc_daemon::ebpf`.
-    let _ebpf = ebpf::start(&cfg.ebpf, dns_cache.clone());
+    let _ebpf = ebpf::start(
+        &cfg.ebpf,
+        dns_cache.clone(),
+        ebpf::proc_table::global().clone(),
+    );
     _ebpf.report.log();
 
     // Persist every decided flow into the events table. Subscribes to the
