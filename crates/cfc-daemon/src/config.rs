@@ -105,24 +105,44 @@ impl Profile {
         }
     }
 
-    /// Every profile denies on timeout.
+    /// **No profile ever produces an Allow by itself.** Not on timeout, not
+    /// when there is nobody to ask. Only a rule, or a person answering a
+    /// prompt, can permit a connection.
     ///
     /// A timeout means the question *was* put to the user and went
     /// unanswered — walking away from a prompt must not be a way to grant
-    /// access, or an attacker's best move is simply to connect while
-    /// nobody is at the keyboard. What the profiles actually differ on is
-    /// how long to wait, and what to do when there is nobody to ask at
-    /// all (`no_ui_action`): a desktop that boots before its session
-    /// starts should keep working, a locked-down box should not.
+    /// access, or an attacker's best move is simply to connect while nobody
+    /// is at the keyboard.
+    ///
+    /// `no_ui_action` is the other half of the same principle, and it used to
+    /// break it: Relaxed and Balanced answered Allow when no client was
+    /// connected, on the theory that a desktop booting before its session
+    /// starts should keep working. That theory quietly gave away the whole
+    /// product on any machine where a session never starts at all. A headless
+    /// server, a VM, anything administered over SSH — `cfc-ui` and the tray
+    /// never run there, so "there is nobody to ask" is not a window during
+    /// boot, it is the permanent condition, and Allow meant those hosts had no
+    /// outbound firewall whatsoever. Denying is the only answer consistent
+    /// with what this program is for.
+    ///
+    /// What the profiles still differ on is how long to wait for an answer.
+    ///
+    /// This cannot lock an operator out of a remote machine: the nftables
+    /// table hooks `output` on `ct state new` only, so an inbound SSH session's
+    /// replies are `ct state established` and are never queued, and loopback is
+    /// accepted outright. Rules can still be added with `cfc-cli` from that
+    /// session. What it *does* mean on a fresh headless install is that
+    /// outbound traffic — package updates, NTP, backups — is denied until
+    /// rules exist for it.
     pub fn policy(self) -> DefaultPolicy {
         match self {
             Profile::Relaxed => DefaultPolicy {
-                no_ui_action: Action::Allow,
+                no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
                 prompt_timeout_secs: 60,
             },
             Profile::Balanced => DefaultPolicy {
-                no_ui_action: Action::Allow,
+                no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
                 prompt_timeout_secs: 30,
             },
@@ -351,7 +371,11 @@ mod tests {
     #[test]
     fn empty_file_yields_balanced_defaults() {
         let cfg = Config::from_toml_str("").unwrap();
-        assert_eq!(cfg.default_policy.no_ui_action, Action::Allow);
+        // Neither half of "we could not ask" may grant access: not a prompt
+        // that expired, and not the absence of anyone to prompt. A shipped
+        // default that allows is the whole product handed away on any host
+        // without a graphical session.
+        assert_eq!(cfg.default_policy.no_ui_action, Action::Deny);
         assert_eq!(cfg.default_policy.timeout_action, Action::Deny);
         assert_eq!(cfg.default_policy.prompt_timeout_secs, 30);
         assert_eq!(cfg.nfqueue.queue_num, 0);
@@ -488,10 +512,39 @@ mod tests {
         assert_eq!(cfg.default_policy.prompt_timeout_secs, 15);
     }
 
+    /// The invariant the whole product rests on, asserted over every profile
+    /// rather than over the one that happens to be the default.
+    ///
+    /// A profile decides how *long* to wait for an answer. It must never
+    /// decide to permit a connection on its own: only a stored rule or a
+    /// person answering a prompt may do that. An explicit
+    /// `[default_policy] no_ui_action = "Allow"` in an operator's config is a
+    /// different matter and is still honoured - see
+    /// `explicit_balanced_values_beat_strict_profile`.
+    #[test]
+    fn no_profile_ever_permits_by_itself() {
+        for profile in [Profile::Relaxed, Profile::Balanced, Profile::Strict] {
+            let p = profile.policy();
+            assert_ne!(
+                p.no_ui_action,
+                Action::Allow,
+                "{profile:?} would allow when no client is connected -- on a \
+                 headless or SSH-only host that is the permanent state, not a \
+                 boot-time window, so this is 'no outbound firewall at all'"
+            );
+            assert_ne!(
+                p.timeout_action,
+                Action::Allow,
+                "{profile:?} would allow an unanswered prompt, making 'connect \
+                 while nobody is at the keyboard' a winning move"
+            );
+        }
+    }
+
     #[test]
     fn unrecognized_profile_falls_back_to_balanced_base() {
         let cfg = Config::from_toml_str(r#"profile = "paranoid""#).unwrap();
-        assert_eq!(cfg.default_policy.no_ui_action, Action::Allow);
+        assert_eq!(cfg.default_policy.no_ui_action, Action::Deny);
         assert_eq!(cfg.default_policy.prompt_timeout_secs, 30);
     }
 

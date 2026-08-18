@@ -43,8 +43,12 @@ profile = "balanced"
 # # Each field overrides the profile's value for that one field only.
 # # What to do when no rule matches and NOTHING is subscribed to prompts -
 # # no GUI, no `cfc prompts`. Nobody is asked; this is applied directly.
+# # Every profile sets this to "Deny": on a headless machine nothing is
+# # ever subscribed, so an allow here means no outbound firewall at all.
+# # Set it to "Allow" only if you want an unattended box to fail open, and
+# # know that the firewall then enforces only what you wrote down.
 # # "Reject" is accepted here but behaves as "Deny" (no refusal is sent).
-# no_ui_action = "Allow"
+# no_ui_action = "Deny"
 # # What to do if a prompt was shown but expired unanswered. Every profile
 # # sets this to "Deny"; override only if you want an unanswered question
 # # to grant access. Same caveat about "Reject".

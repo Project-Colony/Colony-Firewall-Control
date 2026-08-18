@@ -267,9 +267,14 @@ The named profiles are just presets for these three values:
 
 | Profile  | `no_ui_action` | `timeout_action` | `prompt_timeout_secs` |
 |----------|----------------|------------------|-----------------------|
-| relaxed  | Allow          | Deny             | 60                    |
-| balanced | Allow          | Deny             | 30 (default)          |
+| relaxed  | Deny           | Deny             | 60                    |
+| balanced | Deny           | Deny             | 30 (default)          |
 | strict   | Deny           | Deny             | 15                    |
+
+No profile permits anything on its own — the presets differ only in how
+long a prompt waits. Only a stored rule, or a person answering, allows a
+connection. You can still override either field explicitly under
+`[default_policy]`; the point is that nothing does it for you.
 
 `timeout_action` is `Deny` in every profile on purpose: a prompt you
 were shown and did not answer must not become an allow, or connecting
@@ -291,16 +296,22 @@ does.
 ## Prompts never appear on a headless server
 
 There is no GUI to pop them, so the daemon applies `no_ui_action` to
-every unmatched flow without asking anyone. Under `balanced` that means
-everything is silently allowed; under `strict` it means everything is
-silently denied, which looks exactly like a dead network.
+every unmatched flow without asking anyone — a denial under every
+profile, which looks exactly like a dead network. This is the intended
+behaviour: on a headless box "nobody is connected" is the permanent
+state, and allowing would mean the machine has no outbound firewall at
+all.
 
-Confirm which one you are in:
+Confirm what you are in:
 
 ```sh
 cfc status
-# prompt policy    30s timeout -> Deny, no UI -> Allow
+# prompt policy    30s timeout -> Deny, no UI -> Deny
 ```
+
+Inbound SSH is unaffected — the ruleset hooks `output` on `ct state new`,
+and an established session's replies are never queued — so you always
+have a way back in to fix it.
 
 Then pick one of three fixes:
 
@@ -325,10 +336,12 @@ bootstrap-defaults` covers the usual system services; add your own with
 `cfc rules add`. Anything you did not anticipate still hits
 `no_ui_action`.
 
-**3. Change the fallback.** `no_ui_action = "Allow"` in
-`[default_policy]` makes an unattended box fail open. It is the honest
-choice for a server you cannot babysit; it also means the firewall only
-enforces what you explicitly wrote down. Send `SIGHUP` and it takes
+**3. Change the fallback — deliberately.** `no_ui_action = "Allow"` in
+`[default_policy]` makes an unattended box fail open. No profile does
+this for you any more, and you should think before writing it: it means
+the firewall enforces only what you explicitly wrote down, and every
+unanticipated connection — including a payload phoning home — goes out
+unasked. Prefer (1) or (2). If you do set it, send `SIGHUP` and it takes
 effect without a restart.
 
 Note that `cfc prompts` and the GUI can both be connected at once, and

@@ -27,17 +27,31 @@ running" throughout - it subscribes the same way the GUI does.
 | balanced | Allow    | Deny     | 30s    | Daily-driver workstations (default)            |
 | strict   | Deny     | Deny     | 15s    | Lockdown posture, UI always present            |
 
-**Every profile denies on timeout, by design.** A timeout means the
-question *was* put to you and went unanswered; if that granted access,
-the cheapest attack would be to connect while nobody is at the keyboard.
-What the profiles actually differ on is how long to wait, and what to do
-when there is nobody to ask at all (`no_ui_action`) — a desktop that
-boots before its session starts should keep working, a locked-down box
-should not.
+**No profile ever permits a connection by itself.** Not on timeout, not
+when nothing is subscribed. The presets differ only in how long a prompt
+waits for an answer. Only a stored rule, or a person answering, allows
+traffic.
 
-`no_ui_action` and `timeout_action` are genuinely different questions.
+A timeout means the question *was* put to you and went unanswered; if
+that granted access, the cheapest attack would be to connect while
+nobody is at the keyboard.
+
+`no_ui_action` is the other half of the same principle, and it used to
+break it. Relaxed and balanced answered *allow* when nothing was
+subscribed, reasoning that a desktop booting before its session starts
+should keep working. That reasoning does not survive contact with a
+machine where a session never starts at all: on a headless server, a VM,
+anything administered over SSH, `colony-firewall` and the tray never run,
+so "nobody is subscribed" is not a window during boot — it is the
+permanent condition. Those hosts had no outbound firewall whatsoever.
+
+`no_ui_action` and `timeout_action` remain genuinely different questions.
 "Nobody is subscribed" is a property of the machine's state; "you were
-asked and did not answer" is a decision you made by not making one.
+asked and did not answer" is a decision you made by not making one. Both
+now answer *deny*, for different reasons.
+
+You can still set either to `"Allow"` explicitly under `[default_policy]`
+— see below. The change is that nothing does it on your behalf.
 
 The danger with `strict` is bootstrap: the units are ordered
 `Before=network-pre.target`, so filtering is live before any interface

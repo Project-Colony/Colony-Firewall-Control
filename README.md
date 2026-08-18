@@ -203,9 +203,11 @@ systemd-timesyncd and chronyd NTP (:123/udp), the DHCP clients (dhcpcd,
 NetworkManager and systemd-networkd, :67 and :547/udp), pacman and paru
 HTTPS mirrors (:443/tcp), and the SSH client (:22/tcp) - and is
 idempotent (already-present rules are skipped by name; `--dry-run`
-previews). The DHCP rules matter because filtering starts before the
-network is configured (see below): under a strict profile they are what
-lets the machine get a lease at boot with no UI connected yet.
+previews). **Do not skip this step.** No profile allows anything on its
+own, so on a machine with no rules and no UI connected nothing outbound
+gets through - including the DHCP lease. Filtering starts before the
+network is configured (see below), and these rules are what let the
+machine come up at all.
 
 **3. Give prompts somewhere to go.** On a desktop, launch the GUI:
 
@@ -220,8 +222,15 @@ cfc prompts
 ```
 
 With no subscriber at all the daemon applies `no_ui_action` to every
-unmatched flow without asking anyone - silently allowed under
-`balanced`, silently denied under `strict`.
+unmatched flow without asking anyone. **That is a denial under every
+profile.** "Nobody is connected" is a permanent condition on a headless
+box, not a passing one, and answering it with an allow would mean those
+hosts had no outbound firewall whatsoever. Stored rules are what such a
+machine runs on; `cfc prompts` is how you add more without a GUI.
+
+This cannot lock you out of a remote machine: the ruleset hooks `output`
+on `ct state new` only, so an inbound SSH session's replies are
+`ct state established` and are never queued.
 
 **Boot behaviour.** Both units are ordered `Before=network-pre.target`,
 the systemd convention for firewalls: every network-configuration
@@ -231,8 +240,8 @@ in place before any interface is configured. There is no window at boot
 where the network is up but filtering is not - the same guarantee
 Windows' built-in firewall provides with its boot-time filters. During
 that early phase no UI is connected, so unmatched flows resolve via
-`no_ui_action`; the bootstrap DHCP/DNS/NTP rules are what keep a
-`strict` machine bootable.
+`no_ui_action` - a denial - and the bootstrap DHCP/DNS/NTP rules are
+what keep the machine bootable.
 
 Then confirm it is really filtering:
 
