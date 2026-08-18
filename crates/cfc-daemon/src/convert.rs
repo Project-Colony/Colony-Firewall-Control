@@ -6,7 +6,9 @@
 //! manufactured `Allow`. Callers map the `String` error to
 //! `Status::invalid_argument`.
 
-use cfc_core::{Action, Connection, Direction, Process, Protocol, Rule, RuleScope, Verdict};
+use cfc_core::{
+    Action, Connection, Direction, Process, Protocol, Provenance, Rule, RuleScope, Verdict,
+};
 use cfc_proto::v1 as pb;
 use std::str::FromStr;
 
@@ -65,6 +67,29 @@ pub fn protocol_from_pb(p: i32) -> Protocol {
         pb::Protocol::Udp => Protocol::Udp,
         pb::Protocol::Icmp => Protocol::Icmp,
         _ => Protocol::Other(0),
+    }
+}
+
+pub fn provenance_to_pb(p: Provenance) -> pb::Provenance {
+    match p {
+        Provenance::Unknown => pb::Provenance::Unspecified,
+        Provenance::Unpackaged => pb::Provenance::Unpackaged,
+        Provenance::Verified => pb::Provenance::Verified,
+        Provenance::Modified => pb::Provenance::Modified,
+    }
+}
+
+/// Unlike `action_from_pb` this does not fail closed, because there is
+/// nothing to fail closed *to*: provenance is advisory metadata, never a
+/// verdict input. An unset field (an older client) and an integer from a
+/// newer schema both mean the same thing operationally - "this build cannot
+/// say" - which is exactly [`Provenance::Unknown`].
+pub fn provenance_from_pb(p: i32) -> Provenance {
+    match pb::Provenance::try_from(p).unwrap_or(pb::Provenance::Unspecified) {
+        pb::Provenance::Unpackaged => Provenance::Unpackaged,
+        pb::Provenance::Verified => Provenance::Verified,
+        pb::Provenance::Modified => Provenance::Modified,
+        pb::Provenance::Unspecified => Provenance::Unknown,
     }
 }
 
@@ -138,6 +163,10 @@ pub fn process_to_pb(p: &Process) -> pb::ProcessInfo {
             .map(|c| c.to_string_lossy().into_owned())
             .unwrap_or_default(),
         sha256: p.sha256.clone().unwrap_or_default(),
+        // Empty means "no package owns this" or "we did not / could not
+        // check"; `provenance` is what tells those apart.
+        package: p.package.clone().unwrap_or_default(),
+        provenance: provenance_to_pb(p.provenance) as i32,
     }
 }
 
@@ -380,6 +409,52 @@ mod tests {
 
         p.uid = Some(0);
         assert_eq!(process_to_pb(&p).uid, Some(0));
+    }
+
+    #[test]
+    fn provenance_roundtrip() {
+        for p in [
+            Provenance::Unknown,
+            Provenance::Unpackaged,
+            Provenance::Verified,
+            Provenance::Modified,
+        ] {
+            assert_eq!(provenance_from_pb(provenance_to_pb(p) as i32), p);
+        }
+    }
+
+    #[test]
+    fn provenance_unknown_absorbs_unset_and_version_skew() {
+        // Advisory metadata, so an unrecognized value degrades to "cannot
+        // say" instead of erroring a whole prompt off the wire.
+        assert_eq!(provenance_from_pb(0), Provenance::Unknown);
+        assert_eq!(provenance_from_pb(99), Provenance::Unknown);
+        assert_eq!(provenance_from_pb(-1), Provenance::Unknown);
+    }
+
+    #[test]
+    fn process_carries_package_and_provenance_onto_the_wire() {
+        let mut p = cfc_core::Process::unknown(42);
+        // Default: nothing claimed.
+        assert_eq!(process_to_pb(&p).package, "");
+        assert_eq!(
+            process_to_pb(&p).provenance,
+            cfc_proto::v1::Provenance::Unspecified as i32
+        );
+
+        p.package = Some("curl 8.21.0-1".into());
+        p.provenance = Provenance::Modified;
+        let pb = process_to_pb(&p);
+        assert_eq!(pb.package, "curl 8.21.0-1");
+        assert_eq!(pb.provenance, cfc_proto::v1::Provenance::Modified as i32);
+        assert_eq!(provenance_from_pb(pb.provenance), Provenance::Modified);
+
+        // "Owned but unverifiable" (dpkg): a package name alongside
+        // UNSPECIFIED must survive the wire as exactly that pair.
+        p.provenance = Provenance::Unknown;
+        let pb = process_to_pb(&p);
+        assert_eq!(pb.package, "curl 8.21.0-1");
+        assert_eq!(pb.provenance, cfc_proto::v1::Provenance::Unspecified as i32);
     }
 
     #[test]

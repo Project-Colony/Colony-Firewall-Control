@@ -20,6 +20,7 @@ pub mod nfqueue;
 pub mod packet;
 pub mod process_resolve;
 pub mod prompts;
+pub mod provenance;
 pub mod reject;
 pub mod sd_notify;
 pub mod sock_diag;

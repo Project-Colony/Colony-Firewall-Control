@@ -267,9 +267,15 @@ The named profiles are just presets for these three values:
 
 | Profile  | `no_ui_action` | `timeout_action` | `prompt_timeout_secs` |
 |----------|----------------|------------------|-----------------------|
-| relaxed  | Allow          | Allow            | 60                    |
-| balanced | Allow          | Allow            | 15 (default)          |
-| strict   | Deny           | Deny             | 10                    |
+| relaxed  | Allow          | Deny             | 60                    |
+| balanced | Allow          | Deny             | 30 (default)          |
+| strict   | Deny           | Deny             | 15                    |
+
+`timeout_action` is `Deny` in every profile on purpose: a prompt you
+were shown and did not answer must not become an allow, or connecting
+while nobody is at the keyboard is the easiest way through. If you truly
+want the old allow-on-timeout behaviour, set it explicitly:
+`timeout_action = "Allow"` under `[default_policy]`.
 
 Under `strict`, "the UI wasn't running" means "everything was denied" -
 which is the point, but is also why strict on a headless box with no
@@ -293,7 +299,7 @@ Confirm which one you are in:
 
 ```sh
 cfc status
-# prompt policy    15s timeout -> Allow, no UI -> Allow
+# prompt policy    30s timeout -> Deny, no UI -> Allow
 ```
 
 Then pick one of three fixes:

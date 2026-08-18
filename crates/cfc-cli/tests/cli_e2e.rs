@@ -59,6 +59,8 @@ impl Firewall for FakeDaemon {
                     cmdline: vec!["curl".into(), "https://example.com".into()],
                     cwd: "/home/u".into(),
                     sha256: "9f2c1a3b4d5e6f70".into(),
+                    package: "curl 8.21.0-1".into(),
+                    provenance: pb::Provenance::Verified as i32,
                 }),
                 // Far enough out that a slow CI box cannot expire it.
                 deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 60_000,
@@ -161,6 +163,8 @@ impl Firewall for FakeDaemon {
                         cmdline: vec![],
                         cwd: String::new(),
                         sha256: String::new(),
+                        package: String::new(),
+                        provenance: pb::Provenance::Unspecified as i32,
                     }),
                     verdict: pb::Action::Deny as i32,
                     rule_id: "r-7".into(),
@@ -335,6 +339,8 @@ async fn auto_deny_answers_one_prompt_and_exits() {
     assert_eq!(v["exe"], "/usr/bin/curl");
     assert_eq!(v["uid"], 1000);
     assert_eq!(v["dst_host"], "example.com");
+    assert_eq!(v["package"], "curl 8.21.0-1");
+    assert_eq!(v["provenance"], "verified");
 }
 
 /// Drives the interactive decision tree over piped stdin (line mode).
@@ -391,6 +397,12 @@ async fn answering_once_persists_no_rule() {
     assert!(stdout.contains("uid 1000"), "{stdout}");
     assert!(stdout.contains("example.com:443"), "{stdout}");
     assert!(stdout.contains("9f2c1a3b4d5e"), "sha256 missing:\n{stdout}");
+    // Package provenance: the whole point is that it reaches the user's
+    // eyes at decision time, not just the wire.
+    assert!(
+        stdout.contains("curl 8.21.0-1 (verified)"),
+        "provenance missing:\n{stdout}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

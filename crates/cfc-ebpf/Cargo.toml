@@ -1,0 +1,62 @@
+# Kernel-side crate. Deliberately its OWN cargo workspace (note the empty
+# `[workspace]` table at the bottom) so that:
+#
+#   * `cargo build --workspace` / `cargo clippy --workspace` / the MSRV check at
+#     the repo root never see it -- they run on stable and would fail on the
+#     nightly-only `-Z build-std` and the `bpfel-unknown-none` target;
+#   * it gets its own `Cargo.lock`, so aya never enters the root lockfile and
+#     never widens the `cargo deny` surface of the shipped binaries.
+#
+# It is also listed under `exclude` in the root Cargo.toml, belt and braces.
+#
+# Build it with `cargo xtask build-ebpf` from the repo root, or directly with
+# `cargo build --release` from *this* directory (the local
+# `rust-toolchain.toml` + `.cargo/config.toml` supply nightly, the BPF target
+# and `-Z build-std=core`).
+
+[package]
+name = "cfc-ebpf"
+version = "0.2.0"
+edition = "2024"
+# Matches aya-ebpf 0.2's own MSRV. Irrelevant to the workspace MSRV of 1.88:
+# this crate is only ever built by the pinned nightly.
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Project-Colony/Colony-Firewall-Control"
+authors = ["MotherSphere <linhajahad@gmail.com>"]
+description = "Colony Firewall Control - eBPF programs (exec/exit tracking and DNS answer capture)"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.2.1"
+# `default-features = false` drops the `std` feature, turning the shared crate
+# into `#![no_std]`. Same source file, same layout constants, same parsers as
+# the userspace side -- that is the whole point.
+cfc-ebpf-common = { path = "../cfc-ebpf-common", default-features = false }
+
+[[bin]]
+name = "cfc-ebpf"
+path = "src/main.rs"
+test = false
+bench = false
+doc = false
+
+# BPF needs optimisation even in "debug": the verifier's instruction budget and
+# its dislike of stack spills make -O0 output unloadable. `debug = 2` is load
+# bearing -- bpf-linker derives the object's BTF from DWARF, and without BTF the
+# kernel refuses global (.rodata) variables and gives far worse verifier errors.
+[profile.dev]
+opt-level = 2
+debug = 2
+overflow-checks = false
+incremental = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 2
+overflow-checks = false
+# NOTE: never set `strip` here; it would remove .BTF.
+
+[workspace]

@@ -328,9 +328,13 @@ cfc man --dir /usr/share/man/man1
 
 | Profile  | No UI    | Timeout  | Window |
 |----------|----------|----------|--------|
-| relaxed  | Allow    | Allow    | 60s    |
-| balanced | Allow    | Allow    | 15s    | (default)
-| strict   | Deny     | Deny     | 10s    |
+| relaxed  | Allow    | Deny     | 60s    |
+| balanced | Allow    | Deny     | 30s    | (default)
+| strict   | Deny     | Deny     | 15s    |
+
+Every profile denies on timeout: a prompt you were shown and did not
+answer must not become an allow. The profiles differ in how long they
+wait, and in what happens when there is nobody subscribed to ask.
 
 Use `strict` only when you always have the UI running (or `cfc prompts`),
 otherwise you lose network when the daemon starts before a subscriber

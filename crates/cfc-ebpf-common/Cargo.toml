@@ -1,0 +1,20 @@
+[package]
+name = "cfc-ebpf-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Colony Firewall Control - POD types and pure parsers shared by the eBPF programs and userspace"
+
+[features]
+# `std` is on by default so the userspace side (daemon, tests) gets the
+# convenience helpers. The kernel-side crate depends on this one with
+# `default-features = false`, which turns the crate into `#![no_std]`.
+default = ["std"]
+std = []
+
+[dependencies]
+# Intentionally none. This crate is compiled for `bpfel-unknown-none` as well
+# as the host, so it must stay dependency-free (and `no_std`-clean).

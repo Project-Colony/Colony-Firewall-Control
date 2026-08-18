@@ -34,6 +34,7 @@ pub struct Config {
     pub pause: PauseConfig,
     pub events: EventsConfig,
     pub ipc: IpcConfig,
+    pub provenance: ProvenanceConfig,
 }
 
 impl Default for Config {
@@ -82,11 +83,14 @@ impl DefaultPolicyToml {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
-    /// Permissive: allow when no UI and on timeout, long timeout.
+    /// Permissive: allow when there is no UI to ask, and wait a full
+    /// minute before denying an unanswered prompt.
     Relaxed,
-    /// Default: allow on timeout (fail-open) but with a short window.
+    /// Default: allow when there is no UI to ask (so a machine still boots
+    /// and updates), deny an unanswered prompt after 30s.
     Balanced,
-    /// Lock down: deny when no UI and on timeout (fail-closed), short window.
+    /// Lock down: deny when there is no UI to ask, and deny an unanswered
+    /// prompt after 15s. Needs rules for every always-on service.
     Strict,
 }
 
@@ -100,22 +104,31 @@ impl Profile {
         }
     }
 
+    /// Every profile denies on timeout.
+    ///
+    /// A timeout means the question *was* put to the user and went
+    /// unanswered — walking away from a prompt must not be a way to grant
+    /// access, or an attacker's best move is simply to connect while
+    /// nobody is at the keyboard. What the profiles actually differ on is
+    /// how long to wait, and what to do when there is nobody to ask at
+    /// all (`no_ui_action`): a desktop that boots before its session
+    /// starts should keep working, a locked-down box should not.
     pub fn policy(self) -> DefaultPolicy {
         match self {
             Profile::Relaxed => DefaultPolicy {
                 no_ui_action: Action::Allow,
-                timeout_action: Action::Allow,
+                timeout_action: Action::Deny,
                 prompt_timeout_secs: 60,
             },
             Profile::Balanced => DefaultPolicy {
                 no_ui_action: Action::Allow,
-                timeout_action: Action::Allow,
-                prompt_timeout_secs: 15,
+                timeout_action: Action::Deny,
+                prompt_timeout_secs: 30,
             },
             Profile::Strict => DefaultPolicy {
                 no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
-                prompt_timeout_secs: 10,
+                prompt_timeout_secs: 15,
             },
         }
     }
@@ -211,6 +224,21 @@ impl Default for IpcConfig {
     }
 }
 
+/// Binary package provenance (see `crate::provenance`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProvenanceConfig {
+    /// Look every prompted/observed executable up in the system package
+    /// database and report whether it still matches what was installed.
+    pub enabled: bool,
+}
+
+impl Default for ProvenanceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Raw on-disk shape. Only `[default_policy]` needs Option-per-field (it
 /// interacts with `profile`); the other sections carry their own defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -223,6 +251,7 @@ struct ConfigToml {
     pause: PauseConfig,
     events: EventsConfig,
     ipc: IpcConfig,
+    provenance: ProvenanceConfig,
 }
 
 impl ConfigToml {
@@ -248,19 +277,37 @@ impl ConfigToml {
             pause: self.pause,
             events: self.events,
             ipc: self.ipc,
+            provenance: self.provenance,
         }
     }
 }
 
 impl Config {
+    /// Loads the config file, or the built-in defaults when it is absent.
+    ///
+    /// Also publishes the process-wide switches that are not carried by a
+    /// value anyone threads through the call graph — currently just
+    /// `[provenance] enabled`, consumed deep inside process resolution.
+    /// Doing it here rather than in `main` is what makes those switches
+    /// hot-reload: SIGHUP re-enters this function (see `reload_policy` in
+    /// `main.rs`), so re-applying on every load is both the startup path
+    /// and the reload path.
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
+        let cfg = match std::fs::read_to_string(path) {
             Ok(txt) => {
-                Self::from_toml_str(&txt).with_context(|| format!("parsing {}", path.display()))
+                Self::from_toml_str(&txt).with_context(|| format!("parsing {}", path.display()))?
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        cfg.apply_runtime_switches();
+        Ok(cfg)
+    }
+
+    /// Pushes config values that live in process-wide state into it. Kept
+    /// separate from parsing so `from_toml_str` stays a pure function.
+    pub fn apply_runtime_switches(&self) {
+        crate::provenance::set_enabled(self.provenance.enabled);
     }
 
     /// Parses and resolves a TOML document (see the module docs for the
@@ -279,8 +326,8 @@ mod tests {
     fn empty_file_yields_balanced_defaults() {
         let cfg = Config::from_toml_str("").unwrap();
         assert_eq!(cfg.default_policy.no_ui_action, Action::Allow);
-        assert_eq!(cfg.default_policy.timeout_action, Action::Allow);
-        assert_eq!(cfg.default_policy.prompt_timeout_secs, 15);
+        assert_eq!(cfg.default_policy.timeout_action, Action::Deny);
+        assert_eq!(cfg.default_policy.prompt_timeout_secs, 30);
         assert_eq!(cfg.nfqueue.queue_num, 0);
         assert_eq!(cfg.nfqueue.queue_max_len, 4096);
         assert!(!cfg.nfqueue.fail_open);
@@ -288,6 +335,7 @@ mod tests {
         assert_eq!(cfg.events.max_rows, 100_000);
         assert_eq!(cfg.ipc.group, "colony-firewall");
         assert!(cfg.ipc.require_group);
+        assert!(cfg.provenance.enabled);
         assert_eq!(
             cfg.storage.path,
             PathBuf::from("/var/lib/colony-firewall/rules.db")
@@ -295,9 +343,27 @@ mod tests {
     }
 
     #[test]
+    fn provenance_is_on_by_default_and_can_be_switched_off() {
+        assert!(Config::from_toml_str("").unwrap().provenance.enabled);
+        assert!(
+            Config::from_toml_str("[provenance]\n")
+                .unwrap()
+                .provenance
+                .enabled,
+            "an empty section keeps the default"
+        );
+        assert!(
+            !Config::from_toml_str("[provenance]\nenabled = false\n")
+                .unwrap()
+                .provenance
+                .enabled
+        );
+    }
+
+    #[test]
     fn missing_file_yields_defaults() {
         let cfg = Config::load_or_default(Path::new("/nonexistent/cfc/daemon.toml")).unwrap();
-        assert_eq!(cfg.default_policy.prompt_timeout_secs, 15);
+        assert_eq!(cfg.default_policy.prompt_timeout_secs, 30);
         assert_eq!(cfg.pause.default_secs, 600);
     }
 
@@ -306,7 +372,7 @@ mod tests {
         let cfg = Config::from_toml_str(r#"profile = "strict""#).unwrap();
         assert_eq!(cfg.default_policy.no_ui_action, Action::Deny);
         assert_eq!(cfg.default_policy.timeout_action, Action::Deny);
-        assert_eq!(cfg.default_policy.prompt_timeout_secs, 10);
+        assert_eq!(cfg.default_policy.prompt_timeout_secs, 15);
         assert_eq!(cfg.profile.as_deref(), Some("strict"));
     }
 
@@ -368,7 +434,7 @@ mod tests {
     fn unrecognized_profile_falls_back_to_balanced_base() {
         let cfg = Config::from_toml_str(r#"profile = "paranoid""#).unwrap();
         assert_eq!(cfg.default_policy.no_ui_action, Action::Allow);
-        assert_eq!(cfg.default_policy.prompt_timeout_secs, 15);
+        assert_eq!(cfg.default_policy.prompt_timeout_secs, 30);
     }
 
     #[test]
@@ -418,7 +484,7 @@ mod tests {
         let sample = include_str!("../../../systemd/daemon.toml.sample");
         let cfg = Config::from_toml_str(sample).unwrap();
         assert_eq!(cfg.profile.as_deref(), Some("balanced"));
-        assert_eq!(cfg.default_policy.prompt_timeout_secs, 15);
+        assert_eq!(cfg.default_policy.prompt_timeout_secs, 30);
         assert_eq!(cfg.nfqueue.queue_num, 0);
         assert_eq!(cfg.nfqueue.queue_max_len, 4096);
         assert!(!cfg.nfqueue.fail_open);
@@ -426,9 +492,28 @@ mod tests {
         assert_eq!(cfg.events.max_rows, 100_000);
         assert_eq!(cfg.ipc.group, "colony-firewall");
         assert!(cfg.ipc.require_group);
+        assert!(cfg.provenance.enabled);
         assert_eq!(
             cfg.storage.path,
             PathBuf::from("/var/lib/colony-firewall/rules.db")
         );
+    }
+
+    #[test]
+    fn loading_publishes_the_provenance_switch() {
+        // The sample documents [provenance] as reloading on SIGHUP, which
+        // is only true because load_or_default (the function SIGHUP
+        // re-enters via reload_policy) re-applies it every time. Assert the
+        // wiring rather than trusting the comment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.toml");
+
+        std::fs::write(&path, "[provenance]\nenabled = false\n").unwrap();
+        Config::load_or_default(&path).unwrap();
+        assert!(!crate::provenance::enabled());
+
+        std::fs::write(&path, "[provenance]\nenabled = true\n").unwrap();
+        Config::load_or_default(&path).unwrap();
+        assert!(crate::provenance::enabled());
     }
 }

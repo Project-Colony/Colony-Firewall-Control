@@ -1,0 +1,11 @@
+# Workspace-wide cargo config.
+#
+# IMPORTANT: this file must stay free of `[build]`, `[target.*]` and
+# `rustflags` settings. It is picked up by *every* cargo invocation made from
+# the repository root, including the stable `--workspace` builds, the MSRV
+# check and CI. Anything BPF-specific belongs in
+# `crates/cfc-ebpf/.cargo/config.toml`, which only applies when cargo runs with
+# that directory as its cwd (which is what `cargo xtask build-ebpf` does).
+
+[alias]
+xtask = "run --quiet --package xtask --"

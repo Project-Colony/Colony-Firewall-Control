@@ -1,0 +1,7 @@
+# This crate is its own cargo workspace, so it gets its own target dir. The
+# repo-root .gitignore only anchors `/target/`, which does not match here.
+/target/
+
+# Cargo.lock IS committed: the BPF object should be reproducible, and this
+# lockfile is deliberately separate from the root one so aya never enters the
+# dependency graph of the shipped userspace binaries.

@@ -90,6 +90,18 @@ message ProcessInfo {
   repeated string cmdline = 6;
   string cwd = 7;
   string sha256 = 8;
+  // Package that owns `exe`, as "<name> <version>" (e.g. "curl 8.21.0-1").
+  // Empty when no package owns the path, when the host has no package
+  // database, or when provenance checking is disabled.
+  string package = 9;
+  // Whether the RUNNING binary (hashed through /proc/<pid>/exe) still
+  // matches the digest the package recorded for that path.
+  //
+  // Note the pairing with `package`: a non-empty `package` alongside
+  // PROVENANCE_UNSPECIFIED means "we know which package owns this file but
+  // the database records no digest we could verify against" (dpkg records
+  // MD5 only, which we deliberately do not compute).
+  Provenance provenance = 10;
 }
 
 message RuleScope {
@@ -247,4 +259,18 @@ enum Direction {
   DIRECTION_UNSPECIFIED = 0;
   DIRECTION_OUTBOUND = 1;
   DIRECTION_INBOUND = 2;
+}
+
+// Binary package provenance. See ProcessInfo.provenance.
+enum Provenance {
+  // Not checked, no package database, lookup failed, or the owning package
+  // is known but records no verifiable digest.
+  PROVENANCE_UNSPECIFIED = 0;
+  // No installed package owns this path (a /tmp dropper, a hand-built
+  // binary, something from a tarball).
+  PROVENANCE_UNPACKAGED = 1;
+  // Owned by a package and the running binary's sha256 matches.
+  PROVENANCE_VERIFIED = 2;
+  // Owned by a package but the running binary's sha256 DIFFERS.
+  PROVENANCE_MODIFIED = 3;
 }

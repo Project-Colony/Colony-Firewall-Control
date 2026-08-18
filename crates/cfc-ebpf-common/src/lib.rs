@@ -1,0 +1,545 @@
+//! Types and pure parsers shared between the Colony Firewall Control eBPF
+//! programs (`cfc-ebpf`, compiled for `bpfel-unknown-none`) and the userspace
+//! daemon.
+//!
+//! Everything in this crate must compile in `#![no_std]` *and* on the host:
+//!
+//! * the `#[repr(C)]` event structs are the exact wire format of the BPF ring
+//!   buffers and hash maps, so kernel and userspace must agree byte-for-byte;
+//! * the parsers in [`dns`] and [`net`] are the *arithmetic* half of the BPF
+//!   programs. Living here means they can be unit-tested on the host, which is
+//!   the only practical way to test verifier-constrained code.
+//!
+//! # Layout rules
+//!
+//! Every struct is `#[repr(C)]`, POD (no pointers, no `Drop`, no niches) and
+//! carries **explicit** padding fields so that:
+//!
+//! * `size_of` is stable across compilers and architectures (asserted in the
+//!   tests below);
+//! * the kernel never copies uninitialised padding bytes into the ring buffer.
+//!
+//! # `aya::Pod`
+//!
+//! These structs are deliberately *not* wired to `aya::Pod` here: doing so
+//! would force `aya` into the default dependency graph of the stable workspace
+//! (and into `Cargo.lock` / `cargo deny`) purely for a marker trait. The
+//! userspace consumer should instead write, next to its map handles:
+//!
+//! ```ignore
+//! unsafe impl aya::Pod for cfc_ebpf_common::ExecEvent {}
+//! unsafe impl aya::Pod for cfc_ebpf_common::ExitEvent {}
+//! unsafe impl aya::Pod for cfc_ebpf_common::DnsAnswer {}
+//! ```
+//!
+//! which is sound precisely because of the layout rules above.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+// `deny` rather than `forbid`: the crate proper contains no `unsafe`, but the
+// layout tests need a raw byte view of their own POD to prove padding is zero.
+#![deny(unsafe_code)]
+
+pub mod dns;
+pub mod net;
+
+pub use dns::{DnsCursor, DnsHeader, MAX_ANSWERS, MAX_LABEL_JUMPS, MAX_NAME_LEN};
+pub use net::UdpPayload;
+
+/// Length of the kernel's `task_struct::comm` field, including the NUL.
+pub const COMM_LEN: usize = 16;
+
+/// Maximum executable path captured from the `sched_process_exec` tracepoint.
+///
+/// Longer paths are truncated; `ExecEvent::filename_len` always reflects the
+/// number of bytes actually stored.
+pub const FILENAME_LEN: usize = 256;
+
+/// Size of the scratch buffer the DNS program copies packet bytes into.
+///
+/// 512 bytes covers the classic non-EDNS UDP DNS limit (RFC 1035 §4.2.1).
+/// Larger responses are parsed up to this bound and then truncated, which is
+/// safe: [`dns::for_each_answer`] simply stops at the first record it cannot
+/// read in full.
+pub const DNS_BUF_LEN: usize = 512;
+
+// ---------------------------------------------------------------------------
+// ExecEvent
+// ---------------------------------------------------------------------------
+
+/// One `execve()` observed by the `sched/sched_process_exec` tracepoint.
+///
+/// Layout (`size_of` = 292, `align_of` = 4):
+///
+/// ```text
+///   0..4    pid
+///   4..8    ppid
+///   8..12   uid
+///  12..16   gid
+///  16..32   comm
+///  32..288  filename
+/// 288..290  filename_len
+/// 290..292  _pad
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ExecEvent {
+    /// Thread-group id (what userspace calls "the pid").
+    pub pid: u32,
+    /// Thread-group id of the parent, or `0` for "unknown".
+    ///
+    /// Rust/aya has no CO-RE field relocation, so the kernel side can only fill
+    /// this in when the loader supplies `task_struct` offsets resolved from
+    /// BTF. Treat `0` as "resolve it from `/proc` if you care".
+    pub ppid: u32,
+    /// Real uid of the calling task.
+    pub uid: u32,
+    /// Real gid of the calling task.
+    pub gid: u32,
+    /// `task_struct::comm`, NUL-padded.
+    pub comm: [u8; COMM_LEN],
+    /// Executable path as passed to `execve()`, possibly truncated.
+    ///
+    /// Only the first [`Self::filename_len`] bytes are meaningful; the kernel
+    /// writes a NUL after them but does **not** clear the rest of the buffer
+    /// (a 256-byte `memset` is not lowerable on the BPF target). Always read it
+    /// through [`Self::filename_bytes`] / [`Self::filename_str`], which clamp
+    /// on both the length and the NUL.
+    pub filename: [u8; FILENAME_LEN],
+    /// Number of valid bytes in [`Self::filename`] (<= [`FILENAME_LEN`]).
+    pub filename_len: u16,
+    /// Explicit tail padding. Always zero; never read it.
+    pub _pad: [u8; 2],
+}
+
+impl ExecEvent {
+    /// An all-zero event. `const` so the BPF side can use it as a map
+    /// initialiser without a runtime `memset` the verifier has to reason about.
+    pub const fn zeroed() -> Self {
+        Self {
+            pid: 0,
+            ppid: 0,
+            uid: 0,
+            gid: 0,
+            comm: [0; COMM_LEN],
+            filename: [0; FILENAME_LEN],
+            filename_len: 0,
+            _pad: [0; 2],
+        }
+    }
+}
+
+impl Default for ExecEvent {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExitEvent
+// ---------------------------------------------------------------------------
+
+/// A process (thread-group leader) that has exited.
+///
+/// Userspace uses this to evict `pid` from its cache, so a recycled pid can
+/// never be attributed to the process that previously owned it.
+///
+/// Layout (`size_of` = 4, `align_of` = 4).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ExitEvent {
+    /// Thread-group id that just died.
+    pub pid: u32,
+}
+
+// ---------------------------------------------------------------------------
+// DnsAnswer
+// ---------------------------------------------------------------------------
+
+/// One `A` or `AAAA` answer record lifted out of a DNS response.
+///
+/// Layout (`size_of` = 276, `align_of` = 4):
+///
+/// ```text
+///   0..16   ip          (IPv4 in the first 4 bytes, rest zero)
+///  16..17   is_v6
+///  17..270  name
+/// 270..271  name_len
+/// 271..272  _pad
+/// 272..276  ttl
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DnsAnswer {
+    /// Answer address. IPv4 occupies bytes `0..4` with `4..16` zeroed.
+    pub ip: [u8; 16],
+    /// `1` when [`Self::ip`] is an IPv6 address, `0` for IPv4.
+    pub is_v6: u8,
+    /// Owner name of the record, dot-separated, without a trailing dot.
+    ///
+    /// Only the first [`Self::name_len`] bytes are meaningful; a NUL follows
+    /// them, but the rest of the buffer is *not* cleared (same BPF `memset`
+    /// constraint as [`ExecEvent::filename`]). Always read it through
+    /// [`Self::name_bytes`] / [`Self::name_str`].
+    pub name: [u8; MAX_NAME_LEN],
+    /// Number of valid bytes in [`Self::name`] (<= [`MAX_NAME_LEN`] = 253).
+    pub name_len: u8,
+    /// Explicit padding. Always zero; never read it.
+    pub _pad: [u8; 1],
+    /// Record TTL in seconds, host byte order.
+    pub ttl: u32,
+}
+
+impl DnsAnswer {
+    /// An all-zero answer.
+    pub const fn zeroed() -> Self {
+        Self {
+            ip: [0; 16],
+            is_v6: 0,
+            name: [0; MAX_NAME_LEN],
+            name_len: 0,
+            _pad: [0; 1],
+            ttl: 0,
+        }
+    }
+}
+
+impl Default for DnsAnswer {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// no_std-safe accessors (available everywhere)
+// ---------------------------------------------------------------------------
+
+/// Returns the leading NUL-terminated prefix of `buf`, capped at `max`.
+///
+/// Bounded, allocation-free and panic-free, so it is usable from BPF too.
+#[inline(always)]
+pub fn nul_terminated(buf: &[u8], max: usize) -> &[u8] {
+    let cap = if max < buf.len() { max } else { buf.len() };
+    let mut n = 0;
+    while n < cap {
+        match buf.get(n) {
+            Some(0) | None => break,
+            Some(_) => n += 1,
+        }
+    }
+    // `n <= cap <= buf.len()`, so this cannot panic.
+    match buf.get(..n) {
+        Some(s) => s,
+        None => &[],
+    }
+}
+
+impl ExecEvent {
+    /// `comm` as raw bytes, stopping at the first NUL.
+    #[inline]
+    pub fn comm_bytes(&self) -> &[u8] {
+        nul_terminated(&self.comm, COMM_LEN)
+    }
+
+    /// `filename` as raw bytes: `filename_len` bytes, additionally truncated at
+    /// the first NUL so a bogus length can never expose stale buffer contents.
+    #[inline]
+    pub fn filename_bytes(&self) -> &[u8] {
+        nul_terminated(&self.filename, self.filename_len as usize)
+    }
+}
+
+impl DnsAnswer {
+    /// `name` as raw bytes: `name_len` bytes, truncated at the first NUL.
+    #[inline]
+    pub fn name_bytes(&self) -> &[u8] {
+        nul_terminated(&self.name, self.name_len as usize)
+    }
+
+    /// True when this record carries an IPv6 address.
+    #[inline]
+    pub fn is_ipv6(&self) -> bool {
+        self.is_v6 != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// std-only conveniences
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "std")]
+mod std_impls {
+    use super::{DnsAnswer, ExecEvent};
+    use std::borrow::Cow;
+    use std::fmt;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    impl ExecEvent {
+        /// `comm` as a string. Never panics: invalid UTF-8 is replaced.
+        pub fn comm_str(&self) -> Cow<'_, str> {
+            String::from_utf8_lossy(self.comm_bytes())
+        }
+
+        /// `filename` as a string. Never panics: invalid UTF-8 is replaced.
+        pub fn filename_str(&self) -> Cow<'_, str> {
+            String::from_utf8_lossy(self.filename_bytes())
+        }
+    }
+
+    impl DnsAnswer {
+        /// Owner name as a string. Never panics: invalid UTF-8 is replaced.
+        pub fn name_str(&self) -> Cow<'_, str> {
+            String::from_utf8_lossy(self.name_bytes())
+        }
+
+        /// The answer address.
+        pub fn ip_addr(&self) -> IpAddr {
+            if self.is_v6 != 0 {
+                IpAddr::V6(Ipv6Addr::from(self.ip))
+            } else {
+                IpAddr::V4(Ipv4Addr::new(
+                    self.ip[0], self.ip[1], self.ip[2], self.ip[3],
+                ))
+            }
+        }
+
+        /// Store an [`IpAddr`], zero-extending IPv4 into the 16-byte field.
+        pub fn set_ip(&mut self, addr: IpAddr) {
+            match addr {
+                IpAddr::V4(v4) => {
+                    self.ip = [0; 16];
+                    self.ip[..4].copy_from_slice(&v4.octets());
+                    self.is_v6 = 0;
+                }
+                IpAddr::V6(v6) => {
+                    self.ip = v6.octets();
+                    self.is_v6 = 1;
+                }
+            }
+        }
+    }
+
+    // Hand-written so a 256-byte array does not turn every log line into a
+    // wall of integers.
+    impl fmt::Debug for ExecEvent {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ExecEvent")
+                .field("pid", &self.pid)
+                .field("ppid", &self.ppid)
+                .field("uid", &self.uid)
+                .field("gid", &self.gid)
+                .field("comm", &self.comm_str())
+                .field("filename", &self.filename_str())
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for DnsAnswer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DnsAnswer")
+                .field("name", &self.name_str())
+                .field("ip", &self.ip_addr())
+                .field("ttl", &self.ttl)
+                .finish()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, size_of};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // -- layout ------------------------------------------------------------
+
+    #[test]
+    fn exec_event_layout_is_frozen() {
+        assert_eq!(size_of::<ExecEvent>(), 292);
+        assert_eq!(align_of::<ExecEvent>(), 4);
+        // 4 * u32 + comm + filename + u16 + pad == size, i.e. no hidden holes.
+        assert_eq!(
+            16 + COMM_LEN + FILENAME_LEN + 2 + 2,
+            size_of::<ExecEvent>(),
+            "ExecEvent gained implicit padding"
+        );
+    }
+
+    #[test]
+    fn dns_answer_layout_is_frozen() {
+        assert_eq!(size_of::<DnsAnswer>(), 276);
+        assert_eq!(align_of::<DnsAnswer>(), 4);
+        assert_eq!(
+            16 + 1 + MAX_NAME_LEN + 1 + 1 + 4,
+            size_of::<DnsAnswer>(),
+            "DnsAnswer gained implicit padding"
+        );
+    }
+
+    #[test]
+    fn exit_event_layout_is_frozen() {
+        assert_eq!(size_of::<ExitEvent>(), 4);
+        assert_eq!(align_of::<ExitEvent>(), 4);
+    }
+
+    #[test]
+    fn zeroed_constructors_are_all_zero() {
+        let e = ExecEvent::zeroed();
+        let bytes: &[u8] = unsafe_transmute_exec(&e);
+        assert!(bytes.iter().all(|b| *b == 0));
+
+        let a = DnsAnswer::zeroed();
+        let bytes: &[u8] = unsafe_transmute_dns(&a);
+        assert!(bytes.iter().all(|b| *b == 0));
+    }
+
+    // Small local helpers keep `#![forbid(unsafe_code)]` intact for the crate
+    // proper: the test module opts out explicitly and only reads its own POD.
+    #[allow(unsafe_code)]
+    fn unsafe_transmute_exec(e: &ExecEvent) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts((e as *const ExecEvent).cast::<u8>(), size_of::<ExecEvent>())
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn unsafe_transmute_dns(a: &DnsAnswer) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts((a as *const DnsAnswer).cast::<u8>(), size_of::<DnsAnswer>())
+        }
+    }
+
+    // -- string helpers ----------------------------------------------------
+
+    fn exec_with(comm: &[u8], filename: &[u8], filename_len: u16) -> ExecEvent {
+        let mut e = ExecEvent::zeroed();
+        e.comm[..comm.len()].copy_from_slice(comm);
+        e.filename[..filename.len()].copy_from_slice(filename);
+        e.filename_len = filename_len;
+        e
+    }
+
+    #[test]
+    fn comm_str_stops_at_nul() {
+        let e = exec_with(b"curl\0garbage", b"", 0);
+        assert_eq!(e.comm_str(), "curl");
+    }
+
+    #[test]
+    fn comm_str_handles_unterminated_buffer() {
+        // All 16 bytes used, no NUL anywhere.
+        let e = exec_with(b"0123456789abcdef", b"", 0);
+        assert_eq!(e.comm_bytes().len(), COMM_LEN);
+        assert_eq!(e.comm_str(), "0123456789abcdef");
+    }
+
+    #[test]
+    fn comm_str_is_lossy_on_invalid_utf8() {
+        let e = exec_with(&[0xff, 0xfe, b'a', 0x00], b"", 0);
+        let s = e.comm_str();
+        assert!(
+            s.contains('\u{fffd}'),
+            "expected replacement chars, got {s:?}"
+        );
+        assert!(s.ends_with('a'));
+    }
+
+    #[test]
+    fn filename_str_respects_len() {
+        let e = exec_with(b"", b"/usr/bin/curl", 13);
+        assert_eq!(e.filename_str(), "/usr/bin/curl");
+    }
+
+    #[test]
+    fn filename_str_truncates_at_nul_even_if_len_lies() {
+        // A hostile / buggy producer claims 200 bytes but only wrote 5.
+        let e = exec_with(b"", b"/bin\0stale-bytes-from-a-previous-exec", 200);
+        assert_eq!(e.filename_str(), "/bin");
+    }
+
+    #[test]
+    fn filename_str_clamps_len_beyond_buffer() {
+        let mut e = exec_with(b"", &[b'x'; FILENAME_LEN], FILENAME_LEN as u16);
+        e.filename_len = u16::MAX; // nonsense length
+        assert_eq!(e.filename_bytes().len(), FILENAME_LEN);
+    }
+
+    #[test]
+    fn filename_str_is_lossy_on_invalid_utf8() {
+        let e = exec_with(b"", &[b'/', 0xc3, 0x28, b'x'], 4);
+        let s = e.filename_str();
+        assert!(
+            s.contains('\u{fffd}'),
+            "expected replacement chars, got {s:?}"
+        );
+    }
+
+    // -- DnsAnswer helpers -------------------------------------------------
+
+    #[test]
+    fn dns_name_str_and_len() {
+        let mut a = DnsAnswer::zeroed();
+        a.name[..11].copy_from_slice(b"example.com");
+        a.name_len = 11;
+        assert_eq!(a.name_str(), "example.com");
+    }
+
+    #[test]
+    fn dns_name_str_is_lossy_and_bounded() {
+        let mut a = DnsAnswer::zeroed();
+        a.name[..3].copy_from_slice(&[0xff, 0xff, b'z']);
+        a.name_len = 255; // > MAX_NAME_LEN and > written bytes
+        let s = a.name_str();
+        assert!(s.contains('\u{fffd}'));
+        assert_eq!(a.name_bytes().len(), 3, "must stop at the NUL");
+    }
+
+    #[test]
+    fn dns_name_str_unterminated_full_buffer() {
+        let mut a = DnsAnswer::zeroed();
+        a.name = [b'a'; MAX_NAME_LEN];
+        a.name_len = MAX_NAME_LEN as u8;
+        assert_eq!(a.name_bytes().len(), MAX_NAME_LEN);
+        assert_eq!(a.name_str().len(), MAX_NAME_LEN);
+    }
+
+    #[test]
+    fn ip_addr_v4() {
+        let mut a = DnsAnswer::zeroed();
+        a.ip[..4].copy_from_slice(&[93, 184, 216, 34]);
+        assert_eq!(a.ip_addr(), IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert!(!a.is_ipv6());
+    }
+
+    #[test]
+    fn ip_addr_v6() {
+        let mut a = DnsAnswer::zeroed();
+        a.is_v6 = 1;
+        a.ip = Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25c8, 0x1946).octets();
+        assert_eq!(
+            a.ip_addr(),
+            IpAddr::V6(Ipv6Addr::new(
+                0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25c8, 0x1946
+            ))
+        );
+        assert!(a.is_ipv6());
+    }
+
+    #[test]
+    fn set_ip_round_trips() {
+        let mut a = DnsAnswer::zeroed();
+        a.set_ip(IpAddr::V6("::1".parse::<Ipv6Addr>().unwrap()));
+        assert_eq!(a.ip_addr().to_string(), "::1");
+        a.set_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(a.ip_addr().to_string(), "127.0.0.1");
+        assert_eq!(&a.ip[4..], &[0u8; 12], "v4 must zero-extend");
+    }
+
+    #[test]
+    fn nul_terminated_edge_cases() {
+        assert_eq!(nul_terminated(b"", 0), b"");
+        assert_eq!(nul_terminated(b"\0abc", 4), b"");
+        assert_eq!(nul_terminated(b"abc", 0), b"");
+        assert_eq!(nul_terminated(b"abcdef", 3), b"abc");
+        assert_eq!(nul_terminated(b"abc", 99), b"abc");
+    }
+}

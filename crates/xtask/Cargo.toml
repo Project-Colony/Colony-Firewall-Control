@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Colony Firewall Control - build automation (eBPF object build)"
+publish = false
+
+[dependencies]
+# Deliberately none: xtask must never slow down or complicate the main build,
+# and it must stay outside the `cargo deny` blast radius.

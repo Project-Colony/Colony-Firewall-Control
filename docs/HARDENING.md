@@ -23,9 +23,21 @@ running" throughout - it subscribes the same way the GUI does.
 
 | Profile  | No UI    | Timeout  | Window | Use when                                      |
 |----------|----------|----------|--------|------------------------------------------------|
-| relaxed  | Allow    | Allow    | 60s    | Headless servers / can't always be at the UI   |
-| balanced | Allow    | Allow    | 15s    | Daily-driver workstations (default)            |
-| strict   | Deny     | Deny     | 10s    | Lockdown posture, UI always present            |
+| relaxed  | Allow    | Deny     | 60s    | Headless servers / can't always be at the UI   |
+| balanced | Allow    | Deny     | 30s    | Daily-driver workstations (default)            |
+| strict   | Deny     | Deny     | 15s    | Lockdown posture, UI always present            |
+
+**Every profile denies on timeout, by design.** A timeout means the
+question *was* put to you and went unanswered; if that granted access,
+the cheapest attack would be to connect while nobody is at the keyboard.
+What the profiles actually differ on is how long to wait, and what to do
+when there is nobody to ask at all (`no_ui_action`) — a desktop that
+boots before its session starts should keep working, a locked-down box
+should not.
+
+`no_ui_action` and `timeout_action` are genuinely different questions.
+"Nobody is subscribed" is a property of the machine's state; "you were
+asked and did not answer" is a decision you made by not making one.
 
 The danger with `strict` is bootstrap: the units are ordered
 `Before=network-pre.target`, so filtering is live before any interface

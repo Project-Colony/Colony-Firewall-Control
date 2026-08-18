@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
 use views::live::VerdictFilter;
+use views::prompts::PromptAction;
 use views::rules::RuleSort;
 
 const SOCKET_PATH: &str = "/run/colony-firewall/cfc.sock";
@@ -216,6 +217,31 @@ impl RuleEditor {
         }
     }
 
+    /// Seeds the editor from a pending prompt ("Customize this rule before
+    /// creating it").
+    ///
+    /// The prompt itself is answered separately with a one-off allow: the
+    /// daemon is holding a real connection open behind this card, and
+    /// leaving it hanging while the user fills in a form would time the
+    /// flow out under them.
+    pub fn from_prompt(ev: &proto::PromptEvent) -> Self {
+        let exe = ev
+            .process
+            .as_ref()
+            .map(|p| p.exe.as_str())
+            .unwrap_or_default();
+        let (dst_host, dst_ip, dst_port, protocol) = match ev.connection.as_ref() {
+            Some(c) => (
+                c.dst_host.as_str(),
+                c.dst_ip.as_str(),
+                c.dst_port,
+                c.protocol,
+            ),
+            None => ("", "", 0, 0),
+        };
+        Self::from_observed(exe, dst_host, dst_ip, dst_port, protocol)
+    }
+
     /// Seeds the editor from an observed flow (live feed "make rule").
     /// Prefers the hostname, like the prompt card does.
     pub fn from_observed(
@@ -259,10 +285,6 @@ pub struct PromptCard {
     /// Wall clock at which the daemon answers this prompt itself. 0 means
     /// the daemon attached no deadline.
     pub deadline_unix_ms: i64,
-    /// Persistence the scope buttons will use. `Once` cannot be persisted
-    /// (the daemon rejects it), so it disables them.
-    pub duration: proto::Duration,
-    pub details_open: bool,
 }
 
 impl PromptCard {
@@ -270,20 +292,54 @@ impl PromptCard {
         Self {
             deadline_unix_ms: event.deadline_unix_ms,
             event,
-            // Least surprising default: answer this flow only.
-            duration: proto::Duration::Once,
-            details_open: false,
         }
     }
+}
 
-    /// A scope is only sent when the chosen duration can actually be
-    /// persisted; `Once` answers the prompt and nothing more.
-    pub fn persistable(&self) -> bool {
-        !matches!(
-            self.duration,
-            proto::Duration::Once | proto::Duration::Unspecified
-        )
+/// How loudly a newly arrived prompt announces itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// Leave the window alone entirely.
+    None,
+    /// Show the Prompts tab, but do not touch the window.
+    Tab,
+    /// Show the Prompts tab and pull the window in front of whatever the
+    /// user is looking at.
+    TabAndRaise,
+}
+
+/// Decides what the arrival of a prompt does to the window.
+///
+/// `pending_before` is the queue length *before* this prompt was pushed, so
+/// only the 0 -> 1 transition raises. A burst of ten prompts must not slam
+/// the window into the user's face ten times; a queue that drains and then
+/// refills is a genuinely new interruption and may raise again.
+///
+/// An open rule editor suppresses all of it. Focus-stealing is disruptive
+/// at the best of times, and yanking the tab out from under someone
+/// half-way through a form loses what they had typed.
+pub fn prompt_attention(pending_before: usize, editor_open: bool) -> Attention {
+    if editor_open {
+        Attention::None
+    } else if pending_before == 0 {
+        Attention::TabAndRaise
+    } else {
+        Attention::Tab
     }
+}
+
+/// Brings the window forward so a prompt cannot be missed.
+///
+/// `gain_focus` is documented as a no-op on a minimized window, so the
+/// un-minimize has to come first. `latest()` addresses the window this
+/// single-window application actually owns rather than assuming an id.
+fn raise_window() -> Task<Message> {
+    iced::window::latest().and_then(|id| {
+        Task::batch([
+            iced::window::minimize(id, false),
+            iced::window::gain_focus(id),
+        ])
+    })
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -323,11 +379,9 @@ pub enum Message {
     LiveStreamEnded(String),
     PromptEvent(proto::PromptEvent),
     PromptStreamEnded(String),
-    PromptDuration {
-        prompt_id: String,
-        duration: proto::Duration,
-    },
-    TogglePromptDetails(String),
+    /// "Customize this rule before creating it": opens the rule editor
+    /// seeded from the prompt and answers the prompt allow-once.
+    CustomizePromptRule(String),
     SubmitVerdict {
         prompt_id: String,
         action: proto::Action,
@@ -650,38 +704,50 @@ impl App {
                 Task::none()
             }
             Message::PromptEvent(ev) => {
-                notify_prompt(&ev);
+                // No desktop notification here: the tray owns prompt
+                // notifications now - two bubbles per prompt would train
+                // users to ignore them. The GUI shows its card either way.
                 self.stream_trouble = false;
+                // A prompt is a held-open connection with a deadline on it;
+                // a card the user only sees if they happen to be looking at
+                // the right tab is not an ask, it is a countdown they lose.
+                let attention = prompt_attention(self.prompts.len(), self.editor.is_some());
                 self.prompts.push(PromptCard::new(ev));
-                Task::none()
+                match attention {
+                    Attention::None => Task::none(),
+                    Attention::Tab => {
+                        self.tab = Tab::Prompts;
+                        Task::none()
+                    }
+                    Attention::TabAndRaise => {
+                        self.tab = Tab::Prompts;
+                        raise_window()
+                    }
+                }
             }
             Message::PromptStreamEnded(e) => {
                 self.stream_trouble = true;
                 info!("prompt stream interrupted: {e}");
                 Task::none()
             }
-            Message::PromptDuration {
-                prompt_id,
-                duration,
-            } => {
-                if let Some(card) = self
-                    .prompts
-                    .iter_mut()
-                    .find(|p| p.event.prompt_id == prompt_id)
-                {
-                    card.duration = duration;
-                }
-                Task::none()
-            }
-            Message::TogglePromptDetails(prompt_id) => {
-                if let Some(card) = self
-                    .prompts
-                    .iter_mut()
-                    .find(|p| p.event.prompt_id == prompt_id)
-                {
-                    card.details_open = !card.details_open;
-                }
-                Task::none()
+            Message::CustomizePromptRule(prompt_id) => {
+                let Some(card) = self.prompts.iter().find(|p| p.event.prompt_id == prompt_id)
+                else {
+                    return Task::none();
+                };
+                self.editor = Some(RuleEditor::from_prompt(&card.event));
+                self.tab = Tab::Rules;
+                // The daemon is holding a real connection open behind this
+                // card. Answering it one-off now means the user edits the
+                // rule at their own pace instead of racing the deadline -
+                // and `Once` is the only answer that persists nothing, so
+                // whatever they save is the only rule they get.
+                self.update(Message::SubmitVerdict {
+                    prompt_id,
+                    action: proto::Action::Allow,
+                    scope: None,
+                    duration: proto::Duration::Once,
+                })
             }
             Message::SubmitVerdict {
                 prompt_id,
@@ -926,8 +992,16 @@ impl App {
             keyboard::Key::Character(ref c) => {
                 let shift = kp.modifiers.shift();
                 match c.to_lowercase().as_str() {
-                    "a" => self.answer_newest(proto::Action::Allow, shift),
-                    "d" => self.answer_newest(proto::Action::Deny, shift),
+                    "a" => self.answer_newest(if shift {
+                        PromptAction::AllowProgram
+                    } else {
+                        PromptAction::AllowOnce
+                    }),
+                    "d" => self.answer_newest(if shift {
+                        PromptAction::BlockProgram
+                    } else {
+                        PromptAction::BlockOnce
+                    }),
                     "1" => self.update(Message::TabSelected(Tab::Prompts)),
                     "2" => self.update(Message::TabSelected(Tab::Rules)),
                     "3" => self.update(Message::TabSelected(Tab::Live)),
@@ -939,24 +1013,34 @@ impl App {
         }
     }
 
-    /// Answers the most recent prompt. `persist` uses the scope currently
-    /// selected on that card; with `Once` selected there is nothing to
-    /// persist, so it degrades to a plain one-shot answer.
-    fn answer_newest(&mut self, action: proto::Action, persist: bool) -> Task<Message> {
+    /// Answers the most recent prompt with the same verdict the matching
+    /// button would submit.
+    ///
+    /// A program-scoped choice on a flow with no executable path has no
+    /// honest verdict (see `verdict_for`), so it degrades to the one-off
+    /// answer of the same action rather than doing nothing: the user
+    /// pressed Shift+D to stop a connection, and stopping it is the part
+    /// that matters.
+    fn answer_newest(&mut self, choice: PromptAction) -> Task<Message> {
         let Some(card) = self.prompts.last() else {
             return Task::none();
         };
-        let prompt_id = card.event.prompt_id.clone();
-        let (scope, duration) = if persist && card.persistable() {
-            (views::prompts::exe_scope(&card.event), card.duration)
-        } else {
-            (None, proto::Duration::Once)
+        let ev = &card.event;
+        let fallback = match choice {
+            PromptAction::AllowProgram | PromptAction::AllowOnce => PromptAction::AllowOnce,
+            PromptAction::BlockProgram | PromptAction::BlockOnce => PromptAction::BlockOnce,
         };
+        let Some(verdict) = views::prompts::verdict_for(choice, ev)
+            .or_else(|| views::prompts::verdict_for(fallback, ev))
+        else {
+            return Task::none();
+        };
+        let prompt_id = ev.prompt_id.clone();
         self.update(Message::SubmitVerdict {
             prompt_id,
-            action,
-            scope,
-            duration,
+            action: verdict.action,
+            scope: verdict.scope,
+            duration: verdict.duration,
         })
     }
 
@@ -1085,8 +1169,10 @@ impl App {
 
         let hints = column![
             text("1-4  switch tab").size(9),
-            text("A / D  answer newest").size(9),
-            text("Shift+A / D  + persist").size(9),
+            text("A  allow once").size(9),
+            text("D  block for now").size(9),
+            text("Shift+A  always allow program").size(9),
+            text("Shift+D  always block program").size(9),
         ]
         .spacing(1)
         .padding([6, 16]);
@@ -1437,30 +1523,6 @@ async fn submit_verdict(
     Ok((prompt_id, accepted))
 }
 
-fn notify_prompt(ev: &proto::PromptEvent) {
-    let (process_name, pid) = match ev.process.as_ref() {
-        Some(p) => (cfc_client::convert::process_display(p), p.pid),
-        None => ("unknown".to_string(), 0),
-    };
-    // Name the host when the daemon resolved one - "93.184.216.34:443" is
-    // not something anyone can make a decision about.
-    let target = match ev.connection.as_ref() {
-        Some(c) => format!(
-            "{}:{}",
-            format::dest_key(&c.dst_host, &c.dst_ip),
-            c.dst_port
-        ),
-        None => "?".to_string(),
-    };
-    let body = format!("{process_name} (pid {pid}) -> {target}");
-    let _ = notify_rust::Notification::new()
-        .summary("Colony Firewall: new connection")
-        .body(&body)
-        .icon("network-firewall")
-        .timeout(notify_rust::Timeout::Milliseconds(8000))
-        .show();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1680,16 +1742,69 @@ mod tests {
         assert!(entry.display().ends_with("(x4)"));
     }
 
+    fn prompt_event() -> proto::PromptEvent {
+        proto::PromptEvent {
+            prompt_id: "p1".into(),
+            connection: Some(proto::ConnectionInfo {
+                protocol: proto::Protocol::Tcp as i32,
+                dst_ip: "93.184.216.34".into(),
+                dst_port: 443,
+                dst_host: "example.com".into(),
+                ..Default::default()
+            }),
+            process: Some(proto::ProcessInfo {
+                exe: "/usr/bin/curl".into(),
+                ..Default::default()
+            }),
+            deadline_unix_ms: 1_700_000_015_000,
+        }
+    }
+
     #[test]
-    fn once_prompts_are_never_persistable() {
-        let mut card = PromptCard::new(proto::PromptEvent::default());
-        assert!(!card.persistable());
-        card.duration = proto::Duration::Unspecified;
-        assert!(!card.persistable());
-        card.duration = proto::Duration::UntilRestart;
-        assert!(card.persistable());
-        card.duration = proto::Duration::Always;
-        assert!(card.persistable());
+    fn customizing_a_prompt_seeds_a_new_rule_from_it() {
+        let ed = RuleEditor::from_prompt(&prompt_event());
+        assert_eq!(ed.exe, "/usr/bin/curl");
+        assert_eq!(ed.dst_host, "example.com");
+        assert!(ed.dst_net.is_empty(), "the hostname wins over the address");
+        assert_eq!(ed.dst_port, "443");
+        assert_eq!(ed.protocol, Some(proto::Protocol::Tcp));
+        // It is a new rule, not an edit of an existing one.
+        assert!(ed.editing_id.is_none());
+        assert_eq!(ed.created_at_unix_ms, 0);
+        // Whatever the user saves has to be persistable, so it must not
+        // inherit the prompt's one-off semantics.
+        assert_eq!(ed.duration, proto::Duration::Always);
+        assert!(build_rule_from_editor(&ed).is_ok());
+    }
+
+    #[test]
+    fn customizing_an_empty_prompt_does_not_seed_a_match_everything_rule() {
+        let ed = RuleEditor::from_prompt(&proto::PromptEvent::default());
+        assert!(ed.exe.is_empty());
+        assert!(ed.dst_host.is_empty());
+        assert!(ed.dst_net.is_empty());
+        assert!(ed.protocol.is_none());
+        // Nothing to scope on, so saving is refused rather than silently
+        // writing a rule that matches every program.
+        assert!(build_rule_from_editor(&ed).is_err());
+    }
+
+    #[test]
+    fn a_first_prompt_raises_the_window_and_a_burst_does_not() {
+        // 0 -> 1 is the interruption worth stealing focus for.
+        assert_eq!(prompt_attention(0, false), Attention::TabAndRaise);
+        // 1 -> 2, 2 -> 3: the user is already looking at the queue.
+        assert_eq!(prompt_attention(1, false), Attention::Tab);
+        assert_eq!(prompt_attention(9, false), Attention::Tab);
+        // Drained and refilled: a genuinely new interruption.
+        assert_eq!(prompt_attention(0, false), Attention::TabAndRaise);
+    }
+
+    #[test]
+    fn an_open_rule_editor_suppresses_the_raise_and_the_tab_switch() {
+        // Yanking the tab out from under a half-filled form loses it.
+        assert_eq!(prompt_attention(0, true), Attention::None);
+        assert_eq!(prompt_attention(3, true), Attention::None);
     }
 
     #[test]

@@ -17,9 +17,11 @@ cfc-client = { path = "../cfc-client" }
 cfc-proto = { path = "../cfc-proto" }
 
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 
 ksni = { workspace = true }
 notify-rust = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zbus = { version = "5", default-features = false, features = ["tokio"] }

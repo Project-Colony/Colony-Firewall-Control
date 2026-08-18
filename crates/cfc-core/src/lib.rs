@@ -8,7 +8,7 @@ pub mod rule;
 pub mod verdict;
 
 pub use connection::{Connection, Direction, Protocol};
-pub use process::Process;
+pub use process::{Process, Provenance};
 pub use rule::{Action, Duration, Rule, RuleScope, RuleSet};
 pub use verdict::{Verdict, VerdictSource};
 

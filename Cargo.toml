@@ -8,7 +8,13 @@ members = [
     "crates/cfc-ui",
     "crates/cfc-cli",
     "crates/cfc-tray",
+    "crates/cfc-ebpf-common",
+    "crates/xtask",
 ]
+# `crates/cfc-ebpf` is the kernel-side crate. It is built for
+# `bpfel-unknown-none` with a pinned nightly + bpf-linker and declares its own
+# `[workspace]`, so stable never sees it. `cargo xtask build-ebpf` drives it.
+exclude = ["crates/cfc-ebpf"]
 
 [workspace.package]
 version = "0.2.0"
@@ -19,6 +25,11 @@ repository = "https://github.com/Project-Colony/Colony-Firewall-Control"
 authors = ["MotherSphere <linhajahad@gmail.com>"]
 
 [workspace.dependencies]
+# eBPF: POD event types + pure parsers shared with the kernel-side crate.
+# Dependency-free and no_std-capable; the daemon consumes it with default
+# (std) features for the string/IpAddr helpers.
+cfc-ebpf-common = { path = "crates/cfc-ebpf-common" }
+
 # IPC
 tonic = "0.14"
 prost = "0.14"
@@ -61,7 +72,10 @@ sha2 = "0.10"
 
 # UI
 iced = { version = "0.14", features = ["tokio", "advanced", "image", "lazy"] }
-notify-rust = "4.17"
+# `images_no_default_features` gives us `Image` (embedded notification
+# icons) without pulling the `image` crate's format decoders: we build
+# the RGBA buffer ourselves and never decode a file.
+notify-rust = { version = "4.17", features = ["images_no_default_features"] }
 ksni = "0.3"
 
 # CLI

@@ -1,0 +1,34 @@
+# Toolchain pin for the kernel-side crate ONLY.
+#
+# rustup resolves `rust-toolchain.toml` by walking up from the *current working
+# directory*, so this file is picked up when cargo runs with
+# `crates/cfc-ebpf` as its cwd (which is exactly what `cargo xtask build-ebpf`
+# arranges) and is invisible to every build started from the repository root.
+# The workspace as a whole stays on the stable channel pinned by the root
+# `rust-toolchain.toml`.
+#
+# Nightly is required for two reasons, both unavoidable:
+#   * `-Z build-std=core` -- `bpfel-unknown-none` is a tier-3 target with no
+#     precompiled `core`;
+#   * `feature(asm_experimental_arch)`, which aya-ebpf enables for `target_arch
+#     = "bpf"`.
+#
+# The nightly is DATED, and the date is load bearing.
+#
+# `bpfel-unknown-none` has `obj-is-bitcode = true`: rustc hands bpf-linker raw
+# LLVM bitcode, so rustc's LLVM must not be NEWER than the LLVM that bpf-linker
+# was built against, or the link fails with `ERROR llvm: Invalid record`.
+#
+#   bpf-linker 0.11.0 here -> system LLVM 22.1.8
+#   nightly-2026-07-01     -> rustc 1.98.0-nightly, LLVM 22.1.8   (match)
+#   nightly (2026-08-17)   -> rustc 1.100.0-nightly, LLVM 23.1.0  (breaks)
+#
+# When bumping this pin, check `rustc +<pin> -Vv | grep LLVM` against
+# `llvm-config --version` (or whatever LLVM your bpf-linker links) first.
+#
+# Install with:
+#   rustup toolchain install nightly-2026-07-01 --profile minimal
+#   rustup component add rust-src --toolchain nightly-2026-07-01
+[toolchain]
+channel = "nightly-2026-07-01"
+components = ["rust-src"]

@@ -206,15 +206,12 @@ mod tests {
 
     fn proc(exe: &str) -> Process {
         Process {
-            pid: 100,
             ppid: Some(1),
             uid: Some(1000),
             gid: Some(1000),
             exe: PathBuf::from(exe),
             cmdline: vec![exe.to_string()],
-            cwd: None,
-            sha256: None,
-            started_at: None,
+            ..Process::unknown(100)
         }
     }
 

@@ -10,6 +10,7 @@ use crate::tty::{self, Key, RawMode};
 use anyhow::Context;
 use cfc_client::{convert, proto, Client, StreamItem};
 use futures::StreamExt;
+use owo_colors::{OwoColorize, Stream::Stdout};
 use std::io::Write;
 use std::path::Path;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -115,6 +116,10 @@ struct PromptJson<'a> {
     uid: Option<u32>,
     cmdline: Option<String>,
     sha256: Option<&'a str>,
+    /// Owning package as "<name> <version>", null when none/unknown.
+    package: Option<&'a str>,
+    /// One of "verified" | "modified" | "unpackaged" | "unknown".
+    provenance: Option<&'a str>,
     src_ip: Option<&'a str>,
     src_port: u32,
     dst_ip: Option<&'a str>,
@@ -153,6 +158,8 @@ fn to_json<'a>(
             .filter(|p| !p.cmdline.is_empty())
             .map(|p| p.cmdline.join(" ")),
         sha256: proc.and_then(|p| opt(&p.sha256)),
+        package: proc.and_then(|p| opt(&p.package)),
+        provenance: proc.map(|p| convert::provenance_token(p.provenance)),
         src_ip: conn.and_then(|c| opt(&c.src_ip)),
         src_port: conn.map(|c| c.src_port).unwrap_or(0),
         dst_ip: conn.and_then(|c| opt(&c.dst_ip)),
@@ -626,6 +633,21 @@ fn print_prompt(ev: &proto::PromptEvent) {
         if let Some(sha) = short_sha(&p.sha256) {
             println!("  sha256   {sha}");
         }
+        // Skipped entirely on hosts with no package database, where it
+        // would be a permanent "unknown" on every prompt.
+        if convert::has_provenance(p) {
+            let label = convert::provenance_label(p);
+            if p.provenance == proto::Provenance::Modified as i32 {
+                // Same red as a deny: a binary that no longer matches its
+                // package is a genuine red flag, not a footnote.
+                println!(
+                    "  package  {}",
+                    label.if_supports_color(Stdout, |s| s.red())
+                );
+            } else {
+                println!("  package  {label}");
+            }
+        }
     }
     println!(
         "  target   {}",
@@ -647,6 +669,8 @@ mod tests {
             cmdline: vec!["curl".into(), "https://example.com".into()],
             cwd: "/home/u".into(),
             sha256: "9f2c1a3b4d5e6f708192a3b4c5d6e7f8".into(),
+            package: "curl 8.21.0-1".into(),
+            provenance: proto::Provenance::Verified as i32,
         }
     }
 
@@ -800,6 +824,8 @@ mod tests {
         assert_eq!(v["uid"], 1000);
         assert_eq!(v["dst_host"], "example.com");
         assert_eq!(v["cmdline"], "curl https://example.com");
+        assert_eq!(v["package"], "curl 8.21.0-1");
+        assert_eq!(v["provenance"], "verified");
         assert!(
             v.get("verdict").is_none(),
             "verdict omitted when unanswered"

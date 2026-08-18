@@ -93,6 +93,21 @@ fn resolve_inner(pid: u32) -> anyhow::Result<Process> {
     let cmdline = p.cmdline().unwrap_or_default();
     let cwd = p.cwd().ok();
 
+    // Package provenance reuses the digest computed just above rather than
+    // re-hashing. That digest comes from /proc/{pid}/exe -- the binary the
+    // kernel actually mapped -- while the package database describes the
+    // file at `exe` on disk. Comparing those two is the whole point: a
+    // mismatch means the running binary is not the one the package shipped
+    // (replaced, patched, or swapped under a live process), which is what
+    // makes `Modified` worth shouting about. See `crate::provenance`.
+    //
+    // Everything underneath is cached (path index by database mtime,
+    // per-executable records by (dev, inode, mtime)), and this whole
+    // function is itself behind PROCESS_CACHE, so a steady flow of packets
+    // from a known process does no work here at all.
+    let sha256 = exe_sha256(pid);
+    let (package, provenance) = crate::provenance::describe(&exe, sha256.as_deref());
+
     Ok(Process {
         pid,
         ppid: Some(stat.ppid as u32),
@@ -101,8 +116,10 @@ fn resolve_inner(pid: u32) -> anyhow::Result<Process> {
         exe,
         cmdline,
         cwd,
-        sha256: exe_sha256(pid),
+        sha256,
         started_at: None,
+        package,
+        provenance,
     })
 }
 
@@ -410,7 +427,11 @@ fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
 /// Bounded TTL map. `now` is injected so expiry is unit-testable without
 /// sleeping. When full, expired entries are pruned first, then the oldest
 /// entry is evicted.
-struct TtlCache<K, V> {
+///
+/// `pub(crate)` so [`crate::provenance`] can memoize package lookups with
+/// exactly the same eviction and expiry behaviour instead of growing a
+/// second, subtly different cache.
+pub(crate) struct TtlCache<K, V> {
     map: HashMap<K, CacheEntry<V>>,
     ttl: Duration,
     cap: usize,
@@ -422,7 +443,7 @@ struct CacheEntry<V> {
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
-    fn new(ttl: Duration, cap: usize) -> Self {
+    pub(crate) fn new(ttl: Duration, cap: usize) -> Self {
         Self {
             map: HashMap::new(),
             ttl,
@@ -430,7 +451,7 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
         }
     }
 
-    fn get(&mut self, key: &K, now: Instant) -> Option<V> {
+    pub(crate) fn get(&mut self, key: &K, now: Instant) -> Option<V> {
         match self.map.get(key) {
             Some(e) if now.saturating_duration_since(e.inserted) <= self.ttl => {
                 Some(e.value.clone())
@@ -443,7 +464,7 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
         }
     }
 
-    fn insert(&mut self, key: K, value: V, now: Instant) {
+    pub(crate) fn insert(&mut self, key: K, value: V, now: Instant) {
         if self.map.len() >= self.cap && !self.map.contains_key(&key) {
             let ttl = self.ttl;
             self.map

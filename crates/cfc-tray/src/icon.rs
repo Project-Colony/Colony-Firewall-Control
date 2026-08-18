@@ -75,9 +75,34 @@ pub fn shield_pixmap(size: usize) -> Pixmap {
     }
 }
 
+/// Size rendered into notification bubbles. Servers scale it down; a
+/// larger source keeps it crisp on HiDPI.
+const NOTIFICATION_SIZE: usize = 64;
+
 /// All embedded rasters, smallest first.
 pub fn all() -> Vec<Pixmap> {
     SIZES.iter().map(|&s| shield_pixmap(s)).collect()
+}
+
+impl Pixmap {
+    /// The same raster as RGBA bytes, the layout notification servers
+    /// want (`image-data`). The tray's own icon is ARGB32 because that is
+    /// what the StatusNotifierItem spec asks for; converting here keeps
+    /// one generator feeding both.
+    pub fn to_rgba(&self) -> Vec<u8> {
+        self.argb
+            .chunks_exact(4)
+            .flat_map(|p| [p[1], p[2], p[3], p[0]])
+            .collect()
+    }
+}
+
+/// Raster for notification bubbles: embedded rather than looked up by
+/// theme name, so the icon shows even before the package installs it
+/// into hicolor (and on desktops whose icon cache has not caught up).
+pub fn notification_rgba() -> (i32, i32, Vec<u8>) {
+    let p = shield_pixmap(NOTIFICATION_SIZE);
+    (p.width as i32, p.height as i32, p.to_rgba())
 }
 
 #[cfg(test)]

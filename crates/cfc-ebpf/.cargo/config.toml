@@ -1,0 +1,37 @@
+# Cargo config for the kernel-side crate ONLY.
+#
+# Cargo discovers `.cargo/config.toml` by walking up from the current working
+# directory, so this applies when cargo is invoked with `crates/cfc-ebpf` as
+# cwd and NOT when it is invoked from the repository root. Keeping the BPF
+# target and the nightly `-Z` flags here (instead of in the root
+# `.cargo/config.toml`) is what guarantees the stable workspace build is
+# untouched.
+
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+# `bpfel-unknown-none` is tier 3: there is no shipped `core`, so it has to be
+# rebuilt from `rust-src` on every fresh target dir.
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+# rustc's `bpfel-unknown-none` target spec already defaults to the `bpf` linker
+# flavour and to `bpf-linker` as the linker, so no `linker = ...` is needed.
+# `--btf` makes bpf-linker emit the .BTF/.BTF.ext sections from the DWARF that
+# `debug = 2` produces; the kernel needs them for the `.rodata` globals and
+# gives far better verifier diagnostics with them present.
+#
+# `--disable-expand-memcpy-in-order` is NOT optional. bpf-linker passes
+# `-bpf-expand-memcpy-in-order` to LLVM by default, and that flag sets the BPF
+# backend's `MaxStoresPerMemset`/`MaxStoresPerMemcpy` to **zero** while only
+# custom-lowering MEMCPY. The result is that *every* `llvm.memset`, even a
+# 16-byte one such as `[0u8; 16]`, becomes a `memset` libcall and the link dies
+# with "A call to built-in function 'memset' is not supported". Disabling it
+# restores the normal inline expansion for small memsets/memcpys.
+rustflags = [
+    "-C",
+    "link-arg=--btf",
+    "-C",
+    "link-arg=--disable-expand-memcpy-in-order",
+]

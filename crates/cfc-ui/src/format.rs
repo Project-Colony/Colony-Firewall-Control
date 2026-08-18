@@ -84,6 +84,45 @@ pub fn dest_display(dst_host: &str, dst_ip: &str, dst_port: u32) -> String {
     }
 }
 
+/// `"example.com (93.184.216.34):443"` for the prompt detail table.
+///
+/// Differs from [`dest_display`] on purpose: the port belongs to the socket,
+/// not to the parenthesised "and this is the address that name resolved to"
+/// aside, and reading it outside the brackets is what makes the row scan the
+/// same way as `Source`.
+///
+/// Empty when the daemon named neither a host nor an address, so the caller
+/// can drop the row rather than render `?:0`.
+pub fn remote_display(dst_host: &str, dst_ip: &str, dst_port: u32) -> String {
+    match (dst_host.is_empty(), dst_ip.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{dst_ip}:{dst_port}"),
+        (false, true) => format!("{dst_host}:{dst_port}"),
+        (false, false) => format!("{dst_host} ({dst_ip}):{dst_port}"),
+    }
+}
+
+/// `"1.2.3.4:54321"`, empty when the daemon did not report a source address.
+pub fn socket_display(ip: &str, port: u32) -> String {
+    if ip.is_empty() {
+        String::new()
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+/// Clips `s` to `max_chars`, appending an ellipsis when anything was cut.
+///
+/// Counts characters rather than bytes: a command line is arbitrary user
+/// data and may well be UTF-8, and slicing it by byte would panic.
+pub fn ellipsize(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{head}...")
+}
+
 /// The name a rule should be scoped to: the hostname when we know it,
 /// otherwise the literal address.
 pub fn dest_key(dst_host: &str, dst_ip: &str) -> String {
@@ -136,6 +175,26 @@ pub fn format_clock_ms(ms: i64) -> String {
     }
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|d| d.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Clock time in the *user's own* timezone.
+///
+/// The prompt card is the one place the UI has to agree with the wall clock
+/// on the wall: "Outgoing connection - 14:33:04" is how the user correlates
+/// the popup with what they just clicked, and UTC would be off by hours for
+/// most of them. The live feed stays UTC, where the point is ordering rather
+/// than recognition.
+pub fn format_local_clock_ms(ms: i64) -> String {
+    if ms <= 0 {
+        return "?".to_string();
+    }
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|| "?".to_string())
 }
 
@@ -251,6 +310,61 @@ mod tests {
         );
         assert_eq!(dest_display("", "93.184.216.34", 443), "93.184.216.34:443");
         assert_eq!(dest_display("", "", 53), "?:53");
+    }
+
+    #[test]
+    fn remote_display_puts_the_port_outside_the_alias() {
+        assert_eq!(
+            remote_display("example.com", "93.184.216.34", 443),
+            "example.com (93.184.216.34):443"
+        );
+        assert_eq!(
+            remote_display("", "93.184.216.34", 443),
+            "93.184.216.34:443"
+        );
+        assert_eq!(remote_display("example.com", "", 443), "example.com:443");
+        // Nothing to say: the caller drops the row instead of showing ":0".
+        assert_eq!(remote_display("", "", 0), "");
+    }
+
+    #[test]
+    fn socket_display_is_empty_without_an_address() {
+        assert_eq!(socket_display("10.0.0.2", 54321), "10.0.0.2:54321");
+        assert_eq!(socket_display("", 54321), "");
+    }
+
+    #[test]
+    fn ellipsize_counts_characters_not_bytes() {
+        assert_eq!(ellipsize("curl example.com", 40), "curl example.com");
+        assert_eq!(
+            ellipsize("abcdef", 6),
+            "abcdef",
+            "exactly at the cap is kept"
+        );
+        assert_eq!(ellipsize("abcdef", 3), "abc...");
+        // A command line is arbitrary user data; byte slicing would panic.
+        assert_eq!(
+            ellipsize(&"é".repeat(10), 4),
+            format!("{}...", "é".repeat(4))
+        );
+    }
+
+    #[test]
+    fn local_clock_is_a_wall_clock_or_a_question_mark() {
+        // The offset depends on the host timezone, so assert the shape the
+        // header line depends on rather than a fixed hour.
+        assert_eq!(format_local_clock_ms(0), "?");
+        assert_eq!(format_local_clock_ms(-1), "?");
+        let s = format_local_clock_ms(1_700_000_000_000);
+        assert_eq!(s.len(), 8, "{s}");
+        let parts: Vec<&str> = s.split(':').collect();
+        assert_eq!(parts.len(), 3, "{s}");
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit())),
+            "{s}"
+        );
     }
 
     #[test]

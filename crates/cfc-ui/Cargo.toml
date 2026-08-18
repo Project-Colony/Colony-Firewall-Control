@@ -24,7 +24,6 @@ tonic = { workspace = true }
 prost = { workspace = true }
 futures = { workspace = true }
 
-notify-rust = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

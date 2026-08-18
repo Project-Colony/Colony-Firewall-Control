@@ -321,6 +321,49 @@ pub fn subtle_icon(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Inline link ("Customize this rule before creating it"). Burgundy text on
+/// no background, so it reads as a way out of the three big buttons rather
+/// than as a fourth one.
+pub fn link_button(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(Background::Color(PARCHMENT_DARKER)),
+            _ => None,
+        },
+        text_color: BURGUNDY,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 3.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
+/// Subordinate action row ("Allow once"). Outlined rather than filled, so it
+/// never competes with the three decisions above it.
+pub fn action_secondary(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(Background::Color(PARCHMENT_DARKER)),
+            button::Status::Disabled => None,
+            _ => Some(Background::Color(PARCHMENT_BG)),
+        },
+        text_color: match status {
+            button::Status::Disabled => PARCHMENT_MUTED,
+            _ => PARCHMENT_TEXT,
+        },
+        border: Border {
+            color: HAIRLINE,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
 /// Sidebar nav item, inactive. Hover lightens. No border, no bg by default.
 pub fn nav_item_inactive(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {

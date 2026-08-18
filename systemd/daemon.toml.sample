@@ -2,7 +2,8 @@
 #
 # RELOADING
 # ---------
-# `profile` and everything under [default_policy] are re-read on SIGHUP:
+# `profile`, everything under [default_policy], and [provenance] are re-read
+# on SIGHUP:
 #
 #     sudo systemctl kill -s HUP colony-firewalld
 #
@@ -15,11 +16,16 @@
 # Named preset. Pick one of: "relaxed", "balanced", "strict".
 # Omit to use "balanced" defaults.
 #
-#   relaxed  - Allow when no UI / on timeout, 60s prompt window.
+#   relaxed  - Allow when nobody is subscribed, 60s prompt window.
 #              Best for laptops where you don't always have the UI open.
-#   balanced - Allow when no UI / on timeout, 15s window. (default)
-#   strict   - Deny when no UI / on timeout, 10s window.
+#   balanced - Allow when nobody is subscribed, 30s window. (default)
+#   strict   - Deny when nobody is subscribed, 15s window.
 #              Fail-closed posture; only use if you keep the UI running.
+#
+# Every profile DENIES a prompt that expired unanswered. A timeout means
+# the question was put to you and you did not answer it; if that granted
+# access, connecting while nobody is at the keyboard would be the easiest
+# way through. Set timeout_action explicitly below if you disagree.
 #
 # How profile and [default_policy] combine: the profile (or "balanced" when
 # omitted) provides the base values, and each field you explicitly set under
@@ -39,11 +45,12 @@ profile = "balanced"
 # # no GUI, no `cfc prompts`. Nobody is asked; this is applied directly.
 # # "Reject" is accepted here but behaves as "Deny" (no refusal is sent).
 # no_ui_action = "Allow"
-# # What to do if a prompt was shown but expired unanswered. Same caveat
-# # about "Reject".
-# timeout_action = "Allow"
+# # What to do if a prompt was shown but expired unanswered. Every profile
+# # sets this to "Deny"; override only if you want an unanswered question
+# # to grant access. Same caveat about "Reject".
+# timeout_action = "Deny"
 # # How long a prompt waits for an answer, in seconds.
-# prompt_timeout_secs = 15
+# prompt_timeout_secs = 30
 
 # Needs a restart (the queue is bound once, at startup).
 [nfqueue]
@@ -97,6 +104,46 @@ default_secs = 600
 # the loss is logged. Blocked connections are additionally logged to the
 # journal, whether or not the row reaches disk.
 max_rows = 100000
+
+# Reloads on SIGHUP.
+[provenance]
+# Answer "does this binary still match what the distribution installed?"
+# for every process the daemon prompts or reports about, and show it next to
+# the process in the GUI, the tray and `cfc prompts`:
+#
+#   package  curl 8.21.0-1 (verified)          matches the package record
+#   package  curl 8.21.0-1 — MODIFIED since install
+#   package  not from a package                nothing owns this path
+#
+# This is the Linux answer to Windows Firewall Control's "Signed: Yes
+# (Canon Inc.)" line, and a stricter question than a signature: the digest
+# compared is the one taken from /proc/<pid>/exe, i.e. the bytes the kernel
+# actually mapped, while the package database describes the file on disk.
+# MODIFIED therefore means the running binary is not the one the package
+# shipped - patched, replaced, or swapped under a live process. Treat it as
+# a real finding, not a formatting quirk.
+#
+# BACKENDS
+#   pacman (/var/lib/pacman/local) - full verification against the sha256
+#     digests in each package's mtree.
+#   dpkg (/var/lib/dpkg/info) - package NAME only, rendered "(unverified)".
+#     dpkg records MD5 and nothing else, which is not a hash worth asserting
+#     integrity with, so the daemon names the owner and declines to vouch
+#     for the bytes.
+#   Neither present - every process reads "unknown" and the line is hidden.
+#
+# COST
+# The first lookup after start (or after any pacman/dpkg transaction) builds
+# a path -> package index by reading every installed package's file list:
+# about 200ms and ~10MB of memory for a 1300-package desktop, done lazily
+# off the first lookup, never on the packet path. After that a newly-seen
+# binary costs one gzip parse of its own package's mtree, and repeat lookups
+# are served from a cache keyed by the executable's (device, inode, mtime).
+# A build slower than a second logs a warning telling you about this switch.
+#
+# Set false to skip all of it; process resolution and rule matching are
+# unaffected either way.
+enabled = true
 
 # Needs a restart (the socket is secured once, right after bind).
 [ipc]

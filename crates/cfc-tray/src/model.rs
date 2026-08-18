@@ -2,11 +2,30 @@
 //! the menu. Everything in this module is I/O-free so it can be unit
 //! tested without a daemon, a D-Bus session, or a clock.
 
-use cfc_client::ClientError;
+use cfc_client::{proto, ClientError};
 
 /// At most one desktop notification per this many milliseconds, however
-/// fast prompts arrive.
+/// fast prompts arrive. Only used by the generic (non-actionable)
+/// fallback path; actionable notifications are one-per-prompt by design.
 pub const NOTIFY_MIN_INTERVAL_MS: i64 = 30_000;
+
+/// At most this many actionable prompt notifications on screen at once;
+/// prompts beyond the cap fold into one collapsed overflow notification.
+pub const MAX_ACTIONABLE_NOTIFICATIONS: usize = 3;
+
+/// Floor for a prompt notification's expire timeout. A deadline that is
+/// already past still gets a brief, visible bubble rather than a 0ms
+/// ("never expire") or negative ("server default") timeout.
+pub const MIN_PROMPT_TIMEOUT_MS: u32 = 1_000;
+
+/// Notification action keys. `default` is the freedesktop key invoked by
+/// clicking the notification body itself.
+pub const KEY_DEFAULT: &str = "default";
+pub const KEY_ALLOW: &str = "allow";
+pub const KEY_DENY: &str = "deny";
+pub const KEY_BLOCK: &str = "block";
+/// notify-rust reports dismissal/expiry as this pseudo-action key.
+pub const KEY_CLOSED: &str = "__closed";
 
 /// The pause durations offered by the submenu. `0` means "the daemon's
 /// configured default" ([pause] default_secs), matching the SetPaused
@@ -185,6 +204,158 @@ impl NotifyGate {
         self.last_notified_at_ms = Some(now_unix_ms);
         true
     }
+}
+
+/// Whether the notification server can do per-prompt actionable
+/// notifications at all. Decided once at startup from
+/// `org.freedesktop.Notifications.GetCapabilities`; without "actions" the
+/// tray keeps the generic [`NotifyGate`]-driven count notification.
+pub fn actions_supported(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|c| c == "actions")
+}
+
+/// A pure description of one actionable prompt notification, mapped 1:1
+/// onto a notify-rust `Notification` by the tray.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptNotification {
+    /// "<process> wants to connect" - the whole headline, so the bold
+    /// first line of the bubble reads as a sentence on its own.
+    pub summary: String,
+    /// The destination on the first line and the full exe path on the
+    /// second, so the path never runs into the prose.
+    pub body: String,
+    /// Remaining time until the prompt's deadline, clamped to at least
+    /// [`MIN_PROMPT_TIMEOUT_MS`]. When it expires unanswered the daemon
+    /// applies its timeout_action; the tray does nothing.
+    pub timeout_ms: u32,
+    /// Whether "Block app always" is offered. False when the prompt has
+    /// no exe path: a RuleScope with an empty exe_path would be a
+    /// match-everything deny rule, not an app block.
+    pub offer_block: bool,
+}
+
+/// Maps one PromptEvent onto the notification shown for it.
+pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptNotification {
+    let exe = ev.process.as_ref().map_or("", |p| p.exe.as_str());
+    let name = match ev.process.as_ref() {
+        Some(p) => cfc_client::convert::process_display(p),
+        None => "An unknown process".to_string(),
+    };
+    let summary = format!("{name} wants to connect");
+    // "93.184.216.34:443" is not something anyone can make a decision
+    // about; prefer the resolved hostname whenever the daemon has one.
+    let target = match ev.connection.as_ref() {
+        Some(c) => {
+            let host = [c.dst_host.as_str(), c.dst_ip.as_str(), "unknown"]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .expect("literal fallback");
+            format!(
+                "{host}:{} ({})",
+                c.dst_port,
+                cfc_client::convert::protocol_label(c.protocol)
+            )
+        }
+        None => "an unknown destination".to_string(),
+    };
+    let mut body = target;
+    if !exe.is_empty() {
+        body.push('\n');
+        body.push_str(exe);
+    }
+    let remaining = ev.deadline_unix_ms.saturating_sub(now_unix_ms);
+    let timeout_ms = remaining.clamp(i64::from(MIN_PROMPT_TIMEOUT_MS), i64::from(u32::MAX)) as u32;
+    PromptNotification {
+        summary,
+        body,
+        timeout_ms,
+        offer_block: !exe.is_empty(),
+    }
+}
+
+/// What a notification button click means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptChoice {
+    /// "Allow": allow this one connection.
+    AllowOnce,
+    /// "Deny": deny this one connection.
+    DenyOnce,
+    /// "Block app always": deny and persist a rule for this exe.
+    BlockAlways,
+}
+
+/// Maps a notification action key to a verdict choice. [`KEY_DEFAULT`]
+/// (open the GUI) and [`KEY_CLOSED`] (dismissed/expired) are not verdicts
+/// and map to `None`.
+pub fn choice_from_key(key: &str) -> Option<PromptChoice> {
+    match key {
+        KEY_ALLOW => Some(PromptChoice::AllowOnce),
+        KEY_DENY => Some(PromptChoice::DenyOnce),
+        KEY_BLOCK => Some(PromptChoice::BlockAlways),
+        _ => None,
+    }
+}
+
+/// The SubmitVerdict triple for a choice. Once verdicts must never carry
+/// a persist_scope - the daemon rejects a persisted Once outright; only
+/// "Block app always" persists, scoped to the prompting exe.
+pub fn verdict_for(
+    choice: PromptChoice,
+    exe: &str,
+) -> (proto::Action, proto::Duration, Option<proto::RuleScope>) {
+    match choice {
+        PromptChoice::AllowOnce => (proto::Action::Allow, proto::Duration::Once, None),
+        PromptChoice::DenyOnce => (proto::Action::Deny, proto::Duration::Once, None),
+        PromptChoice::BlockAlways => (
+            proto::Action::Deny,
+            proto::Duration::Always,
+            Some(proto::RuleScope {
+                exe_path: exe.to_string(),
+                ..Default::default()
+            }),
+        ),
+    }
+}
+
+/// Body of the brief confirmation after "Block app always" succeeded.
+pub fn block_confirmation(exe: &str) -> String {
+    let name = std::path::Path::new(exe)
+        .file_name()
+        .map_or_else(|| exe.to_string(), |n| n.to_string_lossy().into_owned());
+    format!("Rule created: deny {name} always")
+}
+
+/// How a newly arrived prompt is surfaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptPresentation {
+    /// Its own actionable notification (a free slot exists).
+    Actionable,
+    /// Folded into the single collapsed notification, which now covers
+    /// `count` prompts.
+    Overflow { count: u64 },
+}
+
+/// Decides actionable-vs-collapsed for one new prompt, given how many
+/// actionable notifications are on screen and how many prompts the
+/// current overflow bubble already covers.
+pub fn present_prompt(active_actionable: usize, overflowed: u64) -> PromptPresentation {
+    if active_actionable < MAX_ACTIONABLE_NOTIFICATIONS {
+        PromptPresentation::Actionable
+    } else {
+        PromptPresentation::Overflow {
+            count: overflowed.saturating_add(1),
+        }
+    }
+}
+
+/// Body of the collapsed overflow notification.
+pub fn overflow_body(count: u64) -> String {
+    let noun = if count == 1 {
+        "connection"
+    } else {
+        "connections"
+    };
+    format!("{count} more {noun} waiting — open Colony Firewall")
 }
 
 #[cfg(test)]
@@ -420,5 +591,199 @@ mod tests {
         // about them.
         let mut g = NotifyGate::default();
         assert!(g.on_poll(5, 123));
+    }
+
+    // --- prompt notification mapping ---------------------------------------
+
+    fn prompt_event(exe: &str, host: &str, ip: &str, deadline_unix_ms: i64) -> proto::PromptEvent {
+        proto::PromptEvent {
+            prompt_id: "42".into(),
+            connection: Some(proto::ConnectionInfo {
+                protocol: proto::Protocol::Tcp as i32,
+                dst_ip: ip.into(),
+                dst_port: 443,
+                dst_host: host.into(),
+                ..Default::default()
+            }),
+            process: Some(proto::ProcessInfo {
+                pid: 1234,
+                exe: exe.into(),
+                ..Default::default()
+            }),
+            deadline_unix_ms,
+        }
+    }
+
+    #[test]
+    fn prompt_notification_prefers_host_over_ip() {
+        let n = prompt_notification(
+            &prompt_event("/usr/bin/curl", "example.com", "93.184.216.34", 0),
+            0,
+        );
+        assert!(n.body.starts_with("example.com:443 (tcp)"), "{}", n.body);
+    }
+
+    #[test]
+    fn prompt_notification_falls_back_to_ip_then_unknown() {
+        let n = prompt_notification(&prompt_event("/usr/bin/curl", "", "93.184.216.34", 0), 0);
+        assert!(n.body.starts_with("93.184.216.34:443 (tcp)"), "{}", n.body);
+        let n = prompt_notification(&prompt_event("/usr/bin/curl", "", "", 0), 0);
+        assert!(n.body.starts_with("unknown:443 (tcp)"), "{}", n.body);
+    }
+
+    #[test]
+    fn prompt_notification_summary_is_the_exe_basename() {
+        let n = prompt_notification(&prompt_event("/usr/bin/curl", "example.com", "", 0), 0);
+        assert_eq!(n.summary, "curl wants to connect");
+    }
+
+    #[test]
+    fn prompt_notification_body_carries_the_full_exe_on_a_second_line() {
+        let n = prompt_notification(&prompt_event("/usr/bin/curl", "example.com", "", 0), 0);
+        assert_eq!(n.body, "example.com:443 (tcp)\n/usr/bin/curl");
+    }
+
+    #[test]
+    fn prompt_notification_without_exe_offers_no_block_and_stays_one_line() {
+        // No exe path: "Block app always" would need RuleScope { exe_path },
+        // and an empty exe_path is a match-everything rule, not an app block.
+        let n = prompt_notification(&prompt_event("", "example.com", "", 0), 0);
+        assert!(!n.offer_block);
+        assert!(!n.body.contains('\n'), "{}", n.body);
+        assert_eq!(n.summary, "pid:1234 wants to connect"); // no-exe form
+        let with_exe = prompt_notification(&prompt_event("/usr/bin/curl", "e.com", "", 0), 0);
+        assert!(with_exe.offer_block);
+    }
+
+    #[test]
+    fn prompt_notification_without_process_reads_unknown() {
+        let mut ev = prompt_event("", "example.com", "", 0);
+        ev.process = None;
+        let n = prompt_notification(&ev, 0);
+        assert_eq!(n.summary, "An unknown process wants to connect");
+        assert!(!n.offer_block);
+    }
+
+    #[test]
+    fn prompt_timeout_is_the_remaining_time_until_the_deadline() {
+        let now = 1_000_000;
+        let n = prompt_notification(&prompt_event("/x", "h", "", now + 30_000), now);
+        assert_eq!(n.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn prompt_timeout_clamps_to_at_least_one_second() {
+        let now = 1_000_000;
+        // Already past, exactly now, and barely ahead all clamp up: 0ms
+        // means "never expire" to the server and negative means "server
+        // default", neither of which tracks the daemon's deadline.
+        for deadline in [now - 5_000, now, now + 1, now + 999] {
+            let n = prompt_notification(&prompt_event("/x", "h", "", deadline), now);
+            assert_eq!(n.timeout_ms, MIN_PROMPT_TIMEOUT_MS, "deadline {deadline}");
+        }
+        // And an absurdly far deadline still fits the u32 the server takes.
+        let n = prompt_notification(&prompt_event("/x", "h", "", i64::MAX), now);
+        assert_eq!(n.timeout_ms, u32::MAX);
+    }
+
+    // --- choice -> verdict mapping ------------------------------------------
+
+    #[test]
+    fn once_verdicts_never_carry_a_persist_scope() {
+        // The daemon rejects a persisted Once outright; these must be bare.
+        let (a, d, s) = verdict_for(PromptChoice::AllowOnce, "/usr/bin/curl");
+        assert_eq!((a, d), (proto::Action::Allow, proto::Duration::Once));
+        assert_eq!(s, None);
+        let (a, d, s) = verdict_for(PromptChoice::DenyOnce, "/usr/bin/curl");
+        assert_eq!((a, d), (proto::Action::Deny, proto::Duration::Once));
+        assert_eq!(s, None);
+    }
+
+    #[test]
+    fn block_verdict_persists_a_deny_scoped_to_the_exe() {
+        let (a, d, s) = verdict_for(PromptChoice::BlockAlways, "/usr/bin/curl");
+        assert_eq!((a, d), (proto::Action::Deny, proto::Duration::Always));
+        let scope = s.expect("block must carry a scope");
+        assert_eq!(scope.exe_path, "/usr/bin/curl");
+        // Nothing else narrows or widens the rule.
+        assert_eq!(
+            scope,
+            proto::RuleScope {
+                exe_path: "/usr/bin/curl".into(),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn action_keys_map_to_choices_and_nothing_else_does() {
+        assert_eq!(choice_from_key(KEY_ALLOW), Some(PromptChoice::AllowOnce));
+        assert_eq!(choice_from_key(KEY_DENY), Some(PromptChoice::DenyOnce));
+        assert_eq!(choice_from_key(KEY_BLOCK), Some(PromptChoice::BlockAlways));
+        assert_eq!(choice_from_key(KEY_DEFAULT), None);
+        assert_eq!(choice_from_key(KEY_CLOSED), None);
+        assert_eq!(choice_from_key("bogus"), None);
+    }
+
+    #[test]
+    fn block_confirmation_names_the_basename() {
+        assert_eq!(
+            block_confirmation("/usr/bin/curl"),
+            "Rule created: deny curl always"
+        );
+    }
+
+    // --- collapse beyond the cap --------------------------------------------
+
+    #[test]
+    fn prompts_below_the_cap_get_their_own_notification() {
+        for active in 0..MAX_ACTIONABLE_NOTIFICATIONS {
+            assert_eq!(present_prompt(active, 0), PromptPresentation::Actionable);
+        }
+    }
+
+    #[test]
+    fn prompts_at_or_beyond_the_cap_collapse_and_count_up() {
+        assert_eq!(
+            present_prompt(MAX_ACTIONABLE_NOTIFICATIONS, 0),
+            PromptPresentation::Overflow { count: 1 }
+        );
+        assert_eq!(
+            present_prompt(MAX_ACTIONABLE_NOTIFICATIONS, 4),
+            PromptPresentation::Overflow { count: 5 }
+        );
+        // Even a weird over-cap active count collapses.
+        assert_eq!(
+            present_prompt(MAX_ACTIONABLE_NOTIFICATIONS + 2, 0),
+            PromptPresentation::Overflow { count: 1 }
+        );
+    }
+
+    #[test]
+    fn overflow_body_counts_and_pluralizes() {
+        assert_eq!(
+            overflow_body(1),
+            "1 more connection waiting — open Colony Firewall"
+        );
+        assert_eq!(
+            overflow_body(4),
+            "4 more connections waiting — open Colony Firewall"
+        );
+    }
+
+    // --- capability fallback -------------------------------------------------
+
+    #[test]
+    fn actionable_mode_requires_the_actions_capability() {
+        let caps = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(actions_supported(&caps(&[
+            "body",
+            "actions",
+            "icon-static"
+        ])));
+        assert!(!actions_supported(&caps(&["body", "icon-static"])));
+        assert!(!actions_supported(&caps(&[])));
+        // Substrings must not count.
+        assert!(!actions_supported(&caps(&["actions-icons"])));
     }
 }

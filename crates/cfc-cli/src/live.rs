@@ -300,6 +300,8 @@ mod tests {
                 cmdline: vec![],
                 cwd: String::new(),
                 sha256: String::new(),
+                package: String::new(),
+                provenance: proto::Provenance::Unspecified as i32,
             }),
             verdict: verdict as i32,
             rule_id: String::new(),
