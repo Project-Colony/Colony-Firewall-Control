@@ -26,7 +26,7 @@ trap cleanup EXIT
 say() { printf '\n=== %s ===\n' "$*"; }
 
 say "Building workspace"
-cargo build --workspace --profile fast --quiet
+cargo build --workspace --profile fast --locked --quiet
 
 DAEMON="${ROOT}/target/fast/colony-firewalld"
 CFC="${ROOT}/target/fast/cfc"

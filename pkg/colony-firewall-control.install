@@ -1,0 +1,44 @@
+# pacman install scriptlet for colony-firewall-control.
+
+post_install() {
+    cat <<'EOF'
+==> Colony Firewall Control - first run:
+
+    1. Enable the daemon and the persistent nftables rules:
+           systemctl enable --now colony-firewalld colony-firewall-nft
+       (colony-firewall-nft loads 'table inet colony_firewall'; it is
+        fail-closed while loaded, and PartOf= the daemon, so stopping
+        the daemon also removes the table cleanly.)
+
+    2. Let your desktop user talk to the daemon socket:
+           usermod -aG colony-firewall <your-user>
+       then log out/in. The 'colony-firewall' group is created by
+       systemd-sysusers from /usr/lib/sysusers.d/colony-firewall.conf
+       (applied automatically by the pacman sysusers hook).
+
+    3. Seed sensible default rules:
+           cfc rules bootstrap-defaults
+
+==> The GUI autostarts for all desktop users via
+    /etc/xdg/autostart/colony-firewall.desktop; per-user opt-out: copy it
+    to ~/.config/autostart/ and set Hidden=true.
+==> Config: /etc/colony-firewall/daemon.toml (kept on upgrades).
+EOF
+}
+
+post_upgrade() {
+    cat <<'EOF'
+==> colony-firewall-control upgraded.
+    Changes: /usr/share/doc/colony-firewall-control/README.md and
+    https://github.com/Project-Colony/Colony-Firewall-Control/blob/main/CHANGELOG.md
+    Restart to apply:  systemctl restart colony-firewalld
+EOF
+}
+
+pre_remove() {
+    # Stop enforcement BEFORE the binaries and the snippet disappear, so
+    # the fail-closed NFQUEUE table can never outlive the daemon and
+    # blackhole all new outbound traffic.
+    systemctl disable --now colony-firewall-nft.service colony-firewalld.service 2>/dev/null || true
+    nft delete table inet colony_firewall 2>/dev/null || true
+}

@@ -9,11 +9,14 @@
 #   strict   - Deny when no UI / on timeout, 10s window.
 #              Fail-closed posture; only use if you keep the UI running.
 #
-# If you uncomment any [default_policy] field below, that block becomes
-# authoritative and the profile is ignored.
+# How profile and [default_policy] combine: the profile (or "balanced" when
+# omitted) provides the base values, and each field you explicitly set under
+# [default_policy] overrides just that field. Fields you leave commented out
+# keep the profile's value.
 profile = "balanced"
 
 # [default_policy]
+# # Each field overrides the profile's value for that one field only.
 # # What to do when no rule matches and no UI is connected.
 # no_ui_action = "Allow"
 # # What to do if a prompt expires.
@@ -24,6 +27,23 @@ profile = "balanced"
 [nfqueue]
 # NFQUEUE number. Must match the iptables/nftables rule that enqueues packets.
 queue_num = 0
+# Kernel queue length: how many packets may wait for a verdict before the
+# queue overflows.
+queue_max_len = 4096
+# What happens to packets when the queue overflows or the daemon can't keep
+# up: false drops them (fail-closed, default), true lets them through
+# (fail-open).
+fail_open = false
 
 [storage]
 path = "/var/lib/colony-firewall/rules.db"
+
+[pause]
+# Default duration for `cfc pause` when no explicit duration is given,
+# in seconds. (10 minutes.)
+default_secs = 600
+
+[events]
+# Maximum number of verdict events kept in the database; the oldest beyond
+# this cap are pruned.
+max_rows = 100000

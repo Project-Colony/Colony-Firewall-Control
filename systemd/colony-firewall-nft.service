@@ -1,0 +1,31 @@
+# colony-firewall-nft.service
+#
+# Loads the Colony Firewall nftables snippet (table inet colony_firewall)
+# that enqueues new outbound connections to NFQUEUE 0, and removes the
+# table again on stop.
+#
+# Enabling this unit makes enforcement persistent across reboots:
+#     systemctl enable --now colony-firewall-nft
+#
+# The snippet is deliberately fail-closed ("queue num 0" without bypass):
+# while the table is loaded and the daemon is not running, new outbound
+# connections are dropped. Because this unit is PartOf=colony-firewalld.service,
+# stopping the daemon also stops this unit, which deletes the table and
+# stops enforcement cleanly -- traffic is never blackholed by a stopped
+# daemon or an uninstalled package.
+
+[Unit]
+Description=Colony Firewall nftables NFQUEUE rules
+Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
+PartOf=colony-firewalld.service
+After=colony-firewalld.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /usr/share/colony-firewall/nftables-snippet.conf
+ExecStop=/usr/bin/nft delete table inet colony_firewall
+
+[Install]
+WantedBy=multi-user.target

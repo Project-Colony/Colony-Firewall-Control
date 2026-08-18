@@ -132,6 +132,8 @@ fn recv_loop(
             None => Process::unknown(0),
         };
         if let Some(pid) = pid_hint {
+            // proc.uid is None when attribution failed; keep it None on the
+            // connection too instead of fabricating uid 0.
             conn = conn.with_process(pid, proc.uid);
         }
 

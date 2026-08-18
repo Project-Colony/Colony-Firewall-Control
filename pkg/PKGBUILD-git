@@ -1,53 +1,61 @@
 # Maintainer: MotherSphere <linhajahad@gmail.com>
 #
-# AUR release PKGBUILD for Colony Firewall Control.
-# For building from a git checkout during development, see PKGBUILD-git.
+# Development / VCS variant of colony-firewall-control.
+#
+# Usage (from anywhere):
+#     mkdir /tmp/cfc-git && cp pkg/PKGBUILD-git /tmp/cfc-git/PKGBUILD
+#     cp pkg/colony-firewall-control.install /tmp/cfc-git/
+#     cd /tmp/cfc-git && makepkg -si
+#
+# To build from your local checkout instead of GitHub (fast iteration,
+# uses your working tree's HEAD), point _giturl at the repo root, e.g.:
+#     _giturl="git+file:///home/you/Colony-Firewall-Control"
 
-pkgname=colony-firewall-control
-pkgver=0.1.0
+pkgname=colony-firewall-control-git
+pkgver=r0.0000000
 pkgrel=1
-pkgdesc="Application-aware outbound firewall for Linux, written in Rust"
+pkgdesc="Application-aware outbound firewall for Linux, written in Rust (git version)"
 arch=('x86_64')
 url="https://github.com/Project-Colony/Colony-Firewall-Control"
 license=('GPL-3.0-or-later')
-# Runtime deps, deliberately minimal:
-# - nftables: /usr/bin/nft is required by colony-firewall-nft.service and
-#   by the pre_remove cleanup (table inet colony_firewall).
-# - libxkbcommon / wayland: dlopen'd at runtime by the iced (winit/wgpu) GUI.
-# - No 'sqlite': rusqlite is built with the 'bundled' feature.
-# - No 'libnetfilter_queue'/'libnfnetlink': the nfq crate speaks netlink
-#   directly in pure Rust.
 depends=('gcc-libs' 'glibc' 'nftables' 'libxkbcommon' 'wayland')
-makedepends=('cargo' 'protobuf' 'pkgconf')
+makedepends=('cargo' 'protobuf' 'pkgconf' 'git')
 optdepends=(
     'libnotify: desktop notifications on new prompts'
     'libx11: run the GUI in X11/XWayland sessions'
 )
+provides=('colony-firewall-control')
+conflicts=('colony-firewall-control')
 backup=('etc/colony-firewall/daemon.toml')
 install=colony-firewall-control.install
-source=("$pkgname-$pkgver.tar.gz::https://github.com/Project-Colony/Colony-Firewall-Control/archive/v$pkgver.tar.gz")
-# 'SKIP' is a placeholder: fill in the real checksum per release with
-# `updpkgsums` (pacman-contrib) before pushing to the AUR.
+_giturl="git+https://github.com/Project-Colony/Colony-Firewall-Control.git"
+source=("colony-firewall-control::$_giturl")
 sha256sums=('SKIP')
 
-# GitHub release tarballs extract to <repo>-<version> (no leading 'v').
-_srcname=Colony-Firewall-Control-$pkgver
+pkgver() {
+    cd "$srcdir/colony-firewall-control"
+    # v0.1.0-5-gabc1234 -> 0.1.0.r5.gabc1234 ; falls back to rN.hash before
+    # the first tag.
+    git describe --long --tags 2>/dev/null \
+        | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' \
+        || printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
 
 prepare() {
-    cd "$srcdir/$_srcname"
+    cd "$srcdir/colony-firewall-control"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$srcdir/$_srcname"
+    cd "$srcdir/colony-firewall-control"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     cargo build --workspace --profile release --locked
 }
 
 check() {
-    cd "$srcdir/$_srcname"
+    cd "$srcdir/colony-firewall-control"
     export RUSTUP_TOOLCHAIN=stable
     # Dev profile: the release profile sets panic=abort, which the libtest
     # harness cannot use.
@@ -55,7 +63,7 @@ check() {
 }
 
 package() {
-    cd "$srcdir/$_srcname"
+    cd "$srcdir/colony-firewall-control"
 
     # Binaries
     install -Dm755 target/release/colony-firewalld "$pkgdir/usr/bin/colony-firewalld"

@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Project-Colony/Colony-Firewall-Control"
 authors = ["MotherSphere <linhajahad@gmail.com>"]

@@ -1,0 +1,20 @@
+# Installed to /etc/xdg/autostart/colony-firewall.desktop so the GUI is
+# running when the daemon needs to prompt (without the GUI, unknown flows
+# fall back to the configured default policy instead of asking).
+#
+# Per-user override: copy this file to ~/.config/autostart/ and set
+# Hidden=true (or use your desktop's Startup Applications tool) to
+# disable autostart for one user without touching the system copy.
+#
+# OnlyShowIn is deliberately unset: autostart applies in all desktop
+# environments.
+[Desktop Entry]
+Type=Application
+Name=Colony Firewall
+Comment=Application-aware outbound firewall with per-app prompts
+Comment[fr]=Pare-feu sortant par application avec invites de decision par application
+Exec=colony-firewall
+Icon=colony-firewall
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

@@ -13,24 +13,37 @@ pub enum Action {
     Reject,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Duration {
     Once,
     UntilRestart,
+    #[default]
     Always,
     Seconds(u32),
 }
 
 /// What this rule matches on.
+///
+/// Every predicate is optional; `#[serde(default)]` on each field keeps old
+/// readers compatible with scopes serialized by newer versions that add
+/// fields (unknown fields are ignored, missing fields fall back to `None`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleScope {
+    #[serde(default)]
     pub exe_path: Option<PathBuf>,
+    #[serde(default)]
     pub exe_sha256: Option<String>,
+    #[serde(default)]
     pub parent_exe: Option<PathBuf>,
+    #[serde(default)]
     pub uid: Option<u32>,
+    #[serde(default)]
     pub dst_host: Option<String>,
+    #[serde(default)]
     pub dst_net: Option<IpNet>,
+    #[serde(default)]
     pub dst_port: Option<u16>,
+    #[serde(default)]
     pub protocol: Option<crate::Protocol>,
 }
 
@@ -48,6 +61,24 @@ impl RuleScope {
         }
     }
 
+    /// Number of populated (`Some`) predicates. Higher means more specific;
+    /// [`RuleSet::sort_deterministic`] orders more-specific rules first.
+    pub fn specificity(&self) -> u8 {
+        [
+            self.exe_path.is_some(),
+            self.exe_sha256.is_some(),
+            self.parent_exe.is_some(),
+            self.uid.is_some(),
+            self.dst_host.is_some(),
+            self.dst_net.is_some(),
+            self.dst_port.is_some(),
+            self.protocol.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count() as u8
+    }
+
     pub fn matches(&self, conn: &crate::Connection, proc: &crate::Process) -> bool {
         if let Some(p) = &self.exe_path {
             if &proc.exe != p {
@@ -61,7 +92,10 @@ impl RuleScope {
             }
         }
         if let Some(u) = self.uid {
-            if proc.uid != u {
+            // An unattributed process (`Process::unknown`, uid = None) never
+            // matches a uid-scoped rule; we must not treat "unknown" as any
+            // concrete uid (least of all root's uid 0).
+            if proc.uid != Some(u) {
                 return false;
             }
         }
@@ -90,16 +124,31 @@ impl RuleScope {
     }
 }
 
+/// A persisted rule.
+///
+/// Serde contract: `id`, `name`, `action`, `scope`, and `created_at` are
+/// required; `enabled` (true), `duration` (`Always`), and `hit_count` (0)
+/// default when absent so older snapshots keep parsing after fields grow
+/// defaults. Unknown fields are ignored (no `deny_unknown_fields`), so newer
+/// writers do not break older readers. Frozen v0.1.0 wire-format fixtures
+/// live in `crates/cfc-core/testdata/`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     pub id: uuid::Uuid,
     pub name: String,
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub action: Action,
+    #[serde(default)]
     pub duration: Duration,
     pub scope: RuleScope,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
     pub hit_count: u64,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 impl Rule {
@@ -115,19 +164,88 @@ impl Rule {
             hit_count: 0,
         }
     }
+
+    /// True when this rule should no longer match at `now_unix_ms`.
+    ///
+    /// Only `Duration::Seconds(n)` expires here: the rule stops matching once
+    /// `created_at + n` seconds have elapsed. `Always` and `UntilRestart`
+    /// never expire at lookup time (`UntilRestart` rules are purged from
+    /// storage at daemon startup instead). `Once` also returns false: real
+    /// once-semantics need per-hit tracking, so the ipc layer will reject
+    /// persisting `Once` rules in a later wave rather than pretending they
+    /// expire here.
+    ///
+    /// Public so storage can also use it to purge expired rows.
+    pub fn is_expired(&self, now_unix_ms: i64) -> bool {
+        match self.duration {
+            Duration::Seconds(n) => {
+                self.created_at.timestamp_millis() + (n as i64) * 1000 <= now_unix_ms
+            }
+            Duration::Once | Duration::UntilRestart | Duration::Always => false,
+        }
+    }
 }
 
 /// In-memory snapshot of all rules; the daemon walks this in priority order.
+///
+/// Priority order is established by [`RuleSet::sort_deterministic`], which
+/// must be re-run after any insert, replace, or enable/disable toggle.
 #[derive(Debug, Default, Clone)]
 pub struct RuleSet {
     pub rules: Vec<Rule>,
 }
 
+/// Lower rank = evaluated first on specificity ties: restrictive actions
+/// (Deny, then Reject) beat Allow so a conflict resolves closed, not open.
+fn action_rank(action: Action) -> u8 {
+    match action {
+        Action::Deny => 0,
+        Action::Reject => 1,
+        Action::Allow => 2,
+    }
+}
+
 impl RuleSet {
-    pub fn lookup(&self, conn: &crate::Connection, proc: &crate::Process) -> Option<&Rule> {
+    /// Sort rules into deterministic precedence order:
+    ///
+    /// 1. specificity DESC — more `Some(..)` scope predicates first;
+    /// 2. action severity — Deny, then Reject, before Allow on ties;
+    /// 3. `created_at` ASC — oldest rule first;
+    /// 4. `id` ASC — final total-order tiebreak.
+    ///
+    /// Must be called whenever the set is (re)built or a rule is inserted,
+    /// replaced, or toggled, so `lookup`'s first-match walk is stable across
+    /// daemon restarts regardless of storage iteration order.
+    pub fn sort_deterministic(&mut self) {
+        self.rules.sort_by_key(|r| {
+            (
+                std::cmp::Reverse(r.scope.specificity()),
+                action_rank(r.action),
+                r.created_at,
+                r.id,
+            )
+        });
+    }
+
+    /// Find the winning enabled, non-expired rule for `(conn, proc)`.
+    ///
+    /// Precedence contract: most-specific scope wins; deny beats allow at
+    /// equal specificity; oldest rule first on remaining ties. This holds
+    /// because the set is kept in [`RuleSet::sort_deterministic`] order and
+    /// `lookup` returns the first match of that walk.
+    ///
+    /// `now_unix_ms` is the current wall-clock time; rules whose
+    /// `Duration::Seconds(..)` window has elapsed are skipped (see
+    /// [`Rule::is_expired`]).
+    pub fn lookup(
+        &self,
+        conn: &crate::Connection,
+        proc: &crate::Process,
+        now_unix_ms: i64,
+    ) -> Option<&Rule> {
         self.rules
             .iter()
-            .filter(|r| r.enabled)
+            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
             .find(|r| r.scope.matches(conn, proc))
     }
 }
@@ -154,8 +272,8 @@ mod tests {
         Process {
             pid: 100,
             ppid: Some(1),
-            uid: 1000,
-            gid: 1000,
+            uid: Some(1000),
+            gid: Some(1000),
             exe: PathBuf::from(exe),
             cmdline: vec![exe.to_string()],
             cwd: None,
@@ -164,12 +282,16 @@ mod tests {
         }
     }
 
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
     #[test]
     fn empty_set_returns_none() {
         let set = RuleSet::default();
         let conn = mk_conn();
         let proc = mk_proc("/usr/bin/curl");
-        assert!(set.lookup(&conn, &proc).is_none());
+        assert!(set.lookup(&conn, &proc, now()).is_none());
     }
 
     #[test]
@@ -183,8 +305,12 @@ mod tests {
         };
         let conn = mk_conn();
 
-        assert!(set.lookup(&conn, &mk_proc("/usr/bin/curl")).is_some());
-        assert!(set.lookup(&conn, &mk_proc("/usr/bin/wget")).is_none());
+        assert!(set
+            .lookup(&conn, &mk_proc("/usr/bin/curl"), now())
+            .is_some());
+        assert!(set
+            .lookup(&conn, &mk_proc("/usr/bin/wget"), now())
+            .is_none());
     }
 
     #[test]
@@ -197,9 +323,9 @@ mod tests {
         let proc = mk_proc("/usr/bin/curl");
         let mut conn = mk_conn();
 
-        assert!(set.lookup(&conn, &proc).is_some());
+        assert!(set.lookup(&conn, &proc, now()).is_some());
         conn.dst_port = 80;
-        assert!(set.lookup(&conn, &proc).is_none());
+        assert!(set.lookup(&conn, &proc, now()).is_none());
     }
 
     #[test]
@@ -213,10 +339,10 @@ mod tests {
         let mut conn = mk_conn();
 
         conn.dst_ip = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
-        assert!(set.lookup(&conn, &proc).is_some());
+        assert!(set.lookup(&conn, &proc, now()).is_some());
 
         conn.dst_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        assert!(set.lookup(&conn, &proc).is_none());
+        assert!(set.lookup(&conn, &proc, now()).is_none());
     }
 
     #[test]
@@ -232,20 +358,22 @@ mod tests {
 
         // All three match -> hit.
         let mut conn = mk_conn();
-        assert!(set.lookup(&conn, &proc).is_some());
+        assert!(set.lookup(&conn, &proc, now()).is_some());
 
         // Wrong port -> miss.
         conn.dst_port = 80;
-        assert!(set.lookup(&conn, &proc).is_none());
+        assert!(set.lookup(&conn, &proc, now()).is_none());
 
         // Wrong proto -> miss.
         conn.dst_port = 443;
         conn.protocol = Protocol::Udp;
-        assert!(set.lookup(&conn, &proc).is_none());
+        assert!(set.lookup(&conn, &proc, now()).is_none());
 
         // Wrong exe -> miss.
         conn.protocol = Protocol::Tcp;
-        assert!(set.lookup(&conn, &mk_proc("/usr/bin/python")).is_none());
+        assert!(set
+            .lookup(&conn, &mk_proc("/usr/bin/python"), now())
+            .is_none());
     }
 
     #[test]
@@ -258,11 +386,16 @@ mod tests {
         let set = RuleSet { rules: vec![rule] };
         let conn = mk_conn();
         let proc = mk_proc("/usr/bin/curl");
-        assert!(set.lookup(&conn, &proc).is_none());
+        assert!(set.lookup(&conn, &proc, now()).is_none());
     }
 
+    /// Was `first_matching_rule_wins`, which codified whatever Vec order the
+    /// set happened to be built in (allow-443 beat deny-curl only because it
+    /// was pushed first). Under the deterministic precedence contract both
+    /// rules have specificity 1, so the tie breaks on action severity and
+    /// deny-curl must win.
     #[test]
-    fn first_matching_rule_wins() {
+    fn deny_beats_allow_at_equal_specificity() {
         let mut scope_a = RuleScope::any();
         scope_a.dst_port = Some(443);
         let allow = Rule::new("allow-https", Action::Allow, scope_a);
@@ -271,15 +404,94 @@ mod tests {
         scope_b.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         let deny = Rule::new("deny-curl", Action::Deny, scope_b);
 
-        let set = RuleSet {
+        assert_eq!(allow.scope.specificity(), 1);
+        assert_eq!(deny.scope.specificity(), 1);
+
+        let mut set = RuleSet {
             rules: vec![allow, deny],
         };
+        set.sort_deterministic();
         let conn = mk_conn();
         let proc = mk_proc("/usr/bin/curl");
 
-        let hit = set.lookup(&conn, &proc).expect("should match first rule");
+        let hit = set.lookup(&conn, &proc, now()).expect("should match");
+        assert_eq!(hit.action, Action::Deny);
+        assert_eq!(hit.name, "deny-curl");
+    }
+
+    #[test]
+    fn more_specific_rule_wins_regardless_of_action() {
+        // Specificity 2 allow beats specificity 1 deny: specificity is the
+        // primary key, severity only breaks ties.
+        let mut broad = RuleScope::any();
+        broad.dst_port = Some(443);
+        let deny = Rule::new("deny-443", Action::Deny, broad);
+
+        let mut narrow = RuleScope::any();
+        narrow.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        narrow.dst_port = Some(443);
+        let allow = Rule::new("allow-curl-443", Action::Allow, narrow);
+
+        let mut set = RuleSet {
+            rules: vec![deny, allow],
+        };
+        set.sort_deterministic();
+        let conn = mk_conn();
+        let proc = mk_proc("/usr/bin/curl");
+
+        let hit = set.lookup(&conn, &proc, now()).expect("should match");
+        assert_eq!(hit.name, "allow-curl-443");
         assert_eq!(hit.action, Action::Allow);
-        assert_eq!(hit.name, "allow-https");
+    }
+
+    #[test]
+    fn lookup_result_independent_of_insertion_order() {
+        let mut scope_a = RuleScope::any();
+        scope_a.dst_port = Some(443);
+        let allow = Rule::new("allow-https", Action::Allow, scope_a);
+
+        let mut scope_b = RuleScope::any();
+        scope_b.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let deny = Rule::new("deny-curl", Action::Deny, scope_b);
+
+        let conn = mk_conn();
+        let proc = mk_proc("/usr/bin/curl");
+        let at = now();
+
+        let mut forward = RuleSet {
+            rules: vec![allow.clone(), deny.clone()],
+        };
+        forward.sort_deterministic();
+        let mut reverse = RuleSet {
+            rules: vec![deny, allow],
+        };
+        reverse.sort_deterministic();
+
+        let hit_fwd = forward.lookup(&conn, &proc, at).expect("should match");
+        let hit_rev = reverse.lookup(&conn, &proc, at).expect("should match");
+        assert_eq!(hit_fwd.id, hit_rev.id);
+        assert_eq!(hit_fwd.name, "deny-curl");
+    }
+
+    #[test]
+    fn equal_specificity_and_action_oldest_wins() {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+
+        let mut old = Rule::new("old-allow", Action::Allow, scope.clone());
+        old.created_at = chrono::DateTime::from_timestamp_millis(1_000).unwrap();
+        let mut new = Rule::new("new-allow", Action::Allow, scope);
+        new.created_at = chrono::DateTime::from_timestamp_millis(2_000).unwrap();
+
+        let mut set = RuleSet {
+            rules: vec![new, old],
+        };
+        set.sort_deterministic();
+
+        let hit = set
+            .lookup(&mk_conn(), &mk_proc("/usr/bin/curl"), now())
+            .expect("should match");
+        assert_eq!(hit.name, "old-allow");
     }
 
     #[test]
@@ -291,10 +503,170 @@ mod tests {
         let set = RuleSet { rules: vec![rule] };
         let conn = mk_conn();
 
-        assert!(set.lookup(&conn, &mk_proc("/anything")).is_some());
+        assert!(set.lookup(&conn, &mk_proc("/anything"), now()).is_some());
 
         let mut other = mk_proc("/anything");
-        other.uid = 2000;
-        assert!(set.lookup(&conn, &other).is_none());
+        other.uid = Some(2000);
+        assert!(set.lookup(&conn, &other, now()).is_none());
+    }
+
+    #[test]
+    fn uid_scope_never_matches_unattributed_process() {
+        // Regression: Process::unknown used to fabricate uid 0, so a rule
+        // scoped to uid 0 (root) matched traffic we could not attribute.
+        let mut scope = RuleScope::any();
+        scope.uid = Some(0);
+        let rule = Rule::new("uid-root", Action::Allow, scope);
+
+        let set = RuleSet { rules: vec![rule] };
+        let conn = mk_conn();
+        let unknown = Process::unknown(0);
+        assert_eq!(unknown.uid, None);
+        assert!(set.lookup(&conn, &unknown, now()).is_none());
+    }
+
+    #[test]
+    fn seconds_rule_expires_at_lookup() {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+        let mut rule = Rule::new("allow-443-1h", Action::Allow, scope);
+        rule.duration = Duration::Seconds(3600);
+        rule.created_at = chrono::DateTime::from_timestamp_millis(1_000_000).unwrap();
+
+        let set = RuleSet { rules: vec![rule] };
+        let conn = mk_conn();
+        let proc = mk_proc("/usr/bin/curl");
+
+        let created = 1_000_000i64;
+        let expiry = created + 3600 * 1000;
+
+        // Still inside the window -> matches.
+        assert!(set.lookup(&conn, &proc, created + 1).is_some());
+        assert!(set.lookup(&conn, &proc, expiry - 1).is_some());
+        // At and after expiry -> skipped.
+        assert!(set.lookup(&conn, &proc, expiry).is_none());
+        assert!(set.lookup(&conn, &proc, expiry + 1).is_none());
+    }
+
+    #[test]
+    fn non_seconds_durations_never_expire_at_lookup() {
+        for duration in [Duration::Once, Duration::UntilRestart, Duration::Always] {
+            let mut rule = Rule::new("r", Action::Allow, RuleScope::any());
+            rule.duration = duration;
+            rule.created_at = chrono::DateTime::from_timestamp_millis(0).unwrap();
+            assert!(
+                !rule.is_expired(i64::MAX),
+                "{duration:?} must not expire at lookup time"
+            );
+        }
+    }
+
+    #[test]
+    fn specificity_counts_populated_predicates() {
+        assert_eq!(RuleScope::any().specificity(), 0);
+
+        let mut one = RuleScope::any();
+        one.dst_port = Some(443);
+        assert_eq!(one.specificity(), 1);
+
+        let full = RuleScope {
+            exe_path: Some(PathBuf::from("/usr/bin/curl")),
+            exe_sha256: Some("deadbeef".into()),
+            parent_exe: Some(PathBuf::from("/bin/bash")),
+            uid: Some(1000),
+            dst_host: Some("example.com".into()),
+            dst_net: Some("10.0.0.0/8".parse().unwrap()),
+            dst_port: Some(443),
+            protocol: Some(Protocol::Tcp),
+        };
+        assert_eq!(full.specificity(), 8);
+    }
+
+    // --- frozen v0.1.0 wire-format fixtures ------------------------------
+    // Captured from the serialization produced before the serde(default)
+    // annotations were added; these must keep parsing forever.
+
+    #[test]
+    fn fixture_exe_scoped_parses() {
+        let rule: Rule =
+            serde_json::from_str(include_str!("../testdata/rule_exe_scoped_v010.json")).unwrap();
+        assert_eq!(rule.name, "exe-scoped");
+        assert_eq!(rule.action, Action::Allow);
+        assert_eq!(rule.duration, Duration::Always);
+        assert_eq!(rule.scope.exe_path, Some(PathBuf::from("/usr/bin/curl")));
+        assert_eq!(rule.scope.specificity(), 1);
+    }
+
+    #[test]
+    fn fixture_host_scoped_parses() {
+        let rule: Rule =
+            serde_json::from_str(include_str!("../testdata/rule_host_scoped_v010.json")).unwrap();
+        assert_eq!(rule.name, "host-scoped");
+        assert_eq!(rule.action, Action::Deny);
+        assert_eq!(rule.duration, Duration::UntilRestart);
+        assert_eq!(rule.scope.dst_host.as_deref(), Some("example.com"));
+        assert_eq!(rule.scope.specificity(), 1);
+    }
+
+    #[test]
+    fn fixture_net_port_scoped_parses() {
+        let rule: Rule =
+            serde_json::from_str(include_str!("../testdata/rule_net_port_scoped_v010.json"))
+                .unwrap();
+        assert_eq!(rule.name, "net-port-scoped");
+        assert_eq!(rule.action, Action::Reject);
+        assert_eq!(rule.duration, Duration::Seconds(3600));
+        assert_eq!(rule.scope.dst_net, Some("10.0.0.0/8".parse().unwrap()));
+        assert_eq!(rule.scope.dst_port, Some(443));
+        assert_eq!(rule.scope.specificity(), 2);
+    }
+
+    #[test]
+    fn fixture_uid_scoped_parses() {
+        let rule: Rule =
+            serde_json::from_str(include_str!("../testdata/rule_uid_scoped_v010.json")).unwrap();
+        assert_eq!(rule.name, "uid-scoped");
+        assert_eq!(rule.duration, Duration::Once);
+        assert_eq!(rule.scope.uid, Some(1000));
+        assert_eq!(rule.scope.specificity(), 1);
+    }
+
+    #[test]
+    fn fixture_full_scope_parses() {
+        let rule: Rule =
+            serde_json::from_str(include_str!("../testdata/rule_full_scope_v010.json")).unwrap();
+        assert_eq!(rule.name, "full-scope");
+        assert_eq!(rule.scope.specificity(), 8);
+        assert_eq!(rule.scope.protocol, Some(Protocol::Tcp));
+        assert_eq!(rule.scope.dst_net, Some("93.184.216.0/24".parse().unwrap()));
+    }
+
+    /// Documents the non-`deny_unknown_fields` contract: newer writers may
+    /// add fields and this version must still parse the rule.
+    #[test]
+    fn fixture_with_unknown_extra_fields_parses() {
+        let rule: Rule =
+            serde_json::from_str(include_str!("../testdata/rule_unknown_extra_field.json"))
+                .unwrap();
+        assert_eq!(rule.name, "forward-compat-extra-field");
+        assert_eq!(rule.scope.exe_path, Some(PathBuf::from("/usr/bin/curl")));
+    }
+
+    /// Documents the serde(default) contract: a rule missing `enabled`,
+    /// `duration`, `hit_count`, and most scope fields still parses with the
+    /// documented defaults.
+    #[test]
+    fn fixture_missing_defaulted_fields_parses() {
+        let rule: Rule = serde_json::from_str(include_str!(
+            "../testdata/rule_missing_defaulted_fields.json"
+        ))
+        .unwrap();
+        assert_eq!(rule.name, "minimal-required-only");
+        assert!(rule.enabled, "enabled must default to true");
+        assert_eq!(rule.duration, Duration::Always);
+        assert_eq!(rule.hit_count, 0);
+        assert_eq!(rule.scope.exe_path, Some(PathBuf::from("/usr/bin/curl")));
+        assert_eq!(rule.scope.uid, None);
+        assert_eq!(rule.scope.specificity(), 1);
     }
 }

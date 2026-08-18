@@ -7,8 +7,12 @@ use std::path::PathBuf;
 pub struct Process {
     pub pid: u32,
     pub ppid: Option<u32>,
-    pub uid: u32,
-    pub gid: u32,
+    /// `None` means the process could not be attributed (e.g. it exited
+    /// before /proc was read). It is deliberately not 0: fabricating uid 0
+    /// would make uid-scoped rules for root match unattributed traffic.
+    pub uid: Option<u32>,
+    /// See `uid`: `None` means unknown, never a fabricated gid.
+    pub gid: Option<u32>,
     pub exe: PathBuf,
     pub cmdline: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -21,8 +25,8 @@ impl Process {
         Self {
             pid,
             ppid: None,
-            uid: 0,
-            gid: 0,
+            uid: None,
+            gid: None,
             exe: PathBuf::from("<unknown>"),
             cmdline: Vec::new(),
             cwd: None,

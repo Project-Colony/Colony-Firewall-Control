@@ -56,9 +56,11 @@ impl Connection {
         }
     }
 
-    pub fn with_process(mut self, pid: u32, uid: u32) -> Self {
+    /// Attach the owning pid and (if attributed) uid. `uid` stays `None`
+    /// when the process could not be attributed rather than defaulting to 0.
+    pub fn with_process(mut self, pid: u32, uid: Option<u32>) -> Self {
         self.pid = Some(pid);
-        self.uid = Some(uid);
+        self.uid = uid;
         self
     }
 

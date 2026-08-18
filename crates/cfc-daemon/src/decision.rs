@@ -31,7 +31,11 @@ pub enum Decision {
 }
 
 impl Engine {
-    pub fn new(rules: RuleSet, default_policy: DefaultPolicy) -> Self {
+    pub fn new(mut rules: RuleSet, default_policy: DefaultPolicy) -> Self {
+        // Storage iteration order is arbitrary; establish the deterministic
+        // precedence order (most-specific first, deny before allow on ties)
+        // before the first lookup.
+        rules.sort_deterministic();
         Self {
             inner: Arc::new(EngineInner {
                 rules: RwLock::new(rules),
@@ -44,9 +48,12 @@ impl Engine {
     /// Evaluate without blocking. Returns `Resolved` if a rule matches,
     /// otherwise `NeedsPrompt`.
     pub fn evaluate(&self, conn: &Connection, proc: &Process) -> Decision {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rule_match = {
             let rules = self.inner.rules.read();
-            rules.lookup(conn, proc).map(|r| (r.id, r.action))
+            rules
+                .lookup(conn, proc, now_unix_ms)
+                .map(|r| (r.id, r.action))
         };
         if let Some((rule_id, action)) = rule_match {
             *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
@@ -70,6 +77,9 @@ impl Engine {
         } else {
             rs.rules.push(rule);
         }
+        // Re-establish precedence order: the upsert may have changed the
+        // rule's scope/action/enabled bit, any of which affect its slot.
+        rs.sort_deterministic();
     }
 
     pub fn remove_rule(&self, id: uuid::Uuid) {
@@ -134,8 +144,8 @@ mod tests {
         Process {
             pid: 100,
             ppid: Some(1),
-            uid: 1000,
-            gid: 1000,
+            uid: Some(1000),
+            gid: Some(1000),
             exe: PathBuf::from(exe),
             cmdline: vec![exe.to_string()],
             cwd: None,
@@ -238,6 +248,26 @@ mod tests {
             engine.evaluate(&conn(443), &proc("/usr/bin/curl")),
             Decision::NeedsPrompt { .. }
         ));
+    }
+
+    #[test]
+    fn conflicting_rules_resolve_deny_regardless_of_load_order() {
+        // allow-443 and deny-443 have equal specificity; the deterministic
+        // precedence order must pick deny no matter how storage handed the
+        // rules to Engine::new.
+        let allow = allow_port_rule(443);
+        let deny = deny_port_rule(443);
+
+        for rules in [
+            vec![allow.clone(), deny.clone()],
+            vec![deny.clone(), allow.clone()],
+        ] {
+            let engine = Engine::new(RuleSet { rules }, dp_allow());
+            match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+                Decision::Resolved(v) => assert_eq!(v.action, Action::Deny),
+                _ => panic!("expected Resolved"),
+            }
+        }
     }
 
     #[test]

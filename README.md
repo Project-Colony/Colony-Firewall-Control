@@ -57,9 +57,21 @@ Five workspace crates:
 | `cfc-ui`      | iced GUI                                                 |
 | `cfc-cli`     | Terminal control tool                                    |
 
+More docs:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - process model, packet
+  flow, threading
+- [docs/HARDENING.md](docs/HARDENING.md) - moving to a locked-down profile
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - lockout recovery,
+  no-network debugging, fail-open vs fail-closed
+- [docs/ROADMAP.md](docs/ROADMAP.md) - full phase checklist
+
 ## Install
 
-### Arch Linux (AUR)
+### Arch Linux
+
+Not on the AUR yet. An AUR-ready PKGBUILD ships in `pkg/` for building
+locally in the meantime:
 
 ```sh
 cp pkg/PKGBUILD ./
@@ -80,11 +92,55 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now colony-firewalld
 ```
 
-Then enqueue outbound flows with the nftables snippet:
+Installing only puts the binaries and daemon in place - no traffic is
+filtered until you enable enforcement. See First run below.
+
+## First run
+
+A fresh install has **zero rules**: once enforcement is on, every new
+outbound connection prompts (or falls back to the profile default). Do
+these three things, in order:
+
+**1. Enable enforcement persistently.** This release adds a companion
+unit that loads the nftables ruleset at boot and removes it on stop:
+
+```sh
+sudo systemctl enable --now colony-firewall-nft.service
+```
+
+Alternatively, apply the snippet by hand - but note this does **not**
+survive a reboot; after restarting, the daemon runs while enforcing
+nothing:
 
 ```sh
 sudo nft -f systemd/nftables-snippet.conf
 ```
+
+**2. Seed the starter rules** so always-on system services keep working
+without prompting:
+
+```sh
+cfc rules bootstrap-defaults
+```
+
+This installs six allow rules - systemd-resolved DNS (:53),
+systemd-timesyncd and chronyd NTP (:123/udp), pacman and paru HTTPS
+mirrors (:443/tcp), and the SSH client (:22/tcp) - and is idempotent
+(already-present rules are skipped by name; `--dry-run` previews).
+
+**3. Launch the GUI** so prompts have somewhere to go:
+
+```sh
+colony-firewall
+```
+
+> **WARNING - remote / SSH machines:** the shipped nftables snippet is
+> fail-closed. If the daemon is down while the rule is loaded, **all new
+> outbound connections drop**, and a mistake can lock you out of a box you
+> only reach over SSH. Read
+> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - specifically the
+> SSH exemption and dead-man's-switch patterns - *before* enabling
+> enforcement remotely.
 
 ## Quick start
 
@@ -163,7 +219,7 @@ cargo run -p cfc-ui     # in another terminal
 | 3  CLI                   | done  |
 | 4  eBPF backend          | TODO  |
 | 5a CI                    | done  |
-| 5b Packaging             | done  |
+| 5b Packaging             | in progress (AUR-ready PKGBUILD in `pkg/`, not yet published) |
 | 5  System tray, VT       | TODO  |
 
 See `docs/ROADMAP.md` for the full checklist.

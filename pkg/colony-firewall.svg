@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Colony Firewall Control icon (original artwork, GPL-3.0-or-later).
+       Burgundy shield on a parchment circle. -->
+  <circle cx="64" cy="64" r="60" fill="#f3e9d2"/>
+  <circle cx="64" cy="64" r="60" fill="none" stroke="#6d1a2d" stroke-width="4"/>
+  <!-- Shield -->
+  <path d="M64 24
+           C 55 30, 44 33, 34 34
+           L 34 66
+           C 34 86, 47 98, 64 106
+           C 81 98, 94 86, 94 66
+           L 94 34
+           C 84 33, 73 30, 64 24 Z"
+        fill="#6d1a2d"/>
+  <!-- Inner highlight line -->
+  <path d="M64 32
+           C 57 36, 49 39, 41 40
+           L 41 66
+           C 41 82, 51 92, 64 99
+           C 77 92, 87 82, 87 66
+           L 87 40
+           C 79 39, 71 36, 64 32 Z"
+        fill="none" stroke="#f3e9d2" stroke-width="3" stroke-linejoin="round"/>
+  <!-- Keyhole: allow/deny gate motif -->
+  <circle cx="64" cy="58" r="8" fill="#f3e9d2"/>
+  <path d="M60 62 L 56 80 L 72 80 L 68 62 Z" fill="#f3e9d2"/>
+</svg>

@@ -37,8 +37,8 @@ fn resolve_inner(pid: u32) -> anyhow::Result<Process> {
     Ok(Process {
         pid,
         ppid: Some(stat.ppid as u32),
-        uid: status.ruid,
-        gid: status.rgid,
+        uid: Some(status.ruid),
+        gid: Some(status.rgid),
         exe,
         cmdline,
         cwd,

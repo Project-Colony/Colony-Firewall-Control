@@ -1,0 +1,9 @@
+# sysusers.d(5) fragment for Colony Firewall Control.
+#
+# Members of the 'colony-firewall' group may talk to the daemon's gRPC
+# UNIX socket (the daemon chowns/chmods the socket to this group).
+# Add desktop users with:  usermod -aG colony-firewall <user>
+#
+# Installed as /usr/lib/sysusers.d/colony-firewall.conf; applied by
+# systemd-sysusers at boot and by the pacman sysusers hook at install.
+g colony-firewall -

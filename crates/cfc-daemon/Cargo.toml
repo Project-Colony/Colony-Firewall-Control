@@ -43,3 +43,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 ipnet = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

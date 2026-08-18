@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Colony Firewall
+GenericName=Outbound Firewall
+GenericName[fr]=Pare-feu sortant
+Comment=Application-aware outbound firewall with per-app prompts
+Comment[fr]=Pare-feu sortant par application avec invites de decision par application
+Exec=colony-firewall
+Icon=colony-firewall
+Terminal=false
+StartupNotify=true
+Categories=System;Security;Network;
+Keywords=firewall;network;security;outbound;prompt;

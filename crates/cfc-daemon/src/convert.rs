@@ -81,8 +81,11 @@ pub fn process_to_pb(p: &Process) -> pb::ProcessInfo {
     pb::ProcessInfo {
         pid: p.pid,
         ppid: p.ppid.unwrap_or(0),
-        uid: p.uid,
-        gid: p.gid,
+        // TODO(wave3): proto optional uid. The pb ProcessInfo uid/gid are
+        // plain u32, so an unattributed process (None) flattens to 0 on the
+        // wire. This direction is display-only; rule matching never sees it.
+        uid: p.uid.unwrap_or(0),
+        gid: p.gid.unwrap_or(0),
         exe: p.exe.to_string_lossy().into_owned(),
         cmdline: p.cmdline.clone(),
         cwd: p

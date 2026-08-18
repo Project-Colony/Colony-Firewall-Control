@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -14,46 +17,93 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check version consistency (Cargo.toml / PKGBUILD / colony.json)
+        run: ./scripts/check-versions.sh
 
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: clippy
       - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
       - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --no-fail-fast
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --workspace --locked --no-fail-fast
 
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
       - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --profile fast
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --workspace --profile fast --locked
+
+  # Compile the true release profile (fat LTO, codegen-units=1, panic=abort)
+  # so breakage specific to it is caught before tagging a release.
+  release-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --workspace --profile release --locked
+
+  # Verify the declared MSRV (rust-version in Cargo.toml). 1.88 is the
+  # floor imposed by the current lockfile (wgpu 27 needs 1.88; zvariant
+  # needs 1.87; edition-2024 crates need 1.85) — verified by compiling the
+  # whole workspace with each candidate toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.88"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --workspace --locked

@@ -1,0 +1,19 @@
+{
+  "id": "00000000-0000-0000-0000-000000000005",
+  "name": "full-scope",
+  "enabled": true,
+  "action": "Deny",
+  "duration": "Always",
+  "scope": {
+    "exe_path": "/usr/bin/curl",
+    "exe_sha256": "deadbeef",
+    "parent_exe": "/bin/bash",
+    "uid": 1000,
+    "dst_host": "example.com",
+    "dst_net": "93.184.216.0/24",
+    "dst_port": 443,
+    "protocol": "Tcp"
+  },
+  "created_at": "2026-01-15T12:00:00Z",
+  "hit_count": 0
+}

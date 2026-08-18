@@ -68,6 +68,19 @@ cfc rules add --action deny --dst-host 'incoming.telemetry.mozilla.org' \
               --name 'block-firefox-telemetry'
 ```
 
+### A warning about `dst_host`
+
+Hostname matching is currently based on reverse DNS: the daemon does a
+PTR lookup on the destination IP and matches `dst_host` against whatever
+comes back. **PTR records are controlled by whoever controls the
+destination IP** - a hostile server can name itself anything, including a
+hostname you trust. Treat `dst_host` as best-effort display metadata and
+a convenience for *deny* rules (a telemetry endpoint has no incentive to
+hide its own PTR). Do **not** rely on hostname *allow* rules as a
+security boundary: an attacker-controlled IP can trivially wear an
+allowed name. For allow rules, pin `exe` + `dst_port` (+ `dst_net` where
+destinations are stable) instead.
+
 ## Rule design principles
 
 **Prefer narrow scopes.** A rule that only matches `exe + dst_port +
@@ -93,6 +106,21 @@ real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
   443/tcp flow. Block at the `dst_host` layer or disable DoH per-app.
 - **Container traffic**: Docker / Podman / LXC route through their own
   bridges. You need to enqueue their veth interfaces explicitly in nftables.
+
+## Socket access
+
+The daemon's control socket (`/run/colony-firewall/cfc.sock`) is
+group-gated: it is owned by root with group `colony-firewall`, and only
+members of that group can talk to the daemon. To run the GUI or `cfc`
+as your regular (unprivileged) user:
+
+```sh
+sudo usermod -aG colony-firewall $USER
+```
+
+then log out and back in for the group to take effect. Keep membership
+tight - anyone in the group can rewrite rules and pause enforcement,
+which is root-equivalent control over the firewall.
 
 ## When something stops working
 

@@ -16,20 +16,37 @@
       "installPath": "/usr/bin",
       "postInstall": [
         "install -d -m 0755 /etc/colony-firewall",
-        "install -m 0644 daemon.toml.sample /etc/colony-firewall/daemon.toml",
+        "test -f /etc/colony-firewall/daemon.toml || install -m 0644 daemon.toml.sample /etc/colony-firewall/daemon.toml",
         "install -m 0644 colony-firewalld.service /usr/lib/systemd/system/colony-firewalld.service",
+        "install -m 0644 colony-firewall-nft.service /usr/lib/systemd/system/colony-firewall-nft.service",
+        "install -D -m 0644 colony-firewall.sysusers /usr/lib/sysusers.d/colony-firewall.conf",
+        "install -D -m 0644 nftables-snippet.conf /usr/share/colony-firewall/nftables-snippet.conf",
+        "install -D -m 0644 colony-firewall.desktop /usr/share/applications/colony-firewall.desktop",
+        "install -D -m 0644 colony-firewall-autostart.desktop /etc/xdg/autostart/colony-firewall.desktop",
+        "install -D -m 0644 colony-firewall.svg /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
+        "systemd-sysusers",
+        "systemctl daemon-reload"
+      ],
+      "preRemove": [
+        "systemctl disable --now colony-firewall-nft.service colony-firewalld.service || true",
+        "nft delete table inet colony_firewall || true",
+        "rm -f /usr/lib/systemd/system/colony-firewall-nft.service /usr/lib/systemd/system/colony-firewalld.service",
+        "rm -f /usr/lib/sysusers.d/colony-firewall.conf",
+        "rm -f /usr/share/colony-firewall/nftables-snippet.conf",
+        "rm -f /usr/share/applications/colony-firewall.desktop /etc/xdg/autostart/colony-firewall.desktop",
+        "rm -f /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
         "systemctl daemon-reload"
       ]
     }
   },
   "requiresRoot": true,
   "depends": [
-    "libnetfilter_queue",
-    "libnfnetlink",
-    "sqlite"
+    "nftables",
+    "libxkbcommon",
+    "wayland"
   ],
   "optionalDepends": {
-    "nftables": "required to populate NFQUEUE",
-    "libnotify": "desktop notifications"
+    "libnotify": "desktop notifications",
+    "libx11": "run the GUI in X11/XWayland sessions"
   }
 }

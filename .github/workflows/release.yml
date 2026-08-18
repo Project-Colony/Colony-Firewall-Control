@@ -1,0 +1,121 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev zstd
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build (release profile)
+        run: cargo build --workspace --profile release --locked
+
+      - name: Assemble tarball
+        id: assemble
+        run: |
+          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
+          if [ -z "${VERSION}" ]; then
+            echo "could not extract version from Cargo.toml" >&2
+            exit 1
+          fi
+          NAME="colony-firewall-control-${VERSION}-linux-x86_64"
+          STAGE="$(mktemp -d)/${NAME}"
+          mkdir -p "${STAGE}"
+
+          install -m755 \
+            target/release/colony-firewalld \
+            target/release/colony-firewall \
+            target/release/cfc \
+            "${STAGE}/"
+          install -m644 \
+            systemd/colony-firewalld.service \
+            systemd/daemon.toml.sample \
+            systemd/nftables-snippet.conf \
+            "${STAGE}/"
+
+          # Files from the packaging wave; guarded so this workflow works
+          # both before and after they land.
+          if [ -f systemd/colony-firewall-nft.service ]; then
+            install -m644 systemd/colony-firewall-nft.service "${STAGE}/"
+          fi
+          if [ -f pkg/colony-firewall.desktop ]; then
+            install -m644 pkg/colony-firewall.desktop "${STAGE}/"
+          fi
+
+          tar --zstd -C "$(dirname "${STAGE}")" -cf "${NAME}.tar.zst" "${NAME}"
+          sha256sum "${NAME}.tar.zst" > SHA256SUMS
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tarball=${NAME}.tar.zst" >> "${GITHUB_OUTPUT}"
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          VERSION="${{ steps.assemble.outputs.version }}"
+          # Pull the "## [X.Y.Z]" section if it exists; otherwise fall back
+          # to the whole changelog.
+          awk -v ver="${VERSION}" '
+            $0 ~ ("^## \\[" ver "\\]") { in_section = 1; next }
+            /^## \[/ { if (in_section) exit }
+            in_section { print }
+          ' CHANGELOG.md > RELEASE_BODY.md
+          if [ ! -s RELEASE_BODY.md ]; then
+            echo "No CHANGELOG section for ${VERSION}; using the full changelog."
+            cp CHANGELOG.md RELEASE_BODY.md
+          fi
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.assemble.outputs.version) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.assemble.outputs.version) }}
+          body_path: RELEASE_BODY.md
+          files: |
+            ${{ steps.assemble.outputs.tarball }}
+            SHA256SUMS
+
+  # Validate pkg/PKGBUILD on Arch with makepkg --nobuild. Advisory only
+  # (continue-on-error): the PKGBUILD's source array points at a GitHub
+  # release tarball that only exists once the matching v* tag is pushed,
+  # so this can fail on workflow_dispatch runs or while the packaging
+  # wave is still in flight. Tighten once releases are established.
+  pkgbuild:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Validate PKGBUILD with makepkg --nobuild
+        run: |
+          pacman -Syu --noconfirm --needed rust protobuf pkgconf
+          useradd -m builder
+          chown -R builder: .
+          cd pkg
+          runuser -u builder -- makepkg --nobuild --noconfirm
+
+      - name: namcap lint (optional)
+        run: |
+          pacman -S --noconfirm --needed namcap || exit 0
+          namcap pkg/PKGBUILD || true
