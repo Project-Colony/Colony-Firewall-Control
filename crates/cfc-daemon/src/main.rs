@@ -8,20 +8,10 @@ use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 
-mod config;
-mod convert;
-mod decision;
-mod dns;
-mod ipc;
-mod nfqueue;
-mod packet;
-mod process_resolve;
-mod prompts;
-mod reject;
-mod sd_notify;
-mod sock_diag;
-mod stats;
-mod storage;
+// The daemon's internals live in the library target (`src/lib.rs`) so the
+// integration tests can assemble the same graph this binary does. This file
+// stays the only place that wires them together for real.
+use cfc_daemon::{config, decision, dns, ipc, nfqueue, prompts, sd_notify, stats, storage};
 
 /// How stale the NFQUEUE worker's busy-stamp may get before the watchdog
 /// task considers the worker wedged and withholds the systemd heartbeat.

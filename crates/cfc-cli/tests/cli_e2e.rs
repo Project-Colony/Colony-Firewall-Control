@@ -97,7 +97,7 @@ impl Firewall for FakeDaemon {
             uptime_seconds: 5,
             rules_count: 0,
             prompts_pending: 1,
-            connections_today: 0,
+            connections_seen: 0,
             connections_allowed: 0,
             connections_denied: 0,
             paused: false,

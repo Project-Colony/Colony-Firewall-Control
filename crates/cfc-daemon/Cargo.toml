@@ -8,6 +8,13 @@ repository.workspace = true
 authors.workspace = true
 description = "Colony Firewall Control - privileged decision daemon"
 
+# The daemon's internals live in a library target so `tests/` can assemble
+# them (real store + engine + router + ipc::spawn) without root or NFQUEUE.
+# `src/main.rs` is the only production entry point and merely wires them up.
+[lib]
+name = "cfc_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "colony-firewalld"
 path = "src/main.rs"
@@ -49,3 +56,7 @@ clap = { workspace = true }
 proptest = "1"
 # test-util enables tokio::test(start_paused) for the prompt-timeout tests.
 tokio = { workspace = true, features = ["test-util"] }
+# tests/ipc_integration.rs drives the daemon through the same client the UI
+# and CLI use, over a socket in a temp dir.
+cfc-client = { path = "../cfc-client" }
+tempfile = "3"

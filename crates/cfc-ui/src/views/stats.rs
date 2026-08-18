@@ -66,7 +66,7 @@ pub fn view<'a>(
     );
     blocks.push(
         row![
-            stat_card("connections seen", s.connections_today.to_string()),
+            stat_card("connections seen", s.connections_seen.to_string()),
             stat_card("allowed", s.connections_allowed.to_string()),
             stat_card("denied", s.connections_denied.to_string()),
             Space::new().width(Length::Fill),

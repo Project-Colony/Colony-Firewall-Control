@@ -1,4 +1,16 @@
 # Colony Firewall daemon config. Install to /etc/colony-firewall/daemon.toml.
+#
+# RELOADING
+# ---------
+# `profile` and everything under [default_policy] are re-read on SIGHUP:
+#
+#     sudo systemctl kill -s HUP colony-firewalld
+#
+# The change applies without dropping a packet, and a file that fails to
+# parse is rejected with the running policy left in place. Every OTHER
+# section here - [nfqueue], [storage], [pause], [events], [ipc] - is bound
+# at startup and needs `systemctl restart colony-firewalld`. Each section
+# below says which it is.
 
 # Named preset. Pick one of: "relaxed", "balanced", "strict".
 # Omit to use "balanced" defaults.
@@ -12,42 +24,81 @@
 # How profile and [default_policy] combine: the profile (or "balanced" when
 # omitted) provides the base values, and each field you explicitly set under
 # [default_policy] overrides just that field. Fields you leave commented out
-# keep the profile's value.
+# keep the profile's value. So `profile = "strict"` plus a single
+# prompt_timeout_secs below is strict with a longer window, not balanced.
+# An unrecognized name warns and falls back to the "balanced" base.
+#
+# Reloads on SIGHUP.
 profile = "balanced"
 
+# Reloads on SIGHUP. A changed prompt_timeout_secs applies to the next
+# prompt; prompts already waiting keep the deadline they were created with.
 # [default_policy]
 # # Each field overrides the profile's value for that one field only.
-# # What to do when no rule matches and no UI is connected.
+# # What to do when no rule matches and NOTHING is subscribed to prompts -
+# # no GUI, no `cfc prompts`. Nobody is asked; this is applied directly.
+# # "Reject" is accepted here but behaves as "Deny" (no refusal is sent).
 # no_ui_action = "Allow"
-# # What to do if a prompt expires.
+# # What to do if a prompt was shown but expired unanswered. Same caveat
+# # about "Reject".
 # timeout_action = "Allow"
-# # How long a prompt waits for a user answer, in seconds.
+# # How long a prompt waits for an answer, in seconds.
 # prompt_timeout_secs = 15
 
+# Needs a restart (the queue is bound once, at startup).
 [nfqueue]
-# NFQUEUE number. Must match the iptables/nftables rule that enqueues packets.
+# NFQUEUE number. Must match the `queue num N` in the nftables/iptables rule
+# that enqueues packets. If they disagree, packets queue to a number nobody
+# consumes - which under the shipped fail-closed rule is a total outbound
+# lockout. Bind failure is fatal: the daemon exits non-zero rather than
+# running while enforcing nothing.
 queue_num = 0
 # Kernel queue length: how many packets may wait for a verdict before the
-# queue overflows.
+# queue overflows. Raise it on a busy host that prompts a lot; each queued
+# packet costs kernel memory.
 queue_max_len = 4096
-# What happens to packets when the queue overflows or the daemon can't keep
-# up: false drops them (fail-closed, default), true lets them through
+# What the KERNEL does with packets when this queue overflows: false drops
+# them (fail-closed, default), true lets them through unfiltered
 # (fail-open).
+#
+# Not to be confused with the `bypass` keyword on the nftables rule, which
+# decides what happens when NO daemon is attached to the queue at all. This
+# setting only applies while the daemon is running. See
+# docs/TROUBLESHOOTING.md for the full matrix.
 fail_open = false
 
+# Needs a restart.
 [storage]
+# SQLite database holding both the rules and the verdict event log. The
+# daemon creates it on first start; the directory is provided by the unit's
+# StateDirectory=.
 path = "/var/lib/colony-firewall/rules.db"
 
+# Needs a restart.
 [pause]
-# Default duration for `cfc pause` when no explicit duration is given,
-# in seconds. (10 minutes.)
+# Default duration for `cfc pause` when no `--for` is given, in seconds.
+# (10 minutes.) Any request is clamped to 24 hours, and the daemon reports
+# the real resume time back to the caller.
+#
+# Pausing is not a kill switch: rules are still evaluated, so explicit Deny
+# and Reject rules keep blocking. It only stops PROMPTING, and lets flows
+# that matched no rule through.
 default_secs = 600
 
+# Needs a restart.
 [events]
-# Maximum number of verdict events kept in the database; the oldest beyond
-# this cap are pruned.
+# Retention for the verdict log that backs `cfc log`, as a row cap rather
+# than a time window: the oldest rows beyond this many are pruned, about
+# once a minute. Roughly 200 bytes a row, so the default is a few tens of
+# MB. Set it higher if you want a longer history and can spare the disk.
+#
+# Writing happens off the packet path through a bounded queue, so a slow
+# disk never delays a verdict; if that queue fills, rows are dropped and
+# the loss is logged. Blocked connections are additionally logged to the
+# journal, whether or not the row reaches disk.
 max_rows = 100000
 
+# Needs a restart (the socket is secured once, right after bind).
 [ipc]
 # Access control for the gRPC control socket (/run/colony-firewall/cfc.sock).
 #

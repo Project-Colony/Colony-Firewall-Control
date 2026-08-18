@@ -51,7 +51,7 @@ const VERDICT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Coarse wall-clock unix milliseconds for the watchdog stamps. Only
 /// differences are compared, so occasional NTP steps are harmless at the
 /// minute-scale staleness threshold.
-pub(crate) fn unix_ms() -> i64 {
+pub fn unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)

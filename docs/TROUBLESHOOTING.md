@@ -102,6 +102,107 @@ and every outbound connection is silently allowed. Fail-closed is the
 safer posture; `bypass` is the pragmatic one for remote machines you can't
 reach a console for.
 
+## The daemon exits immediately
+
+A failed NFQUEUE bind now exits non-zero. It used to exit 0, which meant
+systemd showed a happy unit while the fail-closed nftables rule quietly
+blackholed the machine - so if the unit is `failed`, that is the
+improvement working, and the reason is in the journal:
+
+```sh
+journalctl -u colony-firewalld -b --no-pager | tail -40
+```
+
+The daemon prints hint lines next to the failure. Three causes:
+
+**Missing capability.** `failed to open NFQUEUE socket: ...` followed by
+a `CAP_NET_ADMIN` hint. Run it via the bundled unit rather than by hand;
+if you are running it by hand for development, use `--dry-run`, which
+skips the bind entirely and still serves the gRPC/UI surface.
+
+**Missing kernel module.**
+
+```sh
+lsmod | grep nfnetlink_queue
+sudo modprobe nfnetlink_queue
+```
+
+**Queue number already taken.** `failed to bind NFQUEUE 0: ...` plus
+`hint: another process may already own this queue number.` Something else
+(a second copy of the daemon, opensnitch, a stray `nfqws`) owns it:
+
+```sh
+ss -f netlink | grep nfqueue
+```
+
+Either stop the other consumer, or move this daemon to a free number in
+`[nfqueue] queue_num` **and** change the matching `queue num N` in your
+nftables rule. The two must agree or you get the same lockout as a dead
+daemon.
+
+Once it starts cleanly the unit reports ready only after both the queue
+and the control socket are bound, so `systemctl is-active` genuinely
+means "filtering".
+
+## Permission denied on the socket
+
+The GUI will not connect, or `cfc` prints:
+
+```
+permission denied on /run/colony-firewall/cfc.sock - add your user to the
+colony-firewall group (sudo usermod -aG colony-firewall $USER) then log
+out and back in, or run as root
+```
+
+The control socket is `root:colony-firewall` mode 0660, so the kernel
+refuses the connection before the daemon ever sees it. Do exactly what
+the message says:
+
+```sh
+sudo usermod -aG colony-firewall $USER
+```
+
+then **log out and back in**. A new terminal is not enough - group
+membership is fixed at login, so your existing session still has the old
+group set. `id -nG` tells you whether it took; `newgrp colony-firewall`
+gets you a single shell with the group applied if you cannot log out
+right now.
+
+If it still fails, check the socket actually has the group:
+
+```sh
+ls -l /run/colony-firewall/cfc.sock
+# expected: srw-rw---- 1 root colony-firewall ...
+```
+
+`srw-------` and root ownership means the group did not exist when the
+daemon started. It warns about this at startup rather than refusing to
+run:
+
+```sh
+journalctl -u colony-firewalld -g 'does not exist'
+```
+
+Create the group and restart the daemon:
+
+```sh
+sudo systemd-sysusers          # if the shipped sysusers fragment is installed
+# or
+sudo groupadd -r colony-firewall
+sudo systemctl restart colony-firewalld
+```
+
+Two neighbouring errors that are *not* this one, and say so:
+
+- `socket ... does not exist - is colony-firewalld running?` - nothing has
+  ever bound it. Start the daemon, or you are pointing `--socket` at the
+  wrong path.
+- `stale socket at ... - the daemon crashed or was killed` - the file is
+  there but nobody is listening. Restart the daemon.
+
+Every one of these exits 4 ("daemon unreachable"), so scripts can tell
+them apart from a bad argument (2) or a missing rule (3).
+
 ## Loopback and the local resolver
 
 The snippet's `output` hook matches loopback traffic too. On systems using
@@ -141,7 +242,11 @@ What happens to a **new outbound connection** in each state:
 | Daemon up, nft rule loaded         | Filtered: rules, then prompts, then profile fallback | Same |
 | Daemon down, nft rule loaded       | **Dropped. Total outbound lockout.** | Allowed, unfiltered (silent) |
 | Daemon up, nft rule *not* loaded   | Allowed, unfiltered (silent - daemon sees nothing) | Same |
-| Daemon paused (`cfc pause`)        | Allowed - everything gets an accept verdict; auto-resumes after 10 minutes | Same |
+| Daemon paused (`cfc pause`)        | Rules still enforced; only *unmatched* flows pass instead of prompting. Auto-resumes | Same |
+
+Pause has a deadline: it auto-resumes after `[pause] default_secs`
+(default 10 minutes) or whatever `cfc pause --for` asked for, clamped to
+24 hours. `cfc status` shows the resume time.
 
 The two "silent" rows are the ones that bite: everything looks healthy
 (`cfc status` answers, the GUI connects) but no packet is being judged.
@@ -168,8 +273,142 @@ The named profiles are just presets for these three values:
 
 Under `strict`, "the UI wasn't running" means "everything was denied" -
 which is the point, but is also why strict on a headless box with no
-pre-seeded rules looks exactly like a dead network. Uncommenting any
-`[default_policy]` field in `daemon.toml` overrides the profile wholesale.
+pre-seeded rules looks exactly like a dead network. See "Prompts never
+appear on a headless server" below.
+
+Uncommenting a `[default_policy]` field overrides *that one field* and
+leaves the rest of the profile alone - so `profile = "strict"` plus
+`prompt_timeout_secs = 30` is strict with a longer window, not balanced.
+All three fields hot-reload on `SIGHUP`; nothing else in `daemon.toml`
+does.
+
+## Prompts never appear on a headless server
+
+There is no GUI to pop them, so the daemon applies `no_ui_action` to
+every unmatched flow without asking anyone. Under `balanced` that means
+everything is silently allowed; under `strict` it means everything is
+silently denied, which looks exactly like a dead network.
+
+Confirm which one you are in:
+
+```sh
+cfc status
+# prompt policy    15s timeout -> Allow, no UI -> Allow
+```
+
+Then pick one of three fixes:
+
+**1. Answer prompts from the terminal.** This is what `cfc prompts` is
+for - it subscribes just like the GUI does, so the daemon starts asking:
+
+```sh
+cfc prompts
+```
+
+Keys are `a` allow, `d` deny, `r` reject, `s` skip (let it time out), `q`
+quit; then a duration and, for persistent answers, a scope. It works over
+SSH, and falls back to line-at-a-time input when stdin is a pipe.
+
+Run it for a while, answer the traffic you expect, and you have a rule
+set. For a bounded unattended window - during a package install, say -
+`--auto-allow` or `--auto-deny` answer everything without asking, and
+`--count N` exits after N prompts.
+
+**2. Pre-seed rules and accept the fallback.** `cfc rules
+bootstrap-defaults` covers the usual system services; add your own with
+`cfc rules add`. Anything you did not anticipate still hits
+`no_ui_action`.
+
+**3. Change the fallback.** `no_ui_action = "Allow"` in
+`[default_policy]` makes an unattended box fail open. It is the honest
+choice for a server you cannot babysit; it also means the firewall only
+enforces what you explicitly wrote down. Send `SIGHUP` and it takes
+effect without a restart.
+
+Note that `cfc prompts` and the GUI can both be connected at once. A
+prompt goes to every subscriber, but only a subscriber that actually
+received it can answer it - so a verdict from a different user's session
+is refused with "this prompt was not delivered to you".
+
+## Reject behaves like Deny
+
+Symptom: a `Reject` answer or rule makes the application hang until its
+own timeout instead of failing immediately.
+
+**Check for the capability warning first.** Reject injects a real TCP RST
+or ICMP port-unreachable, which needs `CAP_NET_RAW`. The daemon reports a
+missing capability exactly once, at startup:
+
+```sh
+journalctl -u colony-firewalld -b -g 'raw socket setup failed'
+```
+
+```
+raw socket setup failed (...); Reject rules will behave like Deny for
+those families. CAP_NET_RAW is required - the bundled
+colony-firewalld.service grants it.
+```
+
+This is non-fatal by design - the packet is still dropped, so the
+security outcome is unchanged and only the user experience degrades. If
+you see it, you are almost certainly running the daemon outside the
+bundled unit, or with an edited unit that dropped `CAP_NET_RAW` from
+`AmbientCapabilities` / `CapabilityBoundingSet`.
+
+Two cases where Reject legitimately falls back to a plain drop:
+protocols other than TCP and UDP (there is no meaningful refusal to send
+for ICMP), and a packet too short to quote in an ICMP error.
+
+## systemd keeps restarting the daemon
+
+The unit sets `WatchdogSec=30`, and the daemon only sends heartbeats
+while its packet worker is making progress. A restart with
+
+```
+Watchdog timeout (limit 30s)!
+```
+
+in the journal means the worker stopped responding, not that the machine
+was idle - a worker parked in a blocking `recv` with nothing to do is
+explicitly treated as healthy, so an idle system is never killed. Look
+for the daemon's own complaint just before the restart:
+
+```sh
+journalctl -u colony-firewalld -g 'NFQUEUE worker unresponsive'
+```
+
+Detection is bounded at roughly 90 seconds (a 10s heartbeat interval, a
+60s stall threshold, a 30s watchdog). If this recurs, capture
+`journalctl -u colony-firewalld -b -1` from before the restart and file
+it - a wedged worker is a bug, not a tuning problem. As a stopgap you can
+raise `WatchdogSec` with a drop-in
+(`systemctl edit colony-firewalld`), but that trades a restarting daemon
+for a stalled one, and under the fail-closed nftables rule a stalled
+daemon is a dead network.
+
+Restarts *without* a watchdog message are ordinary failures -
+`Restart=on-failure` retrying a bind that keeps failing. See "The daemon
+exits immediately" above.
+
+## Some rules are not being enforced
+
+`cfc status` warns on stderr when rules on disk could not be loaded:
+
+```
+warning: 2 rule(s) on disk could not be loaded and are NOT being enforced
+```
+
+This means the JSON for those rows failed to parse - usually after
+downgrading to an older daemon than the one that wrote them. The rows are
+**preserved on disk**, never deleted, so upgrading again recovers them.
+The ids are named in the journal:
+
+```sh
+journalctl -u colony-firewalld -g 'failed to deserialize'
+```
+
+If you need the rule back now and cannot upgrade, delete the offending
+row by id and re-create it with `cfc rules add`.
 
 ## Where things live
 

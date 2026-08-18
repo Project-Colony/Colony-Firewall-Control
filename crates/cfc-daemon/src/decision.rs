@@ -5,7 +5,7 @@
 //! UI (via `pending_prompts`) and fall back to the configured default policy.
 
 use crate::config::DefaultPolicy;
-use cfc_core::{Action, Connection, Process, Rule, RuleSet, Verdict};
+use cfc_core::{Connection, Process, Rule, RuleSet, Verdict};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,11 +63,9 @@ impl Engine {
         };
         if let Some((rule_id, action)) = rule_match {
             *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
-            let verdict = match action {
-                Action::Allow => Verdict::allow_from_rule(rule_id),
-                Action::Deny | Action::Reject => Verdict::deny_from_rule(rule_id),
-            };
-            return Decision::Resolved(verdict);
+            // Verbatim: a Reject rule must reach the datapath as Reject so
+            // the refusal is actually injected, not silently downgraded.
+            return Decision::Resolved(Verdict::from_rule(action, rule_id));
         }
         Decision::NeedsPrompt {
             fallback: self.fallback_verdict(),
@@ -87,10 +85,7 @@ impl Engine {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .no_ui_action;
-        match no_ui_action {
-            Action::Allow => Verdict::default_allow(),
-            Action::Deny | Action::Reject => Verdict::default_deny(),
-        }
+        Verdict::from_policy(no_ui_action)
     }
 
     pub fn upsert_rule(&self, rule: Rule) {
@@ -132,6 +127,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::config::DefaultPolicy;
+    use cfc_core::Action;
     use cfc_core::{Direction, Protocol, RuleScope, VerdictSource};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
@@ -191,6 +187,43 @@ mod tests {
         let mut scope = RuleScope::any();
         scope.dst_port = Some(port);
         Rule::new(format!("deny-{port}"), Action::Deny, scope)
+    }
+
+    #[test]
+    fn reject_rule_stays_reject() {
+        // Deny and Reject both drop the packet, but only Reject injects a
+        // RST/ICMP refusal in the worker. If the engine downgraded Reject
+        // to Deny here, every persisted Reject rule would silently behave
+        // as Deny and the injection would only ever fire for prompts.
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+        let rule = Rule::new("reject-443", Action::Reject, scope);
+        let rule_id = rule.id;
+        let mut rs = RuleSet::default();
+        rs.rules.push(rule);
+        let engine = Engine::new(rs, shared(dp_allow()));
+
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::Resolved(v) => {
+                assert_eq!(v.action, Action::Reject);
+                assert_eq!(v.source, VerdictSource::Rule(rule_id));
+            }
+            _ => panic!("expected Resolved"),
+        }
+    }
+
+    #[test]
+    fn reject_default_policy_stays_reject() {
+        let policy = DefaultPolicy {
+            no_ui_action: Action::Reject,
+            timeout_action: Action::Reject,
+            prompt_timeout_secs: 15,
+        };
+        let engine = Engine::new(RuleSet::default(), shared(policy));
+
+        let fallback = engine.fallback_verdict();
+        assert_eq!(fallback.action, Action::Reject);
+        assert_eq!(fallback.source, VerdictSource::DefaultPolicy);
     }
 
     #[test]

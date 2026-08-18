@@ -307,7 +307,7 @@ struct StatusJson {
     rules_count: u64,
     skipped_rules: u64,
     prompts_pending: u64,
-    connections_today: u64,
+    connections_seen: u64,
     connections_allowed: u64,
     connections_denied: u64,
     timeout_action: String,
@@ -329,7 +329,7 @@ fn status_json(s: &proto::StatusResponse, now_unix_ms: i64) -> StatusJson {
         rules_count: s.rules_count,
         skipped_rules: s.skipped_rules,
         prompts_pending: s.prompts_pending,
-        connections_today: s.connections_today,
+        connections_seen: s.connections_seen,
         connections_allowed: s.connections_allowed,
         connections_denied: s.connections_denied,
         timeout_action: convert::action_label(s.timeout_action).to_string(),
@@ -395,7 +395,7 @@ async fn cmd_status(client: &mut Client, format: OutputFormat) -> CliResult {
     println!("prompts pending  {}", s.prompts_pending);
     println!(
         "connections      {} (allowed: {}, denied: {})",
-        s.connections_today, s.connections_allowed, s.connections_denied
+        s.connections_seen, s.connections_allowed, s.connections_denied
     );
     println!(
         "prompt policy    {}s timeout -> {}, no UI -> {}",
@@ -465,7 +465,7 @@ mod tests {
             uptime_seconds: 3661,
             rules_count: 12,
             prompts_pending: 1,
-            connections_today: 100,
+            connections_seen: 100,
             connections_allowed: 90,
             connections_denied: 10,
             paused,

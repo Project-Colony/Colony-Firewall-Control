@@ -12,7 +12,12 @@ desktop, not what's theoretically pure.
 3. Run `cfc rules bootstrap-defaults` to install common system rules.
 4. Once the prompt rate drops to maybe 1-2 a day, switch to
    `profile = "strict"` for fail-closed behavior.
-5. Audit `cfc rules list` monthly. Remove rules for apps you no longer use.
+5. Audit `cfc rules list` monthly. Remove rules for apps you no longer
+   use, and check `cfc log --since 30d` for destinations you did not
+   expect.
+
+On a headless machine, substitute `cfc prompts` for "leave the UI
+running" throughout - it subscribes the same way the GUI does.
 
 ## Choosing a profile
 
@@ -70,16 +75,63 @@ cfc rules add --action deny --dst-host 'incoming.telemetry.mozilla.org' \
 
 ### A warning about `dst_host`
 
-Hostname matching is currently based on reverse DNS: the daemon does a
-PTR lookup on the destination IP and matches `dst_host` against whatever
-comes back. **PTR records are controlled by whoever controls the
-destination IP** - a hostile server can name itself anything, including a
-hostname you trust. Treat `dst_host` as best-effort display metadata and
-a convenience for *deny* rules (a telemetry endpoint has no incentive to
-hide its own PTR). Do **not** rely on hostname *allow* rules as a
-security boundary: an attacker-controlled IP can trivially wear an
-allowed name. For allow rules, pin `exe` + `dst_port` (+ `dst_net` where
-destinations are stable) instead.
+Hostname matching is based on reverse DNS: the daemon does a PTR lookup
+on the destination IP and matches `dst_host` against whatever comes
+back. **PTR records are published by whoever controls the destination
+IP** - which, for outbound filtering, is exactly the party you may be
+trying to keep the user away from. Taken at face value, a hostile server
+could name itself `api.github.com` and satisfy an allow rule.
+
+The daemon mitigates this with forward confirmation (FCrDNS): every PTR
+answer is resolved back to its A/AAAA set, and the name is kept only if
+that set contains the IP we started from. Names that fail confirmation
+are discarded, so a rule never matches on one. That makes a hostname as
+trustworthy as the *forward* zone of the claimed domain rather than the
+reverse zone of an arbitrary IP.
+
+It is a mitigation, not a guarantee. Names are still resolved after the
+fact and cached (300s positive, 60s negative), and an attacker who
+controls both zones can still name themselves self-consistently. Treat
+`dst_host` as best-effort metadata and a convenience for *deny* rules (a
+telemetry endpoint has no incentive to hide its own PTR). Do **not**
+lean on a hostname *allow* rule as your only boundary. For allow rules,
+pin `exe` + `dst_port` (+ `dst_net` where destinations are stable)
+instead.
+
+## Deny or Reject?
+
+Both stop the connection; they differ in what the application sees.
+
+| Action   | Kernel verdict | Application sees                          |
+|----------|----------------|-------------------------------------------|
+| `Deny`   | DROP           | Nothing. It hangs until its own timeout.  |
+| `Reject` | DROP + refusal | Connection refused / port unreachable, immediately. |
+
+`Reject` injects a TCP RST for TCP flows and an ICMP (or ICMPv6)
+port-unreachable for UDP. Prefer it for anything interactive: a browser
+that gets an instant refusal shows an error, while a dropped connection
+spins for 30 seconds and users blame the network. Prefer `Deny` when you
+would rather not tell the other end anything at all - though for
+*outbound* filtering the "other end" is a local process you already
+control, so this matters less than it does on an inbound firewall.
+
+Two caveats, both real:
+
+- **`Reject` needs `CAP_NET_RAW`** to open the raw sockets it injects
+  through. The bundled unit grants it. Without it the daemon logs one
+  warning at startup and every Reject silently behaves like a Deny:
+
+  ```
+  raw socket setup failed (...); Reject rules will behave like Deny for
+  those families. CAP_NET_RAW is required - the bundled
+  colony-firewalld.service grants it.
+  ```
+
+- **Reject applies wherever the action comes from** - a saved rule, a
+  prompt you answered, or `no_ui_action`/`timeout_action = "reject"` in
+  `daemon.toml`. The verdict carries the action verbatim to the
+  datapath, so a stored Reject rule refuses exactly like an interactive
+  one.
 
 ## Rule design principles
 
@@ -107,20 +159,161 @@ real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
 - **Container traffic**: Docker / Podman / LXC route through their own
   bridges. You need to enqueue their veth interfaces explicitly in nftables.
 
-## Socket access
+## The control socket and who can talk to it
 
-The daemon's control socket (`/run/colony-firewall/cfc.sock`) is
-group-gated: it is owned by root with group `colony-firewall`, and only
-members of that group can talk to the daemon. To run the GUI or `cfc`
-as your regular (unprivileged) user:
+The daemon runs as root and drives the packet filter, so its control
+socket (`/run/colony-firewall/cfc.sock`) is the entire attack surface.
+Two layers guard it.
+
+**Layer 1 - the socket file.** After bind, the daemon chowns the socket
+to `root:colony-firewall` and then chmods it 0660, in that order, so it
+is never briefly readable by the wrong group. The kernel refuses
+`connect(2)` to anyone outside the group. To run the GUI or `cfc` as your
+regular user:
 
 ```sh
 sudo usermod -aG colony-firewall $USER
 ```
 
-then log out and back in for the group to take effect. Keep membership
-tight - anyone in the group can rewrite rules and pause enforcement,
-which is root-equivalent control over the firewall.
+then log out and back in for the group to take effect.
+
+If the group does not exist the daemon does **not** fail to start. It
+warns, leaves the socket root-only (0600), and only a root `cfc` can
+connect - the UI will report a permission error. Create the group with
+the shipped `sysusers.d` fragment or by hand
+(`groupadd -r colony-firewall`), then add yourself and restart.
+
+**Layer 2 - peer credentials.** Every connection carries `SO_PEERCRED`,
+and the daemon checks the caller per RPC:
+
+| RPC class | RPCs                        | Requires                    |
+|-----------|-----------------------------|-----------------------------|
+| Mutating  | `UpsertRule`, `DeleteRule`, `SetPaused`, `SubmitVerdict` | uid 0, **or** a socket that is genuinely group-gated |
+| Read-only | `ListRules`, `GetStatus`, `ListEvents`, `StreamConnections`, `StreamPrompts` | Only layer 1 |
+
+`require_group = false` in `[ipc]` turns the mutating check off. Leave it
+on unless you are gating the socket some other way (filesystem ACLs);
+with it off, any process that manages to connect can rewrite your rules.
+
+**Say it plainly: every member of the group is fully trusted.** There is
+no in-band authentication, no per-user identity, and no password. Group
+membership grants the ability to allow or deny any traffic on this host,
+which is root-equivalent control over the firewall. This is not a
+multi-user privilege boundary - add only administrators of the machine.
+
+The one exception is prompt ownership: a prompt may only be answered by a
+peer whose `StreamPrompts` subscription actually received it, so one
+desktop session cannot answer another session's prompt. Root is exempt.
+
+## What hot-reloads and what needs a restart
+
+`systemctl reload` is not wired up; send `SIGHUP` (or
+`systemctl kill -s HUP colony-firewalld`). A reload never drops a packet,
+and a config file that fails to parse is rejected with the running policy
+left in place.
+
+| Setting                                            | On SIGHUP |
+|----------------------------------------------------|-----------|
+| `profile`                                          | Live      |
+| `[default_policy] no_ui_action` / `timeout_action` | Live      |
+| `[default_policy] prompt_timeout_secs`             | Live (next prompt) |
+| `[nfqueue] queue_num` / `queue_max_len` / `fail_open` | Restart |
+| `[storage] path`                                   | Restart   |
+| `[events] max_rows`                                | Restart   |
+| `[pause] default_secs`                             | Restart   |
+| `[ipc] group` / `require_group`                    | Restart   |
+
+Rules are not read from the config file at all - they live in the
+database and every change takes effect immediately.
+
+## The audit trail
+
+Three places record what the firewall did:
+
+**1. journald, for anything that changed state.** Every mutating RPC is
+logged with the calling uid and pid, the target, and the outcome:
+
+```sh
+journalctl -u colony-firewalld -g 'rule upserted|rule delete|verdict submitted|paused'
+```
+
+so "who deleted the rule blocking that telemetry endpoint" is answerable
+after the fact.
+
+**2. journald, for every blocked connection.** Deny and Reject verdicts
+log the action, its source, the executable, pid, uid and destination:
+
+```sh
+journalctl -u colony-firewalld -g 'connection blocked'
+```
+
+This line is emitted whether or not the row makes it to disk.
+
+**3. The events table, for everything.** Every observed connection and
+its verdict is persisted in the rules database and queried with `cfc log`:
+
+```sh
+cfc log --since 24h --action deny
+cfc log --exe firefox --limit 200
+cfc log --json --since 1h | jq -r '.[] | .dst_host // .dst_ip' | sort | uniq -c
+```
+
+Persistence happens off the packet path through a bounded queue, so a
+slow disk can never delay a verdict; if the queue fills, rows are dropped
+and the loss is logged. Retention is a row cap, not a time window:
+`[events] max_rows` (default 100000), pruned every 60 seconds. Raise it
+if you want a longer history, and remember the table lives in
+`/var/lib/colony-firewall/rules.db` - back it up or ship it off the host
+if the log matters for forensics, because an attacker with root can
+rewrite it.
+
+Verdicts that were *not* blocks are also recorded, so the log answers
+"what did this app contact?", not just "what did we stop?".
+
+## Daemon sandboxing
+
+The bundled unit is not a bare `ExecStart`. The daemon parses
+attacker-controlled packets as root, so the point of these directives is
+to shrink what a code-execution bug could reach:
+
+| Directive                          | Why                             |
+|------------------------------------|---------------------------------|
+| `CapabilityBoundingSet`, `AmbientCapabilities` | Only three capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc` |
+| `NoNewPrivileges`                  | No regaining privileges via setuid binaries |
+| `SystemCallFilter=@system-service` | seccomp; the biggest blast-radius reduction available |
+| `SystemCallArchitectures=native`   | Closes the 32-bit-syscall bypass of that filter |
+| `MemoryDenyWriteExecute`           | Nothing here JITs; no W+X memory |
+| `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths` | Read-only filesystem apart from the state, runtime and log directories |
+| `RestrictAddressFamilies`          | AF_UNIX, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET only |
+| `RestrictNamespaces`, `LockPersonality`, `RestrictRealtime`, `RestrictSUIDSGID` | Namespace and personality lockdown |
+| `ProtectKernelTunables`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname` | No writing kernel state |
+| `UMask=0077`                       | Closes the window between `bind` and the explicit chmod of the control socket |
+| `PrivateTmp`                       | No shared `/tmp`                |
+
+**`ProtectProc=invisible` is deliberately absent.** It would hide other
+processes' `/proc` entries from the daemon, and that is precisely how
+process attribution works: `/proc/net/{tcp,udp}` gives a socket inode,
+and the owning pid is found by walking `/proc/*/fd` for a matching
+`socket:[inode]` link. Turning it on makes every connection resolve to an
+unknown process, which defeats the entire tool. Same reason
+`CAP_SYS_PTRACE` is in the bounding set. If you are hand-editing the
+unit, do not "harden" either of these.
+
+## Fail-open or fail-closed
+
+The other half of the security posture is the nftables side, not the
+daemon: whether the kernel drops or accepts new connections when nobody
+is answering the queue. The shipped snippet is fail-closed, which is the
+safer default and also the one that can lock you out of a remote box.
+The full matrix - daemon up or down, table loaded or not, with and
+without `bypass` - is in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#fail-open-vs-fail-closed-matrix).
+Read it before enabling enforcement on a machine you only reach over SSH.
+
+Note that `[nfqueue] fail_open` is a *different* knob: it governs what
+the kernel does when the queue overflows while the daemon is running
+(default `false`, drop). The `bypass` keyword governs what happens when
+no daemon is attached at all.
 
 ## When something stops working
 

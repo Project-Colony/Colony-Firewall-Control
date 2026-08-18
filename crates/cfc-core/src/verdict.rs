@@ -21,31 +21,42 @@ pub struct Verdict {
 }
 
 impl Verdict {
-    pub fn allow_from_rule(rule_id: uuid::Uuid) -> Self {
+    /// Carries a rule's action through verbatim.
+    ///
+    /// Deny and Reject must stay distinct all the way to the datapath:
+    /// both drop the packet, but Reject additionally injects a TCP RST or
+    /// ICMP unreachable so the application fails fast. Collapsing them
+    /// here would silently turn every persisted Reject rule into a Deny.
+    pub fn from_rule(action: crate::Action, rule_id: uuid::Uuid) -> Self {
         Self {
-            action: crate::Action::Allow,
+            action,
             source: VerdictSource::Rule(rule_id),
         }
     }
 
+    pub fn allow_from_rule(rule_id: uuid::Uuid) -> Self {
+        Self::from_rule(crate::Action::Allow, rule_id)
+    }
+
     pub fn deny_from_rule(rule_id: uuid::Uuid) -> Self {
+        Self::from_rule(crate::Action::Deny, rule_id)
+    }
+
+    /// Carries a default-policy action through verbatim, for the same
+    /// reason as [`Verdict::from_rule`]: a policy of `reject` configured in
+    /// `daemon.toml` must actually reject.
+    pub fn from_policy(action: crate::Action) -> Self {
         Self {
-            action: crate::Action::Deny,
-            source: VerdictSource::Rule(rule_id),
+            action,
+            source: VerdictSource::DefaultPolicy,
         }
     }
 
     pub fn default_allow() -> Self {
-        Self {
-            action: crate::Action::Allow,
-            source: VerdictSource::DefaultPolicy,
-        }
+        Self::from_policy(crate::Action::Allow)
     }
 
     pub fn default_deny() -> Self {
-        Self {
-            action: crate::Action::Deny,
-            source: VerdictSource::DefaultPolicy,
-        }
+        Self::from_policy(crate::Action::Deny)
     }
 }

@@ -139,7 +139,11 @@ message StatusResponse {
   uint64 uptime_seconds = 2;
   uint64 rules_count = 3;
   uint64 prompts_pending = 4;
-  uint64 connections_today = 5;
+  // Counters are cumulative since the daemon started, not daily: they
+  // reset on restart and never roll over at midnight. (Field 5 was named
+  // `connections_today` until 0.2.0, which was simply untrue.) For
+  // history that survives a restart, query ListEvents.
+  uint64 connections_seen = 5;
   uint64 connections_allowed = 6;
   uint64 connections_denied = 7;
   bool paused = 8;

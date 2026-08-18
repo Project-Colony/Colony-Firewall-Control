@@ -718,6 +718,7 @@ name = "cfc-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfc-client",
  "cfc-core",
  "cfc-proto",
  "chrono",
@@ -737,6 +738,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

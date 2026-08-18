@@ -15,7 +15,7 @@ use crate::convert;
 use crate::decision::SharedPolicy;
 use crate::nfqueue::{PromptRequest, PromptVerdict, VerdictTx};
 use crate::stats::Stats;
-use cfc_core::{Action, Verdict};
+use cfc_core::Verdict;
 use cfc_proto::v1 as pb;
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -53,11 +53,10 @@ impl RouterInner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Verbatim, so a policy of `reject` genuinely rejects rather than
+    /// quietly dropping (see `Verdict::from_policy`).
     fn no_ui_verdict(&self) -> Verdict {
-        match self.policy().no_ui_action {
-            Action::Allow => Verdict::default_allow(),
-            _ => Verdict::default_deny(),
-        }
+        Verdict::from_policy(self.policy().no_ui_action)
     }
 }
 
@@ -145,13 +144,9 @@ impl PromptRouter {
             if inner.pending.lock().remove(&prompt_id) {
                 inner.stats.prompts_dec();
                 debug!(prompt_id, "prompt timed out");
-                let v = match inner.policy().timeout_action {
-                    Action::Allow => Verdict::default_allow(),
-                    _ => Verdict::default_deny(),
-                };
                 let _ = inner.verdict_tx.send(PromptVerdict {
                     prompt_id,
-                    verdict: v,
+                    verdict: Verdict::from_policy(inner.policy().timeout_action),
                 });
             }
         });
@@ -169,6 +164,7 @@ pub async fn run_router_task(mut prompt_rx: mpsc::Receiver<PromptRequest>, route
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cfc_core::Action;
     use cfc_core::{Connection, Direction, Process, Protocol, VerdictSource};
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -204,6 +200,24 @@ mod tests {
             action: Action::Allow,
             source: VerdictSource::UserPrompt,
         }
+    }
+
+    #[tokio::test]
+    async fn no_ui_reject_policy_stays_reject() {
+        // A `no_ui_action = "reject"` policy must reach the worker as
+        // Reject so the refusal is injected; collapsing it to Deny would
+        // make the configured policy a lie.
+        let policy = DefaultPolicy {
+            no_ui_action: Action::Reject,
+            timeout_action: Action::Reject,
+            prompt_timeout_secs: 15,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(policy), Stats::new(), tx);
+        router.enqueue(req(11));
+        let pv = rx.try_recv().expect("verdict should already be queued");
+        assert_eq!(pv.verdict.action, Action::Reject);
+        assert_eq!(pv.verdict.source, VerdictSource::DefaultPolicy);
     }
 
     #[tokio::test]

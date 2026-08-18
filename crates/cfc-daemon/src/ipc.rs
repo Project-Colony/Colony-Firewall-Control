@@ -494,13 +494,13 @@ impl Firewall for FirewallService {
         let policy = self.policy();
         let paused = self.stats.is_paused();
         let uptime_seconds = self.stats.uptime_seconds();
-        let connections_today = self.stats.connections_total();
+        let connections_seen = self.stats.connections_total();
         Ok(Response::new(StatusResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds,
             rules_count,
             prompts_pending: self.stats.prompts_pending(),
-            connections_today,
+            connections_seen,
             connections_allowed: self.stats.connections_allowed(),
             connections_denied: self.stats.connections_denied(),
             paused,
@@ -513,7 +513,7 @@ impl Firewall for FirewallService {
             no_ui_action: convert::action_to_pb(policy.no_ui_action) as i32,
             prompt_timeout_secs: policy.prompt_timeout_secs,
             skipped_rules: self.store.skipped_rules() as u64,
-            enforcing: enforcing_heuristic(self.dry_run, connections_today, uptime_seconds),
+            enforcing: enforcing_heuristic(self.dry_run, connections_seen, uptime_seconds),
         }))
     }
 

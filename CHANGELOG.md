@@ -6,15 +6,226 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Four waves of correctness, security and usability work on top of the
+0.1.0 alpha. The short version: one unanswered prompt no longer stalls
+every new connection on the machine, the control socket is genuinely
+access-controlled, a headless box can answer prompts from a terminal,
+and every verdict is written to a queryable log.
+
 ### Added
-- Pause toggle in the UI header and a `SetPaused` gRPC RPC. When paused,
-  the NFQUEUE worker short-circuits every packet to ACCEPT without
-  parsing or consulting the rule engine. Status response now carries the
-  `paused` flag.
+
+#### Daemon (`colony-firewalld`)
+- Pause toggle in the UI header and a `SetPaused` gRPC RPC. Status
+  response carries the `paused` flag.
 - Better startup diagnostics when NFQUEUE bind fails: hints for missing
   `CAP_NET_ADMIN`, missing `nfnetlink_queue` module, or queue-number
   collision.
-- This `CHANGELOG.md`.
+- Persistent event log. Every observed connection and its verdict is
+  written to an `events` table in the rules database, off the packet
+  path (bounded queue, batched writes, dropped rather than blocking),
+  and pruned to `[events] max_rows`.
+- `ListEvents` RPC with executable-substring, action and since filters.
+- `Reject` now sends a real refusal: a TCP RST for TCP flows, an ICMP /
+  ICMPv6 port-unreachable for UDP, so the application fails immediately
+  instead of hanging until its own timeout. Requires `CAP_NET_RAW`;
+  without it the daemon warns once at startup and Reject behaves like
+  Deny.
+- `SIGHUP` hot-reloads `profile` and `[default_policy]` without dropping
+  a packet or restarting. A config file that fails to parse is rejected
+  and the running policy is kept.
+- systemd `Type=notify` integration: `READY=1` is sent only once both
+  the NFQUEUE and the control socket are bound, `WATCHDOG=1` heartbeats
+  are withheld when the packet worker wedges, and `STOPPING=1` is sent
+  on shutdown.
+- `SIGTERM` joins `SIGINT` on the graceful shutdown path (final hit-count
+  flush, control socket removed).
+- New config sections: `[nfqueue]` (`queue_max_len`, `fail_open`),
+  `[pause]` (`default_secs`), `[events]` (`max_rows`) and `[ipc]`
+  (`group`, `require_group`).
+- `cfc pause` accepts a duration; the daemon clamps it (24h maximum) and
+  reports the real resume time, which `cfc status` and the UI display.
+- `GetStatus` gained `enforcing` (a "no packets seen - is the nft rule
+  loaded?" heuristic), `skipped_rules`, the effective prompt timeout and
+  both fallback actions.
+- Process attribution now covers unconnected UDP sockets (`sendto`
+  without `connect`: mDNS, NTP, QUIC), wildcard-bound local addresses,
+  and v4-mapped entries in the IPv6 socket tables (dual-stack Java, Go
+  and node runtimes). These used to show up as an unknown process.
+- A netlink `sock_diag` fast path for socket lookup, with a silent
+  fallback to `/proc/net/*` when it misses.
+- SHA-256 of the running binary (read through `/proc/<pid>/exe`, so a
+  replaced-on-disk binary is still hashed correctly) is reported with
+  each prompt.
+- SQLite schema versioning (`PRAGMA user_version`) and a migration
+  scaffold.
+
+#### CLI (`cfc`)
+- `cfc prompts` - answer connection prompts from a terminal. This is the
+  headless gap: without a subscriber the daemon just applies its no-UI
+  action. Shows the executable, pid, uid, command line and SHA-256 with
+  a live countdown; `a`/`d`/`r`/`s` answer, then a duration and a scope
+  mirroring the GUI's buttons. Falls back to line mode when stdin is not
+  a TTY, and `--auto-allow` / `--auto-deny` cover scripts.
+- `cfc log` - query the persisted verdict log
+  (`--exe` / `--action` / `--since` / `--limit` / `--offset`).
+- Global `--json` (or `-o json`) on every command; streaming commands
+  emit NDJSON, one object per line.
+- A documented exit-code contract: `0` ok, `1` runtime/RPC error, `2`
+  usage, `3` not found, `4` daemon unreachable.
+- `cfc live` gained an app column, hostnames in place of raw IPs where
+  known, `--follow` (reconnects across daemon restarts) and filters:
+  `--exe`, `--pid`, `--dst-port`, `--uid`, `--denied`.
+- `cfc rules show`, `cfc rules enable` and `cfc rules disable`
+  (idempotent, unlike `toggle`).
+- Anywhere a rule id is accepted you may now pass a unique id prefix or
+  the rule's name.
+- Shell completions (`cfc completions bash|zsh|fish`) and man pages
+  (`cfc man`), generated from the binary and installed by the PKGBUILD.
+
+#### UI (`colony-firewall`)
+- Prompt cards show the daemon's own deadline as a countdown bar, name
+  the action that will fire if it runs out, and remove themselves when
+  it does.
+- Cards show the destination hostname where one is known, plus process
+  details: full path, uid (or "unknown"), working directory, parent and
+  SHA-256.
+- Daemon-death detection: two failed polls flip the status badge, tear
+  down the subscriptions and retry with a 3-5s backoff.
+- Rules tab: sortable columns (name, hits, created), a created-at
+  column, and a two-step confirmation before delete.
+- Live tab: text and verdict filters, pause-with-buffering, colored
+  verdicts, and per-row "make a rule" and "copy" actions.
+- Stats tab: session top-10 apps and destinations, policy tiles, and
+  banners for not-enforcing / skipped rules / paused.
+- A status log (deduplicated, self-expiring, dismissible) replaces the
+  single error string.
+- Keyboard shortcuts: `A`/`D` answer the newest prompt, `Shift`
+  persists, `1`-`4` switch tabs, `Esc`/`Enter` in the rule editor.
+
+#### Packaging & infrastructure
+- AUR-ready `pkg/PKGBUILD` plus a `-git` variant, a `.desktop` entry, an
+  XDG autostart entry and a scalable icon.
+- `colony-firewall-nft.service`: loads the nftables snippet at boot and
+  deletes the table on stop, so a stopped or uninstalled daemon can no
+  longer leave the machine blackholed.
+- A `colony-firewall` group via a `sysusers.d` fragment, and a pacman
+  install script that cleans up the nftables table on removal.
+- `cargo-deny` (advisories, licenses, bans, sources) on PRs and weekly,
+  Dependabot, all GitHub Actions pinned by commit SHA, `--locked`
+  everywhere, a declared MSRV of 1.88 with a CI gate, a release
+  workflow, and a script that keeps the version consistent across
+  `Cargo.toml`, the PKGBUILD and `colony.json`.
+- `docs/TROUBLESHOOTING.md`, a README "First run" section, and this
+  `CHANGELOG.md`.
+
+### Changed
+- `StatusResponse.connections_today` is now `connections_seen`. The
+  counter was never daily: it counts since daemon start and resets on
+  restart. The field number is unchanged, so the wire format is
+  compatible; only the generated field name moves. Use `cfc log` /
+  `ListEvents` for history that survives a restart.
+- **Pausing no longer bypasses the rule engine.** Rules are still
+  evaluated while paused, so explicit Deny and Reject rules stay
+  enforced; pausing only stops *prompting*, and unmatched flows are
+  allowed through. Pause is not a kill switch.
+- Rule precedence is now deterministic instead of dependent on the
+  order SQLite happened to return rows: most specific first, then Deny
+  before Reject before Allow, then oldest first, then by id. Two
+  conflicting rules always resolve the same way.
+- `Duration` is enforced at lookup time - a `Seconds(n)` rule stops
+  matching the moment it expires, and expired rows are reaped every 30
+  seconds rather than lingering until restart.
+- `Once` and `UntilRestart` rules are purged from the database at
+  startup.
+- The daemon writes its control socket as `root:colony-firewall` mode
+  0660. If the group does not exist it warns with the fix and leaves the
+  socket root-only rather than refusing to start.
+- The NFQUEUE queue length and fail-open behaviour are configurable, and
+  the kernel now reports the originating uid/gid with each packet
+  (authoritative over anything found in `/proc`).
+- Process lookups are cached with short TTLs (inode to pid, pid to
+  process details keyed on process start time so pid reuse cannot alias,
+  binary digest keyed on inode and mtime).
+- `cfc status` reports whether the daemon is actually enforcing, and
+  warns on stderr when it is not or when rules on disk failed to load.
+- The systemd unit adds `SystemCallFilter=@system-service`,
+  `SystemCallArchitectures=native`, `MemoryDenyWriteExecute`,
+  `ProtectClock`, `ProtectHostname`, `RestrictSUIDSGID` and
+  `UMask=0077`.
+- Rules that fail to deserialize are counted and reported instead of
+  silently vanishing; the rows are preserved on disk, never deleted.
+
+### Fixed
+- **One unanswered prompt could stall every new connection on the
+  machine.** The NFQUEUE worker used to block waiting for each verdict
+  in turn; it now parks pending packets and answers verdicts out of
+  order. With nothing outstanding it still blocks in `recv`, so the
+  common path costs nothing.
+- Duplicate prompts for the same flow. SYN retransmits and parallel
+  connections from the same program to the same destination now ride one
+  prompt instead of each raising their own.
+- A prompt whose subscriber disappeared could strand its packets
+  forever; each pending prompt now gets its fallback applied.
+- Answering `Once` used to be indistinguishable from `Always` once
+  written to disk. Persisting an `Once` rule is now refused, and the UI
+  disables the scope buttons for it.
+- The CLI help described a bootstrap rule that did not exist.
+- `cfc rules remove <unknown-id>` exited 0; it now exits 3.
+- Connection failures used to surface as an opaque transport error. The
+  CLI now distinguishes "the daemon is not running", "you are not in the
+  `colony-firewall` group" and "the socket is stale", and names the
+  command that fixes each.
+- The UI silently swallowed a rejected verdict; an already-expired
+  prompt now says so.
+- An unattributed process was displayed as uid 0.
+
+### Security
+- **Unattributed traffic could match root's rules.** A process the
+  daemon could not resolve was reported as uid 0 and gid 0, so a `uid =
+  0` allow rule matched it. `uid` and `gid` are now optional end to end
+  (core types, the wire protocol, and the UI), and a uid-scoped rule
+  never matches an unknown process.
+- **The control socket had no access control.** It is now chowned to
+  `root:<group>` and chmodded 0660 before it serves anything, and every
+  connection is checked against its peer credentials: mutating RPCs
+  (`UpsertRule`, `DeleteRule`, `SetPaused`, `SubmitVerdict`) require uid
+  0 or a socket that is genuinely group-gated, while read-only RPCs stay
+  open to any peer that got past the file mode. Every mutating call and
+  every Deny/Reject verdict is written to the journal with the calling
+  uid and pid.
+- **One desktop session could answer another's prompts.** The daemon
+  tracks which subscribers actually received each prompt and refuses a
+  verdict from anyone else (root excepted).
+- **An unknown enum value on the wire became "Allow".** Decoding an
+  unspecified or out-of-range action or duration is now an error
+  (`InvalidArgument`) instead of falling through to the zero value,
+  which was Allow.
+- **`Reject` was a lie.** It handed the kernel the same DROP as `Deny`
+  and sent nothing, so applications hung until their own timeout instead
+  of failing fast. It now injects a real refusal (see Added), for every
+  source of a Reject verdict: a persisted rule, an answered prompt, and
+  a `reject` default policy alike. The verdict pipeline no longer
+  collapses Reject into Deny on its way to the datapath.
+- **A failed NFQUEUE bind exited 0.** Under the shipped fail-closed
+  nftables rule that meant systemd considered the daemon started while
+  the kernel dropped every new outbound connection. Open and bind
+  failures now propagate, so the unit fails visibly and
+  `Restart=on-failure` retries.
+- **IPv6 extension headers could hide the real ports.** The parser
+  assumed the transport header sat immediately after the fixed IPv6
+  header, so a packet carrying a Hop-by-Hop or Destination-Options
+  header was matched on garbage ports. The chain is now walked (bounded
+  to 8 headers) and non-first fragments are classified as neither TCP
+  nor UDP. Likewise, an IPv4 header claiming `ihl < 5` made the parser
+  read "ports" from inside the IP header itself; that is now rejected.
+- Documented the `dst_host` trust model in `docs/HARDENING.md`:
+  hostnames come from reverse DNS, which the destination's own operator
+  controls. The daemon forward-confirms every PTR answer and discards
+  unconfirmed names, but `dst_host` is still best-effort and should not
+  carry an allow rule on its own.
+- Dependency advisories are gated in CI (`cargo-deny`), lockfile updates
+  cleared the outstanding RustSec advisories, and GitHub Actions are
+  pinned by commit SHA.
 
 ## [0.1.0] - 2026-05-25 (initial alpha)
 
