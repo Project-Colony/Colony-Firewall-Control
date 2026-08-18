@@ -40,6 +40,10 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 - opensnitch JSON import for one-shot migration
 - Named profiles: relaxed / balanced / strict (in `daemon.toml`)
 - Shell completions and man pages, generated from the binary
+- **Optional eBPF backend**: exec tracking and observed DNS answers read
+  from inside the kernel, so attribution does not race `/proc` and
+  hostnames come from the resolver's own replies rather than the
+  destination's PTR record
 - Memory-safe Rust top to bottom for a root daemon parsing untrusted packets
 
 ## Architecture
@@ -381,7 +385,7 @@ cargo run -p cfc-ui     # in another terminal
 | 2  UI MVP                    | done, except the system tray icon |
 | 3  CLI                       | done  |
 | 3.5 Hardening & correctness  | done  |
-| 4  eBPF backend              | TODO  |
+| 4  eBPF backend              | done, opt-in (`--features ebpf`) |
 | 5a CI                        | done  |
 | 5b Packaging                 | in progress (AUR-ready PKGBUILD in `pkg/`, not yet published) |
 | 5  System tray, VirusTotal   | TODO  |

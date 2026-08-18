@@ -7,6 +7,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **eBPF backend** (opt-in: `--features ebpf` plus `[ebpf] enabled`).
+  Three kernel programs: `sched_process_exec` / `sched_process_exit`
+  fill a kernel-sourced process table, so attribution no longer races a
+  short-lived process through `/proc`; `cgroup_skb/ingress` observes the
+  DNS answers this host actually receives, and those outrank
+  PTR-derived names in the hostname cache. Verified live on kernel
+  7.1.8. The daemon degrades to `sock_diag` + `/proc` + PTR whenever the
+  feature is off, the object is missing, or the load fails.
 - `colony-firewall-tray`: a system-tray icon (StatusNotifierItem, so KDE
   and most bars natively; GNOME needs the AppIndicator extension) in the
   Windows Firewall Control mold. Shows enforcing / paused / unreachable

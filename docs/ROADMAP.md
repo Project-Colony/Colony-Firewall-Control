@@ -3,8 +3,9 @@
 Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 
 Phases 0-3 are done and have since been through a hardening pass
-(Phase 3.5). What is left is the eBPF backend, the system tray, and
-VirusTotal lookups - plus one end-to-end test that is still manual.
+(Phase 3.5). The eBPF backend and the system tray have since landed
+too. What is left is the whitelist fast-path map, VirusTotal lookups,
+and one end-to-end test that is still manual.
 
 ## Phase 0 - Foundation [done]
 
@@ -143,12 +144,29 @@ were wrong or missing once the happy path worked.
 - [x] AUR-ready PKGBUILD, desktop/autostart/icon, sysusers group
 - [x] `colony-firewall-nft.service` with `ExecStop` cleanup
 
-## Phase 4 - eBPF backend
+## Phase 4 - eBPF backend [mostly done]
 
-- [ ] aya project setup, BPF target in workspace
-- [ ] `sched_process_exec` capture -> kernel pid table
-- [ ] DNS sniff -> resolve dst_ip back to hostname pre-NFQ
-- [ ] Whitelist fast-path map for already-allowed flows
+Off by default: needs `--features ebpf` at build time and `[ebpf]
+enabled` in `daemon.toml`. Verified end to end on kernel 7.1.8.
+
+- [x] aya project setup, BPF target in workspace (own workspace, own
+      pinned nightly, excluded from the stable build; `cargo xtask
+      build-ebpf`)
+- [x] `sched_process_exec` capture -> kernel pid table, with
+      `sched_process_exit` eviction and start-time binding so PID reuse
+      cannot serve a stale record. task_struct offsets come from BTF
+      parsed by the loader (Rust has no CO-RE relocation)
+- [x] DNS sniff -> observed A/AAAA answers outrank PTR-derived names in
+      the hostname cache. The kernel gates and copies; the parser runs
+      in userspace, because the in-kernel version hit the verifier's
+      1,000,000-instruction complexity limit (see
+      `crates/cfc-ebpf/README.md` for the full write-up)
+- [ ] Whitelist fast-path map for already-allowed flows. Note the
+      shape of this one is not what it looks like: nftables enqueues
+      only `ct state new`, so the per-packet cost is already paid once
+      per connection, and the cgroup egress hook runs *after*
+      NF_INET_LOCAL_OUT - it cannot short-circuit NFQUEUE. The win
+      available here is attribution cost, not packet cost
 
 ## Phase 5 - Polish
 
