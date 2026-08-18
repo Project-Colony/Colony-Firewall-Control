@@ -35,6 +35,7 @@ nfq = { workspace = true }
 procfs = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
+sha2 = { workspace = true }
 dns-lookup = { workspace = true }
 
 once_cell = { workspace = true }
@@ -46,3 +47,5 @@ clap = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+# test-util enables tokio::test(start_paused) for the prompt-timeout tests.
+tokio = { workspace = true, features = ["test-util"] }

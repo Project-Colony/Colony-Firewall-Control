@@ -5,7 +5,14 @@ After=network-pre.target
 Wants=network-pre.target
 
 [Service]
-Type=simple
+# Type=notify: the daemon sends READY=1 only after both the NFQUEUE and
+# the control socket are bound, so "started" means "actually filtering";
+# a failed bind exits non-zero before READY and Restart=on-failure retries.
+# WATCHDOG=1 heartbeats are sent from the main process (NotifyAccess=main)
+# and stop if the worker thread wedges, so WatchdogSec restarts the daemon.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
 ExecStart=/usr/bin/colony-firewalld --config /etc/colony-firewall/daemon.toml
 Restart=on-failure
 RestartSec=2
@@ -33,6 +40,22 @@ ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictRealtime=true
 LockPersonality=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+# Pure-Rust daemon; nothing JITs or needs writable+executable memory.
+MemoryDenyWriteExecute=true
+# Biggest RCE-blast-radius reduction available: seccomp-filter syscalls to
+# the service baseline. @network-io is not a systemd syscall set; socket
+# syscalls are already in @system-service. Deliberately NOT setting
+# ProtectProc=invisible: process attribution walks other processes' /proc
+# entries (/proc/net inode -> /proc/*/fd).
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# The control socket is chmod/chgrp'd explicitly by the daemon after bind
+# (root:colony-firewall 0660); a tight umask closes the pre-chmod window.
+UMask=0077
 
 # Required for NFQUEUE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET

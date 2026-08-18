@@ -10,6 +10,12 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Default policy shared between the decision engine, the prompt router
+/// and the SIGHUP reload path in `main`. std `RwLock` (not parking_lot):
+/// reads are cheap and uncontended, writes happen only on config reload,
+/// and no new dependency is pulled into the hot path.
+pub type SharedPolicy = Arc<std::sync::RwLock<DefaultPolicy>>;
+
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<EngineInner>,
@@ -17,7 +23,7 @@ pub struct Engine {
 
 struct EngineInner {
     rules: RwLock<RuleSet>,
-    default_policy: DefaultPolicy,
+    default_policy: SharedPolicy,
     /// Per-rule hit counter increments. Merged into the persisted
     /// `Rule::hit_count` on snapshot() and periodically flushed.
     hits: Mutex<HashMap<uuid::Uuid, u64>>,
@@ -31,7 +37,7 @@ pub enum Decision {
 }
 
 impl Engine {
-    pub fn new(mut rules: RuleSet, default_policy: DefaultPolicy) -> Self {
+    pub fn new(mut rules: RuleSet, default_policy: SharedPolicy) -> Self {
         // Storage iteration order is arbitrary; establish the deterministic
         // precedence order (most-specific first, deny before allow on ties)
         // before the first lookup.
@@ -63,11 +69,28 @@ impl Engine {
             };
             return Decision::Resolved(verdict);
         }
-        let fallback = match self.inner.default_policy.no_ui_action {
+        Decision::NeedsPrompt {
+            fallback: self.fallback_verdict(),
+        }
+    }
+
+    /// The verdict applied when no rule matches and prompting is
+    /// impossible (no UI connected, prompt channel saturated, unparseable
+    /// packet): the configured `no_ui_action`.
+    pub fn fallback_verdict(&self) -> Verdict {
+        // A poisoned lock can only mean a writer panicked mid-store of a
+        // Copy value; recover the value rather than poisoning the packet
+        // path.
+        let no_ui_action = self
+            .inner
+            .default_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .no_ui_action;
+        match no_ui_action {
             Action::Allow => Verdict::default_allow(),
             Action::Deny | Action::Reject => Verdict::default_deny(),
-        };
-        Decision::NeedsPrompt { fallback }
+        }
     }
 
     pub fn upsert_rule(&self, rule: Rule) {
@@ -112,6 +135,10 @@ mod tests {
     use cfc_core::{Direction, Protocol, RuleScope, VerdictSource};
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
+
+    fn shared(dp: DefaultPolicy) -> SharedPolicy {
+        Arc::new(std::sync::RwLock::new(dp))
+    }
 
     fn dp_allow() -> DefaultPolicy {
         DefaultPolicy {
@@ -168,7 +195,7 @@ mod tests {
 
     #[test]
     fn no_rules_returns_needs_prompt() {
-        let engine = Engine::new(RuleSet::default(), dp_allow());
+        let engine = Engine::new(RuleSet::default(), shared(dp_allow()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
             Decision::NeedsPrompt { fallback } => {
                 assert_eq!(fallback.action, Action::Allow);
@@ -181,7 +208,7 @@ mod tests {
     fn matching_allow_rule_resolves_to_allow() {
         let mut rs = RuleSet::default();
         rs.rules.push(allow_port_rule(443));
-        let engine = Engine::new(rs, dp_deny());
+        let engine = Engine::new(rs, shared(dp_deny()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
             Decision::Resolved(v) => {
                 assert_eq!(v.action, Action::Allow);
@@ -195,7 +222,7 @@ mod tests {
     fn matching_deny_rule_resolves_to_deny() {
         let mut rs = RuleSet::default();
         rs.rules.push(deny_port_rule(443));
-        let engine = Engine::new(rs, dp_allow());
+        let engine = Engine::new(rs, shared(dp_allow()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
             Decision::Resolved(v) => assert_eq!(v.action, Action::Deny),
             _ => panic!("expected Resolved"),
@@ -204,7 +231,7 @@ mod tests {
 
     #[test]
     fn fallback_respects_default_policy_deny() {
-        let engine = Engine::new(RuleSet::default(), dp_deny());
+        let engine = Engine::new(RuleSet::default(), shared(dp_deny()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
             Decision::NeedsPrompt { fallback } => {
                 assert_eq!(fallback.action, Action::Deny);
@@ -215,7 +242,7 @@ mod tests {
 
     #[test]
     fn upsert_rule_takes_effect_immediately() {
-        let engine = Engine::new(RuleSet::default(), dp_allow());
+        let engine = Engine::new(RuleSet::default(), shared(dp_allow()));
         // No rule -> NeedsPrompt.
         assert!(matches!(
             engine.evaluate(&conn(443), &proc("/usr/bin/curl")),
@@ -236,7 +263,7 @@ mod tests {
         let id = rule.id;
         let mut rs = RuleSet::default();
         rs.rules.push(rule);
-        let engine = Engine::new(rs, dp_allow());
+        let engine = Engine::new(rs, shared(dp_allow()));
 
         assert!(matches!(
             engine.evaluate(&conn(443), &proc("/usr/bin/curl")),
@@ -262,7 +289,7 @@ mod tests {
             vec![allow.clone(), deny.clone()],
             vec![deny.clone(), allow.clone()],
         ] {
-            let engine = Engine::new(RuleSet { rules }, dp_allow());
+            let engine = Engine::new(RuleSet { rules }, shared(dp_allow()));
             match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
                 Decision::Resolved(v) => assert_eq!(v.action, Action::Deny),
                 _ => panic!("expected Resolved"),
@@ -271,11 +298,29 @@ mod tests {
     }
 
     #[test]
+    fn policy_reload_changes_fallback_verdict() {
+        // Simulates the SIGHUP path in main: the shared policy is swapped
+        // in place and the engine's fallback follows without a rebuild.
+        let policy = shared(dp_allow());
+        let engine = Engine::new(RuleSet::default(), policy.clone());
+        assert_eq!(engine.fallback_verdict().action, Action::Allow);
+
+        *policy.write().unwrap() = dp_deny();
+        assert_eq!(engine.fallback_verdict().action, Action::Deny);
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::NeedsPrompt { fallback } => {
+                assert_eq!(fallback.action, Action::Deny);
+            }
+            _ => panic!("expected NeedsPrompt"),
+        }
+    }
+
+    #[test]
     fn snapshot_clones_rules() {
         let mut rs = RuleSet::default();
         rs.rules.push(allow_port_rule(80));
         rs.rules.push(allow_port_rule(443));
-        let engine = Engine::new(rs, dp_allow());
+        let engine = Engine::new(rs, shared(dp_allow()));
 
         let snap = engine.snapshot();
         assert_eq!(snap.rules.len(), 2);
