@@ -226,14 +226,29 @@ jobs:
           #         crates/cfc-ebpf/README.md was measured on
           #   main  the whole point: catch a future kernel breaking us here
           #         rather than on a user's machine
+          #
+          # Pinned by digest, like every action in this repo: this job pulls a
+          # third-party image and executes the kernel binary inside it, in a
+          # job that also has the repo checkout. These are the OCI *index*
+          # digests, so the amd64 child is still selected normally.
           - kernel: "6.12"
             role: floor-lts
+            image: "ghcr.io/cilium/ci-kernels@sha256:2932ba4cae93bd6503b3e5b51873e69ed273ee7ddfa89718c2d21c9951f2ccb4"
           - kernel: "6.18"
             role: newest-lts
+            image: "ghcr.io/cilium/ci-kernels@sha256:efb63968666d35c0e9890135affbd95b29d1e3df82ebdc31456b1033a652d319"
           - kernel: "7.1"
             role: measured-on
+            image: "ghcr.io/cilium/ci-kernels@sha256:50de8eeb1ebba78b98423463d1bdf8ebd34bd70e156ce68081498b56e4aca164"
+          # DELIBERATELY NOT PINNED. Every other entry is pinned for supply
+          # chain integrity; this one exists precisely to test against a moving
+          # target, and a digest would freeze it at whatever mainline was the
+          # day this line was written - which is the one outcome that makes the
+          # job pointless. It runs unpinned and untrusted-by-design, which is
+          # why it is continue-on-error on PRs.
           - kernel: "mainline"
             role: future
+            image: "ghcr.io/cilium/ci-kernels:mainline"
     # Mainline is expected to break sometimes and must not redden a PR that did
     # not cause it. On the schedule it is a real failure worth an issue.
     continue-on-error: ${{ matrix.kernel == 'mainline' && github.event_name != 'schedule' }}
@@ -258,18 +273,17 @@ jobs:
         run: |
           echo "path=$(./scripts/ebpf-test-binary.sh)" >> "${GITHUB_OUTPUT}"
 
-      # VERIFY (first run): the exact image reference and the path the vmlinuz
-      # lands on. Once confirmed, replace the tag with a sha256 digest - every
-      # other action in this repo is SHA-pinned, and this one executes a
-      # third-party kernel binary in a job that also has the repo checkout.
+      # `/boot/vmlinuz` confirmed by listing the image's own layer against the
+      # registry, not assumed: the 7.1 image's first layer is
+      # `boot/vmlinuz` + `usr/lib/modules/7.1.1/...`.
       - name: Fetch the kernel
         run: |
           set -euo pipefail
-          IMG="ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}"
-          docker create --name k "${IMG}"
+          docker create --name k "${{ matrix.image }}"
           docker cp k:/boot/vmlinuz ./vmlinuz
           docker rm k
           ls -l ./vmlinuz
+          file ./vmlinuz || true
 
       # docker export -> mke2fs -d builds the image from a directory, so the
       # test binary and the object are just files placed there beforehand.
