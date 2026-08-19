@@ -153,7 +153,17 @@ enabled = true
 # at startup; SIGHUP deliberately does not re-attach them.
 # [ebpf]
 # # Load the kernel-side programs (crates/cfc-ebpf) and use them to enrich
-# # process attribution and hostname resolution. OFF by default.
+# # process attribution and hostname resolution.
+# #
+# # THIS WHOLE BLOCK IS COMMENTED OUT, AND THAT IS THE SHIPPED BEHAVIOUR:
+# # with nothing written here `enabled` resolves to "auto", which brings the
+# # layer up on any machine that can support it and degrades quietly on any
+# # machine that cannot. You do not need to do anything to get it.
+# #
+# # Leave it commented unless you want to change that. This file is installed
+# # as a `backup=` config, so an uncommented `enabled = "auto"` would be a
+# # string where older binaries expect a bool, and a rollback or a
+# # mixed-version fleet would then fail to parse it.
 # #
 # # WHAT IT ADDS
 # #   sched_process_exec  - exec-time exe/uid/gid/ppid for every process, and
@@ -186,7 +196,19 @@ enabled = true
 # #   * CAP_BPF and CAP_PERFMON, which the shipped unit grants, plus its
 # #     `SystemCallFilter=bpf perf_event_open` line. If you hand-edited the
 # #     unit and dropped either, every bpf(2) call returns EPERM.
-# enabled = false
+# #
+# # VALUES
+# #   "auto"  (default)  bring it up if this machine can; if not, say so once
+# #                      at info level and carry on. Nothing to configure.
+# #   true / "on"        bring it up, and report every shortfall as an ERROR.
+# #                      Use this when you expect ring 0 and want to be told
+# #                      loudly if you did not get it.
+# #   false / "off"      do not attempt it at all.
+# #
+# # An unrecognised value warns and falls back to "auto" rather than refusing
+# # to start: this daemon's nftables rule is fail-closed, so exiting on a
+# # config typo would take the machine's outbound network with it.
+# enabled = "auto"
 # # Where the BPF object was installed. Omit for the packaged default,
 # # /usr/lib/colony-firewall/cfc-ebpf.o. Point it at
 # # `cargo xtask ebpf-path` output when working on the programs themselves.

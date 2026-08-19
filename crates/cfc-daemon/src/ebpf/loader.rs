@@ -213,7 +213,7 @@ pub(super) fn load_and_attach(
     trust: Trust,
 ) -> Result<(Attached, Report), LoadError> {
     let mut report = Report {
-        configured: true,
+        mode: crate::config::EbpfMode::On,
         compiled_in: true,
         ..Report::default()
     };

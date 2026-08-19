@@ -267,20 +267,102 @@ impl Default for ProvenanceConfig {
 /// program set while packets are flowing is not something a config reload
 /// should be able to do by accident.
 ///
-/// Unlike every other section here, the defaults are `Default`-derived rather
-/// than hand-written: "off, no path" is exactly what `bool`/`Option` already
-/// mean, and spelling it out invites the two from drifting apart.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct EbpfConfig {
-    /// Load and attach the kernel-side programs. Off by default: this is new,
-    /// it needs an installed BPF object and two extra capabilities, and
-    /// everything it provides is an improvement on an answer the daemon can
-    /// already produce without it.
-    pub enabled: bool,
+    /// Whether to bring the ring-0 layer up. See [`EbpfMode`].
+    pub enabled: EbpfMode,
     /// Where the BPF object built by `cargo xtask build-ebpf` was installed.
     /// `None` means `crate::ebpf::DEFAULT_OBJECT_PATH`.
     pub object_path: Option<PathBuf>,
+}
+
+impl Default for EbpfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: EbpfMode::Auto,
+            object_path: None,
+        }
+    }
+}
+
+/// Whether the eBPF layer comes up, and how loudly it complains if it cannot.
+///
+/// Three states rather than two because "yes" and "try" want different
+/// reporting from the same code path. An operator who wrote `enabled = true`
+/// asked for ring 0 and should hear about every reason they did not get it; a
+/// machine that is merely *capable* of ring 0 should bring it up and say so
+/// once, without turning "this kernel cannot" into a warning on every boot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EbpfMode {
+    /// Bring it up if this machine can, and degrade quietly if not. The
+    /// default, and the reason the layer is worth shipping: nothing about a
+    /// capable host should require the operator to discover a config switch.
+    #[default]
+    Auto,
+    /// Bring it up, and treat every shortfall as an error worth reporting.
+    On,
+    /// Do not attempt it at all.
+    Off,
+}
+
+impl EbpfMode {
+    /// Whether to try loading at all.
+    pub fn wants_load(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether a human explicitly asked for this, as opposed to the daemon
+    /// deciding for itself.
+    pub fn is_forced(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+impl<'de> Deserialize<'de> for EbpfMode {
+    /// Accepts `true` / `false` byte-for-byte as before, plus the strings.
+    ///
+    /// **An unrecognised string is not an error.** It warns and falls back to
+    /// `Auto`, matching how `profile` already treats an unknown value, and for
+    /// a reason specific to this daemon: a config parse error propagates out of
+    /// `Config::load` and the process exits *before* `READY=1`. The nftables
+    /// ruleset is `ct state new queue num 0` with no `bypass`, so a loaded
+    /// table with no daemon behind it blackholes every new outbound connection
+    /// on the machine. A typo in an enrichment layer's switch must not cost
+    /// someone their network.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = EbpfMode;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"true, false, or one of "auto", "on", "off""#)
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<EbpfMode, E> {
+                // Byte-for-byte backward compatible: an existing config saying
+                // `enabled = true` keeps meaning "definitely, and tell me if
+                // it did not work".
+                Ok(if v { EbpfMode::On } else { EbpfMode::Off })
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<EbpfMode, E> {
+                Ok(match v.trim().to_ascii_lowercase().as_str() {
+                    "auto" => EbpfMode::Auto,
+                    "on" | "true" | "yes" | "enabled" => EbpfMode::On,
+                    "off" | "false" | "no" | "disabled" => EbpfMode::Off,
+                    other => {
+                        tracing::warn!(
+                            value = other,
+                            r#"unrecognised [ebpf] enabled; expected true, false, "auto", "on" or "off". Using "auto"."#
+                        );
+                        EbpfMode::Auto
+                    }
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// Raw on-disk shape. Only `[default_policy]` needs Option-per-field (it
@@ -386,7 +468,7 @@ mod tests {
         assert_eq!(cfg.ipc.group, "colony-firewall");
         assert!(cfg.ipc.require_group);
         assert!(cfg.provenance.enabled);
-        assert!(!cfg.ebpf.enabled);
+        assert_eq!(cfg.ebpf.enabled, EbpfMode::Auto);
         assert_eq!(cfg.ebpf.object_path, None);
         assert_eq!(
             cfg.storage.path,
@@ -394,14 +476,50 @@ mod tests {
         );
     }
 
+    /// The tri-state, including the compatibility the booleans still have.
     #[test]
-    fn ebpf_is_off_by_default_and_opt_in_only() {
-        // This is a security-relevant default, not a style choice: turning it
-        // on means loading kernel code and granting CAP_BPF/CAP_PERFMON.
-        assert!(!Config::from_toml_str("").unwrap().ebpf.enabled);
-        assert!(
-            !Config::from_toml_str("[ebpf]\n").unwrap().ebpf.enabled,
+    fn ebpf_enabled_is_a_tri_state_defaulting_to_auto() {
+        let mode = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.enabled;
+
+        assert_eq!(mode(""), EbpfMode::Auto, "absent means auto");
+        assert_eq!(
+            mode("[ebpf]\n"),
+            EbpfMode::Auto,
             "an empty section keeps the default"
+        );
+        assert_eq!(
+            mode(
+                r#"[ebpf]
+enabled = "auto""#
+            ),
+            EbpfMode::Auto
+        );
+
+        // Existing configs keep working byte-for-byte. `true` means "I asked
+        // for this", which is louder than auto, not merely equal to it.
+        assert_eq!(mode("[ebpf]\nenabled = true\n"), EbpfMode::On);
+        assert_eq!(mode("[ebpf]\nenabled = false\n"), EbpfMode::Off);
+        assert_eq!(
+            mode(
+                r#"[ebpf]
+enabled = "on""#
+            ),
+            EbpfMode::On
+        );
+        assert_eq!(
+            mode(
+                r#"[ebpf]
+enabled = "off""#
+            ),
+            EbpfMode::Off
+        );
+        // Case and stray whitespace are a typo, not a different intent.
+        assert_eq!(
+            mode(
+                r#"[ebpf]
+enabled = " Auto ""#
+            ),
+            EbpfMode::Auto
         );
 
         let cfg = Config::from_toml_str(
@@ -412,16 +530,39 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(cfg.ebpf.enabled);
+        assert_eq!(cfg.ebpf.enabled, EbpfMode::On);
         assert_eq!(
             cfg.ebpf.object_path,
             Some(PathBuf::from("/opt/cfc/cfc-ebpf.o"))
         );
+    }
 
-        // Enabling without naming a path falls back to the packaged location.
-        let cfg = Config::from_toml_str("[ebpf]\nenabled = true\n").unwrap();
-        assert!(cfg.ebpf.enabled);
-        assert_eq!(cfg.ebpf.object_path, None);
+    /// A typo must not be able to take the machine's network away.
+    ///
+    /// A config parse error propagates out of `Config::load` and the daemon
+    /// exits *before* `READY=1`. `systemd/nftables-snippet.conf` is
+    /// `ct state new queue num 0` with **no** `bypass`, so a loaded table with
+    /// no daemon behind it drops every new outbound connection. Refusing to
+    /// start over a misspelled enrichment-layer switch would turn a one-letter
+    /// mistake into an outage, so an unknown value warns and falls back -
+    /// exactly as `profile` already does.
+    #[test]
+    fn an_unrecognised_ebpf_mode_falls_back_instead_of_failing_to_start() {
+        let cfg = Config::from_toml_str("[ebpf]\nenabled = \"maybe\"\n")
+            .expect("an unknown value must parse, not abort startup");
+        assert_eq!(cfg.ebpf.enabled, EbpfMode::Auto);
+
+        // Same for a value of an entirely wrong shape.
+        let cfg = Config::from_toml_str("[ebpf]\nenabled = \"\"\n")
+            .expect("an empty value must parse too");
+        assert_eq!(cfg.ebpf.enabled, EbpfMode::Auto);
+    }
+
+    #[test]
+    fn ebpf_mode_helpers_match_their_names() {
+        assert!(EbpfMode::Auto.wants_load() && !EbpfMode::Auto.is_forced());
+        assert!(EbpfMode::On.wants_load() && EbpfMode::On.is_forced());
+        assert!(!EbpfMode::Off.wants_load() && !EbpfMode::Off.is_forced());
     }
 
     #[test]
@@ -604,7 +745,12 @@ mod tests {
         assert_eq!(cfg.ipc.group, "colony-firewall");
         assert!(cfg.ipc.require_group);
         assert!(cfg.provenance.enabled);
-        assert!(!cfg.ebpf.enabled, "the sample must ship eBPF switched off");
+        assert_eq!(
+            cfg.ebpf.enabled,
+            EbpfMode::Auto,
+            "the sample must leave the [ebpf] block commented out, so a shipped \
+             config resolves to the automatic default"
+        );
         assert_eq!(
             cfg.storage.path,
             PathBuf::from("/var/lib/colony-firewall/rules.db")

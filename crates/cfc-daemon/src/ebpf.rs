@@ -86,8 +86,18 @@ pub mod tracefs;
 #[cfg(feature = "ebpf")]
 mod loader;
 
-use crate::config::EbpfConfig;
+use crate::config::{EbpfConfig, EbpfMode};
 use crate::dns::DnsCache;
+
+/// Severity for the per-shortfall notes. Separate from `tracing::Level` so it
+/// can be asserted in a test without a subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
 
 /// Where the BPF object is expected to live.
 ///
@@ -222,8 +232,9 @@ impl Ring0 {
 /// What actually came up. Reported once at startup and otherwise inert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
-    /// `[ebpf] enabled` in the config.
-    pub configured: bool,
+    /// `[ebpf] enabled` in the config: what was asked for, which decides how
+    /// loudly a shortfall is reported.
+    pub mode: EbpfMode,
     /// The `ebpf` cargo feature is compiled in.
     pub compiled_in: bool,
     /// `sched_process_exec` is attached and feeding the process table.
@@ -256,9 +267,9 @@ pub struct Report {
 
 impl Report {
     /// A report for a daemon that is not running any eBPF at all.
-    fn inert(configured: bool, compiled_in: bool, note: impl Into<String>) -> Self {
+    fn inert(mode: EbpfMode, compiled_in: bool, note: impl Into<String>) -> Self {
         Self {
-            configured,
+            mode,
             compiled_in,
             notes: vec![note.into()],
             ..Self::default()
@@ -267,14 +278,14 @@ impl Report {
 
     /// Same, with the reason classified.
     fn inert_because(
-        configured: bool,
+        mode: EbpfMode,
         compiled_in: bool,
         degrade: Degrade,
         note: impl Into<String>,
     ) -> Self {
         Self {
             degrade: Some(degrade),
-            ..Self::inert(configured, compiled_in, note)
+            ..Self::inert(mode, compiled_in, note)
         }
     }
 
@@ -289,7 +300,7 @@ impl Report {
     /// with the three flags, and the whole point of this value is that an
     /// operator can trust it.
     pub fn ring0(&self) -> Ring0 {
-        if !self.configured {
+        if !self.mode.wants_load() {
             return Ring0::Off;
         }
         match [self.exec_tracking, self.exit_tracking, self.dns_capture]
@@ -303,6 +314,46 @@ impl Report {
         }
     }
 
+    /// How loudly to report a shortfall, from what was asked for and why it
+    /// fell short.
+    ///
+    /// The whole reason [`EbpfMode`] has three states. Under `On` somebody
+    /// asked for ring 0 and did not get it: that is an error, whatever the
+    /// cause. Under `Auto` the daemon decided to try, and most ways of failing
+    /// are ordinary facts about the machine rather than anything wrong -
+    /// warning about them every boot is how a project teaches people to ignore
+    /// its warnings.
+    ///
+    /// Two `Auto` cases are still worth a warning, for opposite reasons:
+    ///
+    /// * `Rejected` - our program met a kernel that refused it. That is a bug
+    ///   in this project, not a property of the host, and it is the single
+    ///   thing here most worth hearing about.
+    /// * a *partial* bring-up - some programs attached and some did not, which
+    ///   is neither the clean "this host cannot" nor the clean "it works", and
+    ///   usually means something is contended (see the exclusive cgroup slot).
+    ///
+    /// `NotPermitted` is deliberately **not** one of them under `Auto`.
+    /// EPERM from `bpf(2)` is the *normal* answer inside a container with
+    /// Docker's default seccomp profile, in an unprivileged LXC guest, and on
+    /// 5.8-5.10 where BPF map memory is charged to an unraised RLIMIT_MEMLOCK.
+    /// Reading it as "someone edited the unit" would be wrong far more often
+    /// than right.
+    fn note_level(&self) -> NoteLevel {
+        use Degrade::*;
+        match self.mode {
+            EbpfMode::Off => NoteLevel::Debug,
+            EbpfMode::On => NoteLevel::Error,
+            EbpfMode::Auto => match self.degrade {
+                Some(Rejected) => NoteLevel::Warn,
+                Some(_) => NoteLevel::Info,
+                // No classified reason, but not everything came up.
+                None if self.ring0() == Ring0::Partial => NoteLevel::Warn,
+                None => NoteLevel::Info,
+            },
+        }
+    }
+
     /// Names the attribution and hostname sources that are live, so the
     /// journal answers "is eBPF actually doing anything on this host?"
     /// without anyone having to guess from the absence of warnings.
@@ -310,16 +361,13 @@ impl Report {
     /// This is deliberately a log line and not a `GetStatus` field: the
     /// protobuf surface is frozen for this change.
     pub fn log(&self) {
+        let level = self.note_level();
         for note in &self.notes {
-            if self.configured {
-                // The operator asked for this and did not fully get it: say so
-                // loudly enough to be noticed in the journal.
-                tracing::warn!("eBPF: {note}");
-            } else {
-                // "It is switched off" is not a warning. A daemon that logs a
-                // warning on every boot about a default trains people to
-                // ignore its warnings.
-                tracing::debug!("eBPF: {note}");
+            match level {
+                NoteLevel::Error => tracing::error!("eBPF: {note}"),
+                NoteLevel::Warn => tracing::warn!("eBPF: {note}"),
+                NoteLevel::Info => tracing::info!("eBPF: {note}"),
+                NoteLevel::Debug => tracing::debug!("eBPF: {note}"),
             }
         }
         for (program, insns) in &self.verified_insns {
@@ -378,10 +426,10 @@ pub struct Runtime {
 /// table live" against a process-wide `LazyLock` is an assertion about every
 /// other test in the binary as much as about this one.
 pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable) -> Runtime {
-    if !cfg.enabled {
+    if !cfg.enabled.wants_load() {
         return Runtime {
             report: Report::inert(
-                false,
+                cfg.enabled,
                 cfg!(feature = "ebpf"),
                 "disabled in config ([ebpf] enabled = false); using sock_diag + /proc only",
             ),
@@ -397,7 +445,7 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable
         let _ = (dns, table);
         Runtime {
             report: Report::inert_because(
-                true,
+                cfg.enabled,
                 false,
                 Degrade::Unsupported,
                 "[ebpf] enabled = true but this build was compiled with \
@@ -426,7 +474,12 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable
             ),
         };
         match loader::load_and_attach(&path, dns, table.clone(), trust) {
-            Ok((attached, report)) => {
+            Ok((attached, mut report)) => {
+                // The loader builds its report before it knows how it was
+                // asked for; only `start` does. Without this an `auto` host
+                // that came up partially would be logged under the forced-on
+                // error policy.
+                report.mode = cfg.enabled;
                 table.set_live(report.exec_tracking);
                 Runtime {
                     report,
@@ -435,7 +488,7 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable
             }
             Err(e) => Runtime {
                 report: Report::inert_because(
-                    true,
+                    cfg.enabled,
                     true,
                     e.degrade,
                     format!("load failed, continuing without it: {:#}", e.source),
@@ -453,12 +506,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_disabled_config_produces_an_inert_report() {
-        let cfg = EbpfConfig::default();
-        assert!(!cfg.enabled, "[ebpf] must stay off by default");
+    fn an_explicitly_off_config_produces_an_inert_report() {
+        let cfg = EbpfConfig {
+            enabled: EbpfMode::Off,
+            object_path: None,
+        };
         let rt = start(&cfg, DnsCache::new(), proc_table::KernelProcTable::new());
         assert!(!rt.report.any_active());
-        assert!(!rt.report.configured);
+        assert_eq!(rt.report.mode, EbpfMode::Off);
         assert_eq!(rt.report.ring0(), Ring0::Off);
         assert_eq!(rt.report.compiled_in, cfg!(feature = "ebpf"));
         assert_eq!(rt.report.notes.len(), 1);
@@ -479,7 +534,7 @@ mod tests {
         // that some host might one day actually have makes the test lie.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = EbpfConfig {
-            enabled: true,
+            enabled: EbpfMode::On,
             object_path: Some(dir.path().join("cfc-ebpf.o")),
         };
         // An instance, not `proc_table::global()`: the assertion below is about
@@ -487,7 +542,7 @@ mod tests {
         // an assertion about every other test in the binary as well.
         let table = proc_table::KernelProcTable::new();
         let rt = start(&cfg, DnsCache::new(), table.clone());
-        assert!(rt.report.configured);
+        assert_eq!(rt.report.mode, EbpfMode::On);
         assert!(!rt.report.any_active(), "nothing can have attached");
         assert_eq!(rt.report.ring0(), Ring0::Unavailable);
         // The classification differs by build, and both answers are the honest
@@ -510,6 +565,84 @@ mod tests {
             !table.is_live(),
             "a failed load must not leave the table claiming to be live"
         );
+    }
+
+    /// The severity policy, over constructed reports rather than by running
+    /// `start()` — the point is the (mode, degrade) matrix, not the load.
+    #[test]
+    fn severity_follows_what_was_asked_for() {
+        let with = |mode: EbpfMode, degrade: Option<Degrade>| Report {
+            mode,
+            degrade,
+            ..Report::default()
+        };
+
+        // Explicitly on: every shortfall is an error, whatever the cause.
+        // Somebody asked for ring 0 and did not get it.
+        for d in [
+            Degrade::ObjectMissing,
+            Degrade::NotPermitted,
+            Degrade::Unsupported,
+            Degrade::Rejected,
+            Degrade::AbiMismatch,
+        ] {
+            assert_eq!(
+                with(EbpfMode::On, Some(d)).note_level(),
+                NoteLevel::Error,
+                "{d:?} under an explicit `enabled = true` must be an error"
+            );
+        }
+
+        // Off: nothing to say above debug. A daemon that warns every boot
+        // about a default teaches people to ignore its warnings.
+        assert_eq!(
+            with(EbpfMode::Off, Some(Degrade::ObjectMissing)).note_level(),
+            NoteLevel::Debug
+        );
+
+        // Auto: ordinary facts about the machine are info, not warnings.
+        for d in [
+            Degrade::ObjectMissing,
+            Degrade::Unsupported,
+            Degrade::ObjectUntrusted,
+            Degrade::AbiMismatch,
+        ] {
+            assert_eq!(
+                with(EbpfMode::Auto, Some(d)).note_level(),
+                NoteLevel::Info,
+                "{d:?} under auto is a property of the host, not a problem"
+            );
+        }
+
+        // EPERM specifically: the normal answer inside a container with
+        // Docker's default seccomp, in unprivileged LXC, and on 5.8-5.10 with
+        // an unraised RLIMIT_MEMLOCK. Reading it as "the unit was edited"
+        // would be wrong far more often than right.
+        assert_eq!(
+            with(EbpfMode::Auto, Some(Degrade::NotPermitted)).note_level(),
+            NoteLevel::Info,
+            "EPERM under auto is normal in a container, not a misconfiguration"
+        );
+
+        // A verifier rejection is ours, not the host's: the one auto case
+        // worth a warning.
+        assert_eq!(
+            with(EbpfMode::Auto, Some(Degrade::Rejected)).note_level(),
+            NoteLevel::Warn,
+            "a rejected program is a bug in this project meeting a real kernel"
+        );
+
+        // A partial bring-up with no single classified cause is the other:
+        // neither a clean "cannot" nor a clean "works".
+        let partial = Report {
+            mode: EbpfMode::Auto,
+            exec_tracking: true,
+            exit_tracking: true,
+            dns_capture: false,
+            ..Report::default()
+        };
+        assert_eq!(partial.ring0(), Ring0::Partial);
+        assert_eq!(partial.note_level(), NoteLevel::Warn);
     }
 
     /// The path is written down in five places and they must agree.

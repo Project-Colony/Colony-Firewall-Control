@@ -117,18 +117,6 @@ async fn run() -> anyhow::Result<()> {
     let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
     let router = prompts::PromptRouter::new(policy.clone(), stats.clone(), verdict_tx);
 
-    // eBPF enrichment, before the datapath so the exec table and the observed
-    // DNS answers are already filling by the time the first packet is judged.
-    // Held for the daemon's lifetime: dropping it detaches the programs.
-    // Every failure inside is a warning, never a reason not to filter - see
-    // `cfc_daemon::ebpf`.
-    let _ebpf = ebpf::start(
-        &cfg.ebpf,
-        dns_cache.clone(),
-        ebpf::proc_table::global().clone(),
-    );
-    _ebpf.report.log();
-
     // Persist every decided flow into the events table. Subscribes to the
     // live feed before the datapath starts so nothing is missed, and never
     // blocks it (bounded queue + drop counting, see ipc.rs).
@@ -164,7 +152,10 @@ async fn run() -> anyhow::Result<()> {
             verdict_rx,
             observed_tx,
             stats,
-            dns_cache,
+            // Cloned rather than moved: the eBPF consumers write observed DNS
+            // answers into the same cache, and they are started after READY=1
+            // (see below) so the handle has to outlive this call.
+            dns_cache.clone(),
         )
         .context("starting NFQUEUE worker")?
     };
@@ -233,6 +224,39 @@ async fn run() -> anyhow::Result<()> {
         warn!("sd_notify READY=1 failed: {e}");
     }
     info!(socket = %socket_path.display(), "ready");
+
+    // eBPF enrichment. **After READY=1, deliberately.**
+    //
+    // Filtering is already live at this point - nfqueue::spawn has bound the
+    // queue - and everything below is a cache that makes later answers better.
+    // Putting it before READY would put two BTF parses, map creation and three
+    // verifier runs on the path to readiness on every boot, for a unit that is
+    // `Type=notify` and ordered `Before=network-pre.target`. Worse, the object
+    // is read from a path: on a stale NFS or autofs mount that read blocks
+    // until systemd's start timeout fires, with the fail-closed nftables table
+    // already installed and no daemon behind it. That is a machine with no
+    // outbound network, caused by an enrichment layer that is allowed to fail.
+    //
+    // The cost is a short window where the first few packets are attributed by
+    // sock_diag + /proc alone, which is exactly what the daemon does when the
+    // layer is unavailable anyway.
+    //
+    // Held for the daemon's lifetime: dropping it detaches the programs.
+    let _ebpf = ebpf::start(
+        // `--dry-run` means "tell me what you would do without touching the
+        // machine". Creating BPF maps and claiming the exclusive root-cgroup
+        // slot is emphatically touching the machine.
+        &if args.dry_run {
+            let mut c = cfg.ebpf.clone();
+            c.enabled = config::EbpfMode::Off;
+            c
+        } else {
+            cfg.ebpf.clone()
+        },
+        dns_cache.clone(),
+        ebpf::proc_table::global().clone(),
+    );
+    _ebpf.report.log();
 
     // Persistent signal streams (not per-iteration futures) so nothing is
     // dropped and re-registered while the SIGHUP arm re-arms the loop.
