@@ -358,6 +358,20 @@ pub fn block_confirmation(exe: &str) -> String {
 /// Worth showing rather than succeeding silently: the button now grants
 /// standing access, and the user should be told that in the same breath - both
 /// so they know they will not be asked again, and so an accidental click is
+/// Said when the verdict applied but the standing rule did not get saved.
+///
+/// Deliberately not phrased as a success with a caveat: the user asked for a
+/// lasting answer and did not get one, so the next connection from this program
+/// will prompt again. Telling them that now is what stops it looking like the
+/// firewall forgot.
+pub fn rule_not_saved(exe: &str, why: Option<&str>) -> String {
+    let name = exe_display_name(exe);
+    match why {
+        Some(w) => format!("{name}: the answer applied, but no lasting rule was saved ({w})"),
+        None => format!("{name}: the answer applied, but no lasting rule was saved"),
+    }
+}
+
 /// something they can see and undo rather than discover months later.
 pub fn allow_confirmation(exe: &str) -> String {
     format!("Rule created: allow {} always", exe_display_name(exe))
@@ -405,6 +419,25 @@ pub fn overflow_body(count: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_not_saved_message_does_not_read_as_a_success() {
+        // The failure it describes is silent otherwise: the verdict applied, so
+        // the connection went through, and the user has no way to know their
+        // standing answer did not stick until the next prompt appears.
+        let m = rule_not_saved("/usr/bin/firefox", Some("storage: disk full"));
+        assert!(m.contains("firefox"), "{m}");
+        assert!(m.contains("no lasting rule"), "{m}");
+        assert!(m.contains("disk full"), "the cause is worth carrying: {m}");
+        assert!(
+            !m.to_lowercase().contains("rule created"),
+            "it must not be mistakable for the confirmation it replaces: {m}"
+        );
+
+        // And it stands on its own when the daemon gave no reason.
+        let bare = rule_not_saved("/usr/bin/firefox", None);
+        assert!(bare.contains("no lasting rule"), "{bare}");
+    }
     use super::*;
     use std::path::PathBuf;
 

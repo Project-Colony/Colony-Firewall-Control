@@ -29,6 +29,13 @@ struct FakeDaemon {
     /// Every mutation in the order it arrived. `import` correctness is entirely
     /// about that order, so recording it is the test.
     calls: Arc<Mutex<Vec<Call>>>,
+    /// Answer SubmitVerdict with "applied, but the rule was not saved" - the
+    /// state a full or read-only /var/lib produces.
+    rule_persist_fails: bool,
+    /// Rule names whose upsert should fail, so a mid-file import failure can be
+    /// tested. Without this the fake daemon has no failure mode at all and the
+    /// central atomicity claim goes unexercised.
+    upsert_fails_for: Arc<Mutex<Vec<String>>>,
 }
 
 /// One mutation seen by the fake daemon.
@@ -90,15 +97,29 @@ impl Firewall for FakeDaemon {
         req: Request<pb::VerdictRequest>,
     ) -> Result<Response<pb::VerdictResponse>, Status> {
         let req = req.into_inner();
+        let wanted_rule = req.persist_scope.is_some();
         self.verdicts.lock().unwrap().push(Verdict {
             prompt_id: req.prompt_id,
             action: req.action,
             duration: req.duration,
             scope: req.persist_scope,
         });
+        // A real daemon reports the rule separately from the verdict, and can
+        // apply one without saving the other.
+        let persisted = wanted_rule && !self.rule_persist_fails;
         Ok(Response::new(pb::VerdictResponse {
             accepted: true,
             error: String::new(),
+            persisted_rule_id: if persisted {
+                "11111111-1111-4111-8111-111111111111".to_string()
+            } else {
+                String::new()
+            },
+            persist_error: if wanted_rule && self.rule_persist_fails {
+                "storage: disk full".to_string()
+            } else {
+                String::new()
+            },
         }))
     }
 
@@ -141,10 +162,19 @@ impl Firewall for FakeDaemon {
             .into_inner()
             .rule
             .ok_or_else(|| Status::invalid_argument("rule required"))?;
+        if self.upsert_fails_for.lock().unwrap().contains(&r.name) {
+            return Err(Status::invalid_argument(format!(
+                "rule `{}` refused by this test daemon",
+                r.name
+            )));
+        }
+        // A real daemon parses the id and stores the canonical form, so an
+        // uppercase or braced spelling comes back lowercase-hyphenated. Echoing
+        // it verbatim is what let the import bug hide.
         let id = if r.id.is_empty() {
             format!("minted-{}", self.calls.lock().unwrap().len())
         } else {
-            r.id.clone()
+            r.id.to_ascii_lowercase()
         };
         self.calls.lock().unwrap().push(Call::Upsert(id.clone()));
         Ok(Response::new(pb::UpsertRuleResponse {
@@ -642,6 +672,20 @@ async fn import_fixture(
     Arc<Mutex<Vec<Call>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    import_fixture_failing(tag, existing, Vec::new()).await
+}
+
+/// Same, but the daemon refuses the named rules - the only way to exercise a
+/// failure that lands *after* some rules have already been applied.
+async fn import_fixture_failing(
+    tag: &str,
+    existing: Vec<pb::RuleInfo>,
+    refuse: Vec<String>,
+) -> (
+    std::path::PathBuf,
+    Arc<Mutex<Vec<Call>>>,
+    tokio::task::JoinHandle<()>,
+) {
     let path = socket_path(tag);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let server = serve(
@@ -649,6 +693,7 @@ async fn import_fixture(
         FakeDaemon {
             existing: Arc::new(Mutex::new(existing)),
             calls: calls.clone(),
+            upsert_fails_for: Arc::new(Mutex::new(refuse)),
             ..Default::default()
         },
     )
@@ -822,6 +867,125 @@ async fn import_without_replace_never_deletes() {
     assert!(
         !calls.iter().any(|c| matches!(c, Call::Delete(_))),
         "an additive import must not remove anything: {calls:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upsert_that_fails_midway_leaves_the_old_rules_in_place() {
+    // The central claim of the reordering, and the one case the earlier tests
+    // could not reach: validation passes, the apply phase starts, and the
+    // daemon refuses a rule anyway (a duration it will not persist, a storage
+    // error, version skew). "Old rules linger" must hold - an emptied rule set
+    // against a fail-closed table is a machine with no outbound network.
+    let existing = vec![
+        stub_rule("11111111-1111-4111-8111-111111111111", "old-a"),
+        stub_rule("55555555-5555-4555-8555-555555555555", "old-b"),
+    ];
+    let (path, calls, server) =
+        import_fixture_failing("import-midway", existing, vec!["boom".to_string()]).await;
+
+    let ok = rule_json("22222222-2222-4222-8222-222222222222", "fine", "deny");
+    let bad = rule_json("33333333-3333-4333-8333-333333333333", "boom", "deny");
+    let json = format!("[{ok},{bad}]");
+
+    let out = run_cli_with_stdin(
+        &[
+            "--socket",
+            path.to_str().unwrap(),
+            "rules",
+            "import",
+            "--replace",
+        ],
+        Some(&json),
+        Duration::from_secs(10),
+    );
+    assert!(
+        !out.status.success(),
+        "a refused rule must fail the command"
+    );
+
+    let calls = calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Delete(_))),
+        "nothing may be deleted once the apply phase has failed: {calls:?}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("boom"),
+        "the message must name the rule that failed: {err}"
+    );
+    assert!(
+        err.contains("1 rules were already applied"),
+        "and say how far it got, because the state is now partial: {err}"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uppercase_id_updates_the_rule_instead_of_deleting_it() {
+    // `Uuid::parse_str` accepts uppercase; the daemon stores and lists the
+    // canonical lowercase form. Keying the skip-set on the file's spelling meant
+    // the rule was upserted and then deleted as "absent from the import" - and
+    // the first version of this suite could not see it, because the fake daemon
+    // echoed the id back verbatim instead of canonicalising it.
+    let shared_lower = "11111111-1111-4111-8111-111111111111";
+    let (path, calls, server) =
+        import_fixture("import-case", vec![stub_rule(shared_lower, "shared")]).await;
+
+    let json = format!(
+        "[{}]",
+        rule_json(&shared_lower.to_ascii_uppercase(), "shared", "deny")
+    );
+    let out = run_cli_with_stdin(
+        &[
+            "--socket",
+            path.to_str().unwrap(),
+            "rules",
+            "import",
+            "--replace",
+        ],
+        Some(&json),
+        Duration::from_secs(10),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Delete(_))),
+        "the rule the import carried must survive it: {calls:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_rules_sharing_an_id_are_refused_before_anything_is_applied() {
+    // The second upsert overwrites the first, so the file describes a state the
+    // import cannot produce; the printed count would exceed what the daemon
+    // holds, and under --replace a rule the operator believes they imported
+    // would not exist.
+    let (path, calls, server) = import_fixture("import-dup", Vec::new()).await;
+    let id = "22222222-2222-4222-8222-222222222222";
+    let json = format!(
+        "[{},{}]",
+        rule_json(id, "one", "allow"),
+        rule_json(id, "two", "deny")
+    );
+
+    let out = run_cli_with_stdin(
+        &["--socket", path.to_str().unwrap(), "rules", "import"],
+        Some(&json),
+        Duration::from_secs(10),
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("share the id"), "{err}");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a file describing a state it cannot produce must change nothing"
     );
     server.abort();
 }

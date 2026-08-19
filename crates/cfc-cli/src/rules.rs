@@ -457,9 +457,28 @@ pub async fn import(
     // first turns that class of failure into "nothing happened, here is why".
     let mut pending = Vec::with_capacity(rules.len());
     let mut problems = Vec::new();
+    let mut seen_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for r in rules {
         match r.try_into_proto() {
-            Ok(pb) => pending.push(pb),
+            Ok(pb) => {
+                // Two rules sharing an id are not two rules: the second upsert
+                // overwrites the first, so the file describes a state the
+                // import cannot produce and the count printed at the end is
+                // higher than what the daemon ends up holding. Under --replace
+                // the operator also loses a rule they believe they imported.
+                if !pb.id.is_empty() {
+                    let key = pb.id.to_ascii_lowercase();
+                    if let Some(first) = seen_ids.insert(key, pb.name.clone()) {
+                        problems.push(format!(
+                            "rules `{first}` and `{}` share the id `{}`; each rule \
+                             needs its own, or an empty one to be assigned a new id",
+                            pb.name, pb.id
+                        ));
+                        continue;
+                    }
+                }
+                pending.push(pb)
+            }
             Err(e) => problems.push(e),
         }
     }

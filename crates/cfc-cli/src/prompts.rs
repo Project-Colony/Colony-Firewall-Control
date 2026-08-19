@@ -597,9 +597,23 @@ async fn submit(
     duration: proto::Duration,
     scope: Option<proto::RuleScope>,
 ) -> Result<bool, CliError> {
-    Ok(client
+    let wanted_rule = scope.is_some();
+    let outcome = client
         .submit_verdict(prompt_id, action, duration, scope)
-        .await?)
+        .await?;
+    // Said out loud rather than folded into the boolean: `accepted` is about
+    // the connection, not about the rule, and an operator answering prompts
+    // needs to know a standing answer did not stick.
+    if outcome.accepted && wanted_rule && !outcome.rule_persisted {
+        eprintln!(
+            "warning: {}",
+            outcome
+                .persist_error
+                .as_deref()
+                .unwrap_or("the answer applied, but no lasting rule was saved")
+        );
+    }
+    Ok(outcome.accepted)
 }
 
 fn report(

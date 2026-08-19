@@ -128,6 +128,23 @@ pub struct Client {
     inner: FirewallClient<Channel>,
 }
 
+/// What came back from answering a prompt.
+///
+/// `accepted` and `rule_persisted` are separate questions and were previously
+/// conflated: the first says the verdict reached a waiting connection, the
+/// second says a standing rule was written. A storage failure leaves the first
+/// true and the second false, and a client that reports "Rule created" on the
+/// strength of `accepted` alone tells the user something untrue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictOutcome {
+    /// The verdict reached a prompt that was still waiting.
+    pub accepted: bool,
+    /// A standing rule was asked for *and* stored.
+    pub rule_persisted: bool,
+    /// Why the rule could not be stored, when one was asked for and failed.
+    pub persist_error: Option<String>,
+}
+
 impl Client {
     pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = socket_path.as_ref().to_path_buf();
@@ -231,15 +248,20 @@ impl Client {
         action: proto::Action,
         duration: proto::Duration,
         persist_scope: Option<proto::RuleScope>,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<VerdictOutcome, ClientError> {
+        let wanted_rule = persist_scope.is_some();
         let req = proto::VerdictRequest {
             prompt_id: prompt_id.to_string(),
             action: action as i32,
             duration: duration as i32,
             persist_scope,
         };
-        let resp = self.inner.submit_verdict(req).await?;
-        Ok(resp.into_inner().accepted)
+        let resp = self.inner.submit_verdict(req).await?.into_inner();
+        Ok(VerdictOutcome {
+            accepted: resp.accepted,
+            rule_persisted: wanted_rule && !resp.persisted_rule_id.is_empty(),
+            persist_error: (!resp.persist_error.is_empty()).then_some(resp.persist_error),
+        })
     }
 
     pub async fn stream_connections(

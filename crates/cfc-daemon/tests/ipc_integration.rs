@@ -491,7 +491,8 @@ async fn prompt_round_trip_answers_the_worker_and_persists_the_rule() {
             Some(scope_port(443)),
         )
         .await
-        .expect("submitting the verdict");
+        .expect("submitting the verdict")
+        .accepted;
     assert!(accepted, "the prompt was pending, so the answer must land");
 
     // (a) the worker gets exactly the verdict the user picked...
@@ -529,7 +530,8 @@ async fn prompt_answered_without_a_scope_persists_nothing() {
     let accepted = client
         .submit_verdict("7", pb::Action::Deny, pb::Duration::Once, None)
         .await
-        .expect("submitting the verdict");
+        .expect("submitting the verdict")
+        .accepted;
     assert!(accepted);
 
     assert_eq!(d.next_verdict().await.verdict.action, Action::Deny);
@@ -578,7 +580,8 @@ async fn prompt_timeout_falls_back_and_makes_a_late_answer_a_no_op() {
     let accepted = client
         .submit_verdict("9", pb::Action::Allow, pb::Duration::Always, None)
         .await
-        .expect("submitting a late verdict");
+        .expect("submitting a late verdict")
+        .accepted;
     assert!(!accepted, "a resolved prompt cannot be answered again");
     d.assert_no_verdict();
 }
@@ -617,7 +620,7 @@ async fn verdict_for_an_undelivered_prompt_is_refused() {
     if running_as_root() {
         // Root is exempt from the ownership check, so it gets as far as the
         // router, which has no such prompt.
-        assert!(!result.expect("root may submit"), "no such prompt");
+        assert!(!result.expect("root may submit").accepted, "no such prompt");
     } else {
         let status = status_of(result.expect_err("the ownership check must refuse"));
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
@@ -713,10 +716,13 @@ async fn unattributed_prompt_is_delivered_to_any_session() {
     );
 
     // Delivered, therefore answerable.
-    assert!(client
-        .submit_verdict("78", pb::Action::Deny, pb::Duration::Once, None)
-        .await
-        .expect("submitting the verdict"));
+    assert!(
+        client
+            .submit_verdict("78", pb::Action::Deny, pb::Duration::Once, None)
+            .await
+            .expect("submitting the verdict")
+            .accepted
+    );
     assert_eq!(d.next_verdict().await.verdict.action, Action::Deny);
 }
 

@@ -97,8 +97,18 @@ async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) {
                 return;
             }
         };
-    if let Some(note) = outcome.note() {
-        info!("rule exe path: {note}");
+    // A rewrite is a policy-relevant change nobody typed - the stored rule is
+    // about a different path than the one sent - so it is a warning, not a note.
+    // The client that sent it may have no way to show the difference.
+    match &outcome {
+        cfc_core::ResolvedExe::Rewritten { .. } => {
+            warn!("rule exe path: {}", outcome.note().unwrap_or_default())
+        }
+        _ => {
+            if let Some(note) = outcome.note() {
+                info!("rule exe path: {note}");
+            }
+        }
     }
     scope.exe_path = Some(outcome.into_path());
 }
@@ -386,6 +396,7 @@ impl Firewall for FirewallService {
         };
 
         let mut persisted_rule = None;
+        let mut persist_error = String::new();
         if let Some(scope_pb) = req.persist_scope.clone() {
             let mut scope = convert::scope_from_pb(&scope_pb).map_err(Status::invalid_argument)?;
             // The same resolution UpsertRule does. This is the *higher volume*
@@ -408,11 +419,25 @@ impl Firewall for FirewallService {
                 created_at: chrono::Utc::now(),
                 hit_count: 0,
             };
-            if let Err(e) = self.store.upsert(&rule) {
-                warn!("failed to persist rule from prompt verdict: {e}");
-            } else {
-                persisted_rule = Some(rule.id);
-                self.engine.upsert_rule(rule);
+            match self.store.upsert(&rule) {
+                Ok(()) => {
+                    persisted_rule = Some(rule.id);
+                    self.engine.upsert_rule(rule);
+                }
+                Err(e) => {
+                    // Reported to the caller, not only to the journal. The
+                    // verdict itself is still valid and still applies to the
+                    // waiting connection - only the standing rule failed - so
+                    // this must not turn into `accepted = false`. But a client
+                    // that says "Rule created" on the strength of `accepted`
+                    // alone is telling the user something untrue, which for a
+                    // firewall is the worst kind of wrong.
+                    warn!("failed to persist rule from prompt verdict: {e}");
+                    persist_error = format!(
+                        "the verdict was applied, but the \
+                         standing rule could not be saved: {e}"
+                    );
+                }
             }
         }
 
@@ -434,6 +459,8 @@ impl Firewall for FirewallService {
 
         Ok(Response::new(VerdictResponse {
             accepted,
+            persisted_rule_id: persisted_rule.map(|id| id.to_string()).unwrap_or_default(),
+            persist_error,
             error: if accepted {
                 String::new()
             } else {

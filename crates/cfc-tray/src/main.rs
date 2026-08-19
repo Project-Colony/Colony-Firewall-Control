@@ -679,18 +679,29 @@ async fn submit_prompt_verdict(
     let c = client.as_mut().expect("connected above");
     let (action, duration, scope) = model::verdict_for(choice, exe);
     match c.submit_verdict(prompt_id, action, duration, scope).await {
-        Ok(true) => {
+        Ok(o) if o.accepted => {
             debug!(prompt_id, ?choice, "verdict accepted");
             // Both persisted choices confirm. Allow now grants standing
             // access, so saying so is what makes an accidental click
             // something the user can notice and undo.
-            match choice {
-                PromptChoice::BlockAlways => notify_brief(model::block_confirmation(exe)),
-                PromptChoice::AllowAlways => notify_brief(model::allow_confirmation(exe)),
-                PromptChoice::DenyOnce => {}
+            //
+            // Confirming on `accepted` alone was a lie waiting to happen: the
+            // verdict reaching the connection and the rule reaching the disk
+            // are separate outcomes, and a full or read-only /var/lib leaves
+            // the first true and the second false. Announcing a standing rule
+            // that does not exist is worse than announcing nothing - the user
+            // stops watching for the prompt that will come back.
+            match (choice, o.rule_persisted) {
+                (PromptChoice::DenyOnce, _) => {}
+                (PromptChoice::BlockAlways, true) => notify_brief(model::block_confirmation(exe)),
+                (PromptChoice::AllowAlways, true) => notify_brief(model::allow_confirmation(exe)),
+                (_, false) => {
+                    warn!(prompt_id, ?choice, "verdict applied but no rule was saved");
+                    notify_brief(model::rule_not_saved(exe, o.persist_error.as_deref()));
+                }
             }
         }
-        Ok(false) => {
+        Ok(_) => {
             info!(prompt_id, "verdict too late - prompt already resolved");
             notify_brief("Too late — the daemon already applied its default".into());
         }

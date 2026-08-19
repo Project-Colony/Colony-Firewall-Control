@@ -58,6 +58,16 @@ message VerdictRequest {
 message VerdictResponse {
   bool accepted = 1;
   string error = 2;
+  // Set when persist_scope was given AND the rule was actually stored.
+  //
+  // `accepted` is about the *prompt* - it says the verdict reached a waiting
+  // connection. It says nothing about the standing rule, and a storage failure
+  // used to leave the client announcing "Rule created" for a rule that did not
+  // exist. Empty means either no rule was asked for, or one was asked for and
+  // could not be written; `persist_error` distinguishes them.
+  string persisted_rule_id = 3;
+  // Why the rule could not be stored. Empty when nothing went wrong.
+  string persist_error = 4;
 }
 
 message ConnectionEvent {

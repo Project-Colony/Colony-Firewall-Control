@@ -1531,12 +1531,21 @@ async fn submit_verdict(
     scope: Option<proto::RuleScope>,
     duration: proto::Duration,
 ) -> Result<(String, bool), String> {
+    let wanted_rule = scope.is_some();
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
-    let accepted = client
+    let outcome = client
         .submit_verdict(&prompt_id, action, duration, scope)
         .await
         .map_err(|e| e.to_string())?;
-    Ok((prompt_id, accepted))
+    // A verdict that applied but saved no rule is not a success to report
+    // quietly: the user asked for a lasting answer, did not get one, and will
+    // be prompted again by the next connection from the same program.
+    if outcome.accepted && wanted_rule && !outcome.rule_persisted {
+        return Err(outcome
+            .persist_error
+            .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()));
+    }
+    Ok((prompt_id, outcome.accepted))
 }
 
 #[cfg(test)]

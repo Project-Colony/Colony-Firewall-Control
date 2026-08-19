@@ -66,7 +66,27 @@ index - but "should be fine" is not "was observed".
 
 ---
 
-## 3. Rules should bind to the binary, not to its path
+## 3. Executable paths: what resolution does and does not fix
+
+Rules now resolve their `exe_path` to the form `/proc/<pid>/exe` reports, at
+every place a path is entered (`cfc_core::exe_path`). Three properties of that
+are worth stating rather than discovering:
+
+- **Forward-only.** Rules already on disk are never re-resolved. An install
+  that wrote `/bin/curl` before this existed keeps an inert rule after
+  upgrading. The repair is one round trip - `cfc rules export > r.json &&
+  cfc rules import --replace r.json` - because upsert resolves.
+- **A versioned symlink resolves to a version.** `/usr/bin/python ->
+  python3.13` stores `python3.13` and stops applying when the symlink moves.
+  Not a regression (the unresolved rule never matched either), but a new
+  *time-dependent* failure, and worse for a Deny than an Allow.
+- **It follows symlinks the path's owner controls.** A rule for
+  `/home/bob/tool` pointing at `/usr/bin/curl` becomes a rule about curl. The
+  CLI prints what it stored and the daemon warns; nothing pins the inode.
+
+---
+
+## 4. Rules should bind to the binary, not to its path
 
 A rule created from a prompt carries `exe_path` and leaves `exe_sha256` empty
 (`crates/cfc-tray/src/model.rs`, `verdict_for`). The rule therefore follows the
@@ -83,7 +103,7 @@ path otherwise, and say which in the prompt.
 
 ---
 
-## 4. The tray icon fallback does not work where it is needed
+## 5. The tray icon fallback does not work where it is needed
 
 `icon_pixmap` carries an embedded raster precisely so the tray is usable before
 the package installs the theme SVG. Observed on quickshell/Noctalia: the host
@@ -95,7 +115,7 @@ should notice it has no resolvable theme icon and say so.
 
 ---
 
-## 5. Verify the CI that was written for this
+## 6. Verify the CI that was written for this
 
 Neither `.github/workflows/ebpf.yml` nor `.github/workflows/rhel.yml` has ever
 executed - a workflow cannot be run from a working tree. The YAML parses, the
@@ -110,7 +130,7 @@ object).
 
 ---
 
-## 6. The AUR package ships no BPF object
+## 7. The AUR package ships no BPF object
 
 Deliberate, for a reason that is not going away on its own: on Arch `rustup`
 conflicts with `rust`, which the packaging containers install, so

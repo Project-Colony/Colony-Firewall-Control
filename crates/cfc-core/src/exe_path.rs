@@ -27,6 +27,32 @@
 //! refusing it would be worse than storing it verbatim. Callers that can say
 //! something useful about that case — the CLI can, the daemon cannot — are
 //! expected to warn.
+//!
+//! # Three properties worth knowing before relying on this
+//!
+//! **A versioned symlink resolves to a version.** `/usr/bin/python ->
+//! python3.13` stores `/usr/bin/python3.13`, which stops applying the next time
+//! that symlink moves — silently, with the rule still listed and still
+//! plausible. Matching-wise this is not a regression (the unresolved rule never
+//! matched either), but it is a *new, time-dependent* failure and it is the one
+//! a reader should expect. It matters most for a Deny: an allow that stops
+//! applying prompts, a deny that stops applying does not.
+//!
+//! **Resolution follows symlinks whoever owns the path controls.** A rule
+//! written for `/home/bob/tool`, where Bob has pointed that at `/usr/bin/curl`,
+//! is stored as a rule about curl — and for an Allow that widens the policy to
+//! every user's curl. The CLI prints what it stored for exactly this reason;
+//! the daemon logs it at warn. Nothing pins the inode, so this is a plain
+//! time-of-check/time-of-use gap and always was.
+//!
+//! **It is forward-only.** Rules already on disk are never re-resolved: the
+//! daemon loads them as written, so an install that wrote `/bin/curl` before
+//! this existed keeps an inert rule after upgrading. The repair is one round
+//! trip, because import re-upserts every rule and upsert resolves:
+//!
+//! ```sh
+//! cfc rules export > rules.json && cfc rules import --replace rules.json
+//! ```
 
 use std::path::{Path, PathBuf};
 
