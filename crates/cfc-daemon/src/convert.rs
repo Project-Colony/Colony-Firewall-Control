@@ -61,12 +61,28 @@ pub fn protocol_to_pb(p: Protocol) -> pb::Protocol {
     }
 }
 
-pub fn protocol_from_pb(p: i32) -> Protocol {
-    match pb::Protocol::try_from(p).unwrap_or(pb::Protocol::Unspecified) {
-        pb::Protocol::Tcp => Protocol::Tcp,
-        pb::Protocol::Udp => Protocol::Udp,
-        pb::Protocol::Icmp => Protocol::Icmp,
-        _ => Protocol::Other(0),
+/// Fails closed, like [`action_from_pb`] and [`duration_from_pb`].
+///
+/// The previous `_ => Protocol::Other(0)` was worse than a wrong answer: a
+/// scope carrying `has_protocol = true` with an unspecified or unrecognised
+/// value became a predicate that **can never match any parsed packet** - the
+/// datapath only ever produces `Other(n)` for a real IP protocol number, and 0
+/// is IPv6 hop-by-hop, which is an extension header and never a transport. The
+/// rule was therefore inert while still counting toward `specificity()`, so it
+/// also outranked the rules that would have matched.
+pub fn protocol_from_pb(p: i32) -> Result<Protocol, String> {
+    match pb::Protocol::try_from(p) {
+        Ok(pb::Protocol::Tcp) => Ok(Protocol::Tcp),
+        Ok(pb::Protocol::Udp) => Ok(Protocol::Udp),
+        Ok(pb::Protocol::Icmp) => Ok(Protocol::Icmp),
+        // `Other` has no number on the wire to carry, so a scope cannot express
+        // "protocol 47" and must not pretend to.
+        Ok(pb::Protocol::Other) => Err(
+            "protocol `other` cannot be used in a rule scope: the wire format \
+             carries no protocol number for it"
+                .to_string(),
+        ),
+        Ok(pb::Protocol::Unspecified) | Err(_) => Err(format!("protocol unspecified/unknown: {p}")),
     }
 }
 
@@ -194,17 +210,37 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
     }
 }
 
-pub fn scope_from_pb(s: &pb::RuleScope) -> RuleScope {
-    RuleScope {
+/// Converts a scope from the wire, **rejecting** anything it cannot represent.
+///
+/// This is the trust boundary, and it used to be the one place in the product
+/// where a malformed field silently widened a rule. `dst_net` was
+/// `.and_then(|n| IpNet::from_str(&n).ok())`, so a typo'd CIDR became `None` -
+/// turning an Allow scoped `exe + 10.0.0.0/8` into an Allow scoped `exe`, i.e.
+/// "this program may reach anywhere". A client's own validation is not a
+/// substitute: `UpsertRule` accepts whatever any group member sends.
+///
+/// Every other field is total by construction - a string is a string, and
+/// `has_*` flags carry presence explicitly - so the only two that can fail are
+/// `dst_net` and `protocol`. Both now say why.
+pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
+    let dst_net = match empty_to_none(&s.dst_net) {
+        Some(n) => Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad dst_net `{n}`: {e}"))?),
+        None => None,
+    };
+    let protocol = match s.has_protocol {
+        true => Some(protocol_from_pb(s.protocol)?),
+        false => None,
+    };
+    Ok(RuleScope {
         exe_path: empty_to_none(&s.exe_path).map(Into::into),
         exe_sha256: empty_to_none(&s.exe_sha256),
         parent_exe: empty_to_none(&s.parent_exe).map(Into::into),
         uid: s.has_uid.then_some(s.uid),
         dst_host: empty_to_none(&s.dst_host),
-        dst_net: empty_to_none(&s.dst_net).and_then(|n| ipnet::IpNet::from_str(&n).ok()),
+        dst_net,
         dst_port: s.has_dst_port.then_some(s.dst_port as u16),
-        protocol: s.has_protocol.then(|| protocol_from_pb(s.protocol)),
-    }
+        protocol,
+    })
 }
 
 pub fn rule_to_pb(r: &Rule) -> pb::RuleInfo {
@@ -226,11 +262,10 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
     } else {
         uuid::Uuid::parse_str(&r.id).map_err(|e| format!("bad id: {e}"))?
     };
-    let scope = r
-        .scope
-        .as_ref()
-        .map(scope_from_pb)
-        .unwrap_or(RuleScope::any());
+    let scope = match r.scope.as_ref() {
+        Some(s) => scope_from_pb(s)?,
+        None => RuleScope::any(),
+    };
     let created_at = if r.created_at_unix_ms == 0 {
         chrono::Utc::now()
     } else {
@@ -461,7 +496,7 @@ mod tests {
     fn protocol_roundtrip() {
         for p in [Protocol::Tcp, Protocol::Udp, Protocol::Icmp] {
             let pb = protocol_to_pb(p) as i32;
-            assert_eq!(protocol_from_pb(pb), p);
+            assert_eq!(protocol_from_pb(pb).unwrap(), p);
         }
     }
 
@@ -495,7 +530,7 @@ mod tests {
             protocol: Some(Protocol::Tcp),
         };
         let pb = scope_to_pb(&scope);
-        let back = scope_from_pb(&pb);
+        let back = scope_from_pb(&pb).expect("a scope we produced must convert back");
         assert_eq!(back, scope);
     }
 
@@ -503,8 +538,61 @@ mod tests {
     fn scope_roundtrip_empty() {
         let scope = RuleScope::any();
         let pb = scope_to_pb(&scope);
-        let back = scope_from_pb(&pb);
+        let back = scope_from_pb(&pb).expect("a scope we produced must convert back");
         assert_eq!(back, scope);
+    }
+
+    #[test]
+    fn a_malformed_dst_net_is_refused_not_dropped() {
+        // The whole point. Dropping it to None turned "this program may reach
+        // 10.0.0.0/8" into "this program may reach anywhere" - a silent
+        // widening of policy on the path any group member can reach.
+        let mut pb = scope_to_pb(&RuleScope::any());
+        pb.exe_path = "/usr/bin/curl".into();
+        pb.dst_net = "10.0.0.0/33".into();
+        let e = scope_from_pb(&pb).expect_err("a bad CIDR must not be silently ignored");
+        assert!(
+            e.contains("dst_net"),
+            "the message must name the field: {e}"
+        );
+        assert!(e.contains("10.0.0.0/33"), "and quote the value: {e}");
+
+        // A rule carrying it is refused whole, rather than persisted narrower
+        // than it reads.
+        let mut r = rule_to_pb(&Rule::new("x", Action::Allow, RuleScope::any()));
+        r.scope = Some(pb);
+        assert!(rule_from_pb(&r).is_err());
+    }
+
+    #[test]
+    fn an_unspecified_protocol_is_refused_rather_than_made_unmatchable() {
+        // has_protocol = true with UNSPECIFIED used to become Other(0), a
+        // predicate no parsed packet can ever satisfy - so the rule was inert
+        // *and* outranked the rules that would have matched, because an unset
+        // predicate and an unmatchable one score the same specificity.
+        let mut pb = scope_to_pb(&RuleScope::any());
+        pb.has_protocol = true;
+        pb.protocol = cfc_proto::v1::Protocol::Unspecified as i32;
+        assert!(scope_from_pb(&pb).is_err());
+
+        // Same for a value from a newer client this build does not know.
+        pb.protocol = 9999;
+        assert!(scope_from_pb(&pb).is_err());
+
+        // And for `other`, which carries no protocol number on the wire, so a
+        // scope cannot express it even in principle.
+        pb.protocol = cfc_proto::v1::Protocol::Other as i32;
+        assert!(scope_from_pb(&pb).is_err());
+    }
+
+    #[test]
+    fn an_absent_protocol_is_still_absent_not_an_error() {
+        // has_protocol = false is the ordinary "this rule says nothing about
+        // protocol" case and must stay total.
+        let mut pb = scope_to_pb(&RuleScope::any());
+        pb.has_protocol = false;
+        pb.protocol = 9999;
+        assert_eq!(scope_from_pb(&pb).unwrap().protocol, None);
     }
 
     #[test]

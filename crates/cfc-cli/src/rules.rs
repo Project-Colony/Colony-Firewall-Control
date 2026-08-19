@@ -359,12 +359,27 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
         DurationArg::Always => proto::Duration::Always,
     };
 
+    // Resolve the path to the form /proc reports, and say so. Rules match on
+    // exact string equality, so `--exe /bin/curl` on a usr-merged host produces
+    // a rule that lists, ranks by specificity, and never fires - the worst
+    // failure a rule can have, because it is indistinguishable from working.
+    let exe = match args.exe.as_deref() {
+        Some(p) => {
+            let outcome = cfc_core::exe_path::resolve(p);
+            if let Some(note) = outcome.note() {
+                if outcome.is_inert() {
+                    eprintln!("warning: {note}");
+                } else {
+                    eprintln!("note: {note}");
+                }
+            }
+            outcome.into_path().to_string_lossy().into_owned()
+        }
+        None => String::new(),
+    };
+
     let scope = proto::RuleScope {
-        exe_path: args
-            .exe
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        exe_path: exe,
         exe_sha256: String::new(),
         parent_exe: String::new(),
         uid: args.uid.unwrap_or(0),
@@ -432,23 +447,91 @@ pub async fn import(
 
     let rules: Vec<ExportedRule> = serde_json::from_str(&json).context("parsing JSON")?;
 
+    // --- 1. validate everything before touching anything --------------------
+    //
+    // The old order was: delete every existing rule, then upsert one at a time
+    // and abort on the first failure. A single unrecognised field therefore
+    // left the daemon with an **emptied** rule set and a partial import - and
+    // because the nftables ruleset is fail-closed, an emptied rule set is not a
+    // degraded firewall, it is a machine with no outbound network. Validating
+    // first turns that class of failure into "nothing happened, here is why".
+    let mut pending = Vec::with_capacity(rules.len());
+    let mut problems = Vec::new();
+    for r in rules {
+        match r.try_into_proto() {
+            Ok(pb) => pending.push(pb),
+            Err(e) => problems.push(e),
+        }
+    }
+    if !problems.is_empty() {
+        // Every problem, not just the first: an operator fixing an export by
+        // hand should learn about all of them in one pass.
+        for p in &problems {
+            eprintln!("  {p}");
+        }
+        return Err(anyhow::anyhow!(
+            "{} of {} rules could not be read; nothing was changed",
+            problems.len(),
+            problems.len() + pending.len()
+        )
+        .into());
+    }
+
+    // --- 2. apply, in the order that has no empty window --------------------
+    //
+    // Upserts first, deletions last. There is no server-side transaction, so
+    // something has to be the failure window; making it "old rules linger"
+    // rather than "no rules at all" is the only choice that cannot take the
+    // machine's network down. Lingering rules are the status quo of a second
+    // ago, not a new grant.
+    let existing = if replace {
+        client.list_rules().await?
+    } else {
+        Vec::new()
+    };
+
+    let mut imported = 0u32;
+    let mut imported_ids = std::collections::HashSet::new();
+    for pb in pending {
+        let name = pb.name.clone();
+        if !pb.id.is_empty() {
+            imported_ids.insert(pb.id.clone());
+        }
+        client.upsert_rule(pb).await.with_context(|| {
+            format!("importing rule `{name}`; {imported} rules were already applied")
+        })?;
+        imported += 1;
+    }
+
+    // Only now, and only for rules the import did not already carry: an
+    // imported rule that shares an id with an existing one was *updated* by the
+    // upsert above, so deleting it here would throw away the thing just
+    // imported. That is the bug this set exists to prevent.
+    let mut removed = 0u32;
     if replace {
-        let existing = client.list_rules().await?;
-        for r in existing {
-            let _ = client.delete_rule(&r.id).await;
+        for r in &existing {
+            if imported_ids.contains(r.id.as_str()) {
+                continue;
+            }
+            client
+                .delete_rule(&r.id)
+                .await
+                .with_context(|| format!("removing rule `{}`, absent from the import", r.id))?;
+            removed += 1;
         }
     }
 
-    let mut added = 0u32;
-    for r in rules {
-        let pb = r.into_proto();
-        client.upsert_rule(pb).await?;
-        added += 1;
-    }
     if format.is_json() {
-        return output::print_json(&serde_json::json!({ "imported": added }));
+        return output::print_json(&serde_json::json!({
+            "imported": imported,
+            "removed": removed,
+        }));
     }
-    println!("imported {added} rules");
+    if replace {
+        println!("imported {imported} rules, removed {removed} that were not in the file");
+    } else {
+        println!("imported {imported} rules");
+    }
     Ok(())
 }
 
@@ -526,27 +609,57 @@ fn default_duration() -> String {
 }
 
 impl ExportedRule {
-    pub fn into_proto(self) -> proto::RuleInfo {
+    /// Converts one imported rule, **refusing** anything it does not recognise.
+    ///
+    /// This used to be `into_proto`, and every one of its three string matches
+    /// ended in `_ =>` a permissive default - most seriously
+    /// `_ => proto::Action::Allow`. A typo (`block`, `denied`), a truncated
+    /// file, or a rule exported by a newer version therefore imported as an
+    /// **allow**. It was the only string-to-enum mapping in the product that
+    /// did not fail closed, and it sat on the path an operator uses to restore
+    /// rules after an incident - the moment they can least afford it.
+    ///
+    /// The daemon now rejects an unspecified protocol too (`convert.rs`), so
+    /// this is the outer of two gates rather than the only one; it exists to
+    /// name the offending rule and field, which the wire error cannot.
+    pub fn try_into_proto(self) -> Result<proto::RuleInfo, String> {
+        let name = self.name.clone();
+        let bad = |field: &str, value: &str, allowed: &str| {
+            format!("rule `{name}`: unknown {field} `{value}` (expected one of: {allowed})")
+        };
+
         let action = match self.action.to_ascii_lowercase().as_str() {
+            "allow" => proto::Action::Allow,
             "deny" => proto::Action::Deny,
             "reject" => proto::Action::Reject,
-            _ => proto::Action::Allow,
+            other => return Err(bad("action", other, "allow, deny, reject")),
         };
         let duration = match self.duration.to_ascii_lowercase().as_str() {
+            "always" => proto::Duration::Always,
             "once" => proto::Duration::Once,
             "until-restart" | "until_restart" => proto::Duration::UntilRestart,
-            _ => proto::Duration::Always,
+            other => return Err(bad("duration", other, "always, once, until-restart")),
         };
-        let protocol_idx =
-            self.scope
-                .protocol
-                .as_deref()
-                .map(|p| match p.to_ascii_lowercase().as_str() {
-                    "tcp" => proto::Protocol::Tcp as i32,
-                    "udp" => proto::Protocol::Udp as i32,
-                    "icmp" => proto::Protocol::Icmp as i32,
-                    _ => 0,
-                });
+        let protocol_idx = match self.scope.protocol.as_deref() {
+            None => None,
+            Some(p) => Some(match p.to_ascii_lowercase().as_str() {
+                "tcp" => proto::Protocol::Tcp as i32,
+                "udp" => proto::Protocol::Udp as i32,
+                "icmp" => proto::Protocol::Icmp as i32,
+                other => return Err(bad("protocol", other, "tcp, udp, icmp")),
+            }),
+        };
+        // Checked here as well as in the daemon so the message can say which
+        // rule in the file is at fault; the daemon only ever sees one rule at a
+        // time and cannot.
+        if let Some(net) = self.scope.dst_net.as_deref() {
+            net.parse::<ipnet::IpNet>()
+                .map_err(|e| format!("rule `{name}`: bad dst_net `{net}`: {e}"))?;
+        }
+        if !self.id.is_empty() {
+            uuid::Uuid::parse_str(&self.id)
+                .map_err(|e| format!("rule `{name}`: bad id `{}`: {e}", self.id))?;
+        }
         let scope = proto::RuleScope {
             exe_path: self.scope.exe_path.unwrap_or_default(),
             exe_sha256: self.scope.exe_sha256.unwrap_or_default(),
@@ -560,7 +673,7 @@ impl ExportedRule {
             protocol: protocol_idx.unwrap_or(0),
             has_protocol: protocol_idx.is_some(),
         };
-        proto::RuleInfo {
+        Ok(proto::RuleInfo {
             id: self.id,
             name: self.name,
             enabled: self.enabled,
@@ -569,7 +682,7 @@ impl ExportedRule {
             scope: Some(scope),
             created_at_unix_ms: 0,
             hit_count: 0,
-        }
+        })
     }
 }
 
@@ -858,11 +971,18 @@ struct BundleRule {
 
 impl BundleRule {
     /// The path to use on this machine, or `None` if the program is not here.
-    fn resolve(&self) -> Option<&'static str> {
+    ///
+    /// `is_file()` follows symlinks, so the first *existing* candidate can be a
+    /// link — and a rule stored for the link never matches, because /proc
+    /// reports the target. The shipped lists happen to put `/usr/...` first
+    /// everywhere, so they escaped this by luck rather than design; a
+    /// distribution that lays things out differently would not have.
+    fn resolve(&self) -> Option<PathBuf> {
         self.exe_candidates
             .iter()
             .copied()
             .find(|p| std::path::Path::new(p).is_file())
+            .map(|p| cfc_core::exe_path::resolve(std::path::Path::new(p)).into_path())
     }
 }
 
@@ -1154,8 +1274,9 @@ fn find_bundle(name: &str) -> Result<Bundle, CliError> {
 
 /// What a bundle would do on *this* machine.
 struct Planned {
-    /// Entries whose program is installed here.
-    present: Vec<(&'static str, &'static str)>,
+    /// Entries whose program is installed here, with the path as /proc will
+    /// report it - not necessarily the candidate that matched.
+    present: Vec<(&'static str, PathBuf)>,
     /// Entries skipped because no candidate path exists.
     absent: Vec<&'static str>,
 }
@@ -1296,13 +1417,19 @@ pub async fn bundle_add(
         let spec = &by_name[*rule_name];
         if !dry_run {
             client
-                .upsert_rule(allow_rule(rule_name, exe, spec.dst_port, spec.protocol))
+                .upsert_rule(allow_rule(
+                    rule_name,
+                    &exe.to_string_lossy(),
+                    spec.dst_port,
+                    spec.protocol,
+                ))
                 .await?;
         }
         if !format.is_json() {
             println!(
-                "{}: {rule_name}  ({exe}{})",
+                "{}: {rule_name}  ({}{})",
                 if dry_run { "would add" } else { "added" },
+                exe.display(),
                 spec.dst_port
                     .map(|p| format!(" -> :{p}"))
                     .unwrap_or_default()
@@ -1513,6 +1640,100 @@ mod resolve_tests {
 mod json_tests {
     use super::*;
 
+    fn exported(action: &str) -> ExportedRule {
+        ExportedRule {
+            id: String::new(),
+            name: "t".into(),
+            enabled: true,
+            action: action.into(),
+            duration: "always".into(),
+            scope: ExportedScope {
+                exe_path: Some("/usr/bin/curl".into()),
+                exe_sha256: None,
+                parent_exe: None,
+                uid: None,
+                dst_host: None,
+                dst_net: None,
+                dst_port: None,
+                protocol: None,
+            },
+        }
+    }
+
+    #[test]
+    fn an_unknown_action_is_refused_and_never_becomes_allow() {
+        // The single most dangerous line this change removes. `_ => Allow`
+        // meant a typo, a truncated file, or a rule written by a newer version
+        // imported as an **allow** - on the path an operator uses to restore
+        // rules after an incident.
+        for typo in ["block", "denied", "DENY ", "", "drop"] {
+            let e = exported(typo)
+                .try_into_proto()
+                .expect_err("`{typo}` must not be accepted");
+            assert!(e.contains("unknown action"), "{e}");
+            assert!(
+                e.contains("allow, deny, reject"),
+                "the message must say what is valid: {e}"
+            );
+        }
+        // The three real ones still work, in any case.
+        for good in ["allow", "Deny", "REJECT"] {
+            assert!(exported(good).try_into_proto().is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_duration_or_protocol_is_refused_too() {
+        let mut r = exported("deny");
+        r.duration = "forever".into();
+        assert!(r.try_into_proto().unwrap_err().contains("unknown duration"));
+
+        let mut r = exported("deny");
+        r.scope.protocol = Some("sctp".into());
+        assert!(r.try_into_proto().unwrap_err().contains("unknown protocol"));
+
+        // Absent is not unknown.
+        let mut r = exported("deny");
+        r.scope.protocol = None;
+        assert!(r.try_into_proto().is_ok());
+    }
+
+    #[test]
+    fn a_malformed_dst_net_is_caught_before_the_daemon_sees_it() {
+        // The daemon rejects it too, but only one rule at a time - by then
+        // earlier rules in the file have already been applied. Catching it here
+        // is what lets the import report the offending rule by name and change
+        // nothing at all.
+        let mut r = exported("allow");
+        r.scope.dst_net = Some("10.0.0.0/33".into());
+        let e = r.try_into_proto().unwrap_err();
+        assert!(e.contains("dst_net"), "{e}");
+        assert!(e.contains("`t`"), "the message must name the rule: {e}");
+    }
+
+    #[test]
+    fn a_malformed_id_is_caught_before_anything_is_applied() {
+        let mut r = exported("allow");
+        r.id = "not-a-uuid".into();
+        assert!(r.try_into_proto().unwrap_err().contains("bad id"));
+
+        // Empty means "mint a new one", which is how a hand-written file works.
+        let mut r = exported("allow");
+        r.id = String::new();
+        assert!(r.try_into_proto().is_ok());
+    }
+
+    #[test]
+    fn the_error_names_the_rule_so_a_large_file_is_actionable() {
+        let mut r = exported("block");
+        r.name = "allow-updates".into();
+        let e = r.try_into_proto().unwrap_err();
+        assert!(
+            e.contains("allow-updates"),
+            "an import of 200 rules is unusable without this: {e}"
+        );
+    }
+
     #[test]
     fn export_round_trips_through_json() {
         let scope = proto::RuleScope {
@@ -1529,7 +1750,7 @@ mod json_tests {
             has_protocol: true,
         };
         let original = proto::RuleInfo {
-            id: "id-1".into(),
+            id: "3f1b8a0e-5c4d-4e2a-9b7f-1a2b3c4d5e6f".into(),
             name: "curl-https".into(),
             enabled: false,
             action: proto::Action::Deny as i32,
@@ -1541,9 +1762,11 @@ mod json_tests {
 
         let json = serde_json::to_string(&exported_rule(&original)).unwrap();
         let back: ExportedRule = serde_json::from_str(&json).unwrap();
-        let pb = back.into_proto();
+        let pb = back
+            .try_into_proto()
+            .expect("a rule we exported must import");
 
-        assert_eq!(pb.id, "id-1");
+        assert_eq!(pb.id, "3f1b8a0e-5c4d-4e2a-9b7f-1a2b3c4d5e6f");
         assert_eq!(pb.name, "curl-https");
         assert!(!pb.enabled);
         assert_eq!(pb.action, proto::Action::Deny as i32);
@@ -1715,7 +1938,15 @@ mod bundle_tests {
             dst_port: Some(443),
             protocol: Some(proto::Protocol::Tcp),
         };
-        assert_eq!(r.resolve(), Some("/proc/self/exe"));
+        // /proc/self/exe is itself a symlink to the running binary, so this
+        // also proves the candidate is resolved rather than stored verbatim -
+        // a rule for the link would never match.
+        let got = r.resolve().expect("the second candidate exists");
+        assert_eq!(
+            got,
+            std::fs::canonicalize("/proc/self/exe").expect("canonicalize")
+        );
+        assert_ne!(got, PathBuf::from("/proc/self/exe"));
 
         let none = BundleRule {
             name: "t",

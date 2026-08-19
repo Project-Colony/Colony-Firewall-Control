@@ -352,7 +352,7 @@ impl Firewall for FirewallService {
 
         let mut persisted_rule = None;
         if let Some(scope_pb) = req.persist_scope.clone() {
-            let scope = convert::scope_from_pb(&scope_pb);
+            let scope = convert::scope_from_pb(&scope_pb).map_err(Status::invalid_argument)?;
             let duration =
                 convert::duration_from_pb(req.duration).map_err(Status::invalid_argument)?;
             convert::reject_unpersistable_duration(duration).map_err(Status::invalid_argument)?;
@@ -421,6 +421,21 @@ impl Firewall for FirewallService {
             .ok_or_else(|| Status::invalid_argument("rule required"))?;
         let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
         convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
+        // Resolve the executable path here as well as in the CLI, because this
+        // is where *every* client's rule arrives - the GUI's editor takes a
+        // typed path too. Matching is exact string equality against what /proc
+        // reports, which the kernel has already resolved, so an unresolved rule
+        // path is inert while still looking present in every listing.
+        //
+        // Best effort by design: a path that cannot be resolved (not installed
+        // yet, or unreadable) is kept verbatim rather than refused. Refusing it
+        // would break the legitimate "write the rule before installing the
+        // program" case, and this is the wrong layer to have that opinion.
+        if let Some(outcome) = cfc_core::exe_path::resolve_scope(&mut rule.scope) {
+            if let Some(note) = outcome.note() {
+                info!(rpc = "UpsertRule", rule = %rule.id, "exe path: {note}");
+            }
+        }
         // hit_count and created_at belong to the daemon: a client editing a
         // rule must not be able to rewrite its history, deliberately or (as
         // every read-modify-write client did) by echoing back a count that

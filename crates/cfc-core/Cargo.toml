@@ -17,3 +17,6 @@ uuid = { workspace = true }
 ipnet = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

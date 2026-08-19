@@ -24,6 +24,18 @@ struct Verdict {
 #[derive(Default)]
 struct FakeDaemon {
     verdicts: Arc<Mutex<Vec<Verdict>>>,
+    /// Rules the daemon already holds, served by `ListRules`.
+    existing: Arc<Mutex<Vec<pb::RuleInfo>>>,
+    /// Every mutation in the order it arrived. `import` correctness is entirely
+    /// about that order, so recording it is the test.
+    calls: Arc<Mutex<Vec<Call>>>,
+}
+
+/// One mutation seen by the fake daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Call {
+    Upsert(String),
+    Delete(String),
 }
 
 #[tonic::async_trait]
@@ -116,21 +128,38 @@ impl Firewall for FakeDaemon {
         &self,
         _req: Request<pb::ListRulesRequest>,
     ) -> Result<Response<pb::ListRulesResponse>, Status> {
-        Ok(Response::new(pb::ListRulesResponse { rules: vec![] }))
+        Ok(Response::new(pb::ListRulesResponse {
+            rules: self.existing.lock().unwrap().clone(),
+        }))
     }
 
     async fn upsert_rule(
         &self,
-        _req: Request<pb::UpsertRuleRequest>,
+        req: Request<pb::UpsertRuleRequest>,
     ) -> Result<Response<pb::UpsertRuleResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        let r = req
+            .into_inner()
+            .rule
+            .ok_or_else(|| Status::invalid_argument("rule required"))?;
+        let id = if r.id.is_empty() {
+            format!("minted-{}", self.calls.lock().unwrap().len())
+        } else {
+            r.id.clone()
+        };
+        self.calls.lock().unwrap().push(Call::Upsert(id.clone()));
+        Ok(Response::new(pb::UpsertRuleResponse {
+            id,
+            error: String::new(),
+        }))
     }
 
     async fn delete_rule(
         &self,
-        _req: Request<pb::DeleteRuleRequest>,
+        req: Request<pb::DeleteRuleRequest>,
     ) -> Result<Response<pb::DeleteRuleResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        let id = req.into_inner().id;
+        self.calls.lock().unwrap().push(Call::Delete(id));
+        Ok(Response::new(pb::DeleteRuleResponse { deleted: true }))
     }
 
     /// Sends one event and then closes the stream, which is what a daemon
@@ -285,6 +314,7 @@ async fn auto_deny_answers_one_prompt_and_exits() {
         path.clone(),
         FakeDaemon {
             verdicts: verdicts.clone(),
+            ..Default::default()
         },
     )
     .await;
@@ -351,6 +381,7 @@ async fn answer_interactively(tag: &str, keys: &'static str) -> (Vec<Verdict>, S
         path.clone(),
         FakeDaemon {
             verdicts: verdicts.clone(),
+            ..Default::default()
         },
     )
     .await;
@@ -586,4 +617,211 @@ async fn live_filters_are_applied_client_side() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert_eq!(out.status.code(), Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// `cfc rules import`
+//
+// The correctness of import is entirely about *ordering and atomicity*, which
+// no unit test on the conversion can see. These drive the real binary against
+// a daemon that records every mutation in the order it arrives.
+// ---------------------------------------------------------------------------
+
+fn rule_json(id: &str, name: &str, action: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","name":"{name}","enabled":true,"action":"{action}",
+             "duration":"always","scope":{{"exe_path":"/usr/bin/curl"}}}}"#
+    )
+}
+
+async fn import_fixture(
+    tag: &str,
+    existing: Vec<pb::RuleInfo>,
+) -> (
+    std::path::PathBuf,
+    Arc<Mutex<Vec<Call>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let path = socket_path(tag);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let server = serve(
+        path.clone(),
+        FakeDaemon {
+            existing: Arc::new(Mutex::new(existing)),
+            calls: calls.clone(),
+            ..Default::default()
+        },
+    )
+    .await;
+    (path, calls, server)
+}
+
+fn stub_rule(id: &str, name: &str) -> pb::RuleInfo {
+    pb::RuleInfo {
+        id: id.into(),
+        name: name.into(),
+        enabled: true,
+        action: pb::Action::Allow as i32,
+        duration: pb::Duration::Always as i32,
+        scope: None,
+        created_at_unix_ms: 0,
+        hit_count: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_with_an_unknown_action_changes_nothing_at_all() {
+    // The failure this replaces: delete everything, then abort on the first bad
+    // rule, leaving an emptied rule set against a fail-closed nftables table -
+    // i.e. a machine with no outbound network, from a typo.
+    let existing = vec![stub_rule("11111111-1111-4111-8111-111111111111", "keep-me")];
+    let (path, calls, server) = import_fixture("import-bad", existing).await;
+
+    let good = rule_json("22222222-2222-4222-8222-222222222222", "ok", "deny");
+    let bad = rule_json("33333333-3333-4333-8333-333333333333", "typo", "block");
+    let json = format!("[{good},{bad}]");
+
+    let out = run_cli_with_stdin(
+        &[
+            "--socket",
+            path.to_str().unwrap(),
+            "rules",
+            "import",
+            "--replace",
+        ],
+        Some(&json),
+        Duration::from_secs(10),
+    );
+
+    assert!(
+        !out.status.success(),
+        "an unreadable file must fail the command"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown action"), "stderr: {err}");
+    assert!(
+        err.contains("typo"),
+        "the offending rule must be named: {err}"
+    );
+    assert!(err.contains("nothing was changed"), "stderr: {err}");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "not one mutation may reach the daemon: {:?}",
+        calls.lock().unwrap()
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_replace_upserts_before_it_deletes() {
+    // There is no server-side transaction, so something has to be the failure
+    // window. Making it "old rules linger" rather than "no rules at all" is the
+    // only ordering that cannot take the machine's network down.
+    let existing = vec![stub_rule("11111111-1111-4111-8111-111111111111", "old")];
+    let (path, calls, server) = import_fixture("import-order", existing).await;
+
+    let json = format!(
+        "[{}]",
+        rule_json("22222222-2222-4222-8222-222222222222", "new", "deny")
+    );
+    let out = run_cli_with_stdin(
+        &[
+            "--socket",
+            path.to_str().unwrap(),
+            "rules",
+            "import",
+            "--replace",
+        ],
+        Some(&json),
+        Duration::from_secs(10),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            Call::Upsert("22222222-2222-4222-8222-222222222222".into()),
+            Call::Delete("11111111-1111-4111-8111-111111111111".into()),
+        ],
+        "the new rule must exist before the old one is removed"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_replace_does_not_delete_what_it_just_imported() {
+    // The bug this test exists for: `--replace` deleting every pre-existing
+    // rule would throw away the ones the import had just *updated*, because an
+    // imported rule that shares an id with an existing one is an update.
+    let shared = "11111111-1111-4111-8111-111111111111";
+    let existing = vec![
+        stub_rule(shared, "shared"),
+        stub_rule("44444444-4444-4444-8444-444444444444", "stale"),
+    ];
+    let (path, calls, server) = import_fixture("import-shared", existing).await;
+
+    let json = format!("[{}]", rule_json(shared, "shared-updated", "deny"));
+    let out = run_cli_with_stdin(
+        &[
+            "--socket",
+            path.to_str().unwrap(),
+            "rules",
+            "import",
+            "--replace",
+        ],
+        Some(&json),
+        Duration::from_secs(10),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let calls = calls.lock().unwrap().clone();
+    assert!(
+        calls.contains(&Call::Upsert(shared.into())),
+        "the shared rule must have been updated: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&Call::Delete(shared.into())),
+        "and must NOT then be deleted: {calls:?}"
+    );
+    assert!(
+        calls.contains(&Call::Delete("44444444-4444-4444-8444-444444444444".into())),
+        "while a rule absent from the file is still removed: {calls:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_without_replace_never_deletes() {
+    let existing = vec![stub_rule("11111111-1111-4111-8111-111111111111", "old")];
+    let (path, calls, server) = import_fixture("import-additive", existing).await;
+
+    let json = format!(
+        "[{}]",
+        rule_json("22222222-2222-4222-8222-222222222222", "new", "allow")
+    );
+    let out = run_cli_with_stdin(
+        &["--socket", path.to_str().unwrap(), "rules", "import"],
+        Some(&json),
+        Duration::from_secs(10),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = calls.lock().unwrap().clone();
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Delete(_))),
+        "an additive import must not remove anything: {calls:?}"
+    );
+    server.abort();
 }
