@@ -27,6 +27,21 @@ struct EngineInner {
     /// Per-rule hit counter increments. Merged into the persisted
     /// `Rule::hit_count` on snapshot() and periodically flushed.
     hits: Mutex<HashMap<uuid::Uuid, u64>>,
+    /// Called after the rule set changes.
+    ///
+    /// Exists for one caller: the in-kernel verdict map, whose contents are a
+    /// *function* of the rules and therefore go stale the moment a rule is
+    /// added or removed. Without this, a "Block always" answered from a prompt
+    /// would be enforced by the packet path but never reach the kernel for the
+    /// process it was about - so killing the daemon would lift the block that
+    /// had just been asked for, which is precisely the failure the pinned layer
+    /// exists to prevent.
+    ///
+    /// A plain boxed closure rather than a trait: there is one observer, it
+    /// needs no state of its own that the closure cannot capture, and keeping
+    /// it a `Weak` capture on the caller's side is what stops the cycle
+    /// (the observer holds this `Engine`).
+    on_change: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 pub enum Decision {
@@ -47,7 +62,24 @@ impl Engine {
                 rules: RwLock::new(rules),
                 default_policy,
                 hits: Mutex::new(HashMap::new()),
+                on_change: RwLock::new(None),
             }),
+        }
+    }
+
+    /// Registers the callback invoked after every rule-set change.
+    ///
+    /// One observer, last writer wins. The callback must not touch this engine
+    /// re-entrantly: it runs after the rules lock is dropped, but taking the
+    /// write lock again from inside would deadlock a future caller that holds
+    /// it.
+    pub fn set_on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.inner.on_change.write() = Some(f);
+    }
+
+    fn notify_changed(&self) {
+        if let Some(f) = self.inner.on_change.read().as_ref() {
+            f();
         }
     }
 
@@ -155,19 +187,24 @@ impl Engine {
     }
 
     pub fn upsert_rule(&self, rule: Rule) {
-        let mut rs = self.inner.rules.write();
-        if let Some(existing) = rs.rules.iter_mut().find(|r| r.id == rule.id) {
-            *existing = rule;
-        } else {
-            rs.rules.push(rule);
+        {
+            let mut rs = self.inner.rules.write();
+            if let Some(existing) = rs.rules.iter_mut().find(|r| r.id == rule.id) {
+                *existing = rule;
+            } else {
+                rs.rules.push(rule);
+            }
+            // Re-establish precedence order: the upsert may have changed the
+            // rule's scope/action/enabled bit, any of which affect its slot.
+            rs.sort_deterministic();
         }
-        // Re-establish precedence order: the upsert may have changed the
-        // rule's scope/action/enabled bit, any of which affect its slot.
-        rs.sort_deterministic();
+        // Outside the scope above: the observer re-reads the rules.
+        self.notify_changed();
     }
 
     pub fn remove_rule(&self, id: uuid::Uuid) {
         self.inner.rules.write().rules.retain(|r| r.id != id);
+        self.notify_changed();
     }
 
     /// The rule set as callers should see it: persisted counts plus the

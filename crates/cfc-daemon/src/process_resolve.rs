@@ -171,6 +171,37 @@ fn resolve_inner(
         })
         .unwrap_or_else(|| PathBuf::from("<deleted>"));
 
+    // The kernel appends " (deleted)" to /proc/<pid>/exe once the file has been
+    // replaced or removed underneath a running process. On a rolling
+    // distribution that is not an edge case, it is Tuesday: every long-lived
+    // program keeps running the old inode after its package is upgraded.
+    //
+    // Left in place, that suffix is a quiet disaster for an application
+    // firewall, because it is part of the string rules match on:
+    //
+    //   * a rule created from a prompt carries it, and stops matching the
+    //     moment the user restarts the program;
+    //   * a rule the user wrote by hand for the real path never matches while
+    //     the program is running the old bytes.
+    //
+    // Both observed on a live machine, with Firefox upgraded mid-session:
+    // `exe=/usr/lib/firefox/firefox (deleted)`, a hand-written rule for
+    // `/usr/lib/firefox/firefox` inert, and the browser blocked.
+    //
+    // The path is what identity means here, so the suffix is stripped and the
+    // fact is kept separately. `provenance::describe` still needs it - the
+    // digest below is of the *old* bytes, and comparing those against the new
+    // file on disk would report `Modified` for every process running across an
+    // upgrade - so it is passed the original.
+    let replaced_on_disk = exe.to_string_lossy().ends_with(DELETED_SUFFIX);
+    let exe_for_provenance = exe.clone();
+    let exe = if replaced_on_disk {
+        let s = exe.to_string_lossy();
+        PathBuf::from(&s[..s.len() - DELETED_SUFFIX.len()])
+    } else {
+        exe
+    };
+
     // Package provenance reuses the digest computed just above rather than
     // re-hashing. That digest comes from /proc/{pid}/exe -- the binary the
     // kernel actually mapped -- while the package database describes the
@@ -187,7 +218,7 @@ fn resolve_inner(
     // function is itself behind PROCESS_CACHE, so a steady flow of packets
     // from a known process does no work here at all.
     let sha256 = exe_sha256(pid);
-    let (package, provenance) = crate::provenance::describe(&exe, sha256.as_deref());
+    let (package, provenance) = crate::provenance::describe(&exe_for_provenance, sha256.as_deref());
 
     Ok(Process {
         pid,
@@ -475,6 +506,14 @@ fn parse_starttime(stat: &str) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
+/// What the kernel appends to `/proc/<pid>/exe` when the file has been replaced
+/// or removed since the process started.
+///
+/// Shared with `provenance`, which uses it to decline to verify such a path -
+/// the two uses are opposite and both correct: rule matching wants the suffix
+/// gone, provenance wants to know it was there.
+pub(crate) const DELETED_SUFFIX: &str = " (deleted)";
+
 /// sha256 of the running executable, read through /proc/{pid}/exe.
 ///
 /// The magic link resolves to the binary actually mapped by the kernel,
@@ -599,6 +638,25 @@ mod tests {
         // ::1 = 16 bytes ending in 0x01. Linux prints 4 LE-word groups, so
         // the last group is the byte-reversed 0x00000001 = "01000000".
         assert_eq!(s, "00000000000000000000000001000000:0035");
+    }
+
+    #[test]
+    fn a_replaced_binary_still_matches_a_rule_for_its_path() {
+        // The Firefox case, reduced: a package upgrade replaces the file while
+        // the process keeps running the old inode, and the kernel starts
+        // reporting the path with " (deleted)" glued on. Rules match on the
+        // path string, so leaving it there means the rule the user wrote - or
+        // the one a prompt created - matches nothing.
+        let raw = PathBuf::from("/usr/lib/firefox/firefox (deleted)");
+        let s = raw.to_string_lossy();
+        assert!(s.ends_with(DELETED_SUFFIX));
+        let cleaned = PathBuf::from(&s[..s.len() - DELETED_SUFFIX.len()]);
+        assert_eq!(cleaned, PathBuf::from("/usr/lib/firefox/firefox"));
+
+        // And a path that merely *contains* the words is left alone: the
+        // suffix is a suffix, not a substring.
+        let odd = PathBuf::from("/opt/my (deleted) app/bin");
+        assert!(!odd.to_string_lossy().ends_with(DELETED_SUFFIX));
     }
 
     #[test]

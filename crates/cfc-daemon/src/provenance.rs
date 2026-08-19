@@ -167,7 +167,11 @@ pub fn describe(exe: &Path, running_sha256: Option<&str>) -> (Option<String>, Pr
     // Only absolute real paths can be owned by a package. `<unknown>` and
     // `<deleted>` placeholders, and the " (deleted)" suffix the kernel
     // appends for an unlinked binary, are not paths we can ask about.
-    if !exe.is_absolute() || exe.to_string_lossy().ends_with(" (deleted)") {
+    if !exe.is_absolute()
+        || exe
+            .to_string_lossy()
+            .ends_with(crate::process_resolve::DELETED_SUFFIX)
+    {
         return (None, Provenance::Unknown);
     }
     let Some(db) = BACKEND.as_ref() else {

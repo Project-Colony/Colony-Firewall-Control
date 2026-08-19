@@ -27,12 +27,17 @@
 //!   connect6        pinned link  - IPv6 enforcement
 //!   VERDICTS        pinned map   - tgid -> verdict, written by the daemon
 //!   ENFORCE_STATS   pinned map   - per-CPU counters
+//!   DENY_EVENTS     pinned map   - one record per refusal, drained by the daemon
 //! ```
 //!
-//! `DENY_EVENTS` is deliberately *not* pinned: it is a report of what happened,
-//! and a ring buffer nobody is draining is a buffer that fills. While the daemon
-//! is down the refusals still happen and the counters still move; only the log
-//! lines stop, which is the right thing to lose.
+//! `DENY_EVENTS` is pinned for the same reason as the other two, though the
+//! first instinct is not to: a ring buffer nobody drains fills up. It does, and
+//! that costs a log line - the refusal already happened when the record could
+//! not be written. Leaving it unpinned costs much more: on the inherited path
+//! the *previous* daemon's programs are the ones still attached and writing, so
+//! an unpinned ring would leave every in-kernel refusal after a restart silent.
+//! Observed exactly that way on a real machine: 48 refusals counted, none
+//! reported.
 //!
 //! `v2` is [`cfc_ebpf_common::ABI_VERSION`]. It is in the *path* because an
 //! object built against a different event layout is a different program and
@@ -50,6 +55,7 @@ use std::io;
 use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context as _};
 use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuArray};
@@ -61,6 +67,7 @@ use cfc_ebpf_common::{enforce_stat, ABI_VERSION};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
+use super::proc_table::KernelProcTable;
 use crate::decision::Engine;
 
 /// Where the kernel expects a bpffs to be mounted. systemd mounts it here on
@@ -101,11 +108,16 @@ pub(super) const MAP_DENY_EVENTS: &str = "DENY_EVENTS";
 pub(super) struct VerdictSink {
     map: Arc<Mutex<BpfHashMap<MapData, u32, u32>>>,
     engine: Engine,
+    table: KernelProcTable,
 }
 
 impl VerdictSink {
     /// Takes the pinned `VERDICTS` map out of the object.
-    pub(super) fn new(bpf: &mut Ebpf, engine: Engine) -> anyhow::Result<Self> {
+    pub(super) fn new(
+        bpf: &mut Ebpf,
+        engine: Engine,
+        table: KernelProcTable,
+    ) -> anyhow::Result<Self> {
         let map = bpf
             .take_map(MAP_VERDICTS)
             .ok_or_else(|| anyhow!("no map named `{MAP_VERDICTS}` in the object"))?;
@@ -114,7 +126,67 @@ impl VerdictSink {
         Ok(Self {
             map: Arc::new(Mutex::new(map)),
             engine,
+            table,
         })
+    }
+
+    /// Recomputes every live process's verdict.
+    ///
+    /// Called when the rule set changes, which is the only event that can
+    /// invalidate an entry without the process doing anything. `on_exec` alone
+    /// is not enough and the gap it leaves is the interesting one: a user
+    /// clicking "Block always" in a prompt creates a rule for a program that is
+    /// *already running*, so without this the block would be enforced by the
+    /// packet path and never reach the kernel - and killing the daemon would
+    /// lift the block that had just been asked for.
+    ///
+    /// Observed exactly that way on a real machine before this existed: a deny
+    /// rule added for a running process was honoured by NFQUEUE
+    /// (`source="rule"`) and the kernel counters never moved.
+    ///
+    /// O(live processes), on whichever thread changed the rules - an IPC
+    /// handler, never the packet path. A few thousand map operations at worst,
+    /// and only when a human or the CLI actually changed something.
+    pub(super) fn resync(&self) {
+        let live = self.table.live_processes(Instant::now());
+        if live.is_empty() {
+            // Either nothing is tracked or the exec tracepoint is not feeding
+            // the table. Writing nothing is right in both cases: the packet
+            // path still decides, which is where it decided before.
+            return;
+        }
+        let mut denied = 0usize;
+        let mut map = self.map.lock();
+        for proc in &live {
+            let Some(exe) = proc.absolute_exe() else {
+                continue;
+            };
+            let as_process = Process {
+                pid: proc.pid,
+                ppid: proc.ppid,
+                uid: Some(proc.uid),
+                gid: Some(proc.gid),
+                exe: exe.to_path_buf(),
+                ..Process::unknown(proc.pid)
+            };
+            let deny = matches!(
+                self.engine.process_wide_action(&as_process),
+                Some(Action::Deny | Action::Reject)
+            );
+            let r = if deny {
+                denied += 1;
+                map.insert(proc.pid, cfc_ebpf_common::verdict::DENY, 0)
+            } else {
+                clear(&mut map, proc.pid)
+            };
+            if let Err(e) = r {
+                warn!(pid = proc.pid, deny, "verdict resync failed: {e}");
+            }
+        }
+        debug!(
+            processes = live.len(),
+            denied, "resynced in-kernel verdicts after a rule change"
+        );
     }
 
     /// Decides whether this newly-exec'd process gets an in-kernel answer.

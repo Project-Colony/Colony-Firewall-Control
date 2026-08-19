@@ -219,6 +219,30 @@ impl KernelProcTable {
         );
     }
 
+    /// Every live entry, for a caller that has to act on all of them at once
+    /// rather than answer one lookup.
+    ///
+    /// The one such caller is the in-kernel verdict resync: when a rule
+    /// changes, the answer for *already running* processes changes with it, and
+    /// there is no event to hang that off - `exec` already happened. Entries
+    /// past their TTL are skipped rather than evicted, because this is not a
+    /// lookup and should not have side effects on the table.
+    ///
+    /// Returns empty when the table is not live, exactly as [`Self::get`] does:
+    /// without the exec tracepoint these entries are stale by construction.
+    pub fn live_processes(&self, now: Instant) -> Vec<KernelProc> {
+        if !self.is_live() {
+            return Vec::new();
+        }
+        self.inner
+            .map
+            .read()
+            .values()
+            .filter(|e| now.saturating_duration_since(e.seen_at) <= ENTRY_TTL)
+            .map(|e| e.proc.clone())
+            .collect()
+    }
+
     /// Records an exit. The kernel side only publishes these for thread-group
     /// leaders, so this really is "the process is gone", not "a thread of it
     /// finished".

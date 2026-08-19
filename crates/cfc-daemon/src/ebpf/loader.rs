@@ -194,6 +194,11 @@ const MAP_DNS: &str = "DNS_PACKETS";
 pub(super) struct Attached {
     _bpf: Ebpf,
     tasks: Vec<JoinHandle<()>>,
+    /// The only strong reference to the verdict sink. The engine's rule-change
+    /// callback holds a `Weak`, so this field is what decides how long resync
+    /// keeps working - and dropping this whole struct is exactly when it should
+    /// stop.
+    _sink: Option<std::sync::Arc<enforce::VerdictSink>>,
 }
 
 impl Drop for Attached {
@@ -322,12 +327,13 @@ pub(super) fn load_and_attach(
             vec![
                 (enforce::MAP_VERDICTS, dir.join(enforce::MAP_VERDICTS)),
                 (enforce::MAP_STATS, dir.join(enforce::MAP_STATS)),
+                (enforce::MAP_DENY_EVENTS, dir.join(enforce::MAP_DENY_EVENTS)),
             ]
         })
         .unwrap_or_default();
 
     let mut loader = EbpfLoader::new();
-    // Pin the two enforcement maps by name, so they are the *same* kernel
+    // Pin the three enforcement maps by name, so they are the *same* kernel
     // objects across a daemon restart. Without this the pinned programs would
     // go on consulting the map the dead daemon created while the new one wrote
     // to a fresh one nobody reads - enforcement frozen at whatever it held when
@@ -335,9 +341,20 @@ pub(super) fn load_and_attach(
     //
     // aya's `create_pinned_by_name` opens an existing pin when there is one and
     // creates it otherwise, so this is both the first-run and the restart path.
-    // Only these two maps are pinned: the ring buffers and `PROCS` are rebuilt
-    // from scratch every start and pinning them would leak the previous run's
-    // backlog into this one.
+    // `DENY_EVENTS` is pinned for a reason worth spelling out, because the
+    // first instinct is not to: a ring buffer nobody is draining fills up. It
+    // does, and that costs a log line and nothing else - the refusal already
+    // happened when the record could not be written. What pinning buys is the
+    // opposite of a leak. On the inherited path this daemon does not re-attach,
+    // so the *previously* pinned programs are the ones still writing; an
+    // unpinned ring would leave them writing into a map this process cannot
+    // see, and every in-kernel refusal after a restart would be silent. Draining
+    // the backlog on startup is then a bonus: it says what was refused while
+    // nothing was listening.
+    //
+    // `PROCS` and the other two ring buffers stay unpinned. They are rebuilt
+    // from scratch every start, and pinning them really would leak the previous
+    // run's backlog into this one.
     for (name, path) in &pinned_map_paths {
         loader.map_pin_path(name, path.as_path());
     }
@@ -555,15 +572,37 @@ pub(super) fn load_and_attach(
     // consult (the live tests); in both cases the map simply stays empty and
     // every connect falls through to the packet path.
     let sink = match (report.enforcement.is_live(), engine) {
-        (true, Some(engine)) => match enforce::VerdictSink::new(&mut bpf, engine) {
-            Ok(sink) => Some(sink),
-            Err(e) => {
-                report
-                    .notes
-                    .push(format!("in-kernel verdicts will not be written: {e:#}"));
-                None
+        (true, Some(engine)) => {
+            match enforce::VerdictSink::new(&mut bpf, engine.clone(), table.clone()) {
+                Ok(sink) => {
+                    // A rule change invalidates every live process's verdict,
+                    // and there is no event to hang that off - their `exec`
+                    // already happened.
+                    //
+                    // `Weak` on purpose, and the strong `Arc` is kept in
+                    // `Attached`: the sink holds this engine, so a strong
+                    // capture in the callback would be a cycle that never
+                    // drops. It has to be a *real* Arc that something outlives
+                    // the callback - downgrading a temporary would hand the
+                    // engine a Weak that is dead on arrival and a resync that
+                    // silently never runs.
+                    let sink = std::sync::Arc::new(sink);
+                    let weak = std::sync::Arc::downgrade(&sink);
+                    engine.set_on_change(Box::new(move || {
+                        if let Some(sink) = weak.upgrade() {
+                            sink.resync();
+                        }
+                    }));
+                    Some(sink)
+                }
+                Err(e) => {
+                    report
+                        .notes
+                        .push(format!("in-kernel verdicts will not be written: {e:#}"));
+                    None
+                }
             }
-        },
+        }
         _ => None,
     };
 
@@ -719,7 +758,14 @@ pub(super) fn load_and_attach(
         }
     }
 
-    Ok((Attached { _bpf: bpf, tasks }, report))
+    Ok((
+        Attached {
+            _bpf: bpf,
+            tasks,
+            _sink: sink,
+        },
+        report,
+    ))
 }
 
 /// Folds one attach outcome into the report and says whether it is live.
