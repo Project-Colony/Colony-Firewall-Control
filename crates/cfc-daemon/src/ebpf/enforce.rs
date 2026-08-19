@@ -144,11 +144,7 @@ impl VerdictSink {
         let r = if deny {
             map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
         } else {
-            match map.remove(&pid) {
-                // Nothing to clear is the overwhelmingly common case.
-                Err(aya::maps::MapError::KeyNotFound) => Ok(()),
-                other => other,
-            }
+            clear(&mut map, pid)
         };
         if let Err(e) = r {
             warn!(pid, deny, "could not update the in-kernel verdict: {e}");
@@ -163,11 +159,44 @@ impl VerdictSink {
     /// forgets outlives the daemon, and the next process to be handed that pid
     /// would inherit its answer.
     pub(super) fn on_exit(&self, pid: u32) {
-        match self.map.lock().remove(&pid) {
-            Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
-            Err(e) => warn!(pid, "could not evict the in-kernel verdict: {e}"),
+        if let Err(e) = clear(&mut self.map.lock(), pid) {
+            warn!(pid, "could not evict the in-kernel verdict: {e}");
         }
     }
+}
+
+/// Removes `pid`'s entry, treating "there was no entry" as success.
+///
+/// It nearly always *is* the outcome: only a process with a standing deny ever
+/// gets an entry, and every other exec and every exit still comes through here
+/// to make sure a recycled pid inherits nothing.
+///
+/// `MapError::KeyNotFound` looks like the arm to match and is not: aya only
+/// returns that from `get`. `remove` hands back the raw `bpf_map_delete_elem`
+/// failure, so the absent case has to be read out of the errno. Getting this
+/// wrong is not cosmetic - it logged a warning for **every exec on the
+/// machine**, which is both a flood and an accusation that the enforcement
+/// layer is broken when it is working exactly as intended.
+fn clear(map: &mut BpfHashMap<MapData, u32, u32>, pid: u32) -> Result<(), aya::maps::MapError> {
+    match map.remove(&pid) {
+        Err(e) if is_absent(&e) => Ok(()),
+        other => other,
+    }
+}
+
+/// True when a map error is the kernel saying "no such key".
+fn is_absent(err: &aya::maps::MapError) -> bool {
+    if matches!(err, aya::maps::MapError::KeyNotFound) {
+        return true;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if let Some(io) = e.downcast_ref::<io::Error>() {
+            return io.raw_os_error() == Some(libc::ENOENT);
+        }
+        source = e.source();
+    }
+    false
 }
 
 /// Per-CPU counters, summed. See [`enforce_stat`].
@@ -677,6 +706,28 @@ mod tests {
         );
         println!("a Deny rule reached the kernel with nothing stubbed");
         drop(listener);
+    }
+
+    #[test]
+    fn a_missing_key_is_not_an_error_worth_logging() {
+        // The shape aya actually produces: `remove` wraps the raw syscall
+        // failure rather than returning KeyNotFound. Matching on the variant
+        // alone logged a warning for every exec on the machine.
+        let enoent = aya::maps::MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: io::Error::from_raw_os_error(libc::ENOENT),
+        });
+        assert!(is_absent(&enoent));
+        assert!(is_absent(&aya::maps::MapError::KeyNotFound));
+
+        let eperm = aya::maps::MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: io::Error::from_raw_os_error(libc::EPERM),
+        });
+        assert!(
+            !is_absent(&eperm),
+            "a real permission failure must still be reported"
+        );
     }
 
     #[test]

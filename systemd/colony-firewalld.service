@@ -39,6 +39,31 @@ TimeoutStopSec=15
 # CAP_BPF        bpf(2): loading programs and creating/reading maps.
 # CAP_PERFMON    perf_event_open(2), which is how a tracepoint program is
 #                actually attached (the two sched_process_* programs).
+# CAP_CHOWN      chgrp on the control socket.
+# CAP_DAC_READ_SEARCH  reading /proc/<pid>/fd of processes owned by other
+#                users, which is the second half of attribution: sock_diag
+#                gives an inode, and finding which process holds it means
+#                walking every /proc/*/fd. Those directories are 0500 and owned
+#                by the process's own user.
+#
+# Those last two look unnecessary because the daemon runs as uid 0, and they
+# are the two that matter most. Root's "implicit DAC bypass" is not implicit at
+# all - it *is* CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH - so a bounding set that
+# omits them drops them from root too. Both failures found by installing this
+# unit and watching it, not by any of the 640 tests:
+#
+#   without CAP_CHOWN            chown(2) answers EPERM, the socket stays
+#                                root-only, and every client - CLI, tray, GUI -
+#                                silently cannot connect. One WARN at startup.
+#   without CAP_DAC_READ_SEARCH  every connection resolves to `exe=<unknown>
+#                                pid=0`, so no exe-scoped rule can ever match
+#                                and a fail-closed ruleset denies the whole
+#                                machine's traffic. No warning at all: from the
+#                                daemon's side, nothing failed.
+#
+# CAP_DAC_OVERRIDE is deliberately NOT granted: read-and-search is all this
+# needs, and the write half is what would let the daemon edit files it does not
+# own.
 #
 # CAP_BPF and CAP_PERFMON are granted unconditionally. `[ebpf] enabled`
 # defaults to `auto`, so on a capable kernel the ring-0 layer comes up by
@@ -65,8 +90,8 @@ TimeoutStopSec=15
 # Adding User= to this unit, without also granting CAP_DAC_OVERRIDE, would
 # silently cost the daemon both tracepoints (process tracking) while leaving
 # the cgroup program (DNS capture) working.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_CHOWN CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON CAP_CHOWN CAP_DAC_READ_SEARCH
 NoNewPrivileges=true
 
 # Filesystem
@@ -87,7 +112,36 @@ LogsDirectory=colony-firewall
 
 # Sandboxing
 PrivateTmp=true
-ProtectKernelTunables=true
+# ProtectKernelTunables is deliberately OFF, and replaced by hand below.
+#
+# It does the right thing and one wrong thing: it remounts /sys read-only
+# *recursively*, which catches the bpffs mounted at /sys/fs/bpf - and that is
+# where the in-kernel enforcement links are pinned. `ReadWritePaths=/sys/fs/bpf`
+# does not win against it (tried, systemd 261: the bpffs stays ro), and neither
+# does `BindPaths=` (the read-only remount stacks on top of the bind). The
+# observable result was `enforcement=process` instead of `enforcement=pinned`,
+# logged at info, on a machine that was perfectly capable of pinning - which is
+# to say the "denials survive kill -9" property was silently absent.
+#
+# The ReadOnlyPaths below reproduce what ProtectKernelTunables covers, minus
+# the one directory that has to be writable. Every entry of /sys is listed
+# individually rather than /sys as a whole, because listing the parent and then
+# excepting the child is exactly what does not work: systemd makes the parent
+# writable to reach it.
+#
+# What this still protects, verified inside the unit's namespace: /proc/sys is
+# read-only, /sys/kernel is read-only, and /sys/kernel/btf and
+# /sys/kernel/tracing remain readable - which the eBPF loader needs.
+#
+# A new top-level directory in a future kernel's sysfs would be writable to
+# this unit until it is added here. That is the cost of the trade, and it is
+# smaller than losing the pin.
+ProtectKernelTunables=false
+ReadOnlyPaths=/proc/sys /proc/sysrq-trigger /proc/irq /proc/acpi /proc/fs
+ReadOnlyPaths=/sys/block /sys/bus /sys/class /sys/dev /sys/devices /sys/firmware
+ReadOnlyPaths=/sys/hypervisor /sys/kernel /sys/module /sys/power
+ReadOnlyPaths=/sys/fs/btrfs /sys/fs/cgroup /sys/fs/ext4 /sys/fs/fuse
+ReadOnlyPaths=/sys/fs/pstore /sys/fs/resctrl /sys/fs/tmpfs /sys/fs/virtiofs
 ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictNamespaces=true
