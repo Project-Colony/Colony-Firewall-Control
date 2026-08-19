@@ -10,68 +10,59 @@ Ordered by what would change the most, not by effort.
 
 ---
 
-## 1. Decide in the kernel, not in userspace
+## 1. In-kernel enforcement: what is left of it
 
-**The only item here that changes what CFC *is*.**
+Done, in `c281edb` and `c8fb04d`. `cgroup/connect4|6` refuse `connect()` for
+programs already denied, before a packet exists, and their link is **pinned to
+bpffs** so the denials survive the daemon being killed. Killing the daemon no
+longer lifts anything; `nft delete table` no longer lifts the denies it holds.
 
-Today the decision point is a userspace daemon behind NFQUEUE. That makes the
-whole guarantee conditional on a chain: the nftables table must be loaded, the
-daemon must be alive, the attribution must be right. Any root process breaks it
-with one command:
+Two pieces of it are deliberately not done, and both are real work rather than
+oversights:
 
-```sh
-nft delete table inet colony_firewall
-```
+**1a. An in-kernel *allow* buys nothing yet.** The connect hook cannot skip
+NFQUEUE, so a pre-approved program still takes a userspace round trip per
+connection - which is the actual latency cost of CFC, and it is paid dozens of
+times per page load in a browser. Making it real needs
+`bpf_setsockopt(SO_MARK)` on the connect path plus an nft rule that accepts the
+mark before the queue rule. That is a performance change with a
+traffic-bypasses-the-firewall blast radius, so it wants its own change and its
+own tests, not a line in this one.
 
-A `cgroup/connect4` + `connect6` eBPF program can refuse a `connect()` **before
-the syscall returns** - in kernel, with no userspace round trip, no daemon to
-kill and no table to flush. It would not fix injection into an allowed process
-or loopback-mediated egress (see *Limits* below), but it would remove the
-"stop the daemon" bypass entirely and turn fail-closed into real enforcement.
-
-Most of what it needs already exists: the loader, BTF offset resolution, the
-ABI gate, the kernel CI matrix. What is missing is a program that *decides*
-rather than observes, and a way to get a rule set into a BPF map that the
-kernel side can consult without a userspace hop.
-
-Open questions worth settling before writing code:
-
-- Where do rules live kernel-side? A hash map keyed on `(cgroup, exe hash)` is
-  the obvious shape, but exe identity in a BPF map is not free.
-- What happens to prompts? An in-kernel deny cannot ask a question. Probably:
-  the kernel enforces the *known* answers and unknown flows still go to
-  NFQUEUE for a decision, which the daemon then installs into the map.
-- Does this replace NFQUEUE or sit in front of it? In front, almost certainly -
-  NFQUEUE stays for the interactive path.
+**1b. Rules that depend on a destination still cannot be precomputed.**
+`process_wide_action` deliberately answers `None` for them, which is correct and
+also means a browser with a port-scoped rule gets no in-kernel enforcement at
+all. A destination-keyed map would fix it and is a much larger design: the
+kernel side would need to match addresses, and every DNS-name rule would have to
+be resolved to addresses in advance.
 
 ---
 
-## 2. RHEL / Rocky support
+## 2. RHEL / Rocky: what is left of it
 
-Asked for directly. It is a real project, not three lines - three separate
-pieces, none of which exist:
+Mostly done in `8db949b` and `b05eefc`: the SELinux module, the RPM provenance
+backend, the `.spec`, and a 5.10 entry in the kernel matrix that sits *below*
+RHEL 9's backported 5.14.
 
-**2a. SELinux policy module.** On a distribution whose whole argument is
-SELinux enforcing, CFC would be blocked by it. The daemon calls `bpf()`, binds
-NFQUEUE over netlink, creates a unix socket in `/run`, and loads a BPF object
-from `/usr/lib`. Every one of those needs a policy rule. Shipping instructions
-that say "set it permissive" would be the exact wrong advice on that platform,
-so this has to be a real `.te`/`.fc` module.
+What remains is the part that cannot be done from here:
 
-**2b. RPM provenance backend.** `provenance::detect` only knows pacman and
-dpkg (`crates/cfc-daemon/src/provenance.rs`). On Rocky every binary resolves to
-`Unknown`, so the "does this file still match its package?" check silently does
-nothing. Needs an rpmdb reader - and note the dpkg backend is already
-*name-only* because dpkg records MD5; RPM records SHA-256, so an RPM backend
-could actually verify, unlike dpkg.
+**2a. The SELinux policy has never met an enforcing system.** It compiles
+against the real `selinux-policy-devel` on Rocky 9 and Fedora, which proves
+every type and interface it names exists there. It does not prove the rules are
+*sufficient*. Someone has to install it on an enforcing host, run the daemon
+under load, and report what `audit2allow -w` asks for. A missing rule is a bug
+in `packaging/selinux/colony_firewall.te`, not something to add locally.
 
-**2c. `.spec` packaging.** Only the Arch PKGBUILD and the Colony manifest
-exist.
+**2b. Nothing has built the RPM end to end.** CI parses the spec and builds a
+source RPM; a full `rpmbuild -ba` needs Rust >= 1.88, which Rocky 9 does not
+ship in its default repos. Either a `rust-toolset` module dependency or a
+build in a Fedora container, and neither has been tried.
 
-**2d. CI blind spot.** The kernel matrix covers 6.12, 6.18, 7.1 and mainline.
-RHEL 9 ships **5.14 with heavy backports** - a kernel whose version number says
-almost nothing about which BPF features it has. It is exactly the shape of
-kernel that surprises people, and nothing tests it.
+**2c. The provenance subprocess is untested inside the unit's sandbox.** The
+rpm backend runs `rpm -qa`, and the daemon's own `SystemCallFilter`,
+`ProtectSystem=strict` and `MemoryDenyWriteExecute` all apply to that child. It
+should be fine and it degrades safely if it is not - a warning and an empty
+index - but "should be fine" is not "was observed".
 
 ---
 
@@ -106,10 +97,12 @@ should notice it has no resolvable theme icon and say so.
 
 ## 5. Verify the CI that was written for this
 
-None of `.github/workflows/ebpf.yml` has ever executed - a workflow cannot be
-run from a working tree. The YAML parses, the two shell helpers run clean
-locally, the ci-kernels digests and the `/boot/vmlinuz` path were confirmed
-against the registry. **Expect one round of correction on the first push.**
+Neither `.github/workflows/ebpf.yml` nor `.github/workflows/rhel.yml` has ever
+executed - a workflow cannot be run from a working tree. The YAML parses, the
+shell helpers run clean locally, and every ci-kernels digest (including the new
+5.10 entry) was resolved against the registry by hand. **Expect one round of
+correction on the first push**, most likely in the Rocky container's `dnf`
+invocation or in an interface name the SELinux module gets wrong.
 
 Also unverified: the eBPF build steps added to `release.yml`, and Arch
 packaging end to end (`makepkg`, `namcap`, and what `50-strip.sh` does to a BPF
@@ -153,7 +146,7 @@ What defeats it completely:
 
 | | |
 |---|---|
-| **Root** | one `nft delete table`. CFC *is* root; it cannot confine root. Item 1 above narrows this, never closes it. |
+| **Root** | narrower than it was, and still open. `nft delete table` no longer lifts the denials held in the kernel - those need `rm -rf /sys/fs/bpf/colony-firewall` as well, and anything not yet decided still falls through to a ruleset root can flush. CFC *is* root; it cannot confine root. |
 | **Code inside an allowed process** | a browser extension, a script under an allowed interpreter, `ptrace`/`LD_PRELOAD` injection. Structural to every application firewall. Making Allow persistent (`72964b5`) improved usability and widened this. |
 | **Loopback** | `oifname "lo" accept`, deliberately - filtering it stalls the systemd-resolved stub. Anything that can reach a local service which egresses is attributed to that service. |
 | **DNS tunnelling** | the resolver must be allowed for anything to work. CFC *observes* answers; it does not inspect or block queries. |
@@ -165,6 +158,11 @@ state new queue num 0`, no `bypass`). Killing the daemon drops all new outbound
 traffic. That is the right choice for confidentiality and the wrong one for
 availability - anything that can crash the daemon takes the machine's network
 with it.
+
+Since `c281edb` that cuts both ways in the daemon's favour: the pinned
+`cgroup/connect4|6` programs keep refusing denied programs while the daemon is
+down, so a crash no longer converts a deny into a maybe. It converts everything
+else into a drop, which is the same tradeoff as before.
 
 ### Where CFC sits next to other things
 
@@ -205,3 +203,10 @@ within twenty minutes of actually clicking things.
 - **`72964b5`** - "Open Colony Firewall" did nothing at all when the GUI was not
   installed: a `warn!` and no user-visible feedback, from the tray icon, the
   prompts line and the Details button alike.
+- **`a_deny_rule_reaches_the_kernel_by_itself`** found nothing about the daemon
+  and everything about the test: `#[tokio::test]` is single-threaded, so the
+  `std::thread::sleep` waiting for the exec event starved the ring-buffer
+  consumer that was supposed to deliver it. The test failed claiming the rule
+  never reached the kernel. Worth recording because the same shape - block a
+  current-thread runtime, then assert on what a spawned task was meant to do -
+  will look like a product bug every time.
