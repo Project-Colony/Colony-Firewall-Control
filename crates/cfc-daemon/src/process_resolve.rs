@@ -560,20 +560,28 @@ fn pid_owning_inode(inode: u64, deadline: Instant) -> Option<u32> {
         INODE_PID_CACHE.lock().remove(&inode);
     }
 
-    // Two cheap priors before the machine-wide walk. Both cover the workloads
-    // the walk is worst at: a process that just exec'd (highest pid, so the
-    // ascending walk reached it *last*), and a long-lived process opening its
-    // Nth connection (new inode every time, so no cache could know it, but the
-    // pid resolved seconds ago).
-    let recent_execs = crate::ebpf::proc_table::global().recent_pids(24, Instant::now());
-    for pid in recent_execs {
+    // Two cheap priors before the machine-wide walk, recently-resolved first.
+    //
+    // That order is the opposite of the original, and the reason it changed is
+    // that the walk below changed. The exec prior went first because the walk
+    // was *ascending*, so a process that had just exec'd - the highest pid -
+    // was reached last and cost a full pass. The walk is descending now, which
+    // covers that case on its own.
+    //
+    // What the descending walk does not cover is the other prior: a long-lived
+    // process opening its Nth connection. Every connection is a new inode no
+    // cache can know, and the pid may be old and therefore low. So that list
+    // is now the one consulted first, and it is also the shorter of the two
+    // (16 entries against 24), which makes the miss cheaper as well.
+    let recently_resolved: Vec<u32> = RESOLVED_PIDS.lock().iter().copied().collect();
+    for pid in recently_resolved {
         if let Some(found) = pid_has_socket_inode(pid, inode) {
             record_resolved_pid(found);
             return Some(found);
         }
     }
-    let recently_resolved: Vec<u32> = RESOLVED_PIDS.lock().iter().copied().collect();
-    for pid in recently_resolved {
+    let recent_execs = crate::ebpf::proc_table::global().recent_pids(24, Instant::now());
+    for pid in recent_execs {
         if let Some(found) = pid_has_socket_inode(pid, inode) {
             record_resolved_pid(found);
             return Some(found);
