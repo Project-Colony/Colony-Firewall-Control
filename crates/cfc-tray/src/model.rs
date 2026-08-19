@@ -274,13 +274,35 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
 }
 
 /// What a notification button click means.
+///
+/// # Why Allow persists and Deny does not
+///
+/// The two permanent choices are the two that answer the question the user is
+/// actually being asked: *may this program use the network?* That is a
+/// property of the program, not of one TCP connection, and it is how a person
+/// thinks about it - the same shape Windows Firewall Control uses, where you
+/// authorise the executable once and never see it again.
+///
+/// Allow used to be one-shot, and it made the product unusable on the
+/// applications people use most. A browser opens dozens of connections to
+/// render one page: every one of them was a separate bubble, and answering
+/// "yes" to each was not a thing anyone would do. Observed live - a user
+/// denied ten prompts in a row to make them stop and lost their browser
+/// entirely, while Steam and a chat client, which hold a few long-lived
+/// connections, worked fine. The flaw only bit the applications that matter.
+///
+/// Deny stays one-shot on purpose. "Not right now" and "never" are genuinely
+/// different answers, and the permanent form of no already has its own button.
+/// Keeping the transient option on the refusing side, where a mistake costs a
+/// retry rather than access, is the right way round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptChoice {
-    /// "Allow": allow this one connection.
-    AllowOnce,
-    /// "Deny": deny this one connection.
+    /// "Allow": this program may use the network, from now on. Persists a
+    /// rule scoped to the exe, mirroring [`Self::BlockAlways`].
+    AllowAlways,
+    /// "Deny": refuse this one connection. Ask again next time.
     DenyOnce,
-    /// "Block app always": deny and persist a rule for this exe.
+    /// "Block app": deny and persist a rule for this exe.
     BlockAlways,
 }
 
@@ -289,40 +311,63 @@ pub enum PromptChoice {
 /// and map to `None`.
 pub fn choice_from_key(key: &str) -> Option<PromptChoice> {
     match key {
-        KEY_ALLOW => Some(PromptChoice::AllowOnce),
+        KEY_ALLOW => Some(PromptChoice::AllowAlways),
         KEY_DENY => Some(PromptChoice::DenyOnce),
         KEY_BLOCK => Some(PromptChoice::BlockAlways),
         _ => None,
     }
 }
 
-/// The SubmitVerdict triple for a choice. Once verdicts must never carry
-/// a persist_scope - the daemon rejects a persisted Once outright; only
-/// "Block app always" persists, scoped to the prompting exe.
+/// The SubmitVerdict triple for a choice.
+///
+/// Once verdicts must never carry a persist_scope - the daemon rejects a
+/// persisted Once outright. Both `Always` choices persist, scoped to the
+/// prompting exe and nothing else: the rule says *this program*, never this
+/// port or this address, so allowing a browser does not also allow whatever
+/// else happens to talk to the same host.
 pub fn verdict_for(
     choice: PromptChoice,
     exe: &str,
 ) -> (proto::Action, proto::Duration, Option<proto::RuleScope>) {
-    match choice {
-        PromptChoice::AllowOnce => (proto::Action::Allow, proto::Duration::Once, None),
-        PromptChoice::DenyOnce => (proto::Action::Deny, proto::Duration::Once, None),
-        PromptChoice::BlockAlways => (
-            proto::Action::Deny,
+    // Both persisted choices are the same rule with the verdict flipped, so
+    // they are built the same way rather than written out twice.
+    let for_this_exe = |action| {
+        (
+            action,
             proto::Duration::Always,
             Some(proto::RuleScope {
                 exe_path: exe.to_string(),
                 ..Default::default()
             }),
-        ),
+        )
+    };
+    match choice {
+        PromptChoice::AllowAlways => for_this_exe(proto::Action::Allow),
+        PromptChoice::BlockAlways => for_this_exe(proto::Action::Deny),
+        PromptChoice::DenyOnce => (proto::Action::Deny, proto::Duration::Once, None),
     }
 }
 
 /// Body of the brief confirmation after "Block app always" succeeded.
 pub fn block_confirmation(exe: &str) -> String {
-    let name = std::path::Path::new(exe)
+    format!("Rule created: deny {} always", exe_display_name(exe))
+}
+
+/// Body of the brief confirmation after "Allow" created a rule.
+///
+/// Worth showing rather than succeeding silently: the button now grants
+/// standing access, and the user should be told that in the same breath - both
+/// so they know they will not be asked again, and so an accidental click is
+/// something they can see and undo rather than discover months later.
+pub fn allow_confirmation(exe: &str) -> String {
+    format!("Rule created: allow {} always", exe_display_name(exe))
+}
+
+/// The basename, for a message meant to be read at a glance.
+fn exe_display_name(exe: &str) -> String {
+    std::path::Path::new(exe)
         .file_name()
-        .map_or_else(|| exe.to_string(), |n| n.to_string_lossy().into_owned());
-    format!("Rule created: deny {name} always")
+        .map_or_else(|| exe.to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// How a newly arrived prompt is surfaced.
@@ -690,13 +735,50 @@ mod tests {
 
     #[test]
     fn once_verdicts_never_carry_a_persist_scope() {
-        // The daemon rejects a persisted Once outright; these must be bare.
-        let (a, d, s) = verdict_for(PromptChoice::AllowOnce, "/usr/bin/curl");
-        assert_eq!((a, d), (proto::Action::Allow, proto::Duration::Once));
-        assert_eq!(s, None);
+        // The daemon rejects a persisted Once outright; this must be bare.
         let (a, d, s) = verdict_for(PromptChoice::DenyOnce, "/usr/bin/curl");
         assert_eq!((a, d), (proto::Action::Deny, proto::Duration::Once));
         assert_eq!(s, None);
+    }
+
+    /// The answer to "may this program use the network?" is about the
+    /// program, so Allow persists - the same shape as Block, verdict flipped.
+    ///
+    /// It used to be one-shot, and that made the product unusable on exactly
+    /// the applications people care about: a browser opens dozens of
+    /// connections per page, each one its own bubble. Found by using it.
+    #[test]
+    fn allow_persists_a_rule_for_the_exe_like_block_does() {
+        let (a, d, s) = verdict_for(PromptChoice::AllowAlways, "/usr/bin/firefox");
+        assert_eq!((a, d), (proto::Action::Allow, proto::Duration::Always));
+        let scope = s.expect("Allow must persist a rule");
+        assert_eq!(scope.exe_path, "/usr/bin/firefox");
+
+        // Scoped to the program and nothing else. A port or host in here
+        // would mean allowing a browser also allowed anything else that
+        // happened to talk to the same place.
+        assert!(scope.dst_host.is_empty());
+        assert!(scope.dst_net.is_empty());
+        assert!(!scope.has_dst_port);
+        assert!(!scope.has_protocol);
+        assert!(!scope.has_uid);
+
+        // Same rule as Block, opposite verdict - which is the property that
+        // makes the two buttons symmetrical.
+        let (block_a, block_d, block_s) =
+            verdict_for(PromptChoice::BlockAlways, "/usr/bin/firefox");
+        assert_eq!(block_d, d);
+        assert_eq!(block_s.map(|b| b.exe_path), Some(scope.exe_path));
+        assert_ne!(block_a, a);
+    }
+
+    #[test]
+    fn allow_confirmation_names_the_program() {
+        let msg = allow_confirmation("/usr/bin/firefox");
+        assert!(msg.contains("firefox"), "{msg}");
+        assert!(msg.contains("allow"), "{msg}");
+        // The basename, not the whole path: this is read at a glance.
+        assert!(!msg.contains("/usr/bin/"), "{msg}");
     }
 
     #[test]
@@ -717,7 +799,7 @@ mod tests {
 
     #[test]
     fn action_keys_map_to_choices_and_nothing_else_does() {
-        assert_eq!(choice_from_key(KEY_ALLOW), Some(PromptChoice::AllowOnce));
+        assert_eq!(choice_from_key(KEY_ALLOW), Some(PromptChoice::AllowAlways));
         assert_eq!(choice_from_key(KEY_DENY), Some(PromptChoice::DenyOnce));
         assert_eq!(choice_from_key(KEY_BLOCK), Some(PromptChoice::BlockAlways));
         assert_eq!(choice_from_key(KEY_DEFAULT), None);

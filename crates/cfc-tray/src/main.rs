@@ -380,7 +380,18 @@ fn open_gui() {
                 let _ = child.wait();
             });
         }
-        Err(e) => warn!("launching {GUI_BIN}: {e} (is it installed and on PATH?)"),
+        Err(e) => {
+            warn!("launching {GUI_BIN}: {e} (is it installed and on PATH?)");
+            // A log line is not feedback. Every route into the GUI - the tray
+            // icon, the "N prompts waiting" item, the "Details" button on a
+            // prompt bubble - failed by doing *nothing at all*, which reads as
+            // a broken tray rather than a missing binary. Found the same way
+            // as everything else here: by clicking it and watching nothing
+            // happen.
+            notify_brief(format!(
+                "Cannot open Colony Firewall — {GUI_BIN} is not installed or not on PATH"
+            ));
+        }
     }
 }
 
@@ -638,11 +649,22 @@ async fn submit_prompt_verdict(
     choice: PromptChoice,
     exe: &str,
 ) {
-    if choice == PromptChoice::BlockAlways && exe.is_empty() {
-        // A RuleScope with an empty exe_path is a match-everything deny
-        // rule. The button is not offered for exe-less prompts, but never
-        // trust the notification server that far.
-        warn!(prompt_id, "block verdict without an exe path ignored");
+    // A RuleScope with an empty exe_path matches EVERYTHING. As a deny that
+    // is a machine with no network; as an allow it is a firewall that permits
+    // every program on the system. Both persisted choices are refused here
+    // rather than only the block one - the buttons are not offered for
+    // exe-less prompts, but a notification server is not something to trust
+    // that far.
+    if matches!(
+        choice,
+        PromptChoice::BlockAlways | PromptChoice::AllowAlways
+    ) && exe.is_empty()
+    {
+        warn!(
+            prompt_id,
+            ?choice,
+            "persisted verdict without an exe path ignored"
+        );
         return;
     }
     if client.is_none() {
@@ -659,8 +681,13 @@ async fn submit_prompt_verdict(
     match c.submit_verdict(prompt_id, action, duration, scope).await {
         Ok(true) => {
             debug!(prompt_id, ?choice, "verdict accepted");
-            if choice == PromptChoice::BlockAlways {
-                notify_brief(model::block_confirmation(exe));
+            // Both persisted choices confirm. Allow now grants standing
+            // access, so saying so is what makes an accidental click
+            // something the user can notice and undo.
+            match choice {
+                PromptChoice::BlockAlways => notify_brief(model::block_confirmation(exe)),
+                PromptChoice::AllowAlways => notify_brief(model::allow_confirmation(exe)),
+                PromptChoice::DenyOnce => {}
             }
         }
         Ok(false) => {
