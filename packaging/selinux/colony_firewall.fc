@@ -1,0 +1,21 @@
+# File contexts for Colony Firewall Control.
+#
+# Only the daemon gets a domain of its own. `colony-firewall`, `cfc` and
+# `colony-firewall-tray` are client programs that run as the invoking user and
+# do nothing privileged; labelling them would confine the *user's* session
+# rather than the thing holding CAP_NET_ADMIN, which is not where the risk is.
+# They reach the daemon through `colony_firewall_stream_connect`.
+#
+# /usr/lib/colony-firewall/cfc-ebpf.o is deliberately absent too: bin_t/lib_t is
+# the right label for a read-only file under /usr/lib, and the loader already
+# refuses to load it unless it is root-owned and unwritable by anyone else.
+
+/usr/bin/colony-firewalld		--	gen_context(system_u:object_r:colony_firewalld_exec_t,s0)
+
+/etc/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_conf_t,s0)
+/var/lib/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_var_lib_t,s0)
+/var/log/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_log_t,s0)
+/run/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_runtime_t,s0)
+
+/usr/lib/systemd/system/colony-firewalld\.service	--	gen_context(system_u:object_r:colony_firewall_unit_file_t,s0)
+/usr/lib/systemd/system/colony-firewall-nft\.service	--	gen_context(system_u:object_r:colony_firewall_unit_file_t,s0)

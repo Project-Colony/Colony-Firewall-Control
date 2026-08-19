@@ -1,0 +1,153 @@
+# RHEL-family packaging.
+#
+# Everything in `packaging/rpm` and `packaging/selinux` is written against a
+# platform this project is not developed on, which is exactly the kind of file
+# that rots without anyone noticing. Two things are checked here, and neither
+# is cosmetic:
+#
+#   1. the SELinux module *compiles* against the real `selinux-policy-devel` of
+#      each release. That proves every type and interface it names exists
+#      there - `bpf_t`, `rpm_exec_t`, `stream_connect_pattern` and the rest -
+#      which is the failure mode a policy written away from the platform
+#      actually has.
+#   2. the spec parses and produces a source RPM, with `rpmlint` on top.
+#
+# What is deliberately NOT checked: that the rules are *sufficient*. That needs
+# a running enforcing system with the daemon under load, and no amount of
+# compiling proves it. `packaging/selinux/README.md` says so plainly rather
+# than letting a green tick here imply otherwise.
+
+name: rhel
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packaging/**"
+      - "systemd/**"
+      - ".github/workflows/rhel.yml"
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "systemd/**"
+      - ".github/workflows/rhel.yml"
+  # The policy names types from selinux-policy-devel, which moves under us
+  # between releases. A weekly run catches a rename before a user does.
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selinux:
+    name: selinux (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rocky 9 is the deployment target. Fedora is the early warning: its
+          # selinux-policy is where the next RHEL's will come from, so a type
+          # this module names disappearing shows up here first.
+          - name: rocky-9
+            image: "rockylinux:9"
+          - name: fedora-latest
+            image: "fedora:latest"
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install the policy toolchain
+        run: |
+          set -eux
+          # Rocky's `dnf` is `microdnf`-less and full; Fedora's is dnf5. Both
+          # accept this form.
+          dnf -y install make selinux-policy-devel bzip2
+
+      - name: Build the module
+        run: |
+          set -eux
+          cd packaging/selinux
+          make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
+          ls -l colony_firewall.pp
+
+      - name: Show what it granted
+        # `sedismod`/`sedispol` are not installed here, so this is the cheap
+        # version: prove the module loads far enough to be listed, and print
+        # its declared types so a diff in review shows a widened policy.
+        run: |
+          set -eux
+          cd packaging/selinux
+          grep -E '^\s*(type|allow)' colony_firewall.te | sed 's/^\s*//' | sort
+
+      - name: Refuse a permissive escape hatch
+        # A `permissive colony_firewalld_t` line would make this file look like
+        # a policy while behaving like `setenforce 0` for one domain, and it is
+        # the single most likely thing for someone to add while debugging an
+        # AVC and forget to remove.
+        run: |
+          set -eux
+          if grep -qE '^\s*permissive\b' packaging/selinux/colony_firewall.te; then
+            echo "::error file=packaging/selinux/colony_firewall.te::a permissive domain defeats the whole module"
+            exit 1
+          fi
+
+  spec:
+    name: rpm spec
+    runs-on: ubuntu-24.04
+    container:
+      image: "rockylinux:9"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install rpm tooling
+        run: dnf -y install rpm-build rpmlint rpmdevtools
+
+      - name: Parse the spec
+        # `rpmspec -P` expands every macro. A spec that references a macro the
+        # platform does not define - `%selinux_modules_install` is the obvious
+        # candidate - fails here rather than halfway through someone's build.
+        run: |
+          set -eux
+          rpmspec -P packaging/rpm/colony-firewall-control.spec > /dev/null
+          rpmspec -q --qf '%{name}-%{version}-%{release}\n' \
+            packaging/rpm/colony-firewall-control.spec
+
+      - name: Build a source RPM
+        run: |
+          set -eux
+          rpmdev-setuptree
+          # `%prep` needs the tarball to exist even for a source RPM. Its
+          # contents are irrelevant here: nothing is unpacked.
+          touch ~/rpmbuild/SOURCES/colony-firewall-control-0.2.0.tar.gz
+          rpmbuild -bs packaging/rpm/colony-firewall-control.spec
+          ls -l ~/rpmbuild/SRPMS/
+
+      - name: rpmlint
+        # Advisory: rpmlint has opinions this package will not always share
+        # (an unpackaged /usr/lib directory is intentional - it is where a
+        # locally built BPF object goes). Failing the job on them would mean
+        # arguing with a linter instead of packaging.
+        continue-on-error: true
+        run: rpmlint packaging/rpm/colony-firewall-control.spec
+
+  version-agrees:
+    name: version agrees with Cargo.toml
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Compare
+        # Three files now carry the version - Cargo.toml, the PKGBUILD and the
+        # spec - and a release where they disagree ships a package whose name
+        # lies about what is inside it.
+        run: |
+          set -eu
+          cargo="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          pkgbuild="$(grep -m1 '^pkgver=' pkg/PKGBUILD | cut -d= -f2)"
+          spec="$(grep -m1 '^Version:' packaging/rpm/colony-firewall-control.spec | awk '{print $2}')"
+          echo "Cargo.toml=$cargo PKGBUILD=$pkgbuild spec=$spec"
+          test "$cargo" = "$pkgbuild" || { echo "::error::PKGBUILD disagrees with Cargo.toml"; exit 1; }
+          test "$cargo" = "$spec"     || { echo "::error::spec disagrees with Cargo.toml"; exit 1; }

@@ -1,0 +1,101 @@
+## <summary>Colony Firewall Control - interactive outbound application firewall.</summary>
+
+########################################
+## <summary>
+##	Connect to the Colony Firewall Control daemon over its unix socket.
+## </summary>
+## <desc>
+##	<p>
+##	This is the whole client surface. The CLI (<tt>cfc</tt>), the tray and
+##	the GUI all speak gRPC over <tt>/run/colony-firewall/cfc.sock</tt> and
+##	need nothing else from this module - they do not read the rule store,
+##	the log directory or the config file, and should not be granted them.
+##	</p>
+##	<p>
+##	The socket is also protected by DAC: the daemon chgrps it to
+##	<tt>colony-firewall</tt> and chmods it 0660 after bind. Both checks
+##	apply, so a domain granted this interface still needs to be in that
+##	group.
+##	</p>
+## </desc>
+## <param name="domain">
+##	<summary>
+##	Domain allowed to connect.
+##	</summary>
+## </param>
+#
+interface(`colony_firewall_stream_connect',`
+	gen_require(`
+		type colony_firewalld_t;
+		type colony_firewall_runtime_t;
+	')
+
+	files_search_runtime($1)
+	stream_connect_pattern($1, colony_firewall_runtime_t, colony_firewall_runtime_t, colony_firewalld_t)
+')
+
+########################################
+## <summary>
+##	Read the Colony Firewall Control log directory.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`colony_firewall_read_log',`
+	gen_require(`
+		type colony_firewall_log_t;
+	')
+
+	logging_search_logs($1)
+	list_dirs_pattern($1, colony_firewall_log_t, colony_firewall_log_t)
+	read_files_pattern($1, colony_firewall_log_t, colony_firewall_log_t)
+')
+
+########################################
+## <summary>
+##	All of the rights needed to administer Colony Firewall Control.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+## <param name="role">
+##	<summary>
+##	Role allowed access.
+##	</summary>
+## </param>
+## <rolecap/>
+#
+interface(`colony_firewall_admin',`
+	gen_require(`
+		type colony_firewalld_t;
+		type colony_firewalld_exec_t;
+		type colony_firewall_conf_t;
+		type colony_firewall_var_lib_t;
+		type colony_firewall_runtime_t;
+		type colony_firewall_log_t;
+		type colony_firewall_unit_file_t;
+	')
+
+	allow $1 colony_firewalld_t:process { signal_perms ptrace };
+	ps_process_pattern($1, colony_firewalld_t)
+
+	systemd_search_unit_dirs($1)
+	admin_pattern($1, colony_firewall_unit_file_t)
+
+	files_search_etc($1)
+	admin_pattern($1, colony_firewall_conf_t)
+
+	files_search_var_lib($1)
+	admin_pattern($1, colony_firewall_var_lib_t)
+
+	files_search_runtime($1)
+	admin_pattern($1, colony_firewall_runtime_t)
+
+	logging_search_logs($1)
+	admin_pattern($1, colony_firewall_log_t)
+')

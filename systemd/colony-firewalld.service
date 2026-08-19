@@ -136,6 +136,14 @@ MemoryDenyWriteExecute=true
 # Listing them costs nothing when the eBPF backend is off: an allowed syscall
 # that is never called is not an attack surface, and CAP_BPF is a separate gate
 # on making it succeed.
+#
+# One more thing this set has to cover, which is not obvious from the list: on
+# an rpm host the provenance backend runs `rpm -qa` once per package-database
+# generation. fork/clone/execve are already in @system-service, and everything
+# else about this unit is compatible with that child - ProtectSystem=strict
+# leaves /var/lib/rpm readable, and rpm needs no writable-executable memory. If
+# it ever is not compatible, the failure is a warning and an empty provenance
+# index, never a failure to filter.
 SystemCallFilter=@system-service
 SystemCallFilter=bpf perf_event_open
 SystemCallErrorNumber=EPERM
