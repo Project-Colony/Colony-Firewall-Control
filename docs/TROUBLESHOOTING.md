@@ -332,7 +332,12 @@ set. For a bounded unattended window - during a package install, say -
 `--count N` exits after N prompts.
 
 **2. Pre-seed rules and accept the fallback.** `cfc rules
-bootstrap-defaults` covers the usual system services; add your own with
+bundle add system` (also spelled `cfc rules bootstrap-defaults`) covers
+the usual system services. `cfc rules bundle list` shows the others —
+`web` for installed browsers, `dev` for git/cargo/npm, `updates` for
+apt/dnf/flatpak — each scoped to a specific executable, never to a bare
+port. Entries whose program is not installed here are skipped and
+reported. Add your own with
 `cfc rules add`. Anything you did not anticipate still hits
 `no_ui_action`.
 

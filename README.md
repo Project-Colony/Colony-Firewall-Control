@@ -191,7 +191,7 @@ sudo nft -f systemd/nftables-snippet.conf                      # from a checkout
 without prompting:
 
 ```sh
-sudo cfc rules bootstrap-defaults
+sudo cfc rules bootstrap-defaults   # same as: cfc rules bundle add system
 ```
 
 (`sudo` because group membership from `usermod -aG colony-firewall` only
@@ -208,6 +208,24 @@ own, so on a machine with no rules and no UI connected nothing outbound
 gets through - including the DHCP lease. Filtering starts before the
 network is configured (see below), and these rules are what let the
 machine come up at all.
+
+For everything else, there are bundles:
+
+```sh
+cfc rules bundle list                 # what there is, and what applies here
+cfc rules bundle add web --dry-run    # preview
+sudo cfc rules bundle add web         # installed browsers -> 443 and 80
+sudo cfc rules bundle add dev         # git, cargo, npm, pip, docker
+sudo cfc rules bundle add updates     # apt, dnf, flatpak, yay
+sudo cfc rules bundle remove web      # exactly the rules that bundle owns
+```
+
+Two properties worth knowing. **Every rule names an executable** - there
+is no way to write "allow tcp/443" here, because a payload phoning home
+uses 443 exactly like a browser does and a port-shaped rule cannot tell
+them apart. And entries whose program is not installed on this machine
+are **skipped and reported**, so "4 added, 10 skipped" is the normal
+outcome of `bundle add web` on a box with two browsers.
 
 **3. Give prompts somewhere to go.** On a desktop, launch the GUI:
 

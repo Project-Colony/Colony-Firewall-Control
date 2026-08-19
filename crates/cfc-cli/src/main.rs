@@ -180,6 +180,44 @@ enum RulesCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Install or remove a named set of allow rules.
+    ///
+    /// Every rule in a bundle names an executable - there is no way to write
+    /// "allow tcp/443" here, because a payload phoning home uses 443 exactly
+    /// like a browser does and a port-shaped rule cannot tell them apart.
+    ///
+    /// Entries whose program is not installed on this machine are skipped and
+    /// reported, so "4 added, 3 skipped" is a normal outcome.
+    Bundle {
+        #[command(subcommand)]
+        cmd: BundleCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BundleCmd {
+    /// Show the bundles, how many of their entries apply here, and how many
+    /// are already installed.
+    List,
+    /// Install a bundle's rules.
+    Add {
+        /// Bundle name (see `cfc rules bundle list`).
+        name: String,
+        /// Show what would be installed without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the rules a bundle installed.
+    ///
+    /// Matches the bundle's exact rule names, never a prefix, so a rule you
+    /// wrote yourself is never caught by it.
+    Remove {
+        /// Bundle name (see `cfc rules bundle list`).
+        name: String,
+        /// Show what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -279,6 +317,15 @@ async fn dispatch(
             RulesCmd::ImportOpensnitch { path, replace } => {
                 rules::import_opensnitch(client, path, replace, format).await
             }
+            RulesCmd::Bundle { cmd } => match cmd {
+                BundleCmd::List => rules::bundle_list(client, format).await,
+                BundleCmd::Add { name, dry_run } => {
+                    rules::bundle_add(client, &name, dry_run, format).await
+                }
+                BundleCmd::Remove { name, dry_run } => {
+                    rules::bundle_remove(client, &name, dry_run, format).await
+                }
+            },
             RulesCmd::BootstrapDefaults { dry_run } => {
                 rules::bootstrap_defaults(client, dry_run, format).await
             }

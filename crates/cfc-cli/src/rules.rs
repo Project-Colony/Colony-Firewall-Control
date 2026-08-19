@@ -828,184 +828,580 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
 // bootstrap defaults
 // ---------------------------------------------------------------------------
 
-struct DefaultRule {
+/// One rule a bundle would install.
+///
+/// # Every entry names an executable. On purpose.
+///
+/// A bundle must never install a bare "allow tcp/443". That is precisely the
+/// hole this program exists to close: a payload phoning home uses 443 exactly
+/// like a browser does, and a port-shaped rule cannot tell them apart. What
+/// makes a rule worth having is the pairing - *this binary* may reach *this
+/// port* - so `exe_candidates` is not optional and there is no way to express
+/// a rule without it.
+///
+/// # Why a list of candidates
+///
+/// Binary paths differ per distribution: `/usr/bin/NetworkManager` on Arch,
+/// `/usr/sbin/NetworkManager` on Debian. Hardcoding one path would make a
+/// bundle silently install nothing useful on half the machines that run it.
+/// The first candidate that **exists on this machine** is used; if none does,
+/// the entry is skipped and said out loud, so "installed 4 of 7, skipped 3 not
+/// present" is a normal, legible outcome rather than a silent partial success.
+struct BundleRule {
     name: &'static str,
-    exe: Option<&'static str>,
+    /// Absolute paths to try, in order. First one that exists wins.
+    exe_candidates: &'static [&'static str],
     dst_host: Option<&'static str>,
     dst_port: Option<u16>,
     protocol: Option<proto::Protocol>,
 }
 
-fn default_rules() -> Vec<DefaultRule> {
+impl BundleRule {
+    /// The path to use on this machine, or `None` if the program is not here.
+    fn resolve(&self) -> Option<&'static str> {
+        self.exe_candidates
+            .iter()
+            .copied()
+            .find(|p| std::path::Path::new(p).is_file())
+    }
+}
+
+/// A named, selectable set of rules.
+struct Bundle {
+    name: &'static str,
+    summary: &'static str,
+    rules: Vec<BundleRule>,
+}
+
+/// Every bundle this build knows about.
+///
+/// `system` is byte-for-byte the set `bootstrap-defaults` has always
+/// installed - same twelve rule names, same ports - so that command keeps
+/// working and existing installs see no change. What it gains is alternative
+/// paths for distributions that put these binaries elsewhere.
+fn bundles() -> Vec<Bundle> {
+    use proto::Protocol::{Tcp, Udp};
     vec![
-        // DNS - systemd-resolved owns the stub
-        DefaultRule {
-            name: "default-systemd-resolved-dns",
-            exe: Some("/usr/lib/systemd/systemd-resolved"),
-            dst_host: None,
-            dst_port: Some(53),
-            protocol: None,
+        Bundle {
+            name: "system",
+            summary: "what a machine needs to boot, resolve names, keep time and be updated",
+            rules: vec![
+                // DNS - systemd-resolved owns the stub.
+                BundleRule {
+                    name: "default-systemd-resolved-dns",
+                    exe_candidates: &[
+                        "/usr/lib/systemd/systemd-resolved",
+                        "/lib/systemd/systemd-resolved",
+                    ],
+                    dst_host: None,
+                    dst_port: Some(53),
+                    protocol: None,
+                },
+                // NTP - timesyncd or chrony.
+                BundleRule {
+                    name: "default-systemd-timesyncd",
+                    exe_candidates: &[
+                        "/usr/lib/systemd/systemd-timesyncd",
+                        "/lib/systemd/systemd-timesyncd",
+                    ],
+                    dst_host: None,
+                    dst_port: Some(123),
+                    protocol: Some(Udp),
+                },
+                BundleRule {
+                    name: "default-chrony",
+                    exe_candidates: &["/usr/bin/chronyd", "/usr/sbin/chronyd"],
+                    dst_host: None,
+                    dst_port: Some(123),
+                    protocol: Some(Udp),
+                },
+                // Package managers - HTTPS mirrors.
+                BundleRule {
+                    name: "default-pacman-https",
+                    exe_candidates: &["/usr/bin/pacman"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "default-paru-https",
+                    exe_candidates: &["/usr/bin/paru"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                // SSH client.
+                BundleRule {
+                    name: "default-ssh-client",
+                    exe_candidates: &["/usr/bin/ssh"],
+                    dst_host: None,
+                    dst_port: Some(22),
+                    protocol: Some(Tcp),
+                },
+                // DHCP clients. The units are ordered Before=network-pre.target,
+                // so filtering is live before any interface is configured: these
+                // rules are what lets the machine get a lease at boot with no UI
+                // connected yet to answer prompts. (The very first DISCOVER goes
+                // over an AF_PACKET raw socket that bypasses netfilter anyway;
+                // these cover the routed unicast renewals, v4 on 67/udp and
+                // DHCPv6 on 547/udp.)
+                BundleRule {
+                    name: "default-dhcpcd",
+                    exe_candidates: &["/usr/bin/dhcpcd", "/usr/sbin/dhcpcd"],
+                    dst_host: None,
+                    dst_port: Some(67),
+                    protocol: Some(Udp),
+                },
+                BundleRule {
+                    name: "default-dhcpcd-v6",
+                    exe_candidates: &["/usr/bin/dhcpcd", "/usr/sbin/dhcpcd"],
+                    dst_host: None,
+                    dst_port: Some(547),
+                    protocol: Some(Udp),
+                },
+                BundleRule {
+                    name: "default-networkmanager-dhcp",
+                    exe_candidates: &["/usr/bin/NetworkManager", "/usr/sbin/NetworkManager"],
+                    dst_host: None,
+                    dst_port: Some(67),
+                    protocol: Some(Udp),
+                },
+                BundleRule {
+                    name: "default-networkmanager-dhcp6",
+                    exe_candidates: &["/usr/bin/NetworkManager", "/usr/sbin/NetworkManager"],
+                    dst_host: None,
+                    dst_port: Some(547),
+                    protocol: Some(Udp),
+                },
+                BundleRule {
+                    name: "default-networkd-dhcp",
+                    exe_candidates: &[
+                        "/usr/lib/systemd/systemd-networkd",
+                        "/lib/systemd/systemd-networkd",
+                    ],
+                    dst_host: None,
+                    dst_port: Some(67),
+                    protocol: Some(Udp),
+                },
+                BundleRule {
+                    name: "default-networkd-dhcp6",
+                    exe_candidates: &[
+                        "/usr/lib/systemd/systemd-networkd",
+                        "/lib/systemd/systemd-networkd",
+                    ],
+                    dst_host: None,
+                    dst_port: Some(547),
+                    protocol: Some(Udp),
+                },
+            ],
         },
-        // NTP - timesyncd or chrony
-        DefaultRule {
-            name: "default-systemd-timesyncd",
-            exe: Some("/usr/lib/systemd/systemd-timesyncd"),
-            dst_host: None,
-            dst_port: Some(123),
-            protocol: Some(proto::Protocol::Udp),
+        Bundle {
+            name: "updates",
+            summary: "package managers beyond pacman/paru, which are in `system`",
+            rules: vec![
+                BundleRule {
+                    name: "updates-apt-https",
+                    exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/https"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                // Debian mirrors are still commonly plain HTTP; the packages
+                // are signed, so the transport is not what protects them.
+                BundleRule {
+                    name: "updates-apt-http",
+                    exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/http"],
+                    dst_host: None,
+                    dst_port: Some(80),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "updates-dnf-https",
+                    exe_candidates: &["/usr/bin/dnf", "/usr/bin/dnf5"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "updates-flatpak-https",
+                    exe_candidates: &["/usr/bin/flatpak"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "updates-yay-https",
+                    exe_candidates: &["/usr/bin/yay"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+            ],
         },
-        DefaultRule {
-            name: "default-chrony",
-            exe: Some("/usr/bin/chronyd"),
-            dst_host: None,
-            dst_port: Some(123),
-            protocol: Some(proto::Protocol::Udp),
+        Bundle {
+            name: "web",
+            summary: "installed browsers, for HTTPS and the HTTP that redirects to it",
+            rules: browser_rules(),
         },
-        // Package managers - hit HTTPS mirrors
-        DefaultRule {
-            name: "default-pacman-https",
-            exe: Some("/usr/bin/pacman"),
-            dst_host: None,
-            dst_port: Some(443),
-            protocol: Some(proto::Protocol::Tcp),
-        },
-        DefaultRule {
-            name: "default-paru-https",
-            exe: Some("/usr/bin/paru"),
-            dst_host: None,
-            dst_port: Some(443),
-            protocol: Some(proto::Protocol::Tcp),
-        },
-        // SSH client
-        DefaultRule {
-            name: "default-ssh-client",
-            exe: Some("/usr/bin/ssh"),
-            dst_host: None,
-            dst_port: Some(22),
-            protocol: Some(proto::Protocol::Tcp),
-        },
-        // DHCP clients. The units are ordered Before=network-pre.target,
-        // so filtering is live before any interface is configured: under a
-        // strict profile these rules are what lets the machine get a lease
-        // at boot, with no UI connected yet to answer prompts. (The very
-        // first DISCOVER goes over an AF_PACKET raw socket that bypasses
-        // netfilter anyway; these cover the routed unicast renewals, v4 on
-        // 67/udp and DHCPv6 on 547/udp.)
-        DefaultRule {
-            name: "default-dhcpcd",
-            exe: Some("/usr/bin/dhcpcd"),
-            dst_host: None,
-            dst_port: Some(67),
-            protocol: Some(proto::Protocol::Udp),
-        },
-        DefaultRule {
-            name: "default-dhcpcd-v6",
-            exe: Some("/usr/bin/dhcpcd"),
-            dst_host: None,
-            dst_port: Some(547),
-            protocol: Some(proto::Protocol::Udp),
-        },
-        DefaultRule {
-            name: "default-networkmanager-dhcp",
-            exe: Some("/usr/bin/NetworkManager"),
-            dst_host: None,
-            dst_port: Some(67),
-            protocol: Some(proto::Protocol::Udp),
-        },
-        DefaultRule {
-            name: "default-networkmanager-dhcp6",
-            exe: Some("/usr/bin/NetworkManager"),
-            dst_host: None,
-            dst_port: Some(547),
-            protocol: Some(proto::Protocol::Udp),
-        },
-        DefaultRule {
-            name: "default-networkd-dhcp",
-            exe: Some("/usr/lib/systemd/systemd-networkd"),
-            dst_host: None,
-            dst_port: Some(67),
-            protocol: Some(proto::Protocol::Udp),
-        },
-        DefaultRule {
-            name: "default-networkd-dhcp6",
-            exe: Some("/usr/lib/systemd/systemd-networkd"),
-            dst_host: None,
-            dst_port: Some(547),
-            protocol: Some(proto::Protocol::Udp),
+        Bundle {
+            name: "dev",
+            summary: "the tools that fetch code and dependencies",
+            rules: vec![
+                // git speaks both: HTTPS remotes and ssh:// remotes.
+                BundleRule {
+                    name: "dev-git-https",
+                    exe_candidates: &["/usr/bin/git"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "dev-git-ssh",
+                    exe_candidates: &["/usr/bin/git"],
+                    dst_host: None,
+                    dst_port: Some(22),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "dev-cargo-https",
+                    exe_candidates: &["/usr/bin/cargo"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "dev-npm-https",
+                    exe_candidates: &["/usr/bin/npm", "/usr/bin/node"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "dev-pip-https",
+                    exe_candidates: &["/usr/bin/pip", "/usr/bin/pip3"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+                BundleRule {
+                    name: "dev-docker-https",
+                    exe_candidates: &["/usr/bin/dockerd", "/usr/bin/podman"],
+                    dst_host: None,
+                    dst_port: Some(443),
+                    protocol: Some(Tcp),
+                },
+            ],
         },
     ]
 }
 
+/// One HTTPS and one HTTP rule per browser this build knows about.
+///
+/// HTTP is included because a great deal of the web is still reached by an
+/// http:// link that redirects; a browser allowed only 443 fails in a way
+/// users read as "the internet is broken" rather than "the firewall did that".
+fn browser_rules() -> Vec<BundleRule> {
+    /// `(rule stem, candidate paths)`.
+    const BROWSERS: &[(&str, &[&str])] = &[
+        ("firefox", &["/usr/bin/firefox", "/usr/lib/firefox/firefox"]),
+        ("librewolf", &["/usr/bin/librewolf"]),
+        (
+            "chromium",
+            &["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
+        ),
+        ("chrome", &["/usr/bin/google-chrome-stable"]),
+        ("brave", &["/usr/bin/brave"]),
+        ("vivaldi", &["/usr/bin/vivaldi-stable"]),
+        ("epiphany", &["/usr/bin/epiphany"]),
+    ];
+
+    // `&'static str` names are needed by `BundleRule`, and these are built at
+    // run time, so the table below is spelled out rather than formatted. It is
+    // the price of keeping rule names stable and greppable.
+    const HTTPS: u16 = 443;
+    const HTTP: u16 = 80;
+    let mut out = Vec::with_capacity(BROWSERS.len() * 2);
+    for (stem, paths) in BROWSERS {
+        for (port, suffix) in [(HTTPS, "https"), (HTTP, "http")] {
+            out.push(BundleRule {
+                // Leaked once, at startup, for a fixed and tiny set. The
+                // alternative is threading lifetimes through the whole bundle
+                // type for names that live as long as the process anyway.
+                name: Box::leak(format!("web-{stem}-{suffix}").into_boxed_str()),
+                exe_candidates: paths,
+                dst_host: None,
+                dst_port: Some(port),
+                protocol: Some(proto::Protocol::Tcp),
+            });
+        }
+    }
+    out
+}
+
+/// Finds a bundle by name, or lists what there is.
+fn find_bundle(name: &str) -> Result<Bundle, CliError> {
+    let all = bundles();
+    let known: Vec<&str> = all.iter().map(|b| b.name).collect();
+    all.into_iter()
+        .find(|b| b.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| {
+            CliError::not_found(format!(
+                "no bundle named {name:?}; known bundles: {}",
+                known.join(", ")
+            ))
+        })
+}
+
+/// What a bundle would do on *this* machine.
+struct Planned {
+    /// Entries whose program is installed here.
+    present: Vec<(&'static str, &'static str)>,
+    /// Entries skipped because no candidate path exists.
+    absent: Vec<&'static str>,
+}
+
+fn plan(bundle: &Bundle) -> Planned {
+    let mut present = Vec::new();
+    let mut absent = Vec::new();
+    for r in &bundle.rules {
+        match r.resolve() {
+            Some(exe) => present.push((r.name, exe)),
+            None => absent.push(r.name),
+        }
+    }
+    Planned { present, absent }
+}
+
+fn allow_rule(
+    name: &str,
+    exe: &str,
+    port: Option<u16>,
+    proto_: Option<proto::Protocol>,
+) -> proto::RuleInfo {
+    proto::RuleInfo {
+        id: String::new(),
+        name: name.to_string(),
+        enabled: true,
+        action: proto::Action::Allow as i32,
+        duration: proto::Duration::Always as i32,
+        scope: Some(proto::RuleScope {
+            exe_path: exe.to_string(),
+            exe_sha256: String::new(),
+            parent_exe: String::new(),
+            uid: 0,
+            has_uid: false,
+            dst_host: String::new(),
+            dst_net: String::new(),
+            dst_port: port.map(u32::from).unwrap_or(0),
+            has_dst_port: port.is_some(),
+            protocol: proto_.map(|p| p as i32).unwrap_or(0),
+            has_protocol: proto_.is_some(),
+        }),
+        created_at_unix_ms: 0,
+        hit_count: 0,
+    }
+}
+
+/// `cfc rules bundle list`
+pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult {
+    let existing: std::collections::HashSet<String> = client
+        .list_rules()
+        .await?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+
+    let all = bundles();
+    if format.is_json() {
+        let rows: Vec<_> = all
+            .iter()
+            .map(|b| {
+                let p = plan(b);
+                serde_json::json!({
+                    "name": b.name,
+                    "summary": b.summary,
+                    "entries": b.rules.len(),
+                    "available_here": p.present.len(),
+                    "installed": p.present.iter().filter(|(n, _)| existing.contains(*n)).count(),
+                })
+            })
+            .collect();
+        return output::print_json(&serde_json::json!({ "bundles": rows }));
+    }
+
+    println!(
+        "{:<10}  {:>9}  {:>9}  summary",
+        "bundle", "available", "installed"
+    );
+    for b in &all {
+        let p = plan(b);
+        let installed = p
+            .present
+            .iter()
+            .filter(|(n, _)| existing.contains(*n))
+            .count();
+        println!(
+            "{:<10}  {:>9}  {:>9}  {}",
+            b.name,
+            format!("{}/{}", p.present.len(), b.rules.len()),
+            installed,
+            b.summary
+        );
+    }
+    println!("\n`available` counts entries whose program is installed on this machine.");
+    Ok(())
+}
+
+/// `cfc rules bundle add <name>`
+pub async fn bundle_add(
+    client: &mut Client,
+    name: &str,
+    dry_run: bool,
+    format: OutputFormat,
+) -> CliResult {
+    let bundle = find_bundle(name)?;
+    let by_name: std::collections::HashMap<String, BundleRule> = bundle
+        .rules
+        .iter()
+        .map(|r| {
+            (
+                r.name.to_string(),
+                BundleRule {
+                    name: r.name,
+                    exe_candidates: r.exe_candidates,
+                    dst_host: r.dst_host,
+                    dst_port: r.dst_port,
+                    protocol: r.protocol,
+                },
+            )
+        })
+        .collect();
+
+    let existing: std::collections::HashSet<String> = client
+        .list_rules()
+        .await?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+
+    let planned = plan(&bundle);
+    let mut added = Vec::new();
+    let mut skipped_present = 0u32;
+
+    for (rule_name, exe) in &planned.present {
+        if existing.contains(*rule_name) {
+            skipped_present += 1;
+            continue;
+        }
+        let spec = &by_name[*rule_name];
+        if !dry_run {
+            client
+                .upsert_rule(allow_rule(rule_name, exe, spec.dst_port, spec.protocol))
+                .await?;
+        }
+        if !format.is_json() {
+            println!(
+                "{}: {rule_name}  ({exe}{})",
+                if dry_run { "would add" } else { "added" },
+                spec.dst_port
+                    .map(|p| format!(" -> :{p}"))
+                    .unwrap_or_default()
+            );
+        }
+        added.push(*rule_name);
+    }
+
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({
+            "bundle": bundle.name,
+            "dry_run": dry_run,
+            "added": added.len(),
+            "already_present": skipped_present,
+            "not_installed_here": planned.absent,
+            "rules": added,
+        }));
+    }
+
+    // Saying what was skipped is the point, not a footnote: a bundle that
+    // quietly installs four of seven rules looks identical to one that
+    // installed everything, and the difference is which programs can reach the
+    // network.
+    if !planned.absent.is_empty() {
+        println!(
+            "\nnot installed on this machine, so skipped ({}):",
+            planned.absent.len()
+        );
+        for n in &planned.absent {
+            println!("  {n}");
+        }
+    }
+    println!(
+        "\n{}: {} added, {skipped_present} already present, {} skipped",
+        if dry_run { "dry-run" } else { "done" },
+        added.len(),
+        planned.absent.len()
+    );
+    Ok(())
+}
+
+/// `cfc rules bundle remove <name>`
+///
+/// Matches on the exact rule names the bundle defines, never on a prefix: a
+/// prefix would also delete a rule someone hand-wrote and happened to name
+/// `web-something`.
+pub async fn bundle_remove(
+    client: &mut Client,
+    name: &str,
+    dry_run: bool,
+    format: OutputFormat,
+) -> CliResult {
+    let bundle = find_bundle(name)?;
+    let owned: std::collections::HashSet<&str> = bundle.rules.iter().map(|r| r.name).collect();
+
+    let existing = client.list_rules().await?;
+    let mut removed = Vec::new();
+    for r in existing.iter().filter(|r| owned.contains(r.name.as_str())) {
+        if !dry_run {
+            client.delete_rule(&r.id).await?;
+        }
+        if !format.is_json() {
+            println!(
+                "{}: {} ({})",
+                if dry_run { "would remove" } else { "removed" },
+                short_id(&r.id),
+                r.name
+            );
+        }
+        removed.push(r.name.clone());
+    }
+
+    if format.is_json() {
+        return output::print_json(&serde_json::json!({
+            "bundle": bundle.name,
+            "dry_run": dry_run,
+            "removed": removed.len(),
+            "rules": removed,
+        }));
+    }
+    println!(
+        "{}: {} removed",
+        if dry_run { "dry-run" } else { "done" },
+        removed.len()
+    );
+    Ok(())
+}
+
+/// `cfc rules bootstrap-defaults`, kept as the name people already know.
+///
+/// Exactly `bundle add system`. It predates bundles and is referenced from the
+/// README, the packaging notes and TROUBLESHOOTING, so it stays - but there is
+/// only one implementation behind the two spellings.
 pub async fn bootstrap_defaults(
     client: &mut Client,
     dry_run: bool,
     format: OutputFormat,
 ) -> CliResult {
-    let existing = client.list_rules().await?;
-    let existing_names: std::collections::HashSet<String> =
-        existing.iter().map(|r| r.name.clone()).collect();
-
-    let mut added = 0u32;
-    let mut skipped = 0u32;
-    let mut would_add: Vec<&'static str> = Vec::new();
-    for d in default_rules() {
-        if existing_names.contains(d.name) {
-            skipped += 1;
-            continue;
-        }
-        if dry_run {
-            if !format.is_json() {
-                println!("would add: {}", d.name);
-            }
-            would_add.push(d.name);
-            added += 1;
-            continue;
-        }
-
-        let scope = proto::RuleScope {
-            exe_path: d.exe.unwrap_or("").to_string(),
-            exe_sha256: String::new(),
-            parent_exe: String::new(),
-            uid: 0,
-            has_uid: false,
-            dst_host: d.dst_host.unwrap_or("").to_string(),
-            dst_net: String::new(),
-            dst_port: d.dst_port.map(u32::from).unwrap_or(0),
-            has_dst_port: d.dst_port.is_some(),
-            protocol: d.protocol.map(|p| p as i32).unwrap_or(0),
-            has_protocol: d.protocol.is_some(),
-        };
-        let rule = proto::RuleInfo {
-            id: String::new(),
-            name: d.name.to_string(),
-            enabled: true,
-            action: proto::Action::Allow as i32,
-            duration: proto::Duration::Always as i32,
-            scope: Some(scope),
-            created_at_unix_ms: 0,
-            hit_count: 0,
-        };
-        client.upsert_rule(rule).await?;
-        if !format.is_json() {
-            println!("added: {}", d.name);
-        }
-        would_add.push(d.name);
-        added += 1;
-    }
-
-    if format.is_json() {
-        return output::print_json(&serde_json::json!({
-            "dry_run": dry_run,
-            "added": added,
-            "already_present": skipped,
-            "rules": would_add,
-        }));
-    }
-    println!(
-        "{}: {added} added, {skipped} already present",
-        if dry_run { "dry-run" } else { "done" }
-    );
-    Ok(())
+    bundle_add(client, "system", dry_run, format).await
 }
 
 #[cfg(test)]
@@ -1203,6 +1599,165 @@ mod json_tests {
         assert_eq!(v["hit_count"], 42);
         assert!(v["created_at"].as_str().unwrap().starts_with("2023-"));
         assert!(v["summary"].as_str().unwrap().contains("reject"));
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    /// The invariant the whole feature rests on.
+    ///
+    /// A bundle that installed a bare "allow tcp/443" would re-open exactly
+    /// the hole this program exists to close: a payload phoning home uses 443
+    /// like everything else, and a port-shaped rule cannot tell it from a
+    /// browser. The type makes `exe_candidates` mandatory; this makes "empty
+    /// list" - the way round it - impossible too.
+    #[test]
+    fn every_bundle_rule_names_an_executable() {
+        for b in bundles() {
+            for r in &b.rules {
+                assert!(
+                    !r.exe_candidates.is_empty(),
+                    "{}/{} has no candidate path, so it would match on port alone",
+                    b.name,
+                    r.name
+                );
+                for c in r.exe_candidates {
+                    assert!(
+                        c.starts_with('/'),
+                        "{}/{}: candidate {c:?} is not absolute; rules match on \
+                         absolute exe paths, so a relative one can never fire",
+                        b.name,
+                        r.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// `bundle remove` deletes by exact rule name. If two bundles ever shared
+    /// one, removing either would silently take the other's rule with it.
+    #[test]
+    fn rule_names_are_unique_across_every_bundle() {
+        let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+        for b in bundles() {
+            for r in &b.rules {
+                if let Some(other) = seen.insert(r.name.to_string(), b.name) {
+                    panic!(
+                        "rule name {:?} is in both `{other}` and `{}`; removing \
+                         one bundle would delete the other's rule",
+                        r.name, b.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_names_are_unique() {
+        let names: Vec<&str> = bundles().iter().map(|b| b.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "duplicate bundle name in {names:?}"
+        );
+    }
+
+    /// `bootstrap-defaults` is now `bundle add system`, and people have that
+    /// command in scripts and in the README. The rule *names* are the
+    /// contract, because they are what makes it idempotent across upgrades:
+    /// the set may gain members, but must never silently lose or rename one.
+    #[test]
+    fn the_system_bundle_still_contains_the_original_twelve() {
+        const ORIGINAL: &[&str] = &[
+            "default-systemd-resolved-dns",
+            "default-systemd-timesyncd",
+            "default-chrony",
+            "default-pacman-https",
+            "default-paru-https",
+            "default-ssh-client",
+            "default-dhcpcd",
+            "default-dhcpcd-v6",
+            "default-networkmanager-dhcp",
+            "default-networkmanager-dhcp6",
+            "default-networkd-dhcp",
+            "default-networkd-dhcp6",
+        ];
+        let system = bundles()
+            .into_iter()
+            .find(|b| b.name == "system")
+            .expect("the `system` bundle must exist: bootstrap-defaults delegates to it");
+        let have: std::collections::HashSet<&str> = system.rules.iter().map(|r| r.name).collect();
+        for want in ORIGINAL {
+            assert!(
+                have.contains(want),
+                "{want} disappeared from the `system` bundle; an upgrade would \
+                 stop recognising the rule it installed last time and add a \
+                 duplicate under a new name"
+            );
+        }
+    }
+
+    /// `resolve` must pick the first candidate that exists, and answer `None`
+    /// rather than guessing when none does.
+    #[test]
+    fn resolve_picks_the_first_existing_candidate() {
+        // /proc/self/exe and / are the two paths that certainly exist on any
+        // Linux running this test; only the first is a file.
+        let r = BundleRule {
+            name: "t",
+            exe_candidates: &["/definitely/not/here", "/proc/self/exe"],
+            dst_host: None,
+            dst_port: Some(443),
+            protocol: Some(proto::Protocol::Tcp),
+        };
+        assert_eq!(r.resolve(), Some("/proc/self/exe"));
+
+        let none = BundleRule {
+            name: "t",
+            exe_candidates: &["/definitely/not/here", "/nor/here"],
+            ..r
+        };
+        assert_eq!(
+            none.resolve(),
+            None,
+            "a missing program must be skipped, not guessed"
+        );
+
+        // A directory is not an executable; `is_file` is what rejects it.
+        let dir = BundleRule {
+            name: "t",
+            exe_candidates: &["/tmp"],
+            ..r
+        };
+        assert_eq!(
+            dir.resolve(),
+            None,
+            "a directory must not resolve as a program"
+        );
+    }
+
+    /// Every bundle a user can name must be reachable, and an unknown one must
+    /// say what there is rather than failing blankly.
+    #[test]
+    fn find_bundle_is_case_insensitive_and_lists_alternatives_on_a_miss() {
+        assert!(find_bundle("SYSTEM").is_ok());
+        assert!(find_bundle("system").is_ok());
+        let e = match find_bundle("nope") {
+            Err(e) => e.to_string(),
+            Ok(b) => panic!("`nope` should not resolve, got `{}`", b.name),
+        };
+        for b in bundles() {
+            assert!(
+                e.contains(b.name),
+                "the error should list `{}`: {e}",
+                b.name
+            );
+        }
     }
 }
 
