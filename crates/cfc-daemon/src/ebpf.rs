@@ -96,7 +96,7 @@ use crate::dns::DnsCache;
 /// backend must install, in addition to today's files:
 ///
 /// ```text
-///   crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf
+///   crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o
 ///     -> /usr/lib/colony-firewall/cfc-ebpf.o      (0644 root:root)
 /// ```
 ///
@@ -141,6 +141,10 @@ pub enum Degrade {
     /// `EINVAL` / `ENOTSUP` / `ENOSYS`. The kernel does not support something
     /// the object needs. The honest "this machine cannot do ring 0" answer.
     Unsupported,
+    /// The object does not declare the event layout this daemon speaks - it
+    /// was built against a different one. Almost always a half-finished
+    /// upgrade: new binary, old object, or the reverse.
+    AbiMismatch,
     /// The verifier walked the program and refused it. Unlike the others this
     /// one is usually *our* bug meeting a newer kernel, so it is worth saying
     /// loudly wherever it appears.
@@ -157,6 +161,7 @@ impl Degrade {
             Self::ObjectMissing => "object_missing",
             Self::ObjectUnreadable => "object_unreadable",
             Self::ObjectUntrusted => "object_untrusted",
+            Self::AbiMismatch => "abi_mismatch",
             Self::NotPermitted => "not_permitted",
             Self::Unsupported => "unsupported",
             Self::Rejected => "verifier_rejected",

@@ -104,6 +104,21 @@ static PKT_SCRATCH: PerCpuArray<[u8; PKT_SCRATCH_LEN]> = PerCpuArray::with_max_e
 // 0, which this program reads as "unknown, skip ppid" so it degrades to
 // `ppid = 0` rather than reading garbage.
 
+/// Declares which event layout this object was built against.
+///
+/// The name **must** equal `cfc_ebpf_common::ABI_SYMBOL`, and the version in
+/// it must match `ABI_VERSION`. The loader requires this exact symbol to exist
+/// before it attaches anything, so an object built against a different layout
+/// fails to load instead of feeding userspace prefix-decoded garbage. A
+/// mismatch between the two names is not silent either: it fails every load,
+/// which the root test catches immediately.
+///
+/// Rust needs a literal for the symbol name, so this cannot be spelled in
+/// terms of the constant. The `const` assertions in `cfc-ebpf-common` are what
+/// make a layout change that forgets to bump it a build error.
+#[unsafe(no_mangle)]
+static CFC_EBPF_ABI_V1: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
+
 /// Byte offset of `task_struct::real_parent`. 0 means "unresolved".
 #[unsafe(no_mangle)]
 static TASK_REAL_PARENT_OFFSET: Global<u32> = Global::new(0);

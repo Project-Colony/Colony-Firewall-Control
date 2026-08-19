@@ -45,6 +45,41 @@ pub mod net;
 pub use dns::{DnsCursor, DnsHeader, MAX_ANSWERS, MAX_LABEL_JUMPS, MAX_NAME_LEN};
 pub use net::UdpPayload;
 
+/// Name of the symbol the kernel object exports to declare its event layout.
+///
+/// The object is shipped as a separate file and loaded from a path, so a stale
+/// one *will* eventually meet a newer daemon: a package that installed the
+/// object but not the binary, a hand-copied file, an interrupted upgrade.
+/// Nothing about that is loud. `decode<T>` accepts any record at least
+/// `size_of::<T>()` long and reads the prefix, so a layout change turns into
+/// plausible-looking garbage in `exe`, `uid`, `gid` and `ppid` - fields the
+/// daemon *prefers over `/proc`* when deciding who a connection belongs to.
+///
+/// The loader therefore requires this exact symbol to be present before it
+/// attaches anything (`override_global(.., must_exist = true)`, so a missing
+/// one fails the load rather than being silently skipped). The version is in
+/// the *name*, so an object built against a different layout does not merely
+/// carry a different value - it fails to match at all.
+///
+/// **Bump both this and [`ABI_VERSION`] whenever an event struct's layout
+/// changes.** The `const` assertions below exist to make forgetting a build
+/// error rather than a field of garbage.
+pub const ABI_SYMBOL: &str = "CFC_EBPF_ABI_V1";
+
+/// Value stored at [`ABI_SYMBOL`]. Present so the two sides disagree loudly if
+/// the name is ever reused without changing the layout.
+pub const ABI_VERSION: u32 = 1;
+
+// The guard behind ABI_SYMBOL. If any of these fires, an event layout moved:
+// bump ABI_VERSION *and* the version suffix in ABI_SYMBOL, and update the
+// matching `static` in crates/cfc-ebpf/src/main.rs to the new name.
+const _: () = {
+    assert!(core::mem::size_of::<ExecEvent>() == 292);
+    assert!(core::mem::size_of::<ExitEvent>() == 4);
+    assert!(core::mem::size_of::<DnsPacket>() == 514);
+    assert!(core::mem::size_of::<DnsAnswer>() == 276);
+};
+
 /// Length of the kernel's `task_struct::comm` field, including the NUL.
 pub const COMM_LEN: usize = 16;
 

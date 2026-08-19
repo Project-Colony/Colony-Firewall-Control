@@ -122,6 +122,17 @@ fn vet_object(path: &Path) -> anyhow::Result<()> {
 /// `EACCES` here means the kernel refused the *syscall*, not a verifier
 /// verdict: no program has been submitted yet at this point.
 fn classify_load(err: &anyhow::Error) -> Degrade {
+    // A missing ABI symbol is not an errno at all - aya reports it while
+    // parsing, before any syscall. Catching it by message is unlovely, but the
+    // alternative is filing "your object is from a different release" under
+    // `Other` alongside genuine ELF corruption, and those want different
+    // advice. The needle is our own symbol name, which we control.
+    if err
+        .chain()
+        .any(|c| c.to_string().contains(cfc_ebpf_common::ABI_SYMBOL))
+    {
+        return Degrade::AbiMismatch;
+    }
     match errno_of(err) {
         Some(libc::EPERM | libc::EACCES) => Degrade::NotPermitted,
         // ENOTSUP and EOPNOTSUPP are the same number on Linux; naming both
@@ -281,6 +292,29 @@ pub(super) fn load_and_attach(
     report.ppid_offsets = offsets.is_some();
 
     let mut loader = EbpfLoader::new();
+    // The ABI gate, before anything else the loader does.
+    //
+    // `must_exist = true` is the whole mechanism: if the object does not
+    // export this symbol, `load()` fails and nothing attaches. The object
+    // ships as a separate file loaded from a path, so a stale one *will*
+    // eventually meet a newer daemon - a package that updated the binary but
+    // not the object, a hand-copied file, an interrupted upgrade - and nothing
+    // about that is loud on its own. `decode<T>` accepts any record at least
+    // `size_of::<T>()` long and reads the prefix, so a layout change becomes
+    // plausible-looking garbage in `exe`, `uid`, `gid` and `ppid`: exactly the
+    // fields `process_resolve` prefers over `/proc`. A firewall that
+    // confidently attributes a connection to the wrong program is worse than
+    // one that admits it does not know.
+    //
+    // Verified both ways against a live kernel: with the symbol present the
+    // object loads; with a name the object does not export, aya answers
+    // "symbol with name ... not found in the symbols table" and the load
+    // stops there.
+    loader.override_global(
+        cfc_ebpf_common::ABI_SYMBOL,
+        &cfc_ebpf_common::ABI_VERSION,
+        true,
+    );
     // The kernel's own BTF, used by aya to sanitize the object's BTF against
     // what this kernel supports. Optional: a kernel without it still loads
     // programs, it just gives worse verifier diagnostics.
@@ -911,7 +945,7 @@ mod tests {
         let path = std::env::var("CFC_EBPF_OBJECT").unwrap_or_else(|_| {
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf"
+                "/../cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o"
             )
             .to_string()
         });

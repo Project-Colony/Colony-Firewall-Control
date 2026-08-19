@@ -110,12 +110,24 @@ fn ebpf_dir() -> PathBuf {
     repo_root().join("crates/cfc-ebpf")
 }
 
-fn object_path(opts: &Options) -> PathBuf {
+/// Where cargo drops the linked object: named after the crate, no extension.
+fn cargo_output_path(opts: &Options) -> PathBuf {
     ebpf_dir()
         .join("target")
         .join(&opts.target)
         .join(opts.profile_dir())
         .join("cfc-ebpf")
+}
+
+/// What everything downstream expects: `cfc-ebpf.o`.
+///
+/// The daemon's `DEFAULT_OBJECT_PATH`, both PKGBUILDs, `pkg/colony.json` and
+/// the release tarball all use the `.o` name, while cargo emits the bare crate
+/// name. Renaming it here rather than in each recipe is what stops
+/// `check-release-assets.sh` from comparing a staged `cfc-ebpf` against a
+/// manifest entry for `cfc-ebpf.o` and finding nothing.
+fn object_path(opts: &Options) -> PathBuf {
+    cargo_output_path(opts).with_extension("o")
 }
 
 fn build_ebpf(args: &[String]) -> Result<PathBuf, String> {
@@ -139,6 +151,10 @@ fn build_ebpf(args: &[String]) -> Result<PathBuf, String> {
         .env_remove("CARGO_BUILD_TARGET")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
+        // Both PKGBUILDs export CARGO_TARGET_DIR. An absolute value silently
+        // relocates the whole target tree, so the build would succeed and
+        // `object_path()` would then look somewhere the object is not.
+        .env_remove("CARGO_TARGET_DIR")
         .arg("build")
         .arg("--target")
         .arg(&opts.target)
@@ -162,12 +178,18 @@ fn build_ebpf(args: &[String]) -> Result<PathBuf, String> {
         return Err(format!("cargo build failed with {status}"));
     }
 
-    let out = object_path(&opts);
-    if !out.is_file() {
+    let built = cargo_output_path(&opts);
+    if !built.is_file() {
         return Err(format!(
             "expected object at {} but it is missing",
-            out.display()
+            built.display()
         ));
     }
+    // Give it the name every consumer already uses. A copy rather than a
+    // rename so a rebuild is idempotent and cargo's own freshness tracking
+    // still has its file where it left it.
+    let out = object_path(&opts);
+    std::fs::copy(&built, &out)
+        .map_err(|e| format!("copying {} to {}: {e}", built.display(), out.display()))?;
     Ok(out)
 }

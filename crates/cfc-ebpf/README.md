@@ -428,7 +428,7 @@ cargo +nightly-2026-07-01 build --release \
 Output:
 
 ```text
-crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf   (~198 KiB)
+crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o (~158 KiB)
 ```
 
 ### The nightly pin is load bearing
