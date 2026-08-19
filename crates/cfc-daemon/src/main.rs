@@ -258,6 +258,11 @@ async fn run() -> anyhow::Result<()> {
         },
         dns_cache.clone(),
         ebpf::proc_table::global().clone(),
+        // The engine is what turns an `exec` into an in-kernel verdict. Passing
+        // it here rather than having the layer reach for a global keeps the
+        // direction of the dependency the same as everywhere else: the eBPF
+        // layer is handed what it may read, and owns nothing the daemon needs.
+        Some(engine.clone()),
     );
     _ebpf.report.log();
 

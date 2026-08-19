@@ -14,8 +14,9 @@ use anyhow::{anyhow, Context as _};
 use aya::maps::{HashMap as BpfHashMap, MapData, RingBuf};
 use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, ProgramError, TracePoint};
 use aya::{Btf, Ebpf, EbpfLoader};
+use cfc_core::Process;
 use cfc_ebpf_common::dns::{self, DnsCursor, DNS_HEADER_LEN};
-use cfc_ebpf_common::{DnsAnswer, DnsPacket, ExecEvent, ExitEvent};
+use cfc_ebpf_common::{ConnectDeny, DnsAnswer, DnsPacket, ExecEvent, ExitEvent};
 use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -213,6 +214,7 @@ pub(super) fn load_and_attach(
     object_path: &Path,
     dns: DnsCache,
     table: KernelProcTable,
+    engine: Option<crate::decision::Engine>,
     trust: Trust,
 ) -> Result<(Attached, Report), LoadError> {
     let mut report = Report {
@@ -548,6 +550,23 @@ pub(super) fn load_and_attach(
         }
     }
 
+    // The handle the exec consumer writes verdicts through. Absent when
+    // enforcement did not come up, or when the caller has no rule engine to
+    // consult (the live tests); in both cases the map simply stays empty and
+    // every connect falls through to the packet path.
+    let sink = match (report.enforcement.is_live(), engine) {
+        (true, Some(engine)) => match enforce::VerdictSink::new(&mut bpf, engine) {
+            Ok(sink) => Some(sink),
+            Err(e) => {
+                report
+                    .notes
+                    .push(format!("in-kernel verdicts will not be written: {e:#}"));
+                None
+            }
+        },
+        _ => None,
+    };
+
     // Exec without exit tracking would let entries age out on the TTL alone,
     // which is a materially weaker pid-reuse story. Refuse the combination
     // rather than quietly serving it.
@@ -568,6 +587,7 @@ pub(super) fn load_and_attach(
     let mut tasks = Vec::new();
     if report.exec_tracking {
         let t = table.clone();
+        let sink_exec = sink.clone();
         match spawn_ring(&mut bpf, MAP_EXEC, move |bytes| {
             if let Some(event) = decode::<ExecEvent>(bytes) {
                 // Bind the record to /proc/<pid>/stat's start time while the
@@ -576,6 +596,12 @@ pub(super) fn load_and_attach(
                 // `proc_table`. It runs on this task, never on the packet path.
                 let starttime = crate::process_resolve::read_starttime(event.pid);
                 t.observe_exec(&event, starttime, Instant::now());
+                // Precompute the in-kernel answer for this pid, if the rules
+                // have one that does not depend on a destination. Runs here,
+                // on the exec task, and never on the packet path.
+                if let Some(sink) = &sink_exec {
+                    sink.on_exec(event.pid, &exec_process(&event));
+                }
             }
         }) {
             Ok(task) => tasks.push(task),
@@ -590,9 +616,16 @@ pub(super) fn load_and_attach(
 
     if report.exec_tracking && report.exit_tracking {
         let t = table.clone();
+        let sink_exit = sink.clone();
         match spawn_ring(&mut bpf, MAP_EXIT, move |bytes| {
             if let Some(event) = decode::<ExitEvent>(bytes) {
                 t.observe_exit(event.pid);
+                // The verdict map is pinned, so an entry the daemon forgets
+                // outlives the daemon. Evicting here is what stops a recycled
+                // pid inheriting a dead process's answer.
+                if let Some(sink) = &sink_exit {
+                    sink.on_exit(event.pid);
+                }
             }
         }) {
             Ok(task) => tasks.push(task),
@@ -605,6 +638,37 @@ pub(super) fn load_and_attach(
                 report.exec_tracking = false;
                 report.exit_tracking = false;
             }
+        }
+    }
+
+    // Denials refused in the kernel never reach NFQUEUE, so this consumer is
+    // the only thing standing between "CFC blocked it" and "the connection just
+    // failed". It is a log line rather than a prompt on purpose: the user
+    // already answered for this executable, and asking again is the behaviour
+    // `72964b5` removed.
+    if report.enforcement.is_live() {
+        let t = table.clone();
+        match spawn_ring(&mut bpf, enforce::MAP_DENY_EVENTS, move |bytes| {
+            let Some(ev) = decode::<ConnectDeny>(bytes) else {
+                return;
+            };
+            let who = t
+                .get(ev.pid, None, Instant::now())
+                .map(|p| p.comm)
+                .unwrap_or_else(|| "?".to_string());
+            tracing::info!(
+                pid = ev.pid,
+                exe = %who,
+                dst = %ev.destination(),
+                "deny (kernel): connect() refused before a packet existed"
+            );
+        }) {
+            Ok(task) => tasks.push(task),
+            Err(e) => report.notes.push(format!(
+                "{} consumer not started: {e:#}; in-kernel denials will be \
+                 enforced but not reported",
+                enforce::MAP_DENY_EVENTS
+            )),
         }
     }
 
@@ -779,6 +843,25 @@ fn attach_dns(bpf: &mut Ebpf) -> anyhow::Result<Option<u32>> {
     Ok(insns)
 }
 
+/// The exec-time view of a process, for rule matching only.
+///
+/// Deliberately thin. `sha256`, `cmdline`, `cwd` and provenance all cost a file
+/// read or a package-database lookup, and this runs on every `execve` on the
+/// machine; the packet path builds the full [`Process`] when it actually needs
+/// one. `RuleScope::undecidable_for` is what keeps the missing hash from
+/// turning into a wrong answer rather than an absent one.
+fn exec_process(event: &ExecEvent) -> Process {
+    Process {
+        pid: event.pid,
+        // The kernel side reports 0 for "unresolved", never for a real parent.
+        ppid: (event.ppid != 0).then_some(event.ppid),
+        uid: Some(event.uid),
+        gid: Some(event.gid),
+        exe: PathBuf::from(event.filename_str().into_owned()),
+        ..Process::unknown(event.pid)
+    }
+}
+
 /// Takes a ring-buffer map out of the object and starts a task that drains it.
 ///
 /// `AsyncFd` is the pattern aya's own docs point at: `RingBuf` implements
@@ -911,6 +994,7 @@ mod tests {
             &path,
             DnsCache::new(),
             KernelProcTable::new(),
+            None,
             Trust::Refuse,
         )
         .err()
@@ -920,9 +1004,15 @@ mod tests {
         // Under `Warn` the same file gets past the check and fails later, on
         // its own merits -- it is not an ELF. The point is that the trust
         // check is what changed, and nothing else.
-        let warned = load_and_attach(&path, DnsCache::new(), KernelProcTable::new(), Trust::Warn)
-            .err()
-            .expect("`not an ELF` cannot load either way");
+        let warned = load_and_attach(
+            &path,
+            DnsCache::new(),
+            KernelProcTable::new(),
+            None,
+            Trust::Warn,
+        )
+        .err()
+        .expect("`not an ELF` cannot load either way");
         assert_ne!(
             warned.degrade,
             Degrade::ObjectUntrusted,
@@ -940,6 +1030,7 @@ mod tests {
             &dir.path().join("absent.o"),
             DnsCache::new(),
             KernelProcTable::new(),
+            None,
             Trust::Refuse,
         )
         .err()
@@ -1224,6 +1315,7 @@ mod tests {
             Path::new(&path),
             DnsCache::new(),
             KernelProcTable::new(),
+            None,
             Trust::Warn,
         )
         .expect("the unit's capability set must be enough to load the object");
@@ -1237,9 +1329,25 @@ mod tests {
         assert!(report.exec_tracking, "exec: {:?}", report.notes);
         assert!(report.exit_tracking, "exit: {:?}", report.notes);
         assert!(report.dns_capture, "cgroup_skb/ingress: {:?}", report.notes);
-        println!("all three programs attached without CAP_SYS_ADMIN");
+        // The enforcement layer is measured here too, and specifically that it
+        // *pinned*. `BPF_OBJ_PIN` was a CAP_SYS_ADMIN operation before 5.8, and
+        // writing under /sys/fs/bpf is a DAC question on top of that; if either
+        // needed more than this set, the unit's claim would be wrong in the one
+        // place where being wrong means denials quietly stop surviving a
+        // `kill -9`.
+        assert_eq!(
+            report.enforcement,
+            Enforcement::Pinned,
+            "cgroup/connect4|6 must load, attach *and* pin with this set: {:?}",
+            report.notes
+        );
+        println!("all five programs attached and pinned without CAP_SYS_ADMIN");
 
         drop(attached);
+        // Pins outlive the process by design, so this test has to take its own
+        // away or it leaves in-kernel enforcement attached to the machine.
+        let _ =
+            std::fs::remove_dir_all(std::path::Path::new("/sys/fs/bpf").join("colony-firewall"));
     }
 
     /// Actually loads and attaches on this machine. Needs root (or
@@ -1275,9 +1383,14 @@ mod tests {
         // `Trust::Warn`: the object under test lives in `target/`, owned by
         // whoever ran cargo, which is exactly the case the ownership check is
         // meant to refuse in production and must not refuse here.
-        let (attached, report) =
-            load_and_attach(Path::new(&path), cache.clone(), table.clone(), Trust::Warn)
-                .expect("load");
+        let (attached, report) = load_and_attach(
+            Path::new(&path),
+            cache.clone(),
+            table.clone(),
+            None,
+            Trust::Warn,
+        )
+        .expect("load");
         for note in &report.notes {
             println!("note: {note}");
         }

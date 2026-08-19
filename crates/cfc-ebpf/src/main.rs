@@ -1,7 +1,7 @@
 //! Colony Firewall Control - kernel-side eBPF programs.
 //!
-//! Three programs, three jobs (see `README.md` for attach points and
-//! capability requirements):
+//! Five programs (see `README.md` for attach points and capability
+//! requirements):
 //!
 //! | section                            | purpose                                   |
 //! |------------------------------------|-------------------------------------------|
@@ -37,7 +37,7 @@ use aya_ebpf::programs::{SkBuffContext, SockAddrContext, TracePointContext};
 use aya_ebpf::{EbpfContext as _, Global};
 use cfc_ebpf_common::dns::DNS_HEADER_LEN;
 use cfc_ebpf_common::net::{self, IPV4_MIN_HEADER_LEN, UDP_HEADER_LEN};
-use cfc_ebpf_common::{DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent};
+use cfc_ebpf_common::{ConnectDeny, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent};
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -67,6 +67,15 @@ static VERDICTS: HashMap<u32, u32> = HashMap::with_max_entries(10_240, 0);
 #[map]
 static ENFORCE_STATS: PerCpuArray<u64> =
     PerCpuArray::with_max_entries(cfc_ebpf_common::enforce_stat::SLOTS, 0);
+
+/// Stream of `connect()` calls refused in-kernel.
+///
+/// 24-byte records, so 64 KiB holds ~2,700. Only *denials* are reported -
+/// a stream of every connect on the machine would be a different and much
+/// more expensive product. A full ring costs a log line, never a decision:
+/// the refusal already happened when the record is written.
+#[map]
+static DENY_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 /// Stream of `execve` events. 256 KiB = 64 pages, a power-of-two multiple of
 /// the page size as the kernel requires.
@@ -140,7 +149,7 @@ static PKT_SCRATCH: PerCpuArray<[u8; PKT_SCRATCH_LEN]> = PerCpuArray::with_max_e
 /// terms of the constant. The `const` assertions in `cfc-ebpf-common` are what
 /// make a layout change that forgets to bump it a build error.
 #[unsafe(no_mangle)]
-static CFC_EBPF_ABI_V1: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
+static CFC_EBPF_ABI_V2: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
 
 /// Byte offset of `task_struct::real_parent`. 0 means "unresolved".
 #[unsafe(no_mangle)]
@@ -677,6 +686,43 @@ fn bump(slot: u32) {
     }
 }
 
+/// Reports a refusal so it is not a silent one. See [`ConnectDeny`].
+///
+/// Best effort: a full ring buffer drops the record and the refusal stands.
+/// The alternative - letting the connection through because we could not
+/// describe it - is not a trade a firewall gets to make.
+#[inline(always)]
+fn report_deny(ctx: &SockAddrContext, tgid: u32, family: u8) {
+    let Some(mut entry) = DENY_EVENTS.reserve::<ConnectDeny>(0) else {
+        return;
+    };
+    let mut ev = ConnectDeny::zeroed();
+    ev.pid = tgid;
+    ev.family = family;
+    // SAFETY: `sock_addr` is the program's context pointer, non-null for the
+    // whole run, and these are context fields the verifier permits a
+    // `cgroup_sock_addr` program to read directly.
+    unsafe {
+        let sa = &*ctx.sock_addr;
+        // `user_port` is a u32 holding a network-order u16 in its low half.
+        ev.port = (sa.user_port & 0xffff) as u16;
+        if family == 4 {
+            ev.addr[..4].copy_from_slice(&sa.user_ip4.to_ne_bytes());
+        } else {
+            let mut i = 0;
+            // Fixed trip count, unrolled by the compiler: the verifier walks
+            // it as four constant copies rather than a loop.
+            while i < 4 {
+                let word = sa.user_ip6[i].to_ne_bytes();
+                ev.addr[i * 4..i * 4 + 4].copy_from_slice(&word);
+                i += 1;
+            }
+        }
+    }
+    entry.write(ev);
+    entry.submit(0);
+}
+
 /// The whole decision, shared by the v4 and v6 entry points.
 ///
 /// One hash lookup on a `u32`. There is deliberately no path matching, hashing
@@ -688,13 +734,14 @@ fn bump(slot: u32) {
 /// the daemon decided this executable's answer does not depend on where it is
 /// going. Anything destination-scoped is left absent and falls through.
 #[inline(always)]
-fn connect_verdict() -> i32 {
+fn connect_verdict(ctx: &SockAddrContext, family: u8) -> i32 {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
     // SAFETY: `get` on a BPF hash map from a program context; the returned
     // reference borrows map memory that stays valid for this program run.
     match unsafe { VERDICTS.get(&tgid) } {
         Some(&v) if v == cfc_ebpf_common::verdict::DENY => {
             bump(cfc_ebpf_common::enforce_stat::DENIED);
+            report_deny(ctx, tgid, family);
             CONNECT_REFUSE
         }
         Some(&v) if v == cfc_ebpf_common::verdict::ALLOW => {
@@ -718,16 +765,15 @@ fn connect_verdict() -> i32 {
 /// lift a single deny. Only something that can write to bpffs can - which is
 /// to say root, which CFC has never claimed to confine.
 #[cgroup_sock_addr(connect4)]
-pub fn cfc_connect4(_ctx: SockAddrContext) -> i32 {
-    connect_verdict()
+pub fn cfc_connect4(ctx: SockAddrContext) -> i32 {
+    connect_verdict(&ctx, 4)
 }
 
 /// Same, for IPv6. A separate program because the kernel has separate attach
-/// types; the body is identical because the decision does not look at the
-/// address.
+/// types; the decision is identical and only the address it reports differs.
 #[cgroup_sock_addr(connect6)]
-pub fn cfc_connect6(_ctx: SockAddrContext) -> i32 {
-    connect_verdict()
+pub fn cfc_connect6(ctx: SockAddrContext) -> i32 {
+    connect_verdict(&ctx, 6)
 }
 
 // ---------------------------------------------------------------------------

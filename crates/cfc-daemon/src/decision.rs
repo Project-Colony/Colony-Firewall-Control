@@ -72,6 +72,50 @@ impl Engine {
         }
     }
 
+    /// The action that holds for this process no matter where it connects, if
+    /// the rules say one does.
+    ///
+    /// Answers a question the packet path never has to ask: at `exec` time
+    /// there is no connection yet, so the only rules that can be applied are
+    /// the ones whose answer does not depend on one. The `cgroup/connect4|6`
+    /// programs consult the result before a destination has even been chosen.
+    ///
+    /// Deliberately conservative. Rules are already in precedence order
+    /// (most-specific first, deny before allow), and the walk stops at the
+    /// *first* rule that could apply to this process:
+    ///
+    /// * if that rule constrains a destination, there is no process-wide
+    ///   answer - a higher-precedence conditional rule would be overridden by
+    ///   anything precomputed from a lower one, so the packet path keeps the
+    ///   decision;
+    /// * otherwise its action is the answer, because nothing above it can
+    ///   match and it matches everything below it would have.
+    ///
+    /// A rule the caller cannot evaluate - see
+    /// [`RuleScope::undecidable_for`] - also ends the walk with `None`, for
+    /// the same reason: it might have been the one that mattered.
+    ///
+    /// `None` means "ask the packet path", which is always a safe answer: it
+    /// is what happened before this existed.
+    pub fn process_wide_action(&self, proc: &Process) -> Option<cfc_core::Action> {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let rules = self.inner.rules.read();
+        for rule in rules
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
+        {
+            if rule.scope.undecidable_for(proc) {
+                return None;
+            }
+            if !rule.scope.matches_process(proc) {
+                continue;
+            }
+            return (!rule.scope.constrains_destination()).then_some(rule.action);
+        }
+        None
+    }
+
     /// The verdict applied when no rule matches and prompting is
     /// impossible (no UI connected, prompt channel saturated, unparseable
     /// packet): the configured `no_ui_action`.
@@ -225,6 +269,134 @@ mod tests {
         let mut scope = RuleScope::any();
         scope.dst_port = Some(port);
         Rule::new(format!("deny-{port}"), Action::Deny, scope)
+    }
+
+    fn exe_rule(name: &str, exe: &str, action: Action) -> Rule {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from(exe));
+        Rule::new(name, action, scope)
+    }
+
+    fn engine_with(rules: Vec<Rule>) -> Engine {
+        Engine::new(RuleSet { rules }, shared(dp_deny()))
+    }
+
+    // --- process_wide_action -------------------------------------------
+    //
+    // This is what the `cgroup/connect4|6` programs are steered by, and it
+    // answers before a destination exists. Every case below is about the same
+    // question: when is it safe to precommit an answer the packet path will
+    // never get to revise?
+
+    #[test]
+    fn an_unconditional_exe_rule_is_a_process_wide_answer() {
+        let engine = engine_with(vec![exe_rule("deny-curl", "/usr/bin/curl", Action::Deny)]);
+        assert_eq!(
+            engine.process_wide_action(&proc("/usr/bin/curl")),
+            Some(Action::Deny)
+        );
+        assert_eq!(engine.process_wide_action(&proc("/usr/bin/wget")), None);
+    }
+
+    #[test]
+    fn a_destination_scoped_rule_is_never_a_process_wide_answer() {
+        // The rule matches this process, but only for port 443. Precomputing
+        // its action would apply it to every destination.
+        let engine = engine_with(vec![deny_port_rule(443)]);
+        assert_eq!(engine.process_wide_action(&proc("/usr/bin/curl")), None);
+    }
+
+    #[test]
+    fn a_higher_precedence_conditional_rule_blocks_the_answer() {
+        // allow curl -> :443, deny curl everywhere. The deny is *not* the
+        // process-wide answer: curl reaching 443 is allowed, and an in-kernel
+        // deny would refuse it before the packet path could say so.
+        let mut allow_443 = exe_rule("allow-curl-443", "/usr/bin/curl", Action::Allow);
+        allow_443.scope.dst_port = Some(443);
+        let engine = engine_with(vec![
+            allow_443,
+            exe_rule("deny-curl", "/usr/bin/curl", Action::Deny),
+        ]);
+        assert_eq!(engine.process_wide_action(&proc("/usr/bin/curl")), None);
+    }
+
+    #[test]
+    fn a_conditional_rule_for_another_process_does_not_block_the_answer() {
+        // Same shape as above, but the conditional rule names a different
+        // binary, so it can be ruled out without a destination.
+        let mut allow_443 = exe_rule("allow-wget-443", "/usr/bin/wget", Action::Allow);
+        allow_443.scope.dst_port = Some(443);
+        let engine = engine_with(vec![
+            allow_443,
+            exe_rule("deny-curl", "/usr/bin/curl", Action::Deny),
+        ]);
+        assert_eq!(
+            engine.process_wide_action(&proc("/usr/bin/curl")),
+            Some(Action::Deny)
+        );
+    }
+
+    #[test]
+    fn an_unhashed_process_gets_no_answer_when_a_hash_rule_could_apply() {
+        // The caller is the exec path, which does not hash binaries. Skipping
+        // the hash-scoped allow and falling through to the deny below it would
+        // install an in-kernel deny that the packet path - which does know the
+        // hash - would never have applied.
+        let mut allow_hash = exe_rule("allow-known-curl", "/usr/bin/curl", Action::Allow);
+        allow_hash.scope.exe_sha256 = Some("abc123".to_string());
+        let engine = engine_with(vec![
+            allow_hash,
+            exe_rule("deny-curl", "/usr/bin/curl", Action::Deny),
+        ]);
+        assert_eq!(engine.process_wide_action(&proc("/usr/bin/curl")), None);
+
+        // With the hash known, the walk can proceed normally.
+        let mut hashed = proc("/usr/bin/curl");
+        hashed.sha256 = Some("abc123".to_string());
+        assert_eq!(engine.process_wide_action(&hashed), Some(Action::Allow));
+    }
+
+    #[test]
+    fn a_hash_rule_for_another_binary_does_not_block_the_answer() {
+        let mut allow_hash = exe_rule("allow-known-wget", "/usr/bin/wget", Action::Allow);
+        allow_hash.scope.exe_sha256 = Some("abc123".to_string());
+        let engine = engine_with(vec![
+            allow_hash,
+            exe_rule("deny-curl", "/usr/bin/curl", Action::Deny),
+        ]);
+        assert_eq!(
+            engine.process_wide_action(&proc("/usr/bin/curl")),
+            Some(Action::Deny)
+        );
+    }
+
+    #[test]
+    fn a_disabled_or_expired_rule_is_not_a_process_wide_answer() {
+        let mut disabled = exe_rule("deny-curl", "/usr/bin/curl", Action::Deny);
+        disabled.enabled = false;
+        assert_eq!(
+            engine_with(vec![disabled]).process_wide_action(&proc("/usr/bin/curl")),
+            None
+        );
+
+        let mut expired = exe_rule("deny-curl", "/usr/bin/curl", Action::Deny);
+        expired.duration = cfc_core::Duration::Seconds(1);
+        expired.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(
+            engine_with(vec![expired]).process_wide_action(&proc("/usr/bin/curl")),
+            None
+        );
+    }
+
+    #[test]
+    fn no_rules_at_all_means_ask_the_packet_path() {
+        // Never the default policy: `no_ui_action` is what the *prompt* path
+        // falls back to after asking, and precommitting it here would refuse
+        // every process on a Deny profile before a prompt could ever be shown.
+        assert_eq!(
+            engine_with(vec![]).process_wide_action(&proc("/usr/bin/curl")),
+            None
+        );
     }
 
     #[test]

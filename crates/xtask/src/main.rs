@@ -100,13 +100,14 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     // daemon restarts, not just within one load
     "VERDICTS",
     "ENFORCE_STATS",
+    "DENY_EVENTS",
     // patchable .rodata globals
     "TASK_REAL_PARENT_OFFSET",
     "TASK_TGID_OFFSET",
     "EXEC_FILENAME_DATA_LOC",
     // the ABI stamp the loader requires with must_exist = true. Keep in step
     // with `cfc_ebpf_common::ABI_SYMBOL`.
-    "CFC_EBPF_ABI_V1",
+    "CFC_EBPF_ABI_V2",
 ];
 
 /// Sections whose absence would break loading or diagnostics.

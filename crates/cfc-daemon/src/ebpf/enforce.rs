@@ -22,14 +22,19 @@
 //! # Pin layout
 //!
 //! ```text
-//! /sys/fs/bpf/colony-firewall/v1/
+//! /sys/fs/bpf/colony-firewall/v2/
 //!   connect4        pinned link  - IPv4 enforcement
 //!   connect6        pinned link  - IPv6 enforcement
 //!   VERDICTS        pinned map   - tgid -> verdict, written by the daemon
 //!   ENFORCE_STATS   pinned map   - per-CPU counters
 //! ```
 //!
-//! `v1` is [`cfc_ebpf_common::ABI_VERSION`]. It is in the *path* because an
+//! `DENY_EVENTS` is deliberately *not* pinned: it is a report of what happened,
+//! and a ring buffer nobody is draining is a buffer that fills. While the daemon
+//! is down the refusals still happen and the counters still move; only the log
+//! lines stop, which is the right thing to lose.
+//!
+//! `v2` is [`cfc_ebpf_common::ABI_VERSION`]. It is in the *path* because an
 //! object built against a different event layout is a different program and
 //! must not inherit the previous one's pins; putting the version in a file
 //! inside a shared directory would mean reading it before knowing whether it
@@ -44,14 +49,19 @@
 use std::io;
 use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _};
 use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuArray};
 use aya::programs::links::FdLink;
 use aya::programs::{CgroupAttachMode, CgroupSockAddr};
 use aya::Ebpf;
+use cfc_core::{Action, Process};
 use cfc_ebpf_common::{enforce_stat, ABI_VERSION};
+use parking_lot::Mutex;
 use tracing::{debug, warn};
+
+use crate::decision::Engine;
 
 /// Where the kernel expects a bpffs to be mounted. systemd mounts it here on
 /// every system this daemon targets; if it is absent, enforcement is skipped
@@ -76,6 +86,89 @@ pub(super) const PROG_CONNECT6: &str = "cfc_connect6";
 
 pub(super) const MAP_VERDICTS: &str = "VERDICTS";
 pub(super) const MAP_STATS: &str = "ENFORCE_STATS";
+pub(super) const MAP_DENY_EVENTS: &str = "DENY_EVENTS";
+
+/// Writes precomputed verdicts into the pinned map.
+///
+/// Handed to the exec consumer, which is the only place that can populate it:
+/// a verdict is per-pid, and `exec` is the moment a pid acquires the identity
+/// the rules are written against.
+///
+/// Cheap to clone (one `Arc`). The mutex is held only for a map update - the
+/// exec consumer is a single task, so it is uncontended in practice and exists
+/// to satisfy the borrow checker rather than to arbitrate.
+#[derive(Clone)]
+pub(super) struct VerdictSink {
+    map: Arc<Mutex<BpfHashMap<MapData, u32, u32>>>,
+    engine: Engine,
+}
+
+impl VerdictSink {
+    /// Takes the pinned `VERDICTS` map out of the object.
+    pub(super) fn new(bpf: &mut Ebpf, engine: Engine) -> anyhow::Result<Self> {
+        let map = bpf
+            .take_map(MAP_VERDICTS)
+            .ok_or_else(|| anyhow!("no map named `{MAP_VERDICTS}` in the object"))?;
+        let map = BpfHashMap::<_, u32, u32>::try_from(map)
+            .with_context(|| format!("{MAP_VERDICTS} is not a hash map"))?;
+        Ok(Self {
+            map: Arc::new(Mutex::new(map)),
+            engine,
+        })
+    }
+
+    /// Decides whether this newly-exec'd process gets an in-kernel answer.
+    ///
+    /// Only denials are written, and only when no rule that could apply to this
+    /// process depends on a destination. Two things follow from that, both
+    /// deliberate:
+    ///
+    /// * **an allow is never written.** It would buy nothing - the connect hook
+    ///   cannot skip NFQUEUE, so a process with no entry already proceeds and
+    ///   is decided on the packet path - while being the one direction where a
+    ///   stale entry after pid reuse would be a security problem rather than
+    ///   an inconvenience.
+    /// * **a stale entry is always cleared**, even when the answer is "no
+    ///   answer". A pid that re-execs into a different binary must not inherit
+    ///   the verdict written for the one before it.
+    ///
+    /// `Reject` counts as a denial. `EPERM` straight out of `connect()` is if
+    /// anything closer to what a Reject rule promises - an immediate error
+    /// rather than a silent timeout - than the injected RST it replaces.
+    pub(super) fn on_exec(&self, pid: u32, proc: &Process) {
+        let deny = matches!(
+            self.engine.process_wide_action(proc),
+            Some(Action::Deny | Action::Reject)
+        );
+        let mut map = self.map.lock();
+        let r = if deny {
+            map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
+        } else {
+            match map.remove(&pid) {
+                // Nothing to clear is the overwhelmingly common case.
+                Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+                other => other,
+            }
+        };
+        if let Err(e) = r {
+            warn!(pid, deny, "could not update the in-kernel verdict: {e}");
+        } else if deny {
+            debug!(pid, exe = %proc.exe.display(), "in-kernel deny installed");
+        }
+    }
+
+    /// Evicts a dead pid.
+    ///
+    /// Not merely tidiness: this map is *pinned*, so an entry the daemon
+    /// forgets outlives the daemon, and the next process to be handed that pid
+    /// would inherit its answer.
+    pub(super) fn on_exit(&self, pid: u32) {
+        match self.map.lock().remove(&pid) {
+            Ok(()) | Err(aya::maps::MapError::KeyNotFound) => {}
+            Err(e) => warn!(pid, "could not evict the in-kernel verdict: {e}"),
+        }
+    }
+}
 
 /// Per-CPU counters, summed. See [`enforce_stat`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +463,7 @@ mod tests {
             Path::new(&object),
             crate::dns::DnsCache::new(),
             super::super::proc_table::KernelProcTable::new(),
+            None,
             super::super::loader::Trust::Warn,
         )
         .expect("load");
@@ -450,6 +544,139 @@ mod tests {
         // they have to be removed explicitly - that is the feature.
         drop(listener);
         let _ = std::fs::remove_dir_all(Path::new(BPFFS).join(PIN_NAMESPACE));
+    }
+
+    /// The other half: a *rule* reaching the kernel by itself.
+    ///
+    /// The previous test wrote into the map by hand. This one writes a Deny
+    /// rule into a rule engine, hands that engine to the loader, execs a copy
+    /// of bash, and lets the whole chain run - exec tracepoint, ring buffer,
+    /// `process_wide_action`, map write, `connect()` refusal - with nothing
+    /// stubbed. A control run with no rule proves the refusal came from the
+    /// rule and not from the layer simply blocking everything.
+    ///
+    /// Root, ignored by default:
+    ///
+    /// ```text
+    /// sudo ./target/fast/deps/cfc_daemon-<hash> --ignored --nocapture \
+    ///     a_deny_rule_reaches_the_kernel
+    /// ```
+    // `multi_thread` is load-bearing, not decoration. The exec event reaches
+    // the verdict sink through a `tokio::spawn`ed ring-buffer consumer, and the
+    // wait below blocks its thread; on the default current-thread runtime the
+    // consumer would never get to run and this test would fail claiming the
+    // rule did not reach the kernel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs root and a BPF-capable kernel"]
+    async fn a_deny_rule_reaches_the_kernel_by_itself() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::process::{Command, Stdio};
+
+        if !nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping: not root");
+            return;
+        }
+        let object = std::env::var("CFC_EBPF_OBJECT")
+            .unwrap_or_else(|_| super::super::DEFAULT_OBJECT_PATH.to_string());
+        if !Path::new(&object).exists() || !Path::new("/bin/bash").exists() {
+            eprintln!("skipping: no object at {object}, or no bash");
+            return;
+        }
+
+        // A private copy of bash, so the rule names a path nothing else on the
+        // machine runs. Denying /bin/bash itself would deny the test harness's
+        // own shells.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shell = dir.path().join("cfc-test-shell");
+        std::fs::copy("/bin/bash", &shell).expect("copy bash");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let run = |engine: Option<crate::decision::Engine>| -> String {
+            let (attached, report) = super::super::loader::load_and_attach(
+                Path::new(&object),
+                crate::dns::DnsCache::new(),
+                super::super::proc_table::KernelProcTable::new(),
+                engine,
+                super::super::loader::Trust::Warn,
+            )
+            .expect("load");
+            assert!(
+                report.exec_tracking,
+                "the rule reaches the kernel via the exec tracepoint: {:?}",
+                report.notes
+            );
+            assert!(report.enforcement.is_live(), "{:?}", report.notes);
+
+            let mut child = Command::new(&shell)
+                .arg("-c")
+                .arg(format!(
+                    "read -r _; \
+                     if exec 3<>/dev/tcp/127.0.0.1/{port}; then echo CONNECTED; \
+                     else echo REFUSED; fi"
+                ))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn");
+            // The exec event travels through a ring buffer to a tokio task, so
+            // the verdict is not installed synchronously with the spawn. `read`
+            // is what holds the child at the starting line until it is.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin")
+                .write_all(b"\n")
+                .expect("write");
+            let out = child.stdout.take().expect("stdout");
+            let line = BufReader::new(out)
+                .lines()
+                .next()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let _ = child.wait();
+            drop(attached);
+            let _ = std::fs::remove_dir_all(Path::new(BPFFS).join(PIN_NAMESPACE));
+            line
+        };
+
+        // Control: same object, same shell, no rule.
+        let without = run(None);
+
+        // And now with a rule that denies exactly this binary, everywhere.
+        let mut scope = cfc_core::RuleScope::any();
+        scope.exe_path = Some(shell.clone());
+        let mut rules = cfc_core::RuleSet::default();
+        rules.rules.push(cfc_core::Rule::new(
+            "deny-cfc-test-shell",
+            Action::Deny,
+            scope,
+        ));
+        let engine = crate::decision::Engine::new(
+            rules,
+            Arc::new(std::sync::RwLock::new(crate::config::DefaultPolicy {
+                // Irrelevant here - `process_wide_action` never consults it -
+                // but set to Deny so a bug that did consult it would show up as
+                // the control run failing too.
+                no_ui_action: Action::Deny,
+                timeout_action: Action::Deny,
+                prompt_timeout_secs: 10,
+            })),
+        );
+        let with = run(Some(engine));
+
+        assert_eq!(
+            without, "CONNECTED",
+            "with no rule the connect must reach the packet path untouched"
+        );
+        assert_eq!(
+            with, "REFUSED",
+            "a process-wide Deny rule must be refused in the kernel"
+        );
+        println!("a Deny rule reached the kernel with nothing stubbed");
+        drop(listener);
     }
 
     #[test]

@@ -79,7 +79,60 @@ impl RuleScope {
         .count() as u8
     }
 
-    pub fn matches(&self, conn: &crate::Connection, proc: &crate::Process) -> bool {
+    /// True when this scope says anything at all about *where* a connection
+    /// goes.
+    ///
+    /// A scope that does not is one whose answer is the same for every
+    /// destination, which is what makes it safe to precompute - see
+    /// `Engine::process_wide_action` and the `cgroup/connect4|6` programs,
+    /// which decide before a destination has been chosen.
+    pub fn constrains_destination(&self) -> bool {
+        self.dst_host.is_some()
+            || self.dst_net.is_some()
+            || self.dst_port.is_some()
+            || self.protocol.is_some()
+    }
+
+    /// True when this scope cannot be evaluated against `proc` because the
+    /// process's identity is only partly known.
+    ///
+    /// Exactly one predicate can be in that position: `exe_sha256`. Hashing a
+    /// binary is not something the `exec` path does - it costs a full read of
+    /// the file - so a caller deciding at exec time has `proc.sha256 == None`
+    /// and genuinely cannot say whether a hash-scoped rule applies.
+    ///
+    /// Treating "cannot say" as "does not match" would be a real bug rather
+    /// than a rounding error: precedence is ordered, so silently skipping a
+    /// hash-scoped *allow* would hand the decision to a lower-precedence
+    /// *deny* that the packet path - which does know the hash - would never
+    /// have applied.
+    ///
+    /// Scopes already excluded by something knowable are decidable: a missing
+    /// hash does not matter for a rule whose `exe_path` names a different
+    /// binary.
+    pub fn undecidable_for(&self, proc: &crate::Process) -> bool {
+        if self.exe_sha256.is_none() || proc.sha256.is_some() {
+            return false;
+        }
+        if let Some(p) = &self.exe_path {
+            if &proc.exe != p {
+                return false;
+            }
+        }
+        if let Some(u) = self.uid {
+            if proc.uid != Some(u) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The process half of [`Self::matches`], on its own.
+    ///
+    /// Split out so a caller that has a process but no connection can ask
+    /// "could this rule ever apply here?". [`Self::matches`] is defined in
+    /// terms of it, so the two cannot drift.
+    pub fn matches_process(&self, proc: &crate::Process) -> bool {
         if let Some(p) = &self.exe_path {
             if &proc.exe != p {
                 return false;
@@ -98,6 +151,13 @@ impl RuleScope {
             if proc.uid != Some(u) {
                 return false;
             }
+        }
+        true
+    }
+
+    pub fn matches(&self, conn: &crate::Connection, proc: &crate::Process) -> bool {
+        if !self.matches_process(proc) {
+            return false;
         }
         if let Some(h) = &self.dst_host {
             match &conn.dst_host {

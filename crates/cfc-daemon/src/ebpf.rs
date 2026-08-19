@@ -484,7 +484,16 @@ pub struct Runtime {
 /// hand in an instance of its own. Asserting "a failed load did not mark the
 /// table live" against a process-wide `LazyLock` is an assertion about every
 /// other test in the binary as much as about this one.
-pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable) -> Runtime {
+pub fn start(
+    cfg: &EbpfConfig,
+    dns: DnsCache,
+    table: proc_table::KernelProcTable,
+    // Unused without the `ebpf` feature: there is no kernel-side map to steer.
+    // Kept in the signature so callers do not need a cfg of their own.
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))] engine: Option<
+        crate::decision::Engine,
+    >,
+) -> Runtime {
     if !cfg.enabled.wants_load() {
         return Runtime {
             report: Report::inert(
@@ -538,7 +547,7 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable
                 loader::Trust::Refuse,
             ),
         };
-        match loader::load_and_attach(&path, dns, table.clone(), trust) {
+        match loader::load_and_attach(&path, dns, table.clone(), engine, trust) {
             Ok((attached, mut report)) => {
                 // The loader builds its report before it knows how it was
                 // asked for; only `start` does. Without this an `auto` host
@@ -576,7 +585,12 @@ mod tests {
             enabled: EbpfMode::Off,
             object_path: None,
         };
-        let rt = start(&cfg, DnsCache::new(), proc_table::KernelProcTable::new());
+        let rt = start(
+            &cfg,
+            DnsCache::new(),
+            proc_table::KernelProcTable::new(),
+            None,
+        );
         assert!(!rt.report.any_active());
         assert_eq!(rt.report.mode, EbpfMode::Off);
         assert_eq!(rt.report.ring0(), Ring0::Off);
@@ -606,7 +620,7 @@ mod tests {
         // what *this* load did, and against the process-wide table it would be
         // an assertion about every other test in the binary as well.
         let table = proc_table::KernelProcTable::new();
-        let rt = start(&cfg, DnsCache::new(), table.clone());
+        let rt = start(&cfg, DnsCache::new(), table.clone(), None);
         assert_eq!(rt.report.mode, EbpfMode::On);
         assert!(!rt.report.any_active(), "nothing can have attached");
         assert_eq!(rt.report.ring0(), Ring0::Unavailable);
@@ -660,7 +674,7 @@ mod tests {
         );
 
         let table = proc_table::KernelProcTable::new();
-        let rt = start(&cfg, DnsCache::new(), table.clone());
+        let rt = start(&cfg, DnsCache::new(), table.clone(), None);
         for note in &rt.report.notes {
             println!("note: {note}");
         }

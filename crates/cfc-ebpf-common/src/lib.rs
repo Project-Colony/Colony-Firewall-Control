@@ -64,11 +64,16 @@ pub use net::UdpPayload;
 /// **Bump both this and [`ABI_VERSION`] whenever an event struct's layout
 /// changes.** The `const` assertions below exist to make forgetting a build
 /// error rather than a field of garbage.
-pub const ABI_SYMBOL: &str = "CFC_EBPF_ABI_V1";
+pub const ABI_SYMBOL: &str = "CFC_EBPF_ABI_V2";
 
 /// Value stored at [`ABI_SYMBOL`]. Present so the two sides disagree loudly if
 /// the name is ever reused without changing the layout.
-pub const ABI_VERSION: u32 = 1;
+///
+/// **v2** added the `cgroup/connect4|6` programs, `ConnectDeny` and the maps
+/// they use. It is also the version in the bpffs pin path, so bumping it is
+/// what makes a daemon detach the previous version's in-kernel enforcement
+/// instead of inheriting programs it no longer matches.
+pub const ABI_VERSION: u32 = 2;
 
 // The guard behind ABI_SYMBOL. If any of these fires, an event layout moved:
 // bump ABI_VERSION *and* the version suffix in ABI_SYMBOL, and update the
@@ -78,6 +83,7 @@ const _: () = {
     assert!(core::mem::size_of::<ExitEvent>() == 4);
     assert!(core::mem::size_of::<DnsPacket>() == 514);
     assert!(core::mem::size_of::<DnsAnswer>() == 276);
+    assert!(core::mem::size_of::<ConnectDeny>() == 24);
 };
 
 // ---------------------------------------------------------------------------
@@ -107,6 +113,51 @@ pub mod verdict {
     /// packet exists. Written when a rule denies this executable
     /// unconditionally.
     pub const DENY: u32 = 2;
+}
+
+/// One `connect()` refused in the kernel.
+///
+/// Exists so an in-kernel deny is not a *silent* deny. Every other deny CFC
+/// makes passes through NFQUEUE, which logs it, counts the rule hit and streams
+/// an event to the UI. A `connect()` refused before a packet exists never
+/// reaches any of that, and a firewall that blocks things without saying so is
+/// a firewall people stop trusting.
+///
+/// The address is the one the process asked for, taken from `bpf_sock_addr`
+/// before the kernel does anything with it - so this is exactly the destination
+/// NFQUEUE would have reported, minus the DNS name, which userspace resolves
+/// from its own cache anyway.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectDeny {
+    /// Thread-group id, matching the key in `VERDICTS` and `PROCS`.
+    pub pid: u32,
+    /// Destination address, network byte order. IPv4 occupies the first four
+    /// bytes and the rest is zero; `family` says which to read.
+    pub addr: [u8; 16],
+    /// Destination port, **network byte order** - `bpf_sock_addr::user_port`
+    /// is stored that way and this passes it through untouched rather than
+    /// swapping it twice.
+    pub port: u16,
+    /// 4 or 6. Not `AF_INET`/`AF_INET6`: those differ per architecture in the
+    /// UAPI headers this struct is decoded next to, and 4/6 cannot be
+    /// misread.
+    pub family: u8,
+    /// Explicit, so the 24-byte size is not an alignment accident.
+    pub _pad: u8,
+}
+
+impl ConnectDeny {
+    /// All zeroes, for a scratch slot.
+    pub const fn zeroed() -> Self {
+        Self {
+            pid: 0,
+            addr: [0; 16],
+            port: 0,
+            family: 0,
+            _pad: 0,
+        }
+    }
 }
 
 /// Slots in the `ENFORCE_STATS` per-CPU array.
@@ -422,10 +473,10 @@ impl DnsAnswer {
 
 #[cfg(feature = "std")]
 mod std_impls {
-    use super::{DnsAnswer, DnsPacket, ExecEvent};
+    use super::{ConnectDeny, DnsAnswer, DnsPacket, ExecEvent};
     use std::borrow::Cow;
     use std::fmt;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     impl ExecEvent {
         /// `comm` as a string. Never panics: invalid UTF-8 is replaced.
@@ -436,6 +487,30 @@ mod std_impls {
         /// `filename` as a string. Never panics: invalid UTF-8 is replaced.
         pub fn filename_str(&self) -> Cow<'_, str> {
             String::from_utf8_lossy(self.filename_bytes())
+        }
+    }
+
+    impl ConnectDeny {
+        /// The address the process asked for.
+        ///
+        /// `family` decides the width, so a v4 record never reads the 12 zero
+        /// bytes after it. An unrecognised family reads as the unspecified v4
+        /// address rather than panicking: this decodes bytes that crossed a
+        /// kernel boundary, and the only correct response to a record we do not
+        /// understand is a duller log line.
+        pub fn ip_addr(&self) -> IpAddr {
+            if self.family == 6 {
+                IpAddr::V6(Ipv6Addr::from(self.addr))
+            } else {
+                let mut v4 = [0u8; 4];
+                v4.copy_from_slice(&self.addr[..4]);
+                IpAddr::V4(Ipv4Addr::from(v4))
+            }
+        }
+
+        /// `addr:port`, with the port brought back into host order.
+        pub fn destination(&self) -> SocketAddr {
+            SocketAddr::new(self.ip_addr(), u16::from_be(self.port))
         }
     }
 
