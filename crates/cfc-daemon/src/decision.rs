@@ -137,6 +137,22 @@ impl Engine {
             .iter()
             .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
         {
+            // An inbound rule cannot apply to `connect()`, which is outbound
+            // by definition. Skip it rather than abstaining, and the
+            // difference is not academic: an inbound rule names a port and a
+            // source, never an executable, so `matches_process` says yes to
+            // *every* process on the machine. Abstaining on it therefore
+            // switched off in-kernel enforcement machine-wide.
+            //
+            // Measured, because it was not theoretical: with the shipped
+            // `inbound` bundle installed, a plain `deny --exe <path>` rule
+            // produced no `in-kernel deny installed` for a live matching
+            // process, and every refusal came from the userspace packet path.
+            // Disabling those four rules made the same test install the
+            // kernel verdict immediately.
+            if rule.scope.direction == Some(cfc_core::Direction::Inbound) {
+                continue;
+            }
             if rule.scope.undecidable_for(proc) {
                 return None;
             }
@@ -347,6 +363,52 @@ mod tests {
     // answers before a destination exists. Every case below is about the same
     // question: when is it safe to precommit an answer the packet path will
     // never get to revise?
+
+    #[test]
+    fn an_inbound_rule_does_not_switch_off_in_kernel_enforcement() {
+        // The exact shape the shipped `inbound` bundle installs: a port and a
+        // protocol, no executable. `matches_process` therefore says yes to
+        // every process on the machine, and the rule sorts ahead of a plain
+        // exe deny. Counting it as "constrains the destination" - which it
+        // does, for the packet path - used to make this abstain, and one such
+        // rule was enough to stop every in-kernel verdict being written.
+        let mut inbound = RuleScope::any();
+        inbound.direction = Some(cfc_core::Direction::Inbound);
+        inbound.dst_port = Some(22);
+        inbound.protocol = Some(cfc_core::Protocol::Tcp);
+
+        let mut deny = RuleScope::any();
+        deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+
+        let engine = engine_with(vec![
+            Rule::new("inbound-ssh".to_string(), Action::Allow, inbound),
+            Rule::new("deny-curl".to_string(), Action::Deny, deny),
+        ]);
+
+        assert_eq!(
+            engine.process_wide_action(&proc("/usr/bin/curl")),
+            Some(Action::Deny),
+            "an inbound rule must be skipped by the connect hooks, not abstained on"
+        );
+    }
+
+    /// ...and skipping it must not turn an inbound rule into an outbound one.
+    #[test]
+    fn an_inbound_rule_is_never_precommitted_to_the_connect_hooks() {
+        let mut inbound = RuleScope::any();
+        inbound.direction = Some(cfc_core::Direction::Inbound);
+        inbound.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let engine = engine_with(vec![Rule::new(
+            "inbound-deny".to_string(),
+            Action::Deny,
+            inbound,
+        )]);
+        assert_eq!(
+            engine.process_wide_action(&proc("/usr/bin/curl")),
+            None,
+            "an inbound deny must never refuse an outbound connect()"
+        );
+    }
 
     #[test]
     fn an_unconditional_exe_rule_is_a_process_wide_answer() {
