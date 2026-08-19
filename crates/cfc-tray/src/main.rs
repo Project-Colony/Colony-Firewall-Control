@@ -384,12 +384,49 @@ fn open_gui() {
     }
 }
 
+/// Runs a notify-rust call on a thread with **no tokio runtime context**.
+///
+/// `tokio::task::spawn_blocking` is the obvious choice and is the wrong one,
+/// which is why this exists rather than the call being inlined. Threads in
+/// tokio's blocking pool belong to the runtime and keep its context
+/// installed; notify-rust's D-Bus calls build their own internal runtime, and
+/// nesting one inside the other panics with *"Cannot start a runtime from
+/// within a runtime"*.
+///
+/// That alone would only lose one notification. What makes it fatal is what
+/// happens next: the panic poisons notify-rust's `lazy_static`, so **every
+/// later notification in the process fails too**, with
+/// `Once instance has previously been poisoned`. The tray keeps running,
+/// keeps reporting `prompt stream subscribed`, keeps receiving prompts - and
+/// silently shows nothing for the rest of its life. Observed exactly that way
+/// on a live daemon: prompts arrived, timed out unanswered, and the user saw
+/// no bubble at all.
+///
+/// A plain OS thread carries no runtime context, so the nested runtime is
+/// free to exist. Each one is short-lived - a single notification, bounded by
+/// its own timeout - and detached; the number in flight is bounded upstream by
+/// the overflow bubble, which collapses the tail into one.
+///
+/// Related: [`actions_supported`] avoids `notify_rust::get_capabilities` for a
+/// sibling reason. Anything in this crate that calls into notify-rust's
+/// blocking D-Bus path has to answer the same question about where it runs.
+fn on_notification_thread<F: FnOnce() + Send + 'static>(f: F) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("cfc-notify".to_string())
+        .spawn(f)
+    {
+        // Out of threads. Nothing to be done about it here, and the daemon's
+        // timeout_action still covers any prompt this would have shown.
+        warn!("could not spawn a notification thread: {e}");
+    }
+}
+
 /// Generic on purpose: GetStatus only carries counts, not which process
 /// or destination is waiting - the GUI has the details. Only shown when
 /// the notification server cannot do actions (see [`refresh`]).
 fn notify_pending(count: u64) {
     // notify-rust's show() blocks on D-Bus; keep it off the poll loop.
-    tokio::task::spawn_blocking(move || {
+    on_notification_thread(move || {
         let noun = if count == 1 {
             "connection"
         } else {
@@ -409,7 +446,7 @@ fn notify_pending(count: u64) {
 /// A short, non-actionable follow-up ("rule created", "too late"). 5s,
 /// normal urgency.
 fn notify_brief(body: String) {
-    tokio::task::spawn_blocking(move || {
+    on_notification_thread(move || {
         let mut n = notify_rust::Notification::new();
         let _ = brand(&mut n)
             .summary("Colony Firewall")
@@ -476,7 +513,7 @@ impl PromptNotifier {
         // One blocking task per shown notification: show() and
         // wait_for_action() both block on D-Bus, and the wait lasts until
         // the user acts or the bubble expires.
-        tokio::task::spawn_blocking(move || {
+        on_notification_thread(move || {
             let mut notification = notify_rust::Notification::new();
             brand(&mut notification)
                 .summary(&n.summary)
@@ -523,7 +560,7 @@ impl PromptNotifier {
             OverflowBubble::Down => {
                 self.bubble = OverflowBubble::Opening;
                 let tx = self.tx.clone();
-                tokio::task::spawn_blocking(move || {
+                on_notification_thread(move || {
                     let shown = overflow_notification(&body).show();
                     match shown {
                         Ok(handle) => {
@@ -546,7 +583,7 @@ impl PromptNotifier {
             // Count already bumped; reconciled when OverflowShown lands.
             OverflowBubble::Opening => {}
             OverflowBubble::Up(id) => {
-                tokio::task::spawn_blocking(move || {
+                on_notification_thread(move || {
                     let _ = overflow_notification(&body).id(id).show();
                 });
             }
@@ -684,8 +721,56 @@ async fn probe_actions_supported() -> bool {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Forces notify-rust's `SPEC_VERSION` while no tokio runtime exists.
+///
+/// This is the difference between a tray that shows prompts and one that
+/// silently shows nothing, and it is worth the paragraph.
+///
+/// `SPEC_VERSION` is a `lazy_static` whose initialiser makes a **blocking**
+/// D-Bus call (`get_server_information`). It is dereferenced whenever a
+/// notification carrying image data is built - which is every bubble this tray
+/// shows, because [`brand`] attaches the embedded shield. Under the `zbus`
+/// backend that blocking call constructs a tokio runtime, and constructing one
+/// anywhere a runtime is already entered panics with *"Cannot start a runtime
+/// from within a runtime"*.
+///
+/// The panic is not the damage. `lazy_static` marks a panicking initialiser as
+/// poisoned, so **every later deref panics too** - and since every bubble
+/// derefs it, the tray never shows another notification for the rest of its
+/// life. It keeps polling, keeps reporting `prompt stream subscribed`, keeps
+/// receiving prompts, and stays completely silent. That is exactly how it was
+/// found: on a live daemon, prompts arriving and timing out unanswered with no
+/// bubble ever reaching the screen.
+///
+/// Touching it here, from `main` before the runtime is built, makes the one
+/// blocking call on a thread that has no runtime to nest inside. Every later
+/// deref is then a plain memory read.
+///
+/// This is why `main` builds its runtime by hand instead of using
+/// `#[tokio::main]`: the attribute would wrap this line in the runtime it is
+/// trying to stay out of.
+/// No `cfg` guard on a feature name here, deliberately. `SPEC_VERSION` exists
+/// under notify-rust's own `images_no_default_features`, which this workspace
+/// turns on for it - but that is a *dependency's* feature, and `cfg(feature =
+/// ...)` in this crate can only see this crate's own. Writing one would
+/// compile, always evaluate false, and silently skip the warm-up: the exact
+/// failure this function exists to prevent, reintroduced by the guard meant to
+/// protect it. If the workspace ever drops that feature, this stops compiling,
+/// which is the right way to find out.
+fn warm_notification_spec_version() {
+    let _ = *notify_rust::SPEC_VERSION;
+}
+
+fn main() -> anyhow::Result<()> {
+    warm_notification_spec_version();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
