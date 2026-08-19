@@ -567,6 +567,59 @@ mod tests {
         );
     }
 
+    /// The end-to-end claim of the whole automatic-mode change, on the real
+    /// production path: a **default** config, no `object_path`, so the loader
+    /// goes to `DEFAULT_OBJECT_PATH` on its own initiative and therefore vets
+    /// the file under `Trust::Refuse`.
+    ///
+    /// Ignored by default because it needs root, CAP_BPF + CAP_PERFMON, cgroup
+    /// v2, and the object actually installed where a package would put it:
+    ///
+    /// ```sh
+    /// cargo xtask build-ebpf
+    /// sudo install -D -m 0644 -o root -g root \
+    ///     "$(cargo xtask ebpf-path)" /usr/lib/colony-firewall/cfc-ebpf.o
+    /// sudo -E ./target/fast/deps/cfc_daemon-<hash> --ignored --nocapture auto_mode
+    /// ```
+    ///
+    /// It asserts the thing no unit test can: that nobody has to configure
+    /// anything for ring 0 to come up on a machine that can run it.
+    #[tokio::test]
+    #[ignore = "needs root, CAP_BPF and the object installed at DEFAULT_OBJECT_PATH"]
+    async fn auto_mode_brings_ring0_up_on_this_host() {
+        let cfg = EbpfConfig::default();
+        assert_eq!(cfg.enabled, EbpfMode::Auto, "the default must be auto");
+        assert_eq!(
+            cfg.object_path, None,
+            "and it must not name a path, so the loader vets under Trust::Refuse"
+        );
+
+        let table = proc_table::KernelProcTable::new();
+        let rt = start(&cfg, DnsCache::new(), table.clone());
+        for note in &rt.report.notes {
+            println!("note: {note}");
+        }
+        println!(
+            "ring0={} degrade={:?} exec_offset={:?}",
+            rt.report.ring0().as_str(),
+            rt.report.degrade,
+            rt.report.exec_offset
+        );
+        for (program, insns) in &rt.report.verified_insns {
+            println!("verified_insns: {program} = {insns}");
+        }
+
+        assert_eq!(
+            rt.report.ring0(),
+            Ring0::Active,
+            "a default config on a capable host must bring all three programs \
+             up with no configuration at all: {:?}",
+            rt.report.notes
+        );
+        assert_eq!(rt.report.degrade, None);
+        assert!(table.is_live(), "the process table must be serving answers");
+    }
+
     /// The severity policy, over constructed reports rather than by running
     /// `start()` — the point is the (mode, degrade) matrix, not the load.
     #[test]
