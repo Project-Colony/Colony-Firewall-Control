@@ -358,6 +358,35 @@ struct IndexCache {
     warned_slow: AtomicBool,
 }
 
+/// Hand back to the kernel what building the index borrowed.
+///
+/// The index itself is small on purpose - it keeps a 64-bit hash per path
+/// rather than the path, so a desktop Arch install costs about 14 MB.
+/// *Building* it is not small: every installed package's `files` list is read
+/// into a String, parsed, hashed, and dropped. On the owner's machine that is
+/// 66 MB of package database through the allocator in a few hundred
+/// milliseconds.
+///
+/// glibc does not return that to the OS when it is freed. It keeps it in the
+/// arena for reuse, which is the right default for a program that will allocate
+/// again - and the wrong one for a daemon that does this once at startup and
+/// then sits still for weeks. The freed pages stayed resident: reading the
+/// daemon's own memory afterwards showed a 40 MB mapping still full of icon
+/// paths from packages nobody had asked about, half of it zeroes.
+///
+/// `malloc_trim` is the one-line answer. It is glibc-specific, so it is a
+/// no-op elsewhere; failing to trim costs memory, never correctness, which is
+/// why nothing here checks the return value.
+fn release_index_scratch() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` takes a byte count of padding to retain and only
+    // touches the allocator's own free lists. It cannot invalidate a live
+    // pointer: memory still owned by the program is not eligible.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 impl IndexCache {
     fn new(root: PathBuf, backend: &'static str) -> Self {
         Self {
@@ -428,6 +457,7 @@ impl IndexCache {
                 );
             }
             *guard = Some(idx);
+            release_index_scratch();
         }
         let idx = guard.as_ref()?;
         idx.get(key).map(|p| (p, idx.digest(key)))

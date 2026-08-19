@@ -66,6 +66,27 @@ struct Args {
 /// hard ceiling on that: whatever the worker is doing, the process exits.
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        // One worker per core is tokio's default and the wrong shape for this
+        // daemon. Nothing CPU-bound runs on the runtime: the packet loop is a
+        // `spawn_blocking` thread of its own, reverse DNS and exe resolution
+        // are `spawn_blocking` too, and what is left on the workers - the IPC
+        // server, the prompt router, the event writer, the flush timer, the
+        // ring-buffer consumer - is a dozen tasks that spend their lives
+        // waiting on a socket or a channel.
+        //
+        // The cost of the default was not CPU, it was address space. glibc
+        // gives each contending thread its own malloc arena, and on a 16-core
+        // machine that meant 14 arenas of ~63 MB: 1.07 GB of virtual mappings
+        // behind 78 MB of resident memory, for a daemon whose useful heap is
+        // 22 MB. Four workers is more than this ever needs and keeps the
+        // arena count in single digits.
+        //
+        // Deliberately a constant, not `min(4, cores)`: a single-core machine
+        // still gets four workers, which is correct - they are IO-bound, so
+        // oversubscribing costs a few kB of stack and nothing else, and a
+        // firewall that deadlocks because it ran out of workers on a small VM
+        // would be a much worse bug than the one this fixes.
+        .worker_threads(4)
         .enable_all()
         .build()
         .context("building tokio runtime")?;

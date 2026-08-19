@@ -762,6 +762,7 @@ trait ProcessResolver {
     fn pid_for_socket(
         &self,
         protocol: Protocol,
+        direction: Direction,
         src_ip: IpAddr,
         src_port: u16,
         dst_ip: IpAddr,
@@ -777,12 +778,13 @@ impl ProcessResolver for ProcfsResolver {
     fn pid_for_socket(
         &self,
         protocol: Protocol,
+        direction: Direction,
         src_ip: IpAddr,
         src_port: u16,
         dst_ip: IpAddr,
         dst_port: u16,
     ) -> Option<u32> {
-        process_resolve::pid_for_socket(protocol, src_ip, src_port, dst_ip, dst_port)
+        process_resolve::pid_for_socket(protocol, direction, src_ip, src_port, dst_ip, dst_port)
     }
 
     fn resolve(&self, pid: u32) -> Process {
@@ -870,13 +872,29 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
         }
     };
 
-    let pid_hint = deps.resolver.pid_for_socket(
-        conn.protocol,
-        conn.src_ip,
-        conn.src_port,
-        conn.dst_ip,
-        conn.dst_port,
-    );
+    // Inbound is not asked, rather than asked and told nothing.
+    //
+    // `pid_for_socket` searches for a socket already holding this 4-tuple.
+    // An inbound SYN has none - nothing has accepted it yet - so the search
+    // could only ever miss, and missing meant reading /proc/net/tcp and
+    // /proc/net/tcp6: 2.40 ms per packet for an answer of `None`.
+    //
+    // The resolver refuses inbound too. Two locks for one hole, because this
+    // one is silent: the verdict is identical either way, so nothing would
+    // have failed - the firewall would just be fourteen times slower on the
+    // inbound side and say nothing about it.
+    let pid_hint = if conn.direction == Direction::Inbound {
+        None
+    } else {
+        deps.resolver.pid_for_socket(
+            conn.protocol,
+            conn.direction,
+            conn.src_ip,
+            conn.src_port,
+            conn.dst_ip,
+            conn.dst_port,
+        )
+    };
 
     // Always allow our own traffic. Otherwise the daemon's reverse DNS
     // resolver would itself be intercepted, deadlocking on a verdict
@@ -1060,17 +1078,27 @@ mod tests {
     struct StubResolver {
         pid: Option<u32>,
         process: Process,
+        /// How many times the packet path asked for socket attribution.
+        ///
+        /// Counted because "did not call it" is the property worth pinning on
+        /// the inbound path: the real resolver's answer there was always
+        /// `None`, so a regression would not change any verdict - it would
+        /// just silently cost 2.4 ms a packet again.
+        socket_lookups: std::sync::atomic::AtomicUsize,
     }
 
     impl ProcessResolver for StubResolver {
         fn pid_for_socket(
             &self,
             _protocol: Protocol,
+            _direction: Direction,
             _src_ip: IpAddr,
             _src_port: u16,
             _dst_ip: IpAddr,
             _dst_port: u16,
         ) -> Option<u32> {
+            self.socket_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.pid
         }
 
@@ -1128,6 +1156,7 @@ mod tests {
                 resolver: StubResolver {
                     pid: Some(4242),
                     process: test_process(4242, "/usr/bin/curl"),
+                    socket_lookups: std::sync::atomic::AtomicUsize::new(0),
                 },
             }
         }
@@ -1148,6 +1177,44 @@ mod tests {
     // The property the owner asked for, in the words they used: nothing comes
     // in without having been authorised. These pin the three ways that could
     // silently stop being true.
+
+    /// An inbound flow must not pay for socket attribution.
+    ///
+    /// Every step of `pid_for_socket` looks for a socket whose 4-tuple is
+    /// already this flow. For an inbound SYN no such socket exists - nothing
+    /// has accepted it - so the search always missed, and missing cost a read
+    /// of /proc/net/tcp and /proc/net/tcp6: 2.40 ms per packet, measured.
+    /// Inbound connect latency was 2.78 ms median against 0.28 ms outbound
+    /// over the same link; skipping the search takes it to 0.19 ms.
+    ///
+    /// The verdict is unaffected either way, which is exactly why this needs a
+    /// test: a regression here changes no behaviour at all, it just makes the
+    /// firewall fourteen times slower on one side and says nothing.
+    #[test]
+    fn an_inbound_flow_does_not_pay_for_socket_attribution() {
+        let env = TestEnv::new(vec![], dp_deny());
+        env.handle(&tcp_packet(22), &INBOUND_META);
+        assert_eq!(
+            env.resolver
+                .socket_lookups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the inbound path asked for socket attribution that cannot succeed"
+        );
+    }
+
+    /// ...and the outbound path still does, because there it works.
+    #[test]
+    fn an_outbound_flow_still_resolves_its_process() {
+        let env = TestEnv::new(vec![], dp_deny());
+        env.handle(&tcp_packet(443), &NO_META);
+        assert_eq!(
+            env.resolver
+                .socket_lookups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
 
     /// Only `LOCAL_OUT` is outbound. An unexpected hook must land on the
     /// inbound side, because that is the side that cannot end in Allow.
@@ -1631,6 +1698,7 @@ mod tests {
                 resolver: Box::new(StubResolver {
                     pid: Some(4242),
                     process: test_process(4242, "/usr/bin/curl"),
+                    socket_lookups: std::sync::atomic::AtomicUsize::new(0),
                 }),
                 waiters: HashMap::new(),
                 pending_flows: HashMap::new(),
