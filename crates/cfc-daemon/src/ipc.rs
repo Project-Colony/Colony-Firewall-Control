@@ -68,6 +68,41 @@ use tonic::transport::server::UdsConnectInfo;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+/// Resolves a rule's executable path without blocking the IPC worker.
+///
+/// `canonicalize` is a synchronous syscall on a path any `colony-firewall`
+/// group member supplies, and this runs inside a `#[tonic::async_trait]`
+/// handler on the shared runtime. A path under a hung NFS mount or an
+/// unreachable autofs trigger would otherwise park a worker thread with no
+/// timeout; enough concurrent calls and the prompt-delivery tasks stall, which
+/// resolves every waiting connection to `no_ui_action` - Deny. The same
+/// reasoning already puts `dns.rs` and `nfqueue.rs`'s blocking calls on the
+/// blocking pool.
+///
+/// Best effort throughout: a path that cannot be resolved is kept verbatim
+/// rather than refused, because writing a rule for a program you have not
+/// installed yet is legitimate and this is the wrong layer to have an opinion
+/// about it.
+async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) {
+    let Some(current) = scope.exe_path.clone() else {
+        return;
+    };
+    let outcome =
+        match tokio::task::spawn_blocking(move || cfc_core::exe_path::resolve(&current)).await {
+            Ok(o) => o,
+            // The blocking pool is shutting down, or the task panicked. Neither is
+            // a reason to refuse the rule; store what the client sent.
+            Err(e) => {
+                warn!("could not resolve the rule's exe path: {e}");
+                return;
+            }
+        };
+    if let Some(note) = outcome.note() {
+        info!("rule exe path: {note}");
+    }
+    scope.exe_path = Some(outcome.into_path());
+}
+
 use cfc_proto::v1::{
     firewall_server::{Firewall, FirewallServer},
     ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse, ListEventsRequest, ListEventsResponse,
@@ -352,7 +387,14 @@ impl Firewall for FirewallService {
 
         let mut persisted_rule = None;
         if let Some(scope_pb) = req.persist_scope.clone() {
-            let scope = convert::scope_from_pb(&scope_pb).map_err(Status::invalid_argument)?;
+            let mut scope = convert::scope_from_pb(&scope_pb).map_err(Status::invalid_argument)?;
+            // The same resolution UpsertRule does. This is the *higher volume*
+            // of the two paths - every "Allow always" click in the tray and
+            // every prompt answered in the GUI arrives here - and it was missed
+            // on the first pass. It matters most exactly when attribution fell
+            // back to the exec event's path, which is whatever string was
+            // passed to execve() and may well be `/bin/curl`.
+            resolve_exe_off_thread(&mut scope).await;
             let duration =
                 convert::duration_from_pb(req.duration).map_err(Status::invalid_argument)?;
             convert::reject_unpersistable_duration(duration).map_err(Status::invalid_argument)?;
@@ -431,11 +473,7 @@ impl Firewall for FirewallService {
         // yet, or unreadable) is kept verbatim rather than refused. Refusing it
         // would break the legitimate "write the rule before installing the
         // program" case, and this is the wrong layer to have that opinion.
-        if let Some(outcome) = cfc_core::exe_path::resolve_scope(&mut rule.scope) {
-            if let Some(note) = outcome.note() {
-                info!(rpc = "UpsertRule", rule = %rule.id, "exe path: {note}");
-            }
-        }
+        resolve_exe_off_thread(&mut rule.scope).await;
         // hit_count and created_at belong to the daemon: a client editing a
         // rule must not be able to rewrite its history, deliberately or (as
         // every read-modify-write client did) by echoing back a count that

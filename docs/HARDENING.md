@@ -468,4 +468,12 @@ Restore with:
 cfc rules import --replace ~/cfc-rules-2026-05-25.json
 ```
 
-`--replace` deletes everything first; without it, import is additive.
+`--replace` makes the daemon's rule set match the file: every rule in the file
+is written first, and only then are the rules *absent* from it removed. Nothing
+is applied at all unless every rule in the file reads cleanly, so a typo cannot
+leave you with a partial rule set — and against a fail-closed ruleset, a partial
+rule set is a machine with no outbound network. Without `--replace`, import is
+additive and removes nothing.
+
+`--replace` with an empty file is refused rather than obeyed: deleting every
+rule is not something a restore command should do by accident.

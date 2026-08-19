@@ -477,6 +477,19 @@ pub async fn import(
         .into());
     }
 
+    // An empty file is almost never what someone means by "replace my rules
+    // with this", and against a fail-closed ruleset the consequence of being
+    // wrong is the whole machine's outbound network. `--replace` with nothing
+    // to import is refused; deleting every rule has its own command.
+    if replace && pending.is_empty() {
+        return Err(anyhow::anyhow!(
+            "refusing --replace with an empty rule set: that would delete every \
+             rule and leave the machine filtering with none. Remove --replace to \
+             import nothing, or delete rules explicitly."
+        )
+        .into());
+    }
+
     // --- 2. apply, in the order that has no empty window --------------------
     //
     // Upserts first, deletions last. There is no server-side transaction, so
@@ -494,12 +507,21 @@ pub async fn import(
     let mut imported_ids = std::collections::HashSet::new();
     for pb in pending {
         let name = pb.name.clone();
-        if !pb.id.is_empty() {
-            imported_ids.insert(pb.id.clone());
-        }
-        client.upsert_rule(pb).await.with_context(|| {
+        // The id the *daemon* returns, not the one the file carried. `parse_str`
+        // accepts uppercase, braced and 32-char forms; the daemon stores the
+        // canonical lowercase-hyphenated one and lists it back that way. Keying
+        // this set on the file's spelling meant an id that differed only in
+        // case upserted onto an existing rule and was then deleted by the
+        // cleanup below as "absent from the import" - the exact bug the e2e
+        // test was written to pin, invisible to it because the fake daemon
+        // echoed the id back verbatim.
+        //
+        // Using the response also covers the mint-a-new-one case, where the
+        // file has no id at all and only the daemon knows what it became.
+        let assigned = client.upsert_rule(pb).await.with_context(|| {
             format!("importing rule `{name}`; {imported} rules were already applied")
         })?;
+        imported_ids.insert(assigned);
         imported += 1;
     }
 
@@ -513,11 +535,16 @@ pub async fn import(
             if imported_ids.contains(r.id.as_str()) {
                 continue;
             }
-            client
+            // `delete_rule` answers whether a rule was actually there; another
+            // client may have removed it between the listing above and now.
+            // Counting it anyway would report a removal that did not happen.
+            if client
                 .delete_rule(&r.id)
                 .await
-                .with_context(|| format!("removing rule `{}`, absent from the import", r.id))?;
-            removed += 1;
+                .with_context(|| format!("removing rule `{}`, absent from the import", r.id))?
+            {
+                removed += 1;
+            }
         }
     }
 
@@ -795,14 +822,18 @@ pub async fn import_opensnitch(
         )));
     }
 
-    if replace {
-        let existing = client.list_rules().await?;
-        for r in existing {
-            let _ = client.delete_rule(&r.id).await;
-        }
-    }
-
-    let mut imported = 0u32;
+    // Same shape as `import`, and for the same reason: this used to delete every
+    // existing rule *first*, then upsert one at a time and abort with `?` on the
+    // first daemon rejection. That was already a way to end up with an emptied
+    // rule set against a fail-closed table; making `scope_from_pb` strict about
+    // CIDRs turned it from unlikely into ordinary, because opensnitch rule files
+    // carry destination data this converter passes through untouched.
+    //
+    // Convert everything first. A file that will not convert is skipped and
+    // counted, as before - opensnitch exports routinely contain rules with no
+    // CFC equivalent - but a *daemon* rejection now cannot happen after the
+    // deletions, because the deletions happen last.
+    let mut pending = Vec::new();
     let mut skipped = 0u32;
     for file in &files {
         let json =
@@ -816,35 +847,87 @@ pub async fn import_opensnitch(
             }
         };
         match convert_opensnitch(file, osn) {
-            Ok(rule) => {
-                client.upsert_rule(rule).await?;
-                imported += 1;
-            }
+            Ok(rule) => pending.push(rule),
             Err(e) => {
                 eprintln!("skip {}: {e}", file.display());
                 skipped += 1;
             }
         }
     }
+    if replace && pending.is_empty() {
+        return Err(anyhow::anyhow!(
+            "refusing --replace: none of the {} file(s) converted, so this would \
+             delete every existing rule and import nothing",
+            files.len()
+        )
+        .into());
+    }
+
+    // Upserts first, deletions last - see `import`.
+    let existing = if replace {
+        client.list_rules().await?
+    } else {
+        Vec::new()
+    };
+
+    let mut imported = 0u32;
+    let mut imported_ids = std::collections::HashSet::new();
+    for rule in pending {
+        let name = rule.name.clone();
+        let assigned = client.upsert_rule(rule).await.with_context(|| {
+            format!("importing `{name}`; {imported} rules were already applied")
+        })?;
+        imported_ids.insert(assigned);
+        imported += 1;
+    }
+
+    let mut removed = 0u32;
+    if replace {
+        for r in &existing {
+            if imported_ids.contains(r.id.as_str()) {
+                continue;
+            }
+            if client
+                .delete_rule(&r.id)
+                .await
+                .with_context(|| format!("removing rule `{}`, absent from the import", r.id))?
+            {
+                removed += 1;
+            }
+        }
+    }
+
     if format.is_json() {
         return output::print_json(&serde_json::json!({
-            "imported": imported, "skipped": skipped,
+            "imported": imported, "skipped": skipped, "removed": removed,
         }));
     }
-    println!("imported {imported} rules ({skipped} skipped)");
+    println!("imported {imported} rules ({skipped} skipped, {removed} removed)");
     Ok(())
 }
 
 fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<proto::RuleInfo> {
+    // Fails closed, for the same reason `ExportedRule::try_into_proto` does: an
+    // unrecognised or missing action must never become an Allow. This one is
+    // reachable from the migration path the README advertises, so a foreign
+    // file's vocabulary decides what gets allowed - the worst possible input to
+    // trust. A rule that cannot be converted is skipped and counted, which is
+    // already how this command handles anything it does not understand.
     let action = match osn.action.to_ascii_lowercase().as_str() {
+        "allow" | "accept" => proto::Action::Allow,
         "deny" | "drop" => proto::Action::Deny,
         "reject" => proto::Action::Reject,
-        _ => proto::Action::Allow,
+        other => {
+            anyhow::bail!("unknown action `{other}` (expected allow, accept, deny, drop or reject)")
+        }
     };
     let duration = match osn.duration.to_ascii_lowercase().as_str() {
+        "always" => proto::Duration::Always,
         "once" => proto::Duration::Once,
         "until restart" | "until-restart" | "restart" => proto::Duration::UntilRestart,
-        _ => proto::Duration::Always,
+        other => {
+            anyhow::bail!("unknown duration `{other}` (expected always, once or until restart)")
+        }
     };
 
     let mut scope = proto::RuleScope::default();
@@ -1667,9 +1750,10 @@ mod json_tests {
         // imported as an **allow** - on the path an operator uses to restore
         // rules after an incident.
         for typo in ["block", "denied", "DENY ", "", "drop"] {
-            let e = exported(typo)
-                .try_into_proto()
-                .expect_err("`{typo}` must not be accepted");
+            let e = match exported(typo).try_into_proto() {
+                Ok(_) => panic!("`{typo}` must not be accepted"),
+                Err(e) => e,
+            };
             assert!(e.contains("unknown action"), "{e}");
             assert!(
                 e.contains("allow, deny, reject"),

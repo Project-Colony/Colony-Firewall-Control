@@ -81,8 +81,9 @@ impl Resolved {
                 to.display()
             )),
             Self::Missing(p) => Some(format!(
-                "{} does not exist; the rule is stored but will not match until \
-                 it does",
+                "{} does not exist; the rule is stored as written, and if the \
+                 path turns out to be a symlink once the program is installed \
+                 it will need rewriting to the real path",
                 p.display()
             )),
             Self::Relative(p) => Some(format!(
@@ -102,16 +103,74 @@ pub fn resolve(path: &Path) -> Resolved {
     if !path.is_absolute() {
         return Resolved::Relative(path.to_path_buf());
     }
+    // A trailing separator makes `canonicalize` answer ENOTDIR even for a real
+    // file, which would report a perfectly good rule as "does not exist" —
+    // `Path` comparison is component-wise, so `/usr/bin/curl/` matches
+    // `/usr/bin/curl` at packet time regardless. Strip it before asking the
+    // filesystem anything, so the diagnostics describe the file rather than
+    // the spelling.
+    let trimmed;
+    let path = {
+        let raw = path.as_os_str().as_encoded_bytes();
+        if raw.len() > 1 && raw.ends_with(b"/") {
+            let end = raw.iter().rposition(|b| *b != b'/').map_or(1, |i| i + 1);
+            // SAFETY: the slice ends on a component boundary of a valid
+            // `OsStr`, since `/` is never part of a multi-byte sequence.
+            trimmed = PathBuf::from(unsafe {
+                std::ffi::OsStr::from_encoded_bytes_unchecked(&raw[..end])
+            });
+            trimmed.as_path()
+        } else {
+            path
+        }
+    };
     match std::fs::canonicalize(path) {
         Ok(real) if real == path => Resolved::Unchanged(real),
         Ok(real) => Resolved::Rewritten {
             from: path.to_path_buf(),
             to: real,
         },
-        // ENOENT is the common case and the only interesting one; a permission
-        // error or a broken mount lands here too, and the answer is the same —
-        // keep what we were given rather than invent something.
-        Err(_) => Resolved::Missing(path.to_path_buf()),
+        // The file is not there. Giving up on the whole path here was a real
+        // gap: `/bin/notyet` on a usr-merged host would be stored verbatim and
+        // stay inert *after* the program was installed, because nothing
+        // re-resolves a stored rule — while the note cheerfully promised it
+        // would start matching. Resolve the deepest ancestor that does exist
+        // and re-attach the missing tail, so the directory half of the
+        // usr-merge is handled even when the leaf is absent.
+        Err(_) => match resolve_via_ancestor(path) {
+            Some(to) if to != path => Resolved::Rewritten {
+                from: path.to_path_buf(),
+                to,
+            },
+            _ => Resolved::Missing(path.to_path_buf()),
+        },
+    }
+}
+
+/// Canonicalises the longest existing prefix of `path` and re-appends the rest.
+///
+/// Returns `None` when no ancestor resolves, or when the components that would
+/// have to be re-attached contain anything that cannot be reasoned about
+/// without touching the filesystem — `..` past an unresolved component would
+/// mean guessing.
+fn resolve_via_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        let parent = cursor.parent()?;
+        let name = cursor.file_name()?;
+        if name == ".." {
+            return None;
+        }
+        tail.push(name);
+        if let Ok(real) = std::fs::canonicalize(parent) {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        cursor = parent;
     }
 }
 
@@ -190,6 +249,67 @@ mod tests {
         assert_eq!(outcome.path(), p);
         assert!(outcome.is_inert());
         assert!(outcome.note().expect("a note").contains("does not exist"));
+    }
+
+    #[test]
+    fn a_missing_leaf_under_a_symlinked_directory_still_resolves() {
+        // The gap the first version left, and the one that matters most: on a
+        // usr-merged host `/bin` is a symlink, so a rule written for a program
+        // not yet installed (`/bin/mytool`) was stored verbatim and stayed
+        // inert *after* installation - nothing re-resolves a stored rule.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let realdir = dir.path().join("usr-bin");
+        std::fs::create_dir(&realdir).expect("mkdir");
+        let linkdir = dir.path().join("bin");
+        std::os::unix::fs::symlink(&realdir, &linkdir).expect("symlink");
+
+        let wanted = linkdir.join("not-installed-yet");
+        let outcome = resolve(&wanted);
+        assert!(
+            matches!(outcome, Resolved::Rewritten { .. }),
+            "the existing parent must still be resolved: {outcome:?}"
+        );
+        let stored = outcome.into_path();
+        assert_eq!(
+            stored,
+            std::fs::canonicalize(&realdir)
+                .expect("canon")
+                .join("not-installed-yet")
+        );
+
+        // And once the program is installed, that stored path is exactly what
+        // canonicalize reports - which is what /proc will report too.
+        std::fs::write(realdir.join("not-installed-yet"), b"x").expect("write");
+        assert_eq!(
+            stored,
+            std::fs::canonicalize(realdir.join("not-installed-yet")).expect("canon")
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_resolvable_ancestor_is_still_missing() {
+        let outcome = resolve(Path::new("/nonexistent-4b1e9c/deeper/still/prog"));
+        assert!(matches!(outcome, Resolved::Missing(_)), "{outcome:?}");
+        assert!(outcome.is_inert());
+    }
+
+    #[test]
+    fn a_trailing_slash_does_not_produce_a_false_warning() {
+        // canonicalize answers ENOTDIR for `/usr/bin/curl/`, which the first
+        // version reported as "does not exist" - a scary warning about a rule
+        // that matches perfectly well, because PathBuf equality is
+        // component-wise and the trailing slash is not a component.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("prog");
+        std::fs::write(&f, b"x").expect("write");
+        let with_slash = PathBuf::from(format!("{}/", f.display()));
+
+        let outcome = resolve(&with_slash);
+        assert!(
+            !outcome.is_inert(),
+            "a real file must not be reported as missing: {outcome:?}"
+        );
+        assert_eq!(outcome.path(), std::fs::canonicalize(&f).expect("canon"));
     }
 
     #[test]

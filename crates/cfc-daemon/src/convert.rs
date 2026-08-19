@@ -219,9 +219,14 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
 /// "this program may reach anywhere". A client's own validation is not a
 /// substitute: `UpsertRule` accepts whatever any group member sends.
 ///
-/// Every other field is total by construction - a string is a string, and
-/// `has_*` flags carry presence explicitly - so the only two that can fail are
-/// `dst_net` and `protocol`. Both now say why.
+/// Three fields can fail: `dst_net`, `protocol` and `dst_port`. The last is the
+/// least obvious and was missed on the first pass - the wire type is `uint32`
+/// and the scope holds a `u16`, so `as u16` silently *wrapped*: a client asking
+/// for port 65979 got a rule scoped to 443. Same class as the `dst_net` bug, on
+/// the same boundary, so it fails the same way.
+///
+/// The remaining fields are total by construction: a string is a string, and
+/// the `has_*` flags carry presence explicitly.
 pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
     let dst_net = match empty_to_none(&s.dst_net) {
         Some(n) => Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad dst_net `{n}`: {e}"))?),
@@ -231,6 +236,13 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
         true => Some(protocol_from_pb(s.protocol)?),
         false => None,
     };
+    let dst_port =
+        match s.has_dst_port {
+            true => Some(u16::try_from(s.dst_port).map_err(|_| {
+                format!("dst_port {} is out of range; a port is 0-65535", s.dst_port)
+            })?),
+            false => None,
+        };
     Ok(RuleScope {
         exe_path: empty_to_none(&s.exe_path).map(Into::into),
         exe_sha256: empty_to_none(&s.exe_sha256),
@@ -238,7 +250,7 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
         uid: s.has_uid.then_some(s.uid),
         dst_host: empty_to_none(&s.dst_host),
         dst_net,
-        dst_port: s.has_dst_port.then_some(s.dst_port as u16),
+        dst_port,
         protocol,
     })
 }
@@ -256,6 +268,28 @@ pub fn rule_to_pb(r: &Rule) -> pb::RuleInfo {
     }
 }
 
+/// Refuses a scope that constrains nothing.
+///
+/// Such a rule matches every process and every destination, so an Allow one is
+/// "switch the firewall off" and a Deny one is "take the network down" - and it
+/// arrives as an *empty message*, exactly what a default-initialised or
+/// truncated client sends. Every first-party client already blocks it before
+/// sending (the tray's own comment reads "a RuleScope with an empty exe_path
+/// matches EVERYTHING"), which is the strongest argument for enforcing it here:
+/// three clients independently decided it was dangerous, and the one boundary
+/// they all pass through did not check.
+fn reject_unscoped(scope: &RuleScope) -> Result<(), String> {
+    if scope.specificity() == 0 {
+        return Err(
+            "rule scope constrains nothing, so it would match every process and \
+             every destination; scope it to at least one of exe_path, uid, \
+             dst_host, dst_net, dst_port or protocol"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
     let id = if r.id.is_empty() {
         uuid::Uuid::new_v4()
@@ -266,6 +300,7 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
         Some(s) => scope_from_pb(s)?,
         None => RuleScope::any(),
     };
+    reject_unscoped(&scope)?;
     let created_at = if r.created_at_unix_ms == 0 {
         chrono::Utc::now()
     } else {
@@ -420,7 +455,12 @@ mod tests {
             enabled: true,
             action: cfc_proto::v1::Action::Unspecified as i32,
             duration: cfc_proto::v1::Duration::Always as i32,
-            scope: Some(cfc_proto::v1::RuleScope::default()),
+            // Scoped, so this test measures the action/duration gate and not
+            // the unscoped-rule gate below it.
+            scope: Some(cfc_proto::v1::RuleScope {
+                exe_path: "/usr/bin/curl".into(),
+                ..Default::default()
+            }),
             created_at_unix_ms: 0,
             hit_count: 0,
         };
@@ -432,6 +472,64 @@ mod tests {
 
         pb.duration = cfc_proto::v1::Duration::Always as i32;
         assert!(rule_from_pb(&pb).is_ok());
+    }
+
+    #[test]
+    fn a_rule_that_constrains_nothing_is_refused() {
+        // An empty scope matches every process and every destination, so an
+        // Allow one switches the firewall off. It also happens to be what a
+        // default-initialised or truncated client sends, which is why the
+        // boundary has to catch it rather than trusting three clients to.
+        let mut pb = cfc_proto::v1::RuleInfo {
+            id: String::new(),
+            name: "everything".into(),
+            enabled: true,
+            action: cfc_proto::v1::Action::Allow as i32,
+            duration: cfc_proto::v1::Duration::Always as i32,
+            scope: Some(cfc_proto::v1::RuleScope::default()),
+            created_at_unix_ms: 0,
+            hit_count: 0,
+        };
+        let e = rule_from_pb(&pb).expect_err("an unscoped rule must be refused");
+        assert!(e.contains("constrains nothing"), "{e}");
+
+        // A missing scope message is the same thing arriving a different way.
+        pb.scope = None;
+        assert!(rule_from_pb(&pb).is_err());
+
+        // Any single predicate is enough to make it a rule about something.
+        pb.scope = Some(cfc_proto::v1::RuleScope {
+            has_uid: true,
+            uid: 1000,
+            ..Default::default()
+        });
+        assert!(rule_from_pb(&pb).is_ok());
+    }
+
+    #[test]
+    fn an_out_of_range_port_is_refused_rather_than_wrapped() {
+        // `as u16` wrapped: a scope asking for 65979 became a rule scoped to
+        // 443. The wire type is uint32 and the scope holds a u16, so the
+        // conversion has to be checked like any other narrowing at a trust
+        // boundary.
+        let mut scope = cfc_proto::v1::RuleScope {
+            exe_path: "/usr/bin/curl".into(),
+            has_dst_port: true,
+            dst_port: 65_979,
+            ..Default::default()
+        };
+        let e = scope_from_pb(&scope).expect_err("65979 is not a port");
+        assert!(e.contains("out of range"), "{e}");
+        assert!(e.contains("65979"), "the message must quote the value: {e}");
+
+        // 65535 is the largest real port and must still work.
+        scope.dst_port = 65_535;
+        assert_eq!(scope_from_pb(&scope).unwrap().dst_port, Some(65_535));
+
+        // And an absent port is still absent, whatever junk rides along.
+        scope.has_dst_port = false;
+        scope.dst_port = 999_999;
+        assert_eq!(scope_from_pb(&scope).unwrap().dst_port, None);
     }
 
     #[test]

@@ -1467,8 +1467,24 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         );
     }
 
+    // Resolved here, not only in the daemon. The daemon does resolve on
+    // UpsertRule, but it runs under `ProtectHome=true` and `PrivateTmp=true`,
+    // so /home and /tmp are simply not there in its namespace - and those are
+    // exactly the paths a person types by hand (~/.local/bin, ~/.cargo/bin,
+    // AppImages, Steam). Without this the GUI's most likely input is the one
+    // case the daemon cannot fix, and the rule saves looking fine.
+    let typed = ed.exe.trim();
+    let exe = if typed.is_empty() {
+        String::new()
+    } else {
+        cfc_core::exe_path::resolve(std::path::Path::new(typed))
+            .into_path()
+            .to_string_lossy()
+            .into_owned()
+    };
+
     let scope = proto::RuleScope {
-        exe_path: ed.exe.trim().to_string(),
+        exe_path: exe,
         // Not editable here, so preserved rather than dropped: rebuilding
         // the scope from the visible fields alone would widen the rule.
         exe_sha256: ed.carried_scope.exe_sha256.clone(),

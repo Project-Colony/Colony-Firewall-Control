@@ -58,6 +58,30 @@ pub struct EventFilter {
     pub since_ts_unix_ms: Option<i64>,
 }
 
+/// Drops a `protocol: Some(Other(_))` predicate left behind by an older build.
+///
+/// Before the protocol conversion was made to fail closed, a client sending an
+/// unspecified protocol with `has_protocol = true` produced `Other(0)`. No
+/// client could ever create one deliberately - the CLI offers only tcp/udp/icmp
+/// and the wire has no field to carry a protocol *number* - so every such
+/// predicate on disk is that artefact.
+///
+/// Left alone it does two things, both bad: it counts toward `specificity()`
+/// while matching almost nothing, and - since the conversion now rejects it -
+/// it makes the rule **uneditable**, because every client edit is a
+/// read-modify-write that would send the value straight back and be refused.
+/// Healing it in memory restores the rule the operator meant and lets them
+/// save over it.
+///
+/// Returns whether anything changed.
+fn heal_legacy_protocol(rule: &mut Rule) -> bool {
+    if matches!(rule.scope.protocol, Some(cfc_core::Protocol::Other(_))) {
+        rule.scope.protocol = None;
+        return true;
+    }
+    false
+}
+
 impl RuleStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -107,10 +131,16 @@ impl RuleStore {
         })?;
         let mut rules = Vec::new();
         let mut skipped_ids = Vec::new();
+        let mut healed_ids = Vec::new();
         for r in rows {
             let (id, json) = r?;
             match serde_json::from_str::<Rule>(&json) {
-                Ok(rule) => rules.push(rule),
+                Ok(mut rule) => {
+                    if heal_legacy_protocol(&mut rule) {
+                        healed_ids.push(id.clone());
+                    }
+                    rules.push(rule);
+                }
                 Err(e) => {
                     tracing::error!(rule_id = %id, "rule failed to deserialize, skipping (row preserved): {e}");
                     skipped_ids.push(id);
@@ -123,6 +153,16 @@ impl RuleStore {
                 ids = ?skipped_ids,
                 "{} rule(s) could not be loaded; rows are preserved on disk",
                 skipped_ids.len()
+            );
+        }
+        if !healed_ids.is_empty() {
+            tracing::warn!(
+                count = healed_ids.len(),
+                ids = ?healed_ids,
+                "{} rule(s) carried an unusable `other` protocol predicate left by \
+                 an older build; it has been dropped in memory. Re-save them to \
+                 clear it on disk.",
+                healed_ids.len()
             );
         }
         self.skipped.store(skipped_ids.len(), Ordering::Relaxed);
@@ -417,6 +457,37 @@ impl RuleStore {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_legacy_other_protocol_is_healed_so_the_rule_stays_editable() {
+        // Written by a build whose protocol conversion mapped an unspecified
+        // value to Other(0). Now that the conversion rejects `other`, leaving
+        // it in place would make every client edit - all of which are
+        // read-modify-write - fail on a rule the operator can see but cannot
+        // change.
+        let mut rule = Rule::new(
+            "legacy",
+            cfc_core::Action::Allow,
+            cfc_core::RuleScope {
+                exe_path: Some("/usr/bin/curl".into()),
+                protocol: Some(cfc_core::Protocol::Other(0)),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        assert_eq!(rule.scope.specificity(), 2);
+        assert!(super::heal_legacy_protocol(&mut rule));
+        assert_eq!(rule.scope.protocol, None);
+        assert_eq!(
+            rule.scope.specificity(),
+            1,
+            "an unmatchable predicate must stop inflating specificity too"
+        );
+
+        // A real protocol is left alone.
+        rule.scope.protocol = Some(cfc_core::Protocol::Tcp);
+        assert!(!super::heal_legacy_protocol(&mut rule));
+        assert_eq!(rule.scope.protocol, Some(cfc_core::Protocol::Tcp));
+    }
     use super::*;
     use cfc_core::{Action, Rule, RuleScope};
     use std::path::PathBuf;
