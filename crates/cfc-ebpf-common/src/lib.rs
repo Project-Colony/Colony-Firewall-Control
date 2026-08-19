@@ -80,6 +80,52 @@ const _: () = {
     assert!(core::mem::size_of::<DnsAnswer>() == 276);
 };
 
+// ---------------------------------------------------------------------------
+// In-kernel enforcement
+// ---------------------------------------------------------------------------
+
+/// Values the daemon writes into the `VERDICTS` map, keyed by tgid, for the
+/// `cgroup/connect4|6` programs to read.
+///
+/// **Absence is not a verdict.** A pid with no entry is allowed to proceed
+/// through `connect()` and meets NFQUEUE instead, which is where the
+/// interactive prompt lives. This is the one place in CFC where the default is
+/// not Deny, and it is deliberate: the map only ever holds processes the daemon
+/// has seen `exec`, so a default deny here would blackhole every process that
+/// started before the daemon did - including the ones that bring the network
+/// up. The fail-closed guarantee stays where it already was, in the nftables
+/// ruleset (`ct state new queue num 0`, no `bypass`).
+///
+/// The point of this layer is the *opposite* direction: a deny written here
+/// keeps being enforced after the daemon is gone, because the link is pinned.
+pub mod verdict {
+    /// Let `connect()` proceed. Written when a rule allows this executable
+    /// unconditionally, so NFQUEUE would only reach the same answer slower.
+    pub const ALLOW: u32 = 1;
+
+    /// Refuse `connect()` in-kernel; the syscall returns `EPERM` before a
+    /// packet exists. Written when a rule denies this executable
+    /// unconditionally.
+    pub const DENY: u32 = 2;
+}
+
+/// Slots in the `ENFORCE_STATS` per-CPU array.
+///
+/// Counters, not events: the connect path must not allocate, and a ring buffer
+/// record per `connect()` would be a lot of records. The daemon sums these
+/// across CPUs for `cfc status`, which is also how the live tests prove the
+/// hook is firing at all.
+pub mod enforce_stat {
+    /// `connect()` allowed because the map said so.
+    pub const ALLOWED: u32 = 0;
+    /// `connect()` refused in-kernel.
+    pub const DENIED: u32 = 1;
+    /// No entry for this pid; fell through to NFQUEUE.
+    pub const UNKNOWN: u32 = 2;
+    /// Number of slots, and the array's `max_entries`.
+    pub const SLOTS: u32 = 3;
+}
+
 /// Length of the kernel's `task_struct::comm` field, including the NUL.
 pub const COMM_LEN: usize = 16;
 

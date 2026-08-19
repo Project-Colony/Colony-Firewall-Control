@@ -7,11 +7,11 @@
 //! design rationale.
 
 use std::os::fd::AsFd as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context as _};
-use aya::maps::{MapData, RingBuf};
+use aya::maps::{HashMap as BpfHashMap, MapData, RingBuf};
 use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, ProgramError, TracePoint};
 use aya::{Btf, Ebpf, EbpfLoader};
 use cfc_ebpf_common::dns::{self, DnsCursor, DNS_HEADER_LEN};
@@ -20,7 +20,10 @@ use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use super::{btf, cgroup, proc_table::KernelProcTable, tracefs, Degrade, ExecOffset, Report};
+use super::{
+    btf, cgroup, enforce, proc_table::KernelProcTable, tracefs, Degrade, Enforcement, ExecOffset,
+    Report,
+};
 use crate::dns::DnsCache;
 
 /// A load that did not happen, with the reason in a form [`Report::log`] can
@@ -291,7 +294,51 @@ pub(super) fn load_and_attach(
     };
     report.ppid_offsets = offsets.is_some();
 
+    // Where the enforcement pins live, if they can. A failure here is not fatal
+    // and not even a degrade: the connect programs still attach, they just do
+    // not outlive this process. `prepare` also unpins any older event ABI,
+    // which has to happen before the attach below or that attach meets EEXIST.
+    let pin_dir = match enforce::prepare() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            report.notes.push(format!(
+                "in-kernel enforcement cannot be pinned: {e:#}; \
+                 it will stop when this daemon does"
+            ));
+            None
+        }
+    };
+    // If a previous daemon left its pins behind, its programs are still
+    // attached and still enforcing. Do not attach a second copy on top - reuse
+    // the pinned maps and steer what is already there.
+    let inherited = pin_dir.as_deref().is_some_and(enforce::already_attached);
+
+    // Bound outside the loader so the borrows `map_pin_path` takes outlive it.
+    let pinned_map_paths: Vec<(&str, PathBuf)> = pin_dir
+        .as_deref()
+        .map(|dir| {
+            vec![
+                (enforce::MAP_VERDICTS, dir.join(enforce::MAP_VERDICTS)),
+                (enforce::MAP_STATS, dir.join(enforce::MAP_STATS)),
+            ]
+        })
+        .unwrap_or_default();
+
     let mut loader = EbpfLoader::new();
+    // Pin the two enforcement maps by name, so they are the *same* kernel
+    // objects across a daemon restart. Without this the pinned programs would
+    // go on consulting the map the dead daemon created while the new one wrote
+    // to a fresh one nobody reads - enforcement frozen at whatever it held when
+    // the daemon died, which is a far worse failure than not pinning at all.
+    //
+    // aya's `create_pinned_by_name` opens an existing pin when there is one and
+    // creates it otherwise, so this is both the first-run and the restart path.
+    // Only these two maps are pinned: the ring buffers and `PROCS` are rebuilt
+    // from scratch every start and pinning them would leak the previous run's
+    // backlog into this one.
+    for (name, path) in &pinned_map_paths {
+        loader.map_pin_path(name, path.as_path());
+    }
     // The ABI gate, before anything else the loader does.
     //
     // `must_exist = true` is the whole mechanism: if the object does not
@@ -420,6 +467,86 @@ pub(super) fn load_and_attach(
     report.exit_tracking = record_attach(&mut report, PROG_EXIT, "sched_process_exit", r);
     let r = attach_dns(&mut bpf);
     report.dns_capture = record_attach(&mut report, PROG_DNS, "cgroup_skb/ingress", r);
+
+    // --- enforcement ----------------------------------------------------
+
+    report.enforcement = if inherited {
+        report.notes.push(format!(
+            "in-kernel enforcement was already attached and pinned at {}; \
+             steering it rather than replacing it",
+            pin_dir.as_deref().unwrap_or(Path::new("?")).display()
+        ));
+        Enforcement::Inherited
+    } else {
+        match enforce::attach(&mut bpf, pin_dir.as_deref()) {
+            Ok(programs) => {
+                for (name, insns) in programs {
+                    if let Some(n) = insns {
+                        report.verified_insns.push((name, n));
+                    }
+                }
+                if pin_dir.is_some() {
+                    Enforcement::Pinned
+                } else {
+                    Enforcement::Process
+                }
+            }
+            Err(e) => {
+                report
+                    .notes
+                    .push(format!("cgroup/connect4|6 not attached: {e:#}"));
+                report.degrade.get_or_insert(classify_verify(&e));
+                Enforcement::Unavailable
+            }
+        }
+    };
+
+    // Counters are non-zero at startup only when a previous daemon's pinned
+    // programs kept working while this one was not running - which is the whole
+    // claim this layer makes, so it is worth stating rather than leaving to be
+    // inferred from a quiet log.
+    if report.enforcement.is_live() {
+        match bpf
+            .map(enforce::MAP_STATS)
+            .ok_or_else(|| anyhow!("no map named `{}`", enforce::MAP_STATS))
+            .and_then(|m| aya::maps::PerCpuArray::<_, u64>::try_from(m).map_err(Into::into))
+            .and_then(|m| enforce::stats(&m))
+        {
+            Ok(s) if s.denied > 0 || s.allowed > 0 || s.unknown > 0 => report.notes.push(format!(
+                "in-kernel enforcement carried over: {} connect() refused, \
+                 {} allowed, {} passed to the packet path since the pins were made",
+                s.denied, s.allowed, s.unknown
+            )),
+            Ok(_) => {}
+            Err(e) => report
+                .notes
+                .push(format!("enforcement counters unreadable: {e:#}")),
+        }
+    }
+
+    // Evict verdicts for pids that no longer exist. This has to run before the
+    // daemon writes anything: while it was down nothing evicted, so a recycled
+    // pid would otherwise inherit the previous holder's answer. See
+    // `enforce::sweep`.
+    if report.enforcement.is_live() {
+        match bpf.map_mut(enforce::MAP_VERDICTS) {
+            Some(map) => match BpfHashMap::<_, u32, u32>::try_from(map) {
+                Ok(mut verdicts) => {
+                    let n = enforce::sweep(&mut verdicts);
+                    if n > 0 {
+                        debug!("evicted {n} verdicts for pids that no longer exist");
+                    }
+                }
+                Err(e) => report
+                    .notes
+                    .push(format!("{} is not a hash map: {e}", enforce::MAP_VERDICTS)),
+            },
+            None => report.notes.push(format!(
+                "no map named `{}` in the object",
+                enforce::MAP_VERDICTS
+            )),
+        }
+    }
 
     // Exec without exit tracking would let entries age out on the TTL alone,
     // which is a materially weaker pid-reuse story. Refuse the combination
@@ -587,7 +714,7 @@ fn attach_tracepoint(
 /// the wrong side of that (see `crates/cfc-ebpf/README.md`). Logging it turns
 /// "a change made the program more expensive" into something visible before it
 /// becomes "the program stopped loading on someone else's kernel".
-fn verifier_cost(
+pub(super) fn verifier_cost(
     name: &str,
     info: Result<aya::programs::ProgramInfo, ProgramError>,
 ) -> Option<u32> {

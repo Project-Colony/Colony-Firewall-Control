@@ -36,3 +36,15 @@ max = 200
 # than a discovery someone makes six months later.
 observed = 17058
 max = 40000
+
+[cfc_connect4]
+# One hash lookup and one counter increment. It is this small because the
+# decision was already made at exec time and left in a map; anything that grows
+# this number means work moved onto the connect() path, which is the one place
+# in CFC where cost is paid by every process on the machine.
+observed = 61
+max = 200
+
+[cfc_connect6]
+observed = 61
+max = 200

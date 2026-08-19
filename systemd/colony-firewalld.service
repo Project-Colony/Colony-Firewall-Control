@@ -40,11 +40,10 @@ TimeoutStopSec=15
 # CAP_PERFMON    perf_event_open(2), which is how a tracepoint program is
 #                actually attached (the two sched_process_* programs).
 #
-# CAP_BPF and CAP_PERFMON are granted unconditionally even though the eBPF
-# backend is off at runtime by default ([ebpf] enabled in daemon.toml). The
-# loader itself is compiled into the shipped daemon, so that config switch is
-# the only gate. Granting the capabilities here rather than making operators
-# edit the unit keeps the switch in one place; while the switch is off they are
+# CAP_BPF and CAP_PERFMON are granted unconditionally. `[ebpf] enabled`
+# defaults to `auto`, so on a capable kernel the ring-0 layer comes up by
+# itself; granting the capabilities here rather than making operators edit the
+# unit is what makes that automatic. On a host that cannot use them they are
 # simply never exercised.
 #
 # On kernels older than 5.8 neither capability exists and bpf(2) requires
@@ -73,7 +72,13 @@ NoNewPrivileges=true
 # Filesystem
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/colony-firewall /run/colony-firewall /var/log/colony-firewall
+# /sys/fs/bpf is listed because ProtectKernelTunables below remounts /sys
+# read-only, and the enforcement links are *pinned* into the bpffs mounted
+# there. Without this line the pin fails with EROFS, the daemon falls back to
+# process-lifetime links, and `kill -9` on this unit lifts every in-kernel deny
+# it holds - which is the one thing that layer exists to prevent. The daemon
+# only ever creates /sys/fs/bpf/colony-firewall/; it writes nothing else there.
+ReadWritePaths=/var/lib/colony-firewall /run/colony-firewall /var/log/colony-firewall /sys/fs/bpf
 RuntimeDirectory=colony-firewall
 RuntimeDirectoryMode=0755
 StateDirectory=colony-firewall
@@ -124,8 +129,9 @@ MemoryDenyWriteExecute=true
 # chroot and the setuid family, and @debug would hand back ptrace and
 # process_vm_readv - a much larger surface than "load a verified program and
 # attach it to a tracepoint" needs. perf_event_open is required because that
-# is how a tracepoint program is attached; the cgroup_skb program goes through
-# bpf(BPF_LINK_CREATE) alone.
+# is how a tracepoint program is attached; the cgroup_skb and cgroup_sock_addr
+# programs go through bpf(BPF_LINK_CREATE) alone. Pinning is bpf(BPF_OBJ_PIN),
+# also covered by the `bpf` entry.
 #
 # Listing them costs nothing when the eBPF backend is off: an allowed syscall
 # that is never called is not an attack surface, and CAP_BPF is a separate gate

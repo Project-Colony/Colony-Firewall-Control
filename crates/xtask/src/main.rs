@@ -89,10 +89,17 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     "cfc_sched_process_exec",
     "cfc_sched_process_exit",
     "cfc_dns_ingress",
+    // the two that enforce rather than observe; their link is pinned to bpffs
+    "cfc_connect4",
+    "cfc_connect6",
     // maps
     "EXEC_EVENTS",
     "EXIT_EVENTS",
     "DNS_PACKETS",
+    // pinned by name into /sys/fs/bpf, so their names are load-bearing across
+    // daemon restarts, not just within one load
+    "VERDICTS",
+    "ENFORCE_STATS",
     // patchable .rodata globals
     "TASK_REAL_PARENT_OFFSET",
     "TASK_TGID_OFFSET",

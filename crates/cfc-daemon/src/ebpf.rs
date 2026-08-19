@@ -84,6 +84,8 @@ pub mod proc_table;
 pub mod tracefs;
 
 #[cfg(feature = "ebpf")]
+mod enforce;
+#[cfg(feature = "ebpf")]
 mod loader;
 
 use crate::config::{EbpfConfig, EbpfMode};
@@ -229,6 +231,56 @@ impl Ring0 {
     }
 }
 
+/// Whether `connect()` is enforced in the kernel, and whether that enforcement
+/// outlives this process.
+///
+/// Separate from [`Ring0`] on purpose. `Ring0` answers "is the kernel feeding
+/// this daemon better information?"; this answers "does the kernel refuse
+/// anything on its own?". They fail independently - a host can have all three
+/// observers up and no bpffs to pin into - and conflating them would let a
+/// weaker guarantee hide behind a stronger word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Enforcement {
+    /// Not attempted: eBPF is off, or the object never loaded.
+    #[default]
+    Off,
+    /// Attempted, and the kernel refused. Decisions happen in userspace only,
+    /// which is where they happened before this layer existed.
+    Unavailable,
+    /// Attached, but the link is held by this process alone. Every deny it
+    /// holds is lifted the moment the daemon exits.
+    Process,
+    /// Attached with the link pinned to bpffs. Denies survive the daemon being
+    /// killed; lifting them takes a deliberate `rm` under `/sys/fs/bpf`.
+    Pinned,
+    /// Not attached by *this* daemon because a previous one's pins are still
+    /// there and still enforcing. The map is shared, so this daemon steers it.
+    Inherited,
+}
+
+impl Enforcement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Unavailable => "unavailable",
+            Self::Process => "process",
+            Self::Pinned => "pinned",
+            Self::Inherited => "inherited",
+        }
+    }
+
+    /// True when the kernel refuses `connect()` for denied processes, whoever
+    /// owns the link.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Process | Self::Pinned | Self::Inherited)
+    }
+
+    /// True when that stays true after this process dies.
+    pub fn survives_daemon(self) -> bool {
+        matches!(self, Self::Pinned | Self::Inherited)
+    }
+}
+
 /// What actually came up. Reported once at startup and otherwise inert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -243,6 +295,9 @@ pub struct Report {
     pub exit_tracking: bool,
     /// `cgroup_skb/ingress` is attached and feeding observed DNS answers.
     pub dns_capture: bool,
+    /// Whether `cgroup/connect4|6` refuse denied processes in-kernel, and
+    /// whether they keep doing so once this daemon is gone.
+    pub enforcement: Enforcement,
     /// `task_struct` offsets were resolved from BTF, so exec events carry a
     /// real ppid rather than 0.
     pub ppid_offsets: bool,
@@ -384,6 +439,10 @@ impl Report {
             // not more than that. Without these, answering "is ring 0 up on
             // this fleet?" means parsing prose out of three separate flags.
             ring0 = self.ring0().as_str(),
+            // Separate word from `ring0` on purpose: that one says how well the
+            // kernel informs this daemon, this one says whether the kernel
+            // refuses anything without it. See `Enforcement`.
+            enforcement = self.enforcement.as_str(),
             degrade = self.degrade.map(Degrade::as_str).unwrap_or("none"),
             exec_tracking = self.exec_tracking,
             exit_tracking = self.exit_tracking,

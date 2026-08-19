@@ -8,6 +8,11 @@
 //! | `tracepoint/sched/sched_process_exec` | record every `execve` in `PROCS` + `EXEC_EVENTS` |
 //! | `tracepoint/sched/sched_process_exit` | evict dead pids from `PROCS` + `EXIT_EVENTS`     |
 //! | `cgroup_skb/ingress`                 | copy DNS response payloads into `DNS_PACKETS`    |
+//! | `cgroup/connect4`, `cgroup/connect6` | refuse `connect()` for already-denied pids       |
+//!
+//! The first three *observe*. The last two **decide**, and are the only part of
+//! CFC that enforces without a userspace round trip: their link is pinned to
+//! bpffs, so every deny they hold survives the daemon being killed.
 //!
 //! All the interesting arithmetic lives in `cfc-ebpf-common` so it can be
 //! unit-tested on the host; this file is the thin, verifier-shaped shell around
@@ -26,9 +31,9 @@ use aya_ebpf::helpers::{
     bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid,
     bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
 };
-use aya_ebpf::macros::{cgroup_skb, map, tracepoint};
+use aya_ebpf::macros::{cgroup_skb, cgroup_sock_addr, map, tracepoint};
 use aya_ebpf::maps::{HashMap, PerCpuArray, RingBuf};
-use aya_ebpf::programs::{SkBuffContext, TracePointContext};
+use aya_ebpf::programs::{SkBuffContext, SockAddrContext, TracePointContext};
 use aya_ebpf::{EbpfContext as _, Global};
 use cfc_ebpf_common::dns::DNS_HEADER_LEN;
 use cfc_ebpf_common::net::{self, IPV4_MIN_HEADER_LEN, UDP_HEADER_LEN};
@@ -44,6 +49,24 @@ use cfc_ebpf_common::{DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent};
 /// 10240 entries at 292 bytes each is ~3 MiB of (preallocated) kernel memory.
 #[map]
 static PROCS: HashMap<u32, ExecEvent> = HashMap::with_max_entries(10_240, 0);
+
+/// Precomputed per-process verdicts, keyed by tgid, read on the `connect()`
+/// path by `cfc_connect4` / `cfc_connect6`.
+///
+/// The daemon writes an entry when it sees an `exec` whose executable matches a
+/// rule that needs no packet to evaluate - no destination, no port, no
+/// protocol constraint - because such a rule's answer cannot change between
+/// here and NFQUEUE. Anything conditional is left absent on purpose so the
+/// packet path still decides it.
+///
+/// Sized to match `PROCS`; an entry here always has one there.
+#[map]
+static VERDICTS: HashMap<u32, u32> = HashMap::with_max_entries(10_240, 0);
+
+/// Counters for the connect path. See `cfc_ebpf_common::enforce_stat`.
+#[map]
+static ENFORCE_STATS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(cfc_ebpf_common::enforce_stat::SLOTS, 0);
 
 /// Stream of `execve` events. 256 KiB = 64 pages, a power-of-two multiple of
 /// the page size as the kernel requires.
@@ -627,6 +650,84 @@ fn load_at<const N: usize>(ctx: &SkBuffContext, offset: usize, dst: *mut u8) -> 
         )
     };
     ret == 0
+}
+
+// ---------------------------------------------------------------------------
+// connect() enforcement
+// ---------------------------------------------------------------------------
+
+/// What `cgroup/connect4|6` returns to let the syscall proceed.
+const CONNECT_PROCEED: i32 = 1;
+
+/// What it returns to refuse. The kernel turns this into `EPERM` from
+/// `connect(2)` itself - no packet is ever built, so nothing reaches nftables,
+/// NFQUEUE, or the wire.
+const CONNECT_REFUSE: i32 = 0;
+
+/// Bumps one counter in `ENFORCE_STATS`.
+///
+/// Per-CPU, so this is a plain non-atomic add: BPF programs are
+/// non-preemptible, and the daemon sums the per-CPU values when it reads them.
+#[inline(always)]
+fn bump(slot: u32) {
+    if let Some(ptr) = ENFORCE_STATS.get_ptr_mut(slot) {
+        // SAFETY: `get_ptr_mut` bounds-checks against `max_entries` and returned
+        // a non-null pointer to this CPU's slot. See EXEC_SCRATCH.
+        unsafe { *ptr = (*ptr).wrapping_add(1) };
+    }
+}
+
+/// The whole decision, shared by the v4 and v6 entry points.
+///
+/// One hash lookup on a `u32`. There is deliberately no path matching, hashing
+/// or string work here: the daemon does that once at `exec` and leaves the
+/// answer in the map, so this program stays small enough that its cost is
+/// invisible next to `connect()` itself.
+///
+/// Note what is *not* consulted: the destination. An entry in `VERDICTS` means
+/// the daemon decided this executable's answer does not depend on where it is
+/// going. Anything destination-scoped is left absent and falls through.
+#[inline(always)]
+fn connect_verdict() -> i32 {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // SAFETY: `get` on a BPF hash map from a program context; the returned
+    // reference borrows map memory that stays valid for this program run.
+    match unsafe { VERDICTS.get(&tgid) } {
+        Some(&v) if v == cfc_ebpf_common::verdict::DENY => {
+            bump(cfc_ebpf_common::enforce_stat::DENIED);
+            CONNECT_REFUSE
+        }
+        Some(&v) if v == cfc_ebpf_common::verdict::ALLOW => {
+            bump(cfc_ebpf_common::enforce_stat::ALLOWED);
+            CONNECT_PROCEED
+        }
+        // Absent, or a value from an ABI this object does not know. Both mean
+        // "no answer here"; the packet path decides. Never a deny - see the
+        // `verdict` module's docs for why that direction is load-bearing.
+        _ => {
+            bump(cfc_ebpf_common::enforce_stat::UNKNOWN);
+            CONNECT_PROCEED
+        }
+    }
+}
+
+/// Refuses IPv4 `connect()` for processes the daemon has already ruled on.
+///
+/// Attached to the cgroup v2 root through a **pinned** link, which is the
+/// point: the link outlives the daemon, so `kill -9` on the daemon does not
+/// lift a single deny. Only something that can write to bpffs can - which is
+/// to say root, which CFC has never claimed to confine.
+#[cgroup_sock_addr(connect4)]
+pub fn cfc_connect4(_ctx: SockAddrContext) -> i32 {
+    connect_verdict()
+}
+
+/// Same, for IPv6. A separate program because the kernel has separate attach
+/// types; the body is identical because the decision does not look at the
+/// address.
+#[cgroup_sock_addr(connect6)]
+pub fn cfc_connect6(_ctx: SockAddrContext) -> i32 {
+    connect_verdict()
 }
 
 // ---------------------------------------------------------------------------
