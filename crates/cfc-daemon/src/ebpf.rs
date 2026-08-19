@@ -77,6 +77,11 @@
 pub mod btf;
 pub mod cgroup;
 pub mod proc_table;
+// Outside the `ebpf` feature gate on purpose: it is a text parser with no aya
+// in it, and its tests are the only check that the offset logic is right. They
+// must run in the default suite, not only in the configuration that also needs
+// a BPF toolchain to be interesting.
+pub mod tracefs;
 
 #[cfg(feature = "ebpf")]
 mod loader;
@@ -160,6 +165,24 @@ impl Degrade {
     }
 }
 
+/// Where the exec program was told to find the tracepoint's `filename` field.
+///
+/// Worth reporting rather than just logging: `Suppressed` means exec events
+/// arrive with no path at all, which downstream looks identical to a process
+/// that could not be resolved. Without this, "this kernel's record is a shape
+/// we do not read" and "that binary was already gone" are the same symptom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecOffset {
+    /// Read out of tracefs and patched in.
+    Parsed(u32),
+    /// The format file could not be read; the compiled-in default stands.
+    #[default]
+    Default,
+    /// The record is in a form this build cannot read, so the filename read is
+    /// switched off in the kernel program.
+    Suppressed,
+}
+
 /// One positive word for "is ring 0 doing anything on this host?".
 ///
 /// Derived from the per-program flags rather than stored, so it cannot drift
@@ -210,6 +233,8 @@ pub struct Report {
     /// one word. `None` means either "it is fully up" or "the reason has no
     /// classification", and callers must not read anything into which.
     pub degrade: Option<Degrade>,
+    /// Where the exec program was told to find the tracepoint filename field.
+    pub exec_offset: ExecOffset,
     /// `(program, instructions the verifier walked)`, for programs that got as
     /// far as being verified on a kernel that reports the count (>= 5.16).
     ///

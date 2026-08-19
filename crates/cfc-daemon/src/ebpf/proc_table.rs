@@ -109,7 +109,25 @@ impl From<&ExecEvent> for KernelProc {
             ppid: (e.ppid != 0).then_some(e.ppid),
             uid: e.uid,
             gid: e.gid,
-            exe: PathBuf::from(e.filename_str().into_owned()),
+            // `filename_len == 0` is the kernel side saying it did not read a
+            // path: either the probe read faulted, or the loader switched the
+            // read off because this kernel's tracepoint record is a shape it
+            // cannot parse. Build an empty path rather than whatever the
+            // per-CPU scratch buffer happens to still hold from a previous
+            // event -- the buffer is deliberately not memset (a 292-byte
+            // memset does not lower on the BPF backend), so its tail is stale
+            // by design and only `filename_len` says how much of it is real.
+            //
+            // `absolute_exe()` already drops an empty path from rule
+            // evaluation, so this is belt-and-braces at this layer. It is
+            // worth having anyway because a *garbage but absolute* path could
+            // not be detected here at all, which is why the real defence is
+            // suppressing the read at the source.
+            exe: if e.filename_len == 0 {
+                PathBuf::new()
+            } else {
+                PathBuf::from(e.filename_str().into_owned())
+            },
             comm: e.comm_str().into_owned(),
         }
     }
@@ -318,6 +336,37 @@ mod tests {
         let p = t.get(42, None, now).unwrap();
         assert_eq!(p.exe, PathBuf::from("./configure"));
         assert_eq!(p.absolute_exe(), None);
+    }
+
+    /// `filename_len == 0` is the kernel side saying "I did not read a path".
+    ///
+    /// It happens when the probe read faults, and — deliberately — when the
+    /// loader switched the read off because this kernel's tracepoint record is
+    /// a shape it cannot parse. The scratch buffer is not memset between
+    /// events (a 292-byte memset does not lower on the BPF backend), so its
+    /// tail holds the *previous* exec's path. Reading it would attribute a
+    /// connection to whatever ran before.
+    #[test]
+    fn a_zero_length_filename_yields_no_path_not_a_stale_one() {
+        let mut e = exec(42, "/usr/bin/curl", 1000, 1);
+        // The bytes stay; only the length says they are not real. That is
+        // exactly the on-the-wire shape of a suppressed read.
+        e.filename_len = 0;
+
+        let p = KernelProc::from(&e);
+        assert_eq!(
+            p.exe,
+            PathBuf::new(),
+            "a stale buffer must not become a path"
+        );
+        assert_eq!(
+            p.absolute_exe(),
+            None,
+            "and must never reach rule evaluation"
+        );
+        // Everything else about the event is still trustworthy and must survive.
+        assert_eq!(p.pid, 42);
+        assert_eq!(p.uid, 1000);
     }
 
     #[test]

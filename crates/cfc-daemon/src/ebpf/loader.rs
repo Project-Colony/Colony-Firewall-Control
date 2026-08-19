@@ -20,7 +20,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use super::{btf, cgroup, proc_table::KernelProcTable, Degrade, Report};
+use super::{btf, cgroup, proc_table::KernelProcTable, tracefs, Degrade, ExecOffset, Report};
 use crate::dns::DnsCache;
 
 /// A load that did not happen, with the reason in a form [`Report::log`] can
@@ -308,6 +308,64 @@ pub(super) fn load_and_attach(
             real_parent,
             tgid, "patched task_struct offsets into .rodata"
         );
+    }
+
+    // Where `filename` sits in the sched_process_exec record. Bound outside
+    // the match so the borrow outlives the loader.
+    let exec_off: u32;
+    // Never `?`: a record offset has nothing to do with whether exec, exit and
+    // DNS can attach, and failing the whole load over it would trade three
+    // working programs for one unread field.
+    match tracefs::exec_filename_offset() {
+        Ok(tracefs::Resolution::Parsed(off)) => {
+            exec_off = off;
+            // Unconditionally, not "only when it differs from the built-in 8".
+            // Patching only the surprising case means the common case is never
+            // exercised, so the day it stops being 8 is the day this code path
+            // runs for the first time.
+            loader.override_global("EXEC_FILENAME_DATA_LOC", &exec_off, false);
+            if off != 8 {
+                // On every kernel seen so far this is 8. A different value is
+                // the single most interesting thing this parser can report.
+                warn!(
+                    offset = off,
+                    "sched_process_exec puts `filename` somewhere new; \
+                     patched it in"
+                );
+                report.notes.push(format!(
+                    "sched_process_exec filename offset is {off}, not the usual 8"
+                ));
+            }
+            report.exec_offset = ExecOffset::Parsed(off);
+        }
+        Ok(tracefs::Resolution::Unsupported) => {
+            // This must reach the *kernel*. Noticing in userspace and leaving
+            // the program to read offset 8 anyway would be byte-for-byte the
+            // silent failure this change exists to remove.
+            exec_off = 0;
+            loader.override_global("EXEC_FILENAME_DATA_LOC", &exec_off, false);
+            warn!(
+                "this kernel's sched_process_exec record is not one we can read \
+                 (__rel_loc, or an unexpected field width); exec events will \
+                 carry no filename"
+            );
+            report.notes.push(
+                "sched_process_exec filename field is in a form this build cannot \
+                 read; exec events will carry no path, and attribution falls back \
+                 to /proc"
+                    .to_string(),
+            );
+            report.exec_offset = ExecOffset::Suppressed;
+        }
+        Err(e) => {
+            // The compiled-in 8 stands. `debug!` and no note: notes are
+            // escalated to warnings when the layer was asked for, and this
+            // changes nothing on any kernel that exists - aya could not have
+            // attached the tracepoint at all without reading a sibling of the
+            // file we just failed to read.
+            debug!("could not read the sched_process_exec format file ({e}); keeping the built-in offset");
+            report.exec_offset = ExecOffset::Default;
+        }
     }
 
     let mut bpf = loader
@@ -871,6 +929,27 @@ mod tests {
         assert!(report.exec_tracking, "exec tracepoint should attach");
         assert!(report.exit_tracking, "exit tracepoint should attach");
         assert!(report.ppid_offsets, "BTF offsets should resolve");
+        // Assert on the *parse outcome*, not on "an override was issued":
+        // the override is now unconditional, so asserting it happened would
+        // pass on a kernel whose format file could not be read at all.
+        println!("exec_offset = {:?}", report.exec_offset);
+        assert!(
+            matches!(report.exec_offset, ExecOffset::Parsed(_)),
+            "the sched_process_exec filename offset should come from tracefs, \
+             not from the compiled-in fallback: {:?}",
+            report.exec_offset
+        );
+        // The verifier budget is 1,000,000 instructions and the DNS observer
+        // has been over it before. Print the real numbers so a change that
+        // makes a program dramatically more expensive is visible in the run
+        // that introduced it rather than on someone else's kernel.
+        for (program, insns) in &report.verified_insns {
+            println!("verified_insns: {program} = {insns}");
+        }
+        assert!(
+            !report.verified_insns.is_empty(),
+            "this kernel reports verified instruction counts; they should be recorded"
+        );
         println!("dns_capture = {}", report.dns_capture);
         assert!(
             report.dns_capture,

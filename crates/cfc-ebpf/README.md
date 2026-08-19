@@ -46,12 +46,14 @@ field:pid_t          pid;                 offset:12; size:4;
 field:pid_t          old_pid;             offset:16; size:4;
 ```
 
-`filename` is *not* the string. It is a 4-byte word at record offset 8 encoding
+`filename` is *not* the string. It is a 4-byte word encoding
 `(length << 16) | offset`, where `offset` is relative to the start of the
 tracepoint record and points into the record's variable-length tail. So:
 
 ```rust
-let data_loc: u32 = ctx.read_at::<u32>(8)?;   // bpf_probe_read_kernel
+let field_off = EXEC_FILENAME_DATA_LOC.load();          // patched at load time
+if field_off == 0 || field_off > 64 { return; }         // sentinel, and bound
+let data_loc: u32 = ctx.read_at::<u32>(field_off)?;     // bpf_probe_read_kernel
 let offset =  (data_loc & 0xffff) as usize;
 let len    = ((data_loc >> 16)  ) as usize;
 let src    =  ctx.as_ptr().cast::<u8>().add(offset);
@@ -61,6 +63,57 @@ bpf_probe_read_kernel_str_bytes(src, &mut event.filename)
 `bpf_probe_read_kernel_str_bytes` returns the bytes *excluding* the trailing
 NUL, which is exactly the `filename_len` userspace wants. Paths longer than 256
 bytes are truncated.
+
+**Where the field is, is not assumed.** `EXEC_FILENAME_DATA_LOC` is a
+`.rodata` global, patched by the loader from the format file above
+(`cfc-daemon/src/ebpf/tracefs.rs`), exactly as the `task_struct` offsets are
+patched from BTF. It has been 8 on every kernel this has run on and the
+`common_*` header is about as stable as the tracepoint ABI gets — but the
+failure mode of guessing wrong is silent and ugly. Read four bytes of whatever
+field actually sits at offset 8, decode them as `(len << 16) | offset`, and the
+program copies a plausible-looking path out of the middle of the record.
+Nothing downstream can distinguish that from a real filename, so it would
+surface as a firewall confidently attributing connections to a program that
+does not exist.
+
+Three outcomes, all handled in the loader:
+
+| format file says | loader does | kernel side does |
+|---|---|---|
+| `__data_loc`, `size:4` | patches the offset in, unconditionally | reads it |
+| `__rel_loc`, or another width | patches **0** in | reads nothing |
+| unreadable | leaves the built-in 8 | reads offset 8 |
+
+The middle row is the one that matters. Detecting an unreadable layout in
+userspace and leaving the kernel program to read offset 8 anyway would be
+byte-for-byte the silent failure this exists to prevent, so the refusal has to
+reach the kernel. `0` is that signal.
+
+The `> 64` bound is not belt-and-braces either. As a `const` the offset was a
+compile-time literal and the verifier knew the exact address; read from a
+global it is a runtime value with umax 2^32-1, about to be used in pointer
+arithmetic on the context, and the verifier refuses the program without a
+bound. A mask would not do — the point is to *reject* an implausible offset,
+not fold it into range.
+
+Measured cost of making it patchable: **+9 verified instructions** (248 → 257).
+
+### Why not `tp_btf`
+
+A BTF-powered raw tracepoint would skip the format file entirely, reading
+`bprm->filename` from the kernel's own type information. It was rejected
+because it makes BTF **mandatory** for the exec *and* exit programs, where
+today BTF is optional and its absence costs only `ppid`. A kernel built without
+`CONFIG_DEBUG_INFO_BTF` would go from "process tracking, minus parent pids" to
+"no process tracking" — a strange trade for a change whose purpose is to widen
+the set of machines that work. Its residual assumption, that `bprm` is
+raw-tracepoint argument 2, is also an undocumented internal detail whose
+failure mode is the same silent wrong answer.
+
+Reading the format file adds no dependency: aya already reads
+`<tracefs>/events/sched/sched_process_exec/id` to attach at all, a sibling of
+`format` in the same directory. No readable `format`, no attached program for
+the offset to matter to.
 
 ### 2. `tracepoint/sched/sched_process_exit` → `cfc_sched_process_exit`
 
@@ -308,13 +361,17 @@ The result, measured on the same kernel:
 | program | verified insns | budget used |
 |---|---|---|
 | `cfc_dns_ingress` | **17,058** | 1.7% |
-| `cfc_sched_process_exec` | 248 | 0.02% |
+| `cfc_sched_process_exec` | 257 | 0.03% |
 | `cfc_sched_process_exit` | 25 | 0.003% |
 
-From over budget to 1.7% of it. The loader logs these counts at `debug` on
-every load (`verified_insns`), so a change that makes a program dramatically
-more expensive is visible before it becomes "the program stopped loading on
-someone else's kernel".
+From over budget to 1.7% of it. The loader records these counts on every load
+(`Report::verified_insns`, logged at `debug`), so a change that makes a program
+dramatically more expensive is visible before it becomes "the program stopped
+loading on someone else's kernel". The root test asserts they are recorded and
+prints them.
+
+Re-measured on kernel 7.1.8 after `EXEC_FILENAME_DATA_LOC` became a patchable
+global: exec went 248 → 257, the cost of the sentinel check and the bound.
 
 The costs of the split, stated plainly: one extra copy of the payload (into the
 ring buffer), 514-byte records instead of 276-byte ones, and DNS answers now

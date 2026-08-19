@@ -130,8 +130,29 @@ static TASK_TGID_OFFSET: Global<u32> = Global::new(0);
 /// field:pid_t old_pid;                 offset:16; size:4;
 /// ```
 ///
-/// This part of the tracepoint layout is stable ABI, so a constant is safe.
-const EXEC_FILENAME_DATA_LOC: usize = 8;
+/// The first four fields are the `common_*` header every tracepoint carries,
+/// so 8 is the value on every kernel this has ever been run on. It is still
+/// **not** a constant here: `common_*` has grown before, and the failure mode
+/// of guessing wrong is silent and ugly - the program would read four bytes of
+/// whatever field actually sits at offset 8, treat the result as
+/// `(len << 16) | offset`, and copy a plausible-looking path out of the middle
+/// of the record. Userspace cannot tell that apart from a real filename.
+///
+/// So the loader parses the format file at attach time and patches the answer
+/// in, exactly as it does for the `task_struct` offsets above.
+///
+/// **0 means "do not read the filename at all"** - the suppression sentinel the
+/// loader sets when the format file says something this program cannot handle
+/// (a `__rel_loc` field, or a size other than 4). Refusing in userspace alone
+/// would be no refusal: the kernel side would carry on reading offset 8.
+#[unsafe(no_mangle)]
+static EXEC_FILENAME_DATA_LOC: Global<u32> = Global::new(8);
+
+/// Largest plausible `__data_loc` offset, used to bound the read below.
+///
+/// The record header is a handful of fields; anything past this is a parse
+/// gone wrong, not a kernel that reorganised its tracepoints.
+const EXEC_FILENAME_DATA_LOC_MAX: u32 = 64;
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 pub fn cfc_sched_process_exec(ctx: TracePointContext) -> u32 {
@@ -190,9 +211,26 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
 /// sits in the variable-length tail of the record.
 #[inline(always)]
 fn read_exec_filename(ctx: &TracePointContext, event: &mut ExecEvent) {
-    // SAFETY: reading 4 bytes at a fixed, in-record offset via
+    let field_off = EXEC_FILENAME_DATA_LOC.load();
+    // Two jobs, and both are load-bearing.
+    //
+    // `== 0` is the loader's suppression sentinel: this kernel's record is not
+    // one we know how to read, so read nothing rather than something wrong.
+    //
+    // `> MAX` is what keeps the verifier happy, and it is not belt-and-braces.
+    // While this was a `const`, the offset was a compile-time literal and the
+    // verifier knew the exact address. Reading it from a `.rodata` global makes
+    // it a runtime value with umax 2^32-1 as far as the verifier is concerned,
+    // and it is about to be used in pointer arithmetic on the context. Without
+    // a bound it refuses the program outright. A mask would not do: the point
+    // is to *reject* an implausible offset, not to fold it into range.
+    if field_off == 0 || field_off > EXEC_FILENAME_DATA_LOC_MAX {
+        return;
+    }
+
+    // SAFETY: reading 4 bytes at an in-record offset via
     // `bpf_probe_read_kernel`, which faults gracefully rather than crashing.
-    let data_loc = match unsafe { ctx.read_at::<u32>(EXEC_FILENAME_DATA_LOC) } {
+    let data_loc = match unsafe { ctx.read_at::<u32>(field_off as usize) } {
         Ok(v) => v,
         Err(_) => return,
     };
