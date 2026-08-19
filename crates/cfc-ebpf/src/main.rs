@@ -32,7 +32,7 @@ use aya_ebpf::helpers::{
     bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
 };
 use aya_ebpf::macros::{cgroup_skb, cgroup_sock_addr, map, tracepoint};
-use aya_ebpf::maps::{HashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{HashMap, LruHashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::{SkBuffContext, SockAddrContext, TracePointContext};
 use aya_ebpf::{EbpfContext as _, Global};
 use cfc_ebpf_common::dns::DNS_HEADER_LEN;
@@ -62,6 +62,27 @@ static PROCS: HashMap<u32, ExecEvent> = HashMap::with_max_entries(10_240, 0);
 /// Sized to match `PROCS`; an entry here always has one there.
 #[map]
 static VERDICTS: HashMap<u32, u32> = HashMap::with_max_entries(10_240, 0);
+
+/// Socket cookie -> tgid, written at `connect()` time, read by attribution.
+///
+/// This is the map that removes the packet path's single biggest cost. The
+/// NFQUEUE worker used to answer "which pid owns this socket?" by walking every
+/// `/proc/*/fd` on the machine - measured at 37-44 ms per NEW connection on a
+/// desktop, paid before rule evaluation, on every connection, because the inode
+/// is new each time and a fresh process sits at the end of the walk. The
+/// connect hooks already run in the connecting process's context, so the kernel
+/// can hand us the association for free: one `bpf_get_socket_cookie` call here,
+/// one sock_diag round trip plus one map lookup in userspace. The same cookie
+/// is what sock_diag reports as `idiag_cookie`, assigned lazily by the same
+/// `sock_gen_cookie` on whichever side asks first.
+///
+/// LRU on purpose: sockets close without any hook firing here, so a plain hash
+/// would fill with dead cookies and reject new inserts - the failure would land
+/// exactly on the newest connections, the ones attribution is for. 16,384
+/// entries x 12 bytes is ~a megabyte with overhead, and an LRU eviction of a
+/// live-but-old entry costs one fallback walk, not a wrong answer.
+#[map]
+static SOCK_PIDS: LruHashMap<u64, u32> = LruHashMap::with_max_entries(16_384, 0);
 
 /// Counters for the connect path. See `cfc_ebpf_common::enforce_stat`.
 #[map]
@@ -149,7 +170,7 @@ static PKT_SCRATCH: PerCpuArray<[u8; PKT_SCRATCH_LEN]> = PerCpuArray::with_max_e
 /// terms of the constant. The `const` assertions in `cfc-ebpf-common` are what
 /// make a layout change that forgets to bump it a build error.
 #[unsafe(no_mangle)]
-static CFC_EBPF_ABI_V2: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
+static CFC_EBPF_ABI_V3: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
 
 /// Byte offset of `task_struct::real_parent`. 0 means "unresolved".
 #[unsafe(no_mangle)]
@@ -734,8 +755,26 @@ fn report_deny(ctx: &SockAddrContext, tgid: u32, family: u8) {
 /// the daemon decided this executable's answer does not depend on where it is
 /// going. Anything destination-scoped is left absent and falls through.
 #[inline(always)]
-fn connect_verdict(ctx: &SockAddrContext, family: u8) -> i32 {
+fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i32 {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // `record_cookie` is a literal at every call site and this function is
+    // `inline(always)`, so the `false` variants compile to programs that never
+    // reference the helper - which is the whole point: `bpf_get_socket_cookie`
+    // does not exist for sock_addr programs on every kernel this project
+    // supports, and a program that names a missing helper fails verification
+    // outright. The `_basic` entry points below are what old kernels load.
+    if record_cookie {
+        // SAFETY: `as_ptr` hands the program's own context to a helper the
+        // kernel defines for exactly this program type; the kernel assigns the
+        // cookie if the socket does not have one yet.
+        let cookie =
+            unsafe { aya_ebpf::helpers::generated::bpf_get_socket_cookie(ctx.as_ptr()) };
+        if cookie != 0 {
+            // Failure means the LRU is momentarily unable to evict; the cost is
+            // one fallback walk in userspace, never a wrong answer.
+            let _ = SOCK_PIDS.insert(&cookie, &tgid, 0);
+        }
+    }
     // SAFETY: `get` on a BPF hash map from a program context; the returned
     // reference borrows map memory that stays valid for this program run.
     match unsafe { VERDICTS.get(&tgid) } {
@@ -766,14 +805,34 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8) -> i32 {
 /// to say root, which CFC has never claimed to confine.
 #[cgroup_sock_addr(connect4)]
 pub fn cfc_connect4(ctx: SockAddrContext) -> i32 {
-    connect_verdict(&ctx, 4)
+    connect_verdict(&ctx, 4, true)
 }
 
 /// Same, for IPv6. A separate program because the kernel has separate attach
 /// types; the decision is identical and only the address it reports differs.
 #[cgroup_sock_addr(connect6)]
 pub fn cfc_connect6(ctx: SockAddrContext) -> i32 {
-    connect_verdict(&ctx, 6)
+    connect_verdict(&ctx, 6, true)
+}
+
+/// The same programs without the cookie recording, for kernels whose verifier
+/// does not know `bpf_get_socket_cookie` for sock_addr programs.
+///
+/// The loader tries the cookie variants first and falls back to these on a
+/// verifier rejection; enforcement is identical either way, and only the O(1)
+/// attribution is lost - userspace then falls back to its walk, exactly as it
+/// did before the cookie map existed. Shipping both costs nothing at runtime:
+/// aya loads programs individually, so an unloaded variant is just bytes in
+/// the object.
+#[cgroup_sock_addr(connect4)]
+pub fn cfc_connect4_basic(ctx: SockAddrContext) -> i32 {
+    connect_verdict(&ctx, 4, false)
+}
+
+/// See [`cfc_connect4_basic`].
+#[cgroup_sock_addr(connect6)]
+pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
+    connect_verdict(&ctx, 6, false)
 }
 
 // ---------------------------------------------------------------------------

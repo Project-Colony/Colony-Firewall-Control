@@ -38,15 +38,33 @@ observed = 17058
 max = 40000
 
 [cfc_connect4]
-# One hash lookup, one counter increment, and - only on the deny branch - a
-# ring-buffer record. It is this small because the decision was already made at
-# exec time and left in a map; anything that grows this number means work moved
-# onto the connect() path, which is the one place in CFC where cost is paid by
-# every process on the machine.
-observed = 82
-max = 200
+# One cookie read + LRU insert, one hash lookup, one counter increment, and -
+# only on the deny branch - a ring-buffer record. Still small because the
+# decision was already made at exec time and left in a map; anything that grows
+# this number means work moved onto the connect() path, which is the one place
+# in CFC where cost is paid by every process on the machine.
+#
+# The cookie recording is what buys back the packet path's ~37 ms /proc walk per
+# new connection: 24 instructions here (106 against the 82 the no-cookie twin
+# costs) for a measured 44.9 -> 4.3 ms median connect. The cheapest millisecond
+# this project will ever purchase.
+observed = 106
+max = 300
 
 [cfc_connect6]
 # Three more than v4: the address copy is four words instead of one.
-observed = 85
+observed = 109
+max = 300
+
+# The no-cookie twins, for kernels whose verifier does not offer
+# bpf_get_socket_cookie to sock_addr programs. Identical enforcement, no
+# SOCK_PIDS write. `observed` is blank because 7.1.8 verifies the cookie
+# variants, so the loader never attaches these here and nothing measures them -
+# the ceiling still applies on a kernel that does. Do not invent a number: the
+# budget test panics on a measured program with no entry, never on an entry
+# with no measurement.
+[cfc_connect4_basic]
+max = 200
+
+[cfc_connect6_basic]
 max = 200

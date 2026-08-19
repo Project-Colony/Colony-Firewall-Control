@@ -243,6 +243,29 @@ impl KernelProcTable {
             .collect()
     }
 
+    /// The most recently exec'd pids, newest first, capped at `limit`.
+    ///
+    /// The attribution fallback's prior: when the socket-cookie map cannot
+    /// answer, the process that opened a brand-new connection is very often one
+    /// that exec'd moments ago - and those are exactly the pids the full
+    /// `/proc` walk reaches *last*, because a fresh pid sorts highest. Probing
+    /// these first turns the curl-just-ran case from a 40 ms walk into a
+    /// couple of readlinks.
+    pub fn recent_pids(&self, limit: usize, now: Instant) -> Vec<u32> {
+        if !self.is_live() {
+            return Vec::new();
+        }
+        let map = self.inner.map.read();
+        let mut entries: Vec<(u32, Instant)> = map
+            .iter()
+            .filter(|(_, e)| now.saturating_duration_since(e.seen_at) <= ENTRY_TTL)
+            .map(|(pid, e)| (*pid, e.seen_at))
+            .collect();
+        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        entries.truncate(limit);
+        entries.into_iter().map(|(pid, _)| pid).collect()
+    }
+
     /// Records an exit. The kernel side only publishes these for thread-group
     /// leaders, so this really is "the process is gone", not "a thread of it
     /// finished".

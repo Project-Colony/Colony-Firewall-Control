@@ -90,6 +90,13 @@ const PIN_NAMESPACE: &str = "colony-firewall";
 /// ELF symbol names, as with the other programs.
 pub(super) const PROG_CONNECT4: &str = "cfc_connect4";
 pub(super) const PROG_CONNECT6: &str = "cfc_connect6";
+/// Identical enforcement without `bpf_get_socket_cookie`, for kernels whose
+/// verifier does not offer that helper to sock_addr programs. Tried second;
+/// only O(1) attribution is lost, never enforcement.
+pub(super) const PROG_CONNECT4_BASIC: &str = "cfc_connect4_basic";
+pub(super) const PROG_CONNECT6_BASIC: &str = "cfc_connect6_basic";
+
+pub(super) const MAP_SOCK_PIDS: &str = "SOCK_PIDS";
 
 pub(super) const MAP_VERDICTS: &str = "VERDICTS";
 pub(super) const MAP_STATS: &str = "ENFORCE_STATS";
@@ -439,10 +446,30 @@ pub(super) fn attach(
         .with_context(|| format!("opening cgroup v2 root {}", root.display()))?;
 
     let mut out = Vec::with_capacity(2);
-    for (name, pin_name) in [(PROG_CONNECT4, "connect4"), (PROG_CONNECT6, "connect6")] {
+    for (name, basic, pin_name) in [
+        (PROG_CONNECT4, PROG_CONNECT4_BASIC, "connect4"),
+        (PROG_CONNECT6, PROG_CONNECT6_BASIC, "connect6"),
+    ] {
         let pin = dir.map(|d| d.join(pin_name));
-        let insns = attach_one(bpf, name, &cgroup, pin.as_deref())?;
-        out.push((name.to_string(), insns));
+        // The cookie variant first. A verifier rejection here is the expected
+        // answer on a kernel without `bpf_get_socket_cookie` for sock_addr
+        // programs, not a bug - so it downgrades to the `_basic` twin rather
+        // than failing the layer. Any error on the *fallback* is real and
+        // propagates.
+        let insns = match attach_one(bpf, name, &cgroup, pin.as_deref()) {
+            Ok(i) => {
+                out.push((name.to_string(), i));
+                continue;
+            }
+            Err(first) => {
+                warn!(
+                    "{name} did not verify ({first:#}); attaching {basic} - \
+                     enforcement is unaffected, O(1) attribution is unavailable"
+                );
+                attach_one(bpf, basic, &cgroup, pin.as_deref())?
+            }
+        };
+        out.push((basic.to_string(), insns));
     }
     Ok(out)
 }

@@ -47,6 +47,7 @@ use parking_lot::Mutex;
 use procfs::process::{FDTarget, Process as ProcFsProcess};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fs;
 use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -252,11 +253,65 @@ pub fn pid_for_socket(
     // Fast path: one exact-tuple kernel query. Any failure (EPERM,
     // unsupported protocol, unconnected UDP the kernel won't match)
     // falls through to the table scan.
-    let inode = crate::sock_diag::query(protocol, src_ip, src_port, dst_ip, dst_port)
-        .map(|info| info.inode)
+    let info = crate::sock_diag::query(protocol, src_ip, src_port, dst_ip, dst_port);
+
+    // Fastest path: the kernel recorded cookie -> tgid at connect() time
+    // (`SOCK_PIDS`, written by cfc_connect4|6 in the connecting process's own
+    // context). One map lookup replaces the /proc walk below, which measures
+    // 37-44 ms on a loaded desktop - per NEW connection, before rule
+    // evaluation, on the only worker thread. This one line is the difference
+    // between the firewall being invisible and being felt.
+    if let Some(cookie) = info.as_ref().and_then(|i| i.cookie) {
+        if let Some(pid) = crate::ebpf::cookie_pid(cookie) {
+            record_resolved_pid(pid);
+            return Some(pid);
+        }
+    }
+
+    let inode = info
+        .map(|i| i.inode)
         .or_else(|| proc_net_inode(protocol, src_ip, src_port, dst_ip, dst_port, deadline))?;
 
     pid_owning_inode(inode, deadline)
+}
+
+/// Pids that recently owned a resolved socket, most recent first.
+///
+/// The walk fallback's second prior, after recent execs: a browser opens
+/// dozens of connections from one long-lived pid, and each new socket is a new
+/// inode the caches cannot know - but the *pid* is the one that resolved two
+/// seconds ago. Sixteen entries covers every interactive workload; this is a
+/// hint list, not a cache, so staleness costs a few wasted readlinks and
+/// nothing else.
+static RESOLVED_PIDS: Mutex<VecDeque<u32>> = Mutex::new(VecDeque::new());
+const RESOLVED_PIDS_CAP: usize = 16;
+
+fn record_resolved_pid(pid: u32) {
+    let mut q = RESOLVED_PIDS.lock();
+    if q.front() == Some(&pid) {
+        return;
+    }
+    q.retain(|p| *p != pid);
+    q.push_front(pid);
+    q.truncate(RESOLVED_PIDS_CAP);
+}
+
+/// Does `/proc/<pid>/fd` contain a socket with this inode?
+///
+/// The unit of work the probe lists reuse: one process's fd table instead of
+/// every process's.
+fn pid_has_socket_inode(pid: u32, inode: u64) -> Option<u32> {
+    let p = ProcFsProcess::new(pid as i32).ok()?;
+    let fds = p.fd().ok()?;
+    for fd in fds.flatten() {
+        if matches!(fd.target, FDTarget::Socket(i) if i == inode) {
+            INODE_PID_CACHE
+                .lock()
+                .insert(inode, (pid, fd.fd), Instant::now());
+            return Some(pid);
+        }
+    }
+    None
 }
 
 /// Slow path: scan the relevant /proc/net tables for the tuple's inode.
@@ -457,26 +512,43 @@ fn pid_owning_inode(inode: u64, deadline: Instant) -> Option<u32> {
         INODE_PID_CACHE.lock().remove(&inode);
     }
 
+    // Two cheap priors before the machine-wide walk. Both cover the workloads
+    // the walk is worst at: a process that just exec'd (highest pid, so the
+    // ascending walk reached it *last*), and a long-lived process opening its
+    // Nth connection (new inode every time, so no cache could know it, but the
+    // pid resolved seconds ago).
+    let recent_execs = crate::ebpf::proc_table::global().recent_pids(24, Instant::now());
+    for pid in recent_execs {
+        if let Some(found) = pid_has_socket_inode(pid, inode) {
+            record_resolved_pid(found);
+            return Some(found);
+        }
+    }
+    let recently_resolved: Vec<u32> = RESOLVED_PIDS.lock().iter().copied().collect();
+    for pid in recently_resolved {
+        if let Some(found) = pid_has_socket_inode(pid, inode) {
+            record_resolved_pid(found);
+            return Some(found);
+        }
+    }
+
+    // Last resort: every process - in DESCENDING pid order, because the socket
+    // being resolved belongs to a new connection and new connections skew
+    // heavily toward new processes. Collecting-and-sorting ~500 dirents is
+    // microseconds against the tens of milliseconds the walk itself costs.
     let proc_dir = fs::read_dir("/proc").ok()?;
-    for entry in proc_dir.flatten() {
+    let mut pids: Vec<u32> = proc_dir
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .collect();
+    pids.sort_unstable_by(|a, b| b.cmp(a));
+    for pid in pids {
         if Instant::now() > deadline {
             return None;
         }
-        let name = entry.file_name();
-        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(p) = ProcFsProcess::new(pid as i32) else {
-            continue;
-        };
-        let Ok(fds) = p.fd() else { continue };
-        for fd in fds.flatten() {
-            if matches!(fd.target, FDTarget::Socket(i) if i == inode) {
-                INODE_PID_CACHE
-                    .lock()
-                    .insert(inode, (pid, fd.fd), Instant::now());
-                return Some(pid);
-            }
+        if let Some(found) = pid_has_socket_inode(pid, inode) {
+            record_resolved_pid(found);
+            return Some(found);
         }
     }
     None

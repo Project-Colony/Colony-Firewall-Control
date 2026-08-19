@@ -520,6 +520,24 @@ pub(super) fn load_and_attach(
         }
     };
 
+    // The socket-cookie -> pid map, for O(1) attribution. Taken whenever it
+    // exists: with the `_basic` fallback attached nothing writes it and every
+    // lookup simply misses, which costs one syscall before the walk the caller
+    // was going to do anyway. A OnceLock because attribution is called from
+    // the NFQUEUE worker thread, far from anything that could carry a handle.
+    if report.enforcement.is_live() {
+        if let Some(map) = bpf.take_map(enforce::MAP_SOCK_PIDS) {
+            match aya::maps::HashMap::<_, u64, u32>::try_from(map) {
+                Ok(m) => {
+                    let _ = super::sock_pids::HANDLE.set(m);
+                }
+                Err(e) => report
+                    .notes
+                    .push(format!("{} unusable: {e}", enforce::MAP_SOCK_PIDS)),
+            }
+        }
+    }
+
     // Counters are non-zero at startup only when a previous daemon's pinned
     // programs kept working while this one was not running - which is the whole
     // claim this layer makes, so it is worth stating rather than leaving to be

@@ -92,6 +92,10 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     // the two that enforce rather than observe; their link is pinned to bpffs
     "cfc_connect4",
     "cfc_connect6",
+    // fallback variants for kernels without bpf_get_socket_cookie on
+    // sock_addr programs; the loader tries the cookie ones first
+    "cfc_connect4_basic",
+    "cfc_connect6_basic",
     // maps
     "EXEC_EVENTS",
     "EXIT_EVENTS",
@@ -101,13 +105,14 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     "VERDICTS",
     "ENFORCE_STATS",
     "DENY_EVENTS",
+    "SOCK_PIDS",
     // patchable .rodata globals
     "TASK_REAL_PARENT_OFFSET",
     "TASK_TGID_OFFSET",
     "EXEC_FILENAME_DATA_LOC",
     // the ABI stamp the loader requires with must_exist = true. Keep in step
     // with `cfc_ebpf_common::ABI_SYMBOL`.
-    "CFC_EBPF_ABI_V2",
+    "CFC_EBPF_ABI_V3",
 ];
 
 /// Sections whose absence would break loading or diagnostics.

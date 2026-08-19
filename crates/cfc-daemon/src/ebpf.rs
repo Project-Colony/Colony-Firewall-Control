@@ -88,6 +88,38 @@ mod enforce;
 #[cfg(feature = "ebpf")]
 mod loader;
 
+/// Socket-cookie -> pid, answered from the kernel's `SOCK_PIDS` map.
+///
+/// The fast path of attribution: the `cfc_connect4|6` programs record the
+/// association at `connect()` time, in the connecting process's own context, so
+/// this is exact and race-free where the `/proc` walk it replaces was a 37-44ms
+/// scan per new connection. `None` means the layer is not up, the object
+/// predates the map, the old-kernel `_basic` variants are attached, or the
+/// entry was evicted - in every case the caller falls back to the walk, which
+/// is what it did before this existed.
+pub fn cookie_pid(cookie: u64) -> Option<u32> {
+    #[cfg(feature = "ebpf")]
+    {
+        sock_pids::HANDLE.get().and_then(|m| m.get(&cookie, 0).ok())
+    }
+    #[cfg(not(feature = "ebpf"))]
+    {
+        let _ = cookie;
+        None
+    }
+}
+
+#[cfg(feature = "ebpf")]
+pub(crate) mod sock_pids {
+    use std::sync::OnceLock;
+
+    /// Set once by the loader when the map exists in the loaded object.
+    /// `aya`'s `HashMap::get` is one `bpf(BPF_MAP_LOOKUP_ELEM)` syscall on a
+    /// shared fd - `&self`, no lock needed.
+    pub(crate) static HANDLE: OnceLock<aya::maps::HashMap<aya::maps::MapData, u64, u32>> =
+        OnceLock::new();
+}
+
 use crate::config::{EbpfConfig, EbpfMode};
 use crate::dns::DnsCache;
 

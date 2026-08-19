@@ -26,6 +26,11 @@ const INET_DIAG_MSG_LEN: usize = 72;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SockInfo {
     pub inode: u64,
+    /// `sk_cookie`, the kernel's stable per-socket id. The same value the
+    /// `cfc_connect4|6` programs key `SOCK_PIDS` on: both sides go through
+    /// `sock_gen_cookie`, which assigns it lazily to whoever asks first.
+    /// `None` when the kernel reported the unassigned sentinel.
+    pub cookie: Option<u64>,
     #[allow(dead_code)]
     pub uid: u32,
 }
@@ -134,13 +139,19 @@ fn parse_response(buf: &[u8]) -> Option<SockInfo> {
     if payload.len() < INET_DIAG_MSG_LEN {
         return None;
     }
-    // struct inet_diag_msg tail: expires, rqueue, wqueue, uid, inode.
+    // struct inet_diag_msg: id.idiag_cookie sits at payload offset 44
+    // (family/state/timer/retrans = 4, sport+dport = 4, src = 16, dst = 16,
+    // if = 4), then expires, rqueue, wqueue, uid at 64, inode at 68. The
+    // kernel splits `sk_cookie` into two native-endian u32s, which on the
+    // architectures this daemon targets reads back as one ne u64.
+    let cookie_raw = u64::from_ne_bytes(payload[44..52].try_into().ok()?);
+    let cookie = (cookie_raw != 0 && cookie_raw != u64::MAX).then_some(cookie_raw);
     let uid = u32::from_ne_bytes(payload[64..68].try_into().ok()?);
     let inode = u32::from_ne_bytes(payload[68..72].try_into().ok()?) as u64;
     if inode == 0 {
         return None;
     }
-    Some(SockInfo { inode, uid })
+    Some(SockInfo { inode, uid, cookie })
 }
 
 /// Owned NETLINK_SOCK_DIAG socket with a short receive timeout.
@@ -289,6 +300,7 @@ mod tests {
             parse_response(&buf),
             Some(SockInfo {
                 inode: 31337,
+                cookie: None,
                 uid: 1000
             })
         );

@@ -64,16 +64,22 @@ pub use net::UdpPayload;
 /// **Bump both this and [`ABI_VERSION`] whenever an event struct's layout
 /// changes.** The `const` assertions below exist to make forgetting a build
 /// error rather than a field of garbage.
-pub const ABI_SYMBOL: &str = "CFC_EBPF_ABI_V2";
+pub const ABI_SYMBOL: &str = "CFC_EBPF_ABI_V3";
 
 /// Value stored at [`ABI_SYMBOL`]. Present so the two sides disagree loudly if
 /// the name is ever reused without changing the layout.
 ///
 /// **v2** added the `cgroup/connect4|6` programs, `ConnectDeny` and the maps
-/// they use. It is also the version in the bpffs pin path, so bumping it is
-/// what makes a daemon detach the previous version's in-kernel enforcement
-/// instead of inheriting programs it no longer matches.
-pub const ABI_VERSION: u32 = 2;
+/// they use. **v3** added `SOCK_PIDS` (socket cookie -> tgid, written at
+/// `connect()` for O(1) attribution) and the `_basic` program variants for
+/// kernels without `bpf_get_socket_cookie` on sock_addr programs.
+///
+/// The version is also the bpffs pin path, so bumping it is what makes a
+/// daemon detach the previous version's in-kernel enforcement instead of
+/// inheriting programs whose behaviour it no longer matches - here, v2 pins
+/// would enforce fine but never write a cookie, which would silently cost
+/// every connection the 40 ms walk the map exists to remove.
+pub const ABI_VERSION: u32 = 3;
 
 // The guard behind ABI_SYMBOL. If any of these fires, an event layout moved:
 // bump ABI_VERSION *and* the version suffix in ABI_SYMBOL, and update the
