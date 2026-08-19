@@ -207,7 +207,21 @@ async fn run() -> anyhow::Result<()> {
                     tracing::warn!("hit-count flush failed: {e}");
                 }
             }
-            match flush_store.purge_expired(chrono::Utc::now().timestamp_millis()) {
+            // Only scan when there is something to find. `purge_expired`
+            // reads every row and JSON-deserializes it; the in-memory rule
+            // set already knows whether any rule has a deadline that has
+            // passed, and on a machine whose rules are all `always` - which
+            // is every machine most of the time - the answer is no.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let any_expired = flush_engine
+                .snapshot()
+                .rules
+                .iter()
+                .any(|r| r.is_expired(now_ms));
+            if !any_expired {
+                continue;
+            }
+            match flush_store.purge_expired(now_ms) {
                 Ok(n) if n > 0 => tracing::debug!(removed = n, "purged expired rules"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("expired-rule purge failed: {e}"),

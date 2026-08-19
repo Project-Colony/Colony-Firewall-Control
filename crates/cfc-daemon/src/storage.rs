@@ -366,9 +366,12 @@ impl RuleStore {
         }
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        // `prepare_cached`, not `prepare`: this compiled a fresh statement per
+        // changed rule, inside the transaction, every 30 s. Same SQL every
+        // time, so the cache turns N compilations into one.
         for (id, extra) in increments {
             let id_str = id.to_string();
-            let mut stmt = tx.prepare("SELECT data FROM rules WHERE id = ?1")?;
+            let mut stmt = tx.prepare_cached("SELECT data FROM rules WHERE id = ?1")?;
             let row: Option<String> = stmt
                 .query_row(rusqlite::params![&id_str], |row| row.get(0))
                 .ok();
@@ -382,10 +385,8 @@ impl RuleStore {
             };
             rule.hit_count = rule.hit_count.saturating_add(*extra);
             let new_json = serde_json::to_string(&rule)?;
-            tx.execute(
-                "UPDATE rules SET data = ?2 WHERE id = ?1",
-                rusqlite::params![id_str, new_json],
-            )?;
+            tx.prepare_cached("UPDATE rules SET data = ?2 WHERE id = ?1")?
+                .execute(rusqlite::params![id_str, new_json])?;
         }
         tx.commit()?;
         Ok(())

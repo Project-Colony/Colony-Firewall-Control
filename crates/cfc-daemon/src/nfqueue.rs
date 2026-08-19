@@ -82,6 +82,15 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(250);
 /// latency an intercepted packet can pick up; see the module docs.
 const RECV_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How many prompts may be waiting for an answer at once.
+///
+/// Not a UI limit - it is a memory bound. See `park_for_prompt`: every parked
+/// packet pins the 68 KiB buffer it arrived in, so this cap is worth about
+/// 34 MB of worst-case residency inside the packet worker. Far above any
+/// number of bubbles a person could face, and far below what an unattended
+/// flood would otherwise take.
+const MAX_PARKED_PROMPTS: usize = 512;
+
 /// `NF_INET_LOCAL_IN` - a packet addressed to this machine.
 const NF_INET_LOCAL_IN: u8 = 1;
 /// `NF_INET_LOCAL_OUT` - a packet this machine is sending.
@@ -688,6 +697,26 @@ impl<Q: PacketQueue> Worker<Q> {
             self.pending_flows.remove(&flow);
         }
 
+        // A parked packet is not free. Each one holds the nfq `Message` it
+        // arrived in, and that owns the 68 KiB netlink receive buffer the
+        // kernel copied it into - so 512 unanswered prompts is ~34 MB pinned
+        // inside the packet worker, and nothing bounded it. A process opening
+        // new flows faster than a human answers bubbles - a torrent client
+        // reaching for peers, a scan - reaches that in seconds.
+        //
+        // Over the cap, take the same branch as a saturated router below:
+        // apply `fallback`, which is the configured `no_ui_action`. That is
+        // fail-closed on every shipped profile, and it replaces an
+        // out-of-memory path with a verdict.
+        if self.waiters.len() >= MAX_PARKED_PROMPTS {
+            trace!(
+                parked = self.waiters.len(),
+                "prompt backlog at its cap; applying the fallback rather than parking"
+            );
+            self.apply_action(msg, fallback.action);
+            return;
+        }
+
         let prompt_id = self.next_prompt_id;
         self.next_prompt_id += 1;
         let req = PromptRequest {
@@ -1187,6 +1216,61 @@ mod tests {
     // The property the owner asked for, in the words they used: nothing comes
     // in without having been authorised. These pin the three ways that could
     // silently stop being true.
+
+    /// Past the cap, a flow takes the configured fallback instead of being
+    /// parked.
+    ///
+    /// Every parked packet holds the nfq message it arrived in, and that owns
+    /// the 68 KiB netlink buffer the kernel copied it into. Nothing bounded
+    /// the count, so a process opening flows faster than a human answers
+    /// bubbles - a torrent client reaching for peers, a scan - grew it until
+    /// the worker ran out of memory. Overflow now takes the same branch a
+    /// saturated prompt router already took, which is fail-closed.
+    #[test]
+    fn a_prompt_backlog_at_its_cap_falls_back_instead_of_parking() {
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+
+        // Fill to the cap through the real path, so the state is exactly what
+        // production would hold.
+        for i in 0..MAX_PARKED_PROMPTS {
+            h.worker().park_for_prompt(
+                FakeMsg::new(i as u32, tcp_packet(443)),
+                // A distinct destination per park: `FlowKey` folds packets of
+                // the same flow onto one prompt, which is the behaviour under
+                // test elsewhere and would collapse this to a single waiter.
+                conn_to(1024 + i as u16, 1111),
+                test_process(4242, "/usr/bin/curl"),
+                Verdict::default_deny(),
+            );
+            // Drain as we go: the harness channel holds 16, and a full channel
+            // takes the saturation branch instead of parking - which is the
+            // *other* fallback path and would hide what this test is about.
+            while h.prompt_rx.try_recv().is_ok() {}
+        }
+        assert_eq!(h.worker().waiters.len(), MAX_PARKED_PROMPTS);
+        let parked_verdicts = h.verdicts().len();
+
+        // One more. It must be answered, not parked.
+        let overflow_id = MAX_PARKED_PROMPTS as u32 + 1;
+        h.worker().park_for_prompt(
+            FakeMsg::new(overflow_id, tcp_packet(443)),
+            conn_to(9000, 1111),
+            test_process(4242, "/usr/bin/curl"),
+            Verdict::default_deny(),
+        );
+
+        assert_eq!(
+            h.worker().waiters.len(),
+            MAX_PARKED_PROMPTS,
+            "the backlog grew past its cap"
+        );
+        let new_verdicts: Vec<_> = h.verdicts().into_iter().skip(parked_verdicts).collect();
+        assert_eq!(
+            new_verdicts,
+            vec![(overflow_id, NfqVerdict::Drop)],
+            "overflow must take the fallback verdict, and dp_deny() means Drop"
+        );
+    }
 
     /// The worker must declare its thread to be the datapath.
     ///

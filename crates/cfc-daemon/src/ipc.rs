@@ -612,7 +612,7 @@ impl Firewall for FirewallService {
         req: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         self.authorize(&req, Access::ReadOnly)?;
-        let rules_count = self.engine.snapshot().rules.len() as u64;
+        let rules_count = self.engine.rule_count() as u64;
         let policy = self.policy();
         let paused = self.stats.is_paused();
         let uptime_seconds = self.stats.uptime_seconds();

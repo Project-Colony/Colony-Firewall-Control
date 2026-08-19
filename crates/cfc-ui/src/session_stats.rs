@@ -47,11 +47,11 @@ impl SessionStats {
             Some(p) if !p.exe.is_empty() => p.exe.clone(),
             _ => "unknown".to_string(),
         };
-        self.apps.entry(app).or_default().record(ev.verdict);
+        record_bounded(&mut self.apps, app, ev.verdict);
 
         if let Some(c) = ev.connection.as_ref() {
             let dest = format::dest_key(&c.dst_host, &c.dst_ip);
-            self.dests.entry(dest).or_default().record(ev.verdict);
+            record_bounded(&mut self.dests, dest, ev.verdict);
         }
     }
 
@@ -68,12 +68,56 @@ impl SessionStats {
     }
 }
 
+/// How many distinct keys either table keeps before folding the rest.
+///
+/// These are session-scoped display counters, and only ten rows are ever
+/// shown - but the map grew one permanent entry per distinct destination
+/// seen. A browser session or a torrent client reaches tens of thousands,
+/// each costing the key bytes plus map overhead, for a table nobody reads
+/// past row ten.
+const KEY_CAP: usize = 4096;
+
+/// The key everything past [`KEY_CAP`] is counted under.
+///
+/// Visible on purpose: a top-ten table that silently dropped the tail would
+/// be lying about the totals. This way the folded remainder shows up as a row
+/// like any other.
+const OVERFLOW_KEY: &str = "(autres)";
+
+/// Counts `key`, folding into [`OVERFLOW_KEY`] once the table is full.
+///
+/// Keys already present keep being counted exactly, so the busy entries - the
+/// ones that reach the top ten - stay accurate however long the session runs.
+fn record_bounded(map: &mut HashMap<String, Counts>, key: String, verdict: i32) {
+    if let Some(c) = map.get_mut(&key) {
+        c.record(verdict);
+        return;
+    }
+    if map.len() >= KEY_CAP {
+        map.entry(OVERFLOW_KEY.to_string())
+            .or_default()
+            .record(verdict);
+        return;
+    }
+    map.entry(key).or_default().record(verdict);
+}
+
 /// Highest `total` first; ties break on the key so the table does not
 /// reshuffle between frames.
+///
+/// Selects before it sorts. A full sort of every key ran on every frame to
+/// show ten rows; `select_nth_unstable_by` is linear and leaves the same ten
+/// elements to sort, so the emitted order is unchanged.
 fn top_n(map: &HashMap<String, Counts>, n: usize) -> Vec<(&str, Counts)> {
     let mut v: Vec<(&str, Counts)> = map.iter().map(|(k, c)| (k.as_str(), *c)).collect();
-    v.sort_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(b.0)));
-    v.truncate(n);
+    let cmp = |a: &(&str, Counts), b: &(&str, Counts)| {
+        b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(b.0))
+    };
+    if n < v.len() {
+        v.select_nth_unstable_by(n, cmp);
+        v.truncate(n);
+    }
+    v.sort_by(cmp);
     v
 }
 
@@ -213,5 +257,68 @@ mod tests {
         e.process = None;
         s.record(&e);
         assert_eq!(s.top_apps(1)[0].0, "unknown");
+    }
+
+    #[cfg(test)]
+    mod bounded_tests {
+        use super::*;
+
+        /// The table is display-only, but it lives for the whole session and grew
+        /// one permanent entry per distinct destination. A torrent client reaches
+        /// tens of thousands; only ten are ever shown.
+        #[test]
+        fn the_key_tables_stop_growing_and_say_so() {
+            let mut m: HashMap<String, Counts> = HashMap::new();
+            for i in 0..(KEY_CAP + 500) {
+                record_bounded(&mut m, format!("h{i}.example"), proto::Action::Allow as i32);
+            }
+            assert_eq!(
+                m.len(),
+                KEY_CAP + 1,
+                "the cap plus exactly one bucket for the remainder"
+            );
+            assert_eq!(
+                m.get(OVERFLOW_KEY).map(|c| c.total),
+                Some(500),
+                "the folded tail must still be counted, not dropped"
+            );
+        }
+
+        /// A key already in the table keeps counting exactly, however full the
+        /// table is - otherwise the busiest entries would freeze at the moment the
+        /// cap was reached, which is precisely when the table matters.
+        #[test]
+        fn an_existing_key_keeps_counting_after_the_cap() {
+            let mut m: HashMap<String, Counts> = HashMap::new();
+            record_bounded(&mut m, "busy".into(), proto::Action::Allow as i32);
+            for i in 0..(KEY_CAP + 100) {
+                record_bounded(&mut m, format!("x{i}"), proto::Action::Allow as i32);
+            }
+            record_bounded(&mut m, "busy".into(), proto::Action::Allow as i32);
+            assert_eq!(m.get("busy").map(|c| c.total), Some(2));
+        }
+
+        /// The selection changed from a full sort to `select_nth_unstable_by`;
+        /// the ten rows and their order must be identical.
+        #[test]
+        fn the_partial_selection_emits_the_same_rows_as_a_full_sort() {
+            let mut m: HashMap<String, Counts> = HashMap::new();
+            for i in 0..500 {
+                let k = format!("k{i:03}");
+                for _ in 0..(i % 7) {
+                    record_bounded(&mut m, k.clone(), proto::Action::Allow as i32);
+                }
+                record_bounded(&mut m, k, proto::Action::Allow as i32);
+            }
+            let got = top_n(&m, 10);
+
+            let mut all: Vec<(&str, Counts)> = m.iter().map(|(k, c)| (k.as_str(), *c)).collect();
+            all.sort_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(b.0)));
+            all.truncate(10);
+
+            let got: Vec<_> = got.iter().map(|(k, c)| (*k, c.total)).collect();
+            let want: Vec<_> = all.iter().map(|(k, c)| (*k, c.total)).collect();
+            assert_eq!(got, want);
+        }
     }
 }

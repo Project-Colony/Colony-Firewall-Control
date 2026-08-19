@@ -164,6 +164,16 @@ impl Engine {
         None
     }
 
+    /// How many rules are loaded, without copying any of them.
+    ///
+    /// `snapshot()` clones the whole set - every name, every `PathBuf`, every
+    /// `Option<String>` in every scope - which is right for `ListRules` and
+    /// absurd for `GetStatus`, which wanted `.len()` and was called about
+    /// once a second per connected client, forever.
+    pub fn rule_count(&self) -> usize {
+        self.inner.rules.read().rules.len()
+    }
+
     /// What an inbound flow gets when no rule matches.
     ///
     /// Separate from `no_ui_action` because it answers a different question.

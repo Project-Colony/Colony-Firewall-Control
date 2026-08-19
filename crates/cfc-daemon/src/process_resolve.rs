@@ -71,7 +71,27 @@ const PROCESS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Executable digests are keyed by (dev, inode, mtime) which is already
 /// content-addressed for our purposes; the TTL is just a memory backstop.
-const SHA_CACHE_TTL: Duration = Duration::from_secs(3600);
+/// The digest cache does not expire, and that is the point.
+///
+/// Its key is `(dev, inode, mtime, mtime_nsec)`, which is content-addressed:
+/// a file whose bytes change gets a new mtime and therefore a new key, so a
+/// stale entry cannot be returned for changed content. An hour's expiry
+/// bought nothing and cost a re-hash of the whole binary on the packet
+/// worker - a single thread - every hour, per executable:
+///
+/// ```text
+/// /usr/bin/node        59.9 MB  ->  ~34 ms
+/// /usr/bin/gh          38.8 MB  ->  ~22 ms
+/// /usr/bin/tailscaled  28.5 MB  ->  ~16 ms
+/// ```
+///
+/// The 64 MiB size cap barely helps: it excludes almost nothing that is
+/// actually installed. The 1024-entry bound still evicts, so this is a cache
+/// with a size limit and no clock, not an unbounded one.
+///
+/// The digest cannot simply be skipped instead: `RuleScope::exe_sha256` is a
+/// rule predicate, and a hash-scoped rule abstains when the hash is unknown.
+const SHA_CACHE_TTL: Duration = Duration::from_secs(u64::MAX / 2);
 
 /// Don't hash executables larger than this.
 const SHA256_MAX_LEN: u64 = 64 * 1024 * 1024;
