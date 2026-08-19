@@ -12,7 +12,9 @@ use tracing::{error, info, warn};
 // The daemon's internals live in the library target (`src/lib.rs`) so the
 // integration tests can assemble the same graph this binary does. This file
 // stays the only place that wires them together for real.
-use cfc_daemon::{config, decision, dns, ebpf, ipc, nfqueue, prompts, sd_notify, stats, storage};
+use cfc_daemon::{
+    config, decision, dns, ebpf, ipc, nfqueue, prompts, provenance, sd_notify, stats, storage,
+};
 
 /// How stale the NFQUEUE worker's activity stamp may get before the
 /// watchdog task considers the worker wedged and withholds the systemd
@@ -31,6 +33,13 @@ const WORKER_STALL_MS: i64 = 60_000;
 /// can never hold the process hostage the way a plain `Runtime` drop
 /// (which waits forever) used to.
 const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How often the provenance index is checked for staleness and rebuilt.
+///
+/// See the warmer task in `run`. Not a hot path: the check is one `stat` of
+/// the package database directory, and a rebuild only happens when its mtime
+/// moved.
+const PROVENANCE_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, Parser)]
 #[command(name = "colony-firewalld", version, about)]
@@ -206,6 +215,31 @@ async fn run() -> anyhow::Result<()> {
             // Persisted events are pruned to [events] max_rows by the
             // event-writer task (ipc::spawn_event_pipeline), which owns
             // that table's whole lifecycle.
+        }
+    });
+
+    // Package-index warmer.
+    //
+    // The datapath refuses to build the provenance index - building it reads
+    // every installed package's file list, and the packet worker is one
+    // thread, so a build there stops every flow on the machine for a tenth of
+    // a second. Something else has to do it, and this is that something: if
+    // nothing called it, provenance would simply never resolve.
+    //
+    // On the blocking pool, not a worker, for the same reason. The first run
+    // is immediate so a fresh daemon has provenance within a second; after
+    // that it is a poll, because the trigger is the package database's mtime
+    // changing under us and there is no cheap way to be told about that. Two
+    // minutes is chosen against what it costs to be wrong: a package installed
+    // just now shows as unpackaged for at most that long, in a field that
+    // decorates an event and decides nothing.
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(PROVENANCE_WARM_INTERVAL);
+        loop {
+            tick.tick().await;
+            if tokio::task::spawn_blocking(provenance::warm).await.is_err() {
+                tracing::debug!("provenance warm task panicked; retrying next tick");
+            }
         }
     });
 

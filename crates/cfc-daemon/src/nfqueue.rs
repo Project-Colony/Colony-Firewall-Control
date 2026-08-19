@@ -484,6 +484,16 @@ impl<Q: PacketQueue> Worker<Q> {
         // that here rather than trusting the caller to have done it.
         self.queue.set_nonblocking(true);
 
+        // This thread is the datapath, and it is the only one. Saying so once
+        // here covers everything reached from it, however deep: in particular
+        // a provenance lookup that finds the package index stale now answers
+        // "no package" rather than rebuilding it, which reads every installed
+        // package's file list. Measured cold on the owner's machine, that
+        // rebuild took 123 ms - and since this loop is a single thread, that
+        // is not one slow packet, it is every flow on the machine stopping
+        // together. `provenance::warm` does the build off this thread.
+        crate::provenance::mark_datapath_thread();
+
         let mut consecutive_errors: u32 = 0;
         loop {
             if self.stop.load(Ordering::Relaxed) {
@@ -1177,6 +1187,36 @@ mod tests {
     // The property the owner asked for, in the words they used: nothing comes
     // in without having been authorised. These pin the three ways that could
     // silently stop being true.
+
+    /// The worker must declare its thread to be the datapath.
+    ///
+    /// That declaration is what stops a provenance lookup from rebuilding the
+    /// package index under the packets - 123 ms with every flow on the machine
+    /// waiting. Removing the one line that makes it breaks nothing visibly,
+    /// which is exactly why it is asserted here.
+    #[test]
+    fn the_worker_declares_its_thread_to_be_the_datapath() {
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+        let worker = h.worker.take().unwrap();
+        // Stop before the first iteration: `run` marks the thread on the way
+        // in, so an empty loop is enough to observe it.
+        h.stop.store(true, Ordering::Relaxed);
+
+        std::thread::spawn(move || {
+            assert!(
+                !crate::provenance::is_datapath_thread(),
+                "a fresh thread must not start out marked"
+            );
+            worker.run().unwrap();
+            assert!(
+                crate::provenance::is_datapath_thread(),
+                "the worker did not declare its thread; provenance builds will \
+                 stall the datapath again"
+            );
+        })
+        .join()
+        .unwrap();
+    }
 
     /// An inbound flow must not pay for socket attribution.
     ///

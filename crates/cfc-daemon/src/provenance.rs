@@ -356,6 +356,68 @@ struct IndexCache {
     index: RwLock<Option<Index>>,
     /// One warn per process for a slow build, not one per rebuild.
     warned_slow: AtomicBool,
+    /// Set by a datapath caller that found the index stale and refused to
+    /// build it. [`warm`] reads and clears it.
+    wanted: AtomicBool,
+}
+
+thread_local! {
+    /// Whether *this thread* is the packet worker.
+    ///
+    /// The property is about the thread, not the call. There is exactly one
+    /// packet worker, it is long-lived, and everything reached from it is on
+    /// the datapath by definition - so marking it once at the top of its loop
+    /// is total, where marking call sites would be a list someone has to keep
+    /// correct.
+    ///
+    /// Default `false`, so every other thread - the warmer, the IPC handlers,
+    /// every test - behaves exactly as it did before this existed.
+    static ON_DATAPATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Declares the calling thread to be the packet worker.
+///
+/// Call once, from the worker itself. After this, a provenance lookup on this
+/// thread that finds the package index stale answers "no package" instead of
+/// building it, and leaves a note for [`warm`].
+pub fn mark_datapath_thread() {
+    ON_DATAPATH.with(|c| c.set(true));
+}
+
+/// Whether the calling thread has been declared the packet worker.
+///
+/// Exists so the worker's own test can prove it made the declaration. Without
+/// that, removing the call would be invisible: nothing fails, the datapath
+/// just quietly goes back to building the index under the packets.
+pub fn is_datapath_thread() -> bool {
+    ON_DATAPATH.with(|c| c.get())
+}
+
+fn may_build() -> bool {
+    !is_datapath_thread()
+}
+
+/// Build the package index if it is missing or stale.
+///
+/// Runs on the blocking pool, never on the packet worker. It is what keeps
+/// provenance working now that the datapath refuses to build: without a
+/// caller, a stale index would never be rebuilt and processes would report no
+/// package until the daemon restarted.
+///
+/// Returns true if a backend was asked.
+pub fn warm() -> bool {
+    if !enabled() {
+        return false;
+    }
+    let Some(db) = BACKEND.as_ref() else {
+        return false;
+    };
+    // The answer is thrown away; reaching the cache is the point, and a
+    // stale index rebuilds on the way. `/usr/bin/env` is chosen because it
+    // exists and is packaged on every distribution this supports, so the
+    // lookup is not short-circuited before it gets there.
+    let _ = db.lookup(Path::new("/usr/bin/env"));
+    true
 }
 
 /// Hand back to the kernel what building the index borrowed.
@@ -394,6 +456,7 @@ impl IndexCache {
             backend,
             index: RwLock::new(None),
             warned_slow: AtomicBool::new(false),
+            wanted: AtomicBool::new(false),
         }
     }
 
@@ -414,7 +477,7 @@ impl IndexCache {
         exe: &Path,
         build: impl FnOnce(Option<SystemTime>) -> Index,
     ) -> Option<String> {
-        self.record_of(exe, build).map(|(pkg, _)| pkg)
+        self.record_of(exe, build, may_build()).map(|(pkg, _)| pkg)
     }
 
     /// The package owning `exe` *and* the digest the index carries for it, for
@@ -424,6 +487,7 @@ impl IndexCache {
         &self,
         exe: &Path,
         build: impl FnOnce(Option<SystemTime>) -> Index,
+        may_build: bool,
     ) -> Option<(String, Option<String>)> {
         let stamp = self.stamp();
         let key = path_hash(exe);
@@ -432,6 +496,23 @@ impl IndexCache {
             if idx.stamp == stamp {
                 return idx.get(key).map(|p| (p, idx.digest(key)));
             }
+        }
+
+        // The datapath does not build. Building means reading every installed
+        // package's file list - 123 ms and 66 MB through the allocator on the
+        // owner's machine - and the packet worker is a single thread, so that
+        // is not one slow packet, it is every flow on the machine stopping for
+        // a tenth of a second. Measured cold: the second connection after a
+        // restart took 21 ms while the rest took 0.6 ms.
+        //
+        // So a caller that cannot afford to build says so, gets `None`, and
+        // leaves a note. `None` here means "no package known", which is
+        // already the honest answer for anything unpackaged, and provenance is
+        // not a rule predicate - it decorates prompts and events. Nothing is
+        // enforced differently while the index is a few seconds late.
+        if !may_build {
+            self.wanted.store(true, Ordering::Relaxed);
+            return None;
         }
 
         let mut guard = self.index.write();
@@ -458,6 +539,7 @@ impl IndexCache {
             }
             *guard = Some(idx);
             release_index_scratch();
+            self.wanted.store(false, Ordering::Relaxed);
         }
         let idx = guard.as_ref()?;
         idx.get(key).map(|p| (p, idx.digest(key)))
@@ -950,7 +1032,9 @@ impl PackageDb for Rpm {
     }
 
     fn lookup(&self, exe: &Path) -> Option<PackageFile> {
-        let (package, sha256) = self.cache.record_of(exe, |s| self.build_index(s))?;
+        let (package, sha256) = self
+            .cache
+            .record_of(exe, |s| self.build_index(s), may_build())?;
         Some(PackageFile { package, sha256 })
     }
 }
@@ -1306,6 +1390,53 @@ mod tests {
         // Nobody owns it.
         assert_eq!(db.lookup(Path::new("/tmp/curl")), None);
         assert_eq!(decide(None, Some("abc123")), Provenance::Unpackaged);
+    }
+
+    #[test]
+    fn the_datapath_thread_does_not_build_the_index() {
+        // Runs on its own thread: `mark_datapath_thread` is thread-local and
+        // must not leak into the rest of the suite.
+        let tmp = tempfile::tempdir().unwrap();
+        fake_pacman(tmp.path(), "abc123");
+        let root = tmp.path().to_path_buf();
+
+        std::thread::spawn(move || {
+            let db = Pacman::new(root.clone());
+            mark_datapath_thread();
+
+            // The index is cold. A datapath lookup must answer "no package"
+            // rather than spending 123 ms reading every package's file list.
+            assert!(
+                db.lookup(Path::new("/usr/bin/curl")).is_none(),
+                "the packet worker built the package index"
+            );
+            assert!(
+                db.cache.wanted.load(Ordering::Relaxed),
+                "it must at least leave a note that a build is due"
+            );
+
+            // The same lookup from any other thread still builds and answers,
+            // which is what `warm` relies on.
+            let other =
+                std::thread::spawn(move || Pacman::new(root).lookup(Path::new("/usr/bin/curl")));
+            assert!(
+                other.join().unwrap().is_some(),
+                "a non-datapath thread must still build"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// `warm` is the only thing that rebuilds a stale index once the datapath
+    /// refuses to. If it silently stopped working, provenance would go quiet
+    /// and nothing else would fail.
+    #[test]
+    fn warm_reports_whether_a_backend_was_asked() {
+        // No assertion on the return value's truth: it depends on whether this
+        // build host has a package database. What must hold is that it does
+        // not panic and does not hang, on any host.
+        let _ = warm();
     }
 
     #[test]
