@@ -139,8 +139,15 @@ pub struct Client {
 pub struct VerdictOutcome {
     /// The verdict reached a prompt that was still waiting.
     pub accepted: bool,
-    /// A standing rule was asked for *and* stored.
-    pub rule_persisted: bool,
+    /// Whether a standing rule was asked for and stored.
+    ///
+    /// `None` means the daemon did not say - either no rule was asked for, or
+    /// it is a build predating `persisted_rule_id`. That third state is not
+    /// pedantry: a package upgrade leaves new client binaries talking to the
+    /// still-running old daemon until it is restarted, and treating silence as
+    /// failure would report every successful "Allow always" as lost. Clients
+    /// must complain only on `Some(false)`.
+    pub rule_persisted: Option<bool>,
     /// Why the rule could not be stored, when one was asked for and failed.
     pub persist_error: Option<String>,
 }
@@ -257,9 +264,16 @@ impl Client {
             persist_scope,
         };
         let resp = self.inner.submit_verdict(req).await?.into_inner();
+        let said_something = !resp.persisted_rule_id.is_empty() || !resp.persist_error.is_empty();
         Ok(VerdictOutcome {
             accepted: resp.accepted,
-            rule_persisted: wanted_rule && !resp.persisted_rule_id.is_empty(),
+            rule_persisted: match (wanted_rule, said_something) {
+                (false, _) => None,
+                // A daemon that answers neither field is one that does not know
+                // about them; silence is not a failure report.
+                (true, false) => None,
+                (true, true) => Some(!resp.persisted_rule_id.is_empty()),
+            },
             persist_error: (!resp.persist_error.is_empty()).then_some(resp.persist_error),
         })
     }

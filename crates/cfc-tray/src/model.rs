@@ -353,11 +353,6 @@ pub fn block_confirmation(exe: &str) -> String {
     format!("Rule created: deny {} always", exe_display_name(exe))
 }
 
-/// Body of the brief confirmation after "Allow" created a rule.
-///
-/// Worth showing rather than succeeding silently: the button now grants
-/// standing access, and the user should be told that in the same breath - both
-/// so they know they will not be asked again, and so an accidental click is
 /// Said when the verdict applied but the standing rule did not get saved.
 ///
 /// Deliberately not phrased as a success with a caveat: the user asked for a
@@ -372,6 +367,11 @@ pub fn rule_not_saved(exe: &str, why: Option<&str>) -> String {
     }
 }
 
+/// Body of the brief confirmation after "Allow" created a rule.
+///
+/// Worth showing rather than succeeding silently: the button now grants
+/// standing access, and the user should be told that in the same breath - both
+/// so they know they will not be asked again, and so an accidental click is
 /// something they can see and undo rather than discover months later.
 pub fn allow_confirmation(exe: &str) -> String {
     format!("Rule created: allow {} always", exe_display_name(exe))

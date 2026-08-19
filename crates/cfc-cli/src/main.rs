@@ -160,7 +160,7 @@ enum RulesCmd {
     Import {
         /// File to read; reads stdin if omitted.
         file: Option<PathBuf>,
-        /// Replace mode: delete all existing rules first.
+        /// Replace mode: make the rule set match the file. Nothing is applied unless every rule reads cleanly; rules in the file are written first, then any not in it are removed.
         #[arg(long)]
         replace: bool,
     },
@@ -168,7 +168,7 @@ enum RulesCmd {
     ImportOpensnitch {
         /// Path to opensnitch rules dir (e.g. /etc/opensnitchd/rules) or a single .json.
         path: PathBuf,
-        /// Replace mode: delete all existing rules first.
+        /// Replace mode: make the rule set match the file. Nothing is applied unless every rule reads cleanly; rules in the file are written first, then any not in it are removed.
         #[arg(long)]
         replace: bool,
     },

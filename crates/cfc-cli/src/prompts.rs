@@ -604,7 +604,7 @@ async fn submit(
     // Said out loud rather than folded into the boolean: `accepted` is about
     // the connection, not about the rule, and an operator answering prompts
     // needs to know a standing answer did not stick.
-    if outcome.accepted && wanted_rule && !outcome.rule_persisted {
+    if outcome.accepted && wanted_rule && outcome.rule_persisted == Some(false) {
         eprintln!(
             "warning: {}",
             outcome

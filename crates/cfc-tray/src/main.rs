@@ -693,9 +693,16 @@ async fn submit_prompt_verdict(
             // stops watching for the prompt that will come back.
             match (choice, o.rule_persisted) {
                 (PromptChoice::DenyOnce, _) => {}
-                (PromptChoice::BlockAlways, true) => notify_brief(model::block_confirmation(exe)),
-                (PromptChoice::AllowAlways, true) => notify_brief(model::allow_confirmation(exe)),
-                (_, false) => {
+                // `None` is a daemon that did not say - an older build, most
+                // likely one not yet restarted after an upgrade. Reporting a
+                // loss on silence would cry wolf on every single answer.
+                (PromptChoice::BlockAlways, Some(true) | None) => {
+                    notify_brief(model::block_confirmation(exe))
+                }
+                (PromptChoice::AllowAlways, Some(true) | None) => {
+                    notify_brief(model::allow_confirmation(exe))
+                }
+                (_, Some(false)) => {
                     warn!(prompt_id, ?choice, "verdict applied but no rule was saved");
                     notify_brief(model::rule_not_saved(exe, o.persist_error.as_deref()));
                 }

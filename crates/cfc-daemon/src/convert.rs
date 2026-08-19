@@ -278,7 +278,7 @@ pub fn rule_to_pb(r: &Rule) -> pb::RuleInfo {
 /// matches EVERYTHING"), which is the strongest argument for enforcing it here:
 /// three clients independently decided it was dangerous, and the one boundary
 /// they all pass through did not check.
-fn reject_unscoped(scope: &RuleScope) -> Result<(), String> {
+pub fn reject_unscoped(scope: &RuleScope) -> Result<(), String> {
     if scope.specificity() == 0 {
         return Err(
             "rule scope constrains nothing, so it would match every process and \

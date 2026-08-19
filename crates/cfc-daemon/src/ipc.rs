@@ -395,9 +395,24 @@ impl Firewall for FirewallService {
             source: cfc_core::VerdictSource::UserPrompt,
         };
 
+        // The prompt is answered FIRST, and the standing rule only follows if
+        // the answer landed.
+        //
+        // The other order persisted unconditionally and then discovered the
+        // prompt was gone - so a click on a card whose prompt had already timed
+        // out created a permanent rule while every client said "too late". For
+        // "Allow always" that is standing network access granted by a click the
+        // user was told did nothing, and prompt ids restart at 1 on every daemon
+        // start, so a stale card can carry a live id. A verdict that reached
+        // nothing should leave nothing behind.
+        let accepted = self.router.submit(&req.prompt_id, verdict);
+        if let Some(id) = numeric_id {
+            self.audience.forget(id);
+        }
+
         let mut persisted_rule = None;
         let mut persist_error = String::new();
-        if let Some(scope_pb) = req.persist_scope.clone() {
+        if let (true, Some(scope_pb)) = (accepted, req.persist_scope.clone()) {
             let mut scope = convert::scope_from_pb(&scope_pb).map_err(Status::invalid_argument)?;
             // The same resolution UpsertRule does. This is the *higher volume*
             // of the two paths - every "Allow always" click in the tray and
@@ -406,6 +421,10 @@ impl Firewall for FirewallService {
             // back to the exec event's path, which is whatever string was
             // passed to execve() and may well be `/bin/curl`.
             resolve_exe_off_thread(&mut scope).await;
+            // The same gate `rule_from_pb` applies on the UpsertRule path. It
+            // was missed here, which left the busier of the two paths able to
+            // persist a rule that matches every process and every destination.
+            convert::reject_unscoped(&scope).map_err(Status::invalid_argument)?;
             let duration =
                 convert::duration_from_pb(req.duration).map_err(Status::invalid_argument)?;
             convert::reject_unpersistable_duration(duration).map_err(Status::invalid_argument)?;
@@ -439,11 +458,6 @@ impl Firewall for FirewallService {
                     );
                 }
             }
-        }
-
-        let accepted = self.router.submit(&req.prompt_id, verdict);
-        if let Some(id) = numeric_id {
-            self.audience.forget(id);
         }
 
         info!(

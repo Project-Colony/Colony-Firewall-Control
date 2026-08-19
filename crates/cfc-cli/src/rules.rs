@@ -467,8 +467,16 @@ pub async fn import(
                 // higher than what the daemon ends up holding. Under --replace
                 // the operator also loses a rule they believe they imported.
                 if !pb.id.is_empty() {
-                    let key = pb.id.to_ascii_lowercase();
-                    if let Some(first) = seen_ids.insert(key, pb.name.clone()) {
+                    // `try_into_proto` canonicalised it, so equal ids are equal
+                    // strings here whatever the file spelled.
+                    //
+                    // `entry` rather than `insert`: with three rules sharing an
+                    // id, insert would overwrite the stored name each round and
+                    // the third message would name the second - a rule that was
+                    // itself rejected and never imported.
+                    let key = pb.id.clone();
+                    if let Some(first) = seen_ids.get(&key) {
+                        let first = first.clone();
                         problems.push(format!(
                             "rules `{first}` and `{}` share the id `{}`; each rule \
                              needs its own, or an empty one to be assigned a new id",
@@ -476,6 +484,7 @@ pub async fn import(
                         ));
                         continue;
                     }
+                    seen_ids.insert(key, pb.name.clone());
                 }
                 pending.push(pb)
             }
@@ -702,10 +711,42 @@ impl ExportedRule {
             net.parse::<ipnet::IpNet>()
                 .map_err(|e| format!("rule `{name}`: bad dst_net `{net}`: {e}"))?;
         }
-        if !self.id.is_empty() {
-            uuid::Uuid::parse_str(&self.id)
-                .map_err(|e| format!("rule `{name}`: bad id `{}`: {e}", self.id))?;
+        // Everything below is refused by the daemon on upsert. Checking it here
+        // too is not belt and braces - it is the difference between "nothing was
+        // changed" and a 200-rule file that applies 149 and then stops, which is
+        // the outcome the whole validate-first pass exists to prevent.
+        if duration == proto::Duration::Once {
+            return Err(format!(
+                "rule `{name}`: duration `once` answers a single prompt and cannot be \
+                 stored; use always or until-restart"
+            ));
         }
+        let constrains_something = self.scope.exe_path.is_some()
+            || self.scope.exe_sha256.is_some()
+            || self.scope.parent_exe.is_some()
+            || self.scope.uid.is_some()
+            || self.scope.dst_host.is_some()
+            || self.scope.dst_net.is_some()
+            || self.scope.dst_port.is_some()
+            || protocol_idx.is_some();
+        if !constrains_something {
+            return Err(format!(
+                "rule `{name}`: scope constrains nothing, so it would match every \
+                 process and every destination"
+            ));
+        }
+        // Canonicalised, not merely validated. `parse_str` accepts hyphenated,
+        // 32-char, braced and urn spellings of the same id; keeping whichever
+        // one the file used meant two spellings of one id looked like two ids to
+        // the duplicate check, and looked different again from what the daemon
+        // lists back. Both bugs disappear if the parsed value is what travels.
+        let id = if self.id.is_empty() {
+            String::new()
+        } else {
+            uuid::Uuid::parse_str(&self.id)
+                .map_err(|e| format!("rule `{name}`: bad id `{}`: {e}", self.id))?
+                .to_string()
+        };
         let scope = proto::RuleScope {
             exe_path: self.scope.exe_path.unwrap_or_default(),
             exe_sha256: self.scope.exe_sha256.unwrap_or_default(),
@@ -720,7 +761,7 @@ impl ExportedRule {
             has_protocol: protocol_idx.is_some(),
         };
         Ok(proto::RuleInfo {
-            id: self.id,
+            id,
             name: self.name,
             enabled: self.enabled,
             action: action as i32,

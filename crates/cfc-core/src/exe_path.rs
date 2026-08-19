@@ -69,6 +69,14 @@ pub enum Resolved {
     /// Nothing is there to resolve. The path is kept verbatim; a rule using it
     /// will not match until the file exists, and may not match then either.
     Missing(PathBuf),
+    /// The directories exist and resolve, but the file itself does not.
+    ///
+    /// Split out from both neighbours because it is both things at once and
+    /// collapsing it into either loses something: reported as `Rewritten` it
+    /// claims a path the kernel does not report (nothing is there), and
+    /// reported as `Missing` it throws away the directory resolution that makes
+    /// the stored path right once the program is installed.
+    RewrittenButMissing { from: PathBuf, to: PathBuf },
     /// Not an absolute path. `/proc/<pid>/exe` is always absolute, so a
     /// relative rule path can never match anything.
     Relative(PathBuf),
@@ -79,7 +87,7 @@ impl Resolved {
     pub fn path(&self) -> &Path {
         match self {
             Self::Unchanged(p) | Self::Missing(p) | Self::Relative(p) => p,
-            Self::Rewritten { to, .. } => to,
+            Self::Rewritten { to, .. } | Self::RewrittenButMissing { to, .. } => to,
         }
     }
 
@@ -87,13 +95,16 @@ impl Resolved {
     pub fn into_path(self) -> PathBuf {
         match self {
             Self::Unchanged(p) | Self::Missing(p) | Self::Relative(p) => p,
-            Self::Rewritten { to, .. } => to,
+            Self::Rewritten { to, .. } | Self::RewrittenButMissing { to, .. } => to,
         }
     }
 
     /// True when a rule built from this will not match anything as it stands.
     pub fn is_inert(&self) -> bool {
-        matches!(self, Self::Missing(_) | Self::Relative(_))
+        matches!(
+            self,
+            Self::Missing(_) | Self::Relative(_) | Self::RewrittenButMissing { .. }
+        )
     }
 
     /// One line for a human, or `None` when there is nothing worth saying.
@@ -103,6 +114,14 @@ impl Resolved {
             Self::Rewritten { from, to } => Some(format!(
                 "resolved {} to {} (the kernel reports the second, so a rule for \
                  the first would never match)",
+                from.display(),
+                to.display()
+            )),
+            Self::RewrittenButMissing { from, to } => Some(format!(
+                "{} resolves to {}, but nothing is installed there yet; the rule \
+                 is stored against the resolved path and will match once it is - \
+                 unless the program installs as a symlink, which would need the \
+                 rule rewritten",
                 from.display(),
                 to.display()
             )),
@@ -164,7 +183,11 @@ pub fn resolve(path: &Path) -> Resolved {
         // and re-attach the missing tail, so the directory half of the
         // usr-merge is handled even when the leaf is absent.
         Err(_) => match resolve_via_ancestor(path) {
-            Some(to) if to != path => Resolved::Rewritten {
+            // The file is still not there - that is why we are here - so this is
+            // never a plain `Rewritten`. Saying so is what keeps the "you have
+            // not installed this" warning that the first version of the ancestor
+            // walk silently deleted.
+            Some(to) if to != path => Resolved::RewrittenButMissing {
                 from: path.to_path_buf(),
                 to,
             },
@@ -189,7 +212,14 @@ fn resolve_via_ancestor(path: &Path) -> Option<PathBuf> {
             return None;
         }
         tail.push(name);
+        // `is_dir()` matters: an ancestor that resolves to a *file* would
+        // otherwise yield a path nothing can ever occupy - `/usr/bin/curl` is a
+        // binary, so `/usr/bin/curl/plugins/tool` is not a place - and that was
+        // reported as a confident rewrite.
         if let Ok(real) = std::fs::canonicalize(parent) {
+            if !real.is_dir() {
+                return None;
+            }
             let mut out = real;
             for part in tail.iter().rev() {
                 out.push(part);
@@ -292,8 +322,9 @@ mod tests {
         let wanted = linkdir.join("not-installed-yet");
         let outcome = resolve(&wanted);
         assert!(
-            matches!(outcome, Resolved::Rewritten { .. }),
-            "the existing parent must still be resolved: {outcome:?}"
+            matches!(outcome, Resolved::RewrittenButMissing { .. }),
+            "the existing parent must still be resolved, and the absent file \
+             still reported: {outcome:?}"
         );
         let stored = outcome.into_path();
         assert_eq!(
@@ -310,6 +341,60 @@ mod tests {
             stored,
             std::fs::canonicalize(realdir.join("not-installed-yet")).expect("canon")
         );
+    }
+
+    #[test]
+    fn a_not_yet_installed_program_is_still_flagged_even_when_the_directory_resolves() {
+        // The ancestor walk was added so `/bin/mytool` would be stored as
+        // `/usr/bin/mytool`. It also silently turned "you have not installed
+        // this" into a confident rewrite, so the only warning a user ever got
+        // about a missing program disappeared - on exactly the usr-merged host
+        // the walk exists for.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let realdir = dir.path().join("usr-bin");
+        std::fs::create_dir(&realdir).expect("mkdir");
+        std::os::unix::fs::symlink(&realdir, dir.path().join("bin")).expect("symlink");
+
+        let outcome = resolve(&dir.path().join("bin").join("not-installed"));
+        assert!(
+            matches!(outcome, Resolved::RewrittenButMissing { .. }),
+            "both facts must survive: {outcome:?}"
+        );
+        assert!(
+            outcome.is_inert(),
+            "a rule for a program that is not there matches nothing, resolved or not"
+        );
+        // Still stored against the resolved directory, which is the point.
+        assert_eq!(
+            outcome.path(),
+            std::fs::canonicalize(&realdir)
+                .expect("canon")
+                .join("not-installed")
+        );
+        let note = outcome.note().expect("a note");
+        assert!(note.contains("nothing is installed there yet"), "{note}");
+    }
+
+    #[test]
+    fn an_ancestor_that_is_a_file_is_not_a_place_anything_can_live() {
+        // `/usr/bin/curl` is a binary, so `/usr/bin/curl/plugins/tool` is not a
+        // path - and reporting it as a resolved rewrite told the operator a rule
+        // was fine when it could never fire.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let realdir = dir.path().join("usr-bin");
+        std::fs::create_dir(&realdir).expect("mkdir");
+        std::fs::write(realdir.join("curl"), b"x").expect("write");
+        std::os::unix::fs::symlink(&realdir, dir.path().join("bin")).expect("symlink");
+
+        let outcome = resolve(
+            &dir.path()
+                .join("bin")
+                .join("curl")
+                .join("plugins")
+                .join("tool"),
+        );
+        assert!(matches!(outcome, Resolved::Missing(_)), "{outcome:?}");
+        assert!(outcome.is_inert());
     }
 
     #[test]

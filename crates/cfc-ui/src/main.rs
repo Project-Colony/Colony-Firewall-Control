@@ -1540,7 +1540,7 @@ async fn submit_verdict(
     // A verdict that applied but saved no rule is not a success to report
     // quietly: the user asked for a lasting answer, did not get one, and will
     // be prompted again by the next connection from the same program.
-    if outcome.accepted && wanted_rule && !outcome.rule_persisted {
+    if outcome.accepted && wanted_rule && outcome.rule_persisted == Some(false) {
         return Err(outcome
             .persist_error
             .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()));

@@ -661,6 +661,16 @@ fn path_hash(path: &Path) -> u64 {
 /// Canonical location of the rpm database directory.
 pub const RPM_DB: &str = "/var/lib/rpm";
 
+/// Digs an errno out of an error chain.
+///
+/// Local rather than shared with the eBPF loader's copy: that one lives behind
+/// the `ebpf` cargo feature, and provenance has to work in every build.
+fn errno_of(err: &anyhow::Error) -> Option<i32> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+}
+
 /// How long `rpm -qa` is given before it is killed and the index left empty.
 ///
 /// Not a performance knob - a safety one. `dnf` holds the rpmdb open for the
@@ -768,7 +778,25 @@ impl Rpm {
     }
 
     /// Runs the query with a deadline, killing it if it overruns.
+    ///
+    /// One retry on `ETXTBSY`. That errno means someone holds the binary open
+    /// for writing, which for `rpm` means rpm is being upgraded - a transient
+    /// condition where an empty provenance index is a worse answer than waiting
+    /// 50 ms. Found by a test that writes a script and execs it from a
+    /// multi-threaded binary, where another thread's `fork()` briefly inherits
+    /// the still-open write fd; the production case is rarer and the remedy is
+    /// the same.
     fn run_query(&self) -> anyhow::Result<String> {
+        match self.run_query_once() {
+            Err(e) if errno_of(&e) == Some(libc::ETXTBSY) => {
+                std::thread::sleep(Duration::from_millis(50));
+                self.run_query_once()
+            }
+            other => other,
+        }
+    }
+
+    fn run_query_once(&self) -> anyhow::Result<String> {
         use std::process::{Command, Stdio};
 
         let mut child = Command::new(&self.program)
@@ -1403,15 +1431,52 @@ mod tests {
         rpm.timeout = Duration::from_millis(300);
 
         let started = Instant::now();
-        assert!(rpm.run_query().is_err(), "a hung rpm must be an error");
+        let e = rpm.run_query().expect_err("a hung rpm must be an error");
         let took = started.elapsed();
         assert!(
             took >= rpm.timeout,
-            "it gave up before the deadline: took {took:?}"
+            "it gave up before the deadline: took {took:?}, error was: {e:#}"
         );
         assert!(
             took < Duration::from_secs(10),
             "the query was not bounded: took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_busy_binary_is_retried_rather_than_reported_as_an_empty_index() {
+        // ETXTBSY means someone holds the binary open for writing. For `rpm`
+        // that is rpm upgrading itself; in this suite it is another test
+        // thread's fork() inheriting a still-open write fd, which made all
+        // three spawning tests flake about one run in twenty.
+        //
+        // The script starts unwritable-and-busy by being held open for writing
+        // here, and becomes runnable once that handle drops - which is exactly
+        // the shape the retry exists for.
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("rpmdb");
+        std::fs::create_dir_all(&db).unwrap();
+        let prog = tmp.path().join("busy-rpm");
+        let mut f = std::fs::File::create(&prog).unwrap();
+        f.write_all(b"#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rpm = Rpm::with_program(db, prog);
+        let handle = std::thread::spawn(move || {
+            // Still open for writing when the first attempt runs; released well
+            // inside the 50 ms the retry waits.
+            std::thread::sleep(Duration::from_millis(20));
+            drop(f);
+        });
+        let out = rpm.run_query();
+        handle.join().unwrap();
+        assert!(
+            out.is_ok(),
+            "a transiently busy binary must be retried, not turned into an \
+             empty index: {:?}",
+            out.err()
         );
     }
 

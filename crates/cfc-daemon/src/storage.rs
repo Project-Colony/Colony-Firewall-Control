@@ -82,6 +82,22 @@ fn heal_legacy_protocol(rule: &mut Rule) -> bool {
     false
 }
 
+/// True when a stored rule constrains nothing and therefore matches everything.
+///
+/// Older builds accepted these; the boundary now refuses them. Left loaded they
+/// are worse than useless: the rule matches every process and every destination
+/// *and* cannot be edited or disabled, because every client edit is a
+/// read-modify-write that sends the empty scope straight back to a daemon that
+/// now rejects it. The one thing an operator would reach for on a
+/// match-everything rule is the one thing that stops working.
+///
+/// So it is disabled in memory and named in the log. Not deleted: the row is
+/// the operator's, and `cfc rules list` is not where a firewall should silently
+/// lose things.
+fn is_unscoped(rule: &Rule) -> bool {
+    rule.scope.specificity() == 0
+}
+
 impl RuleStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -132,12 +148,17 @@ impl RuleStore {
         let mut rules = Vec::new();
         let mut skipped_ids = Vec::new();
         let mut healed_ids = Vec::new();
+        let mut unscoped_ids = Vec::new();
         for r in rows {
             let (id, json) = r?;
             match serde_json::from_str::<Rule>(&json) {
                 Ok(mut rule) => {
                     if heal_legacy_protocol(&mut rule) {
                         healed_ids.push(id.clone());
+                    }
+                    if is_unscoped(&rule) {
+                        unscoped_ids.push(id.clone());
+                        continue;
                     }
                     rules.push(rule);
                 }
@@ -163,6 +184,16 @@ impl RuleStore {
                  an older build; it has been dropped in memory. Re-save them to \
                  clear it on disk.",
                 healed_ids.len()
+            );
+        }
+        if !unscoped_ids.is_empty() {
+            tracing::warn!(
+                count = unscoped_ids.len(),
+                ids = ?unscoped_ids,
+                "{} stored rule(s) constrain nothing and would match every process \
+                 and every destination; they are not being applied. Delete them \
+                 with `cfc rules remove <id>` - the rows are preserved on disk.",
+                unscoped_ids.len()
             );
         }
         self.skipped.store(skipped_ids.len(), Ordering::Relaxed);
@@ -457,6 +488,31 @@ impl RuleStore {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_stored_rule_that_constrains_nothing_is_not_applied() {
+        // Older builds accepted these. Loaded, such a rule matches every process
+        // and every destination *and* cannot be disabled, because disabling is a
+        // read-modify-write that sends the empty scope back to a daemon that now
+        // refuses it - so the one remedy an operator would reach for is the one
+        // that stops working.
+        let unscoped = Rule::new(
+            "everything",
+            cfc_core::Action::Allow,
+            cfc_core::RuleScope::any(),
+        );
+        assert!(super::is_unscoped(&unscoped));
+
+        let scoped = Rule::new(
+            "curl",
+            cfc_core::Action::Allow,
+            cfc_core::RuleScope {
+                exe_path: Some("/usr/bin/curl".into()),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        assert!(!super::is_unscoped(&scoped));
+    }
 
     #[test]
     fn a_legacy_other_protocol_is_healed_so_the_rule_stays_editable() {
