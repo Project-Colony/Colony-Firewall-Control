@@ -55,6 +55,33 @@ profile = "balanced"
 # timeout_action = "Deny"
 # # How long a prompt waits for an answer, in seconds.
 # prompt_timeout_secs = 30
+# # What an INBOUND flow gets when no rule matches. Only consulted when the
+# # inbound chain is loaded (`systemctl enable --now colony-firewall-nft-inbound`);
+# # without that unit nothing is queued from the input hook and this is inert.
+# #
+# # This is deliberately NOT no_ui_action. That one means "nobody is there to
+# # ask"; this one means "we are not asking, by design". Inbound never
+# # prompts: an exposed machine is scanned continuously, the traffic is not
+# # caused by anything you did, and a bubble per inbound SYN would be a denial
+# # of service on your attention. Authorising inbound traffic is what rules
+# # are for:
+# #
+# #     cfc rules add --direction in --action allow --protocol tcp \
+# #         --dst-port 22 --src-net 192.168.1.0/24 --name ssh-from-lan
+# #
+# # Inbound, --dst-port is the port on THIS host and --src-net is the peer.
+# #
+# # "Allow" is not on the menu. Setting it logs a warning and uses "Deny"
+# # instead - the value is refused, but the daemon still starts, because a
+# # config that aborts startup would leave a fail-closed ruleset with nothing
+# # answering the queue, i.e. a machine with no network. An allow-by-default
+# # inbound firewall is an accept-everything chain with extra steps anyway.
+# #
+# # So: "Deny" (silent drop) or "Reject" (send an RST or ICMP refusal).
+# # Reject is friendlier on a LAN, where a timeout looks like a broken host;
+# # Deny tells a scanner less. The profiles differ here: "relaxed" uses
+# # Reject, "balanced" and "strict" use Deny.
+# inbound_action = "Deny"
 
 # Needs a restart (the queue is bound once, at startup).
 [nfqueue]

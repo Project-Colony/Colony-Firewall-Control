@@ -298,6 +298,7 @@ mod tests {
         DefaultPolicy {
             no_ui_action: Action::Deny,
             timeout_action: Action::Deny,
+            inbound_action: Action::Deny,
             prompt_timeout_secs,
         }
     }
@@ -450,6 +451,7 @@ mod tests {
         let policy = DefaultPolicy {
             no_ui_action: Action::Reject,
             timeout_action: Action::Reject,
+            inbound_action: Action::Deny,
             prompt_timeout_secs: 15,
         };
         let (tx, rx) = std::sync::mpsc::channel();

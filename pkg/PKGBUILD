@@ -68,6 +68,11 @@ package() {
         "$pkgdir/usr/lib/systemd/system/colony-firewalld.service"
     install -Dm644 systemd/colony-firewall-nft.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewall-nft.service"
+    # Inbound is a separate unit, and stays disabled until someone enables it:
+    # switching it on can strand a machine reached over the network, so it must
+    # never be something an upgrade does to them.
+    install -Dm644 systemd/colony-firewall-nft-inbound.service \
+        "$pkgdir/usr/lib/systemd/system/colony-firewall-nft-inbound.service"
 
     # sysusers: creates the 'colony-firewall' group for gRPC socket access
     install -Dm644 systemd/colony-firewall.sysusers \
@@ -80,6 +85,14 @@ package() {
     # nftables snippet, loaded by colony-firewall-nft.service
     install -Dm644 systemd/nftables-snippet.conf \
         "$pkgdir/usr/share/colony-firewall/nftables-snippet.conf"
+    # inbound chain, loaded by colony-firewall-nft-inbound.service
+    install -Dm644 systemd/nftables-inbound.conf \
+        "$pkgdir/usr/share/colony-firewall/nftables-inbound.conf"
+
+    # The lockout pre-flight, run as that unit's ExecStartPre. 0755: systemd
+    # execs it directly.
+    install -Dm755 scripts/inbound-lockout-guard.sh \
+        "$pkgdir/usr/lib/colony-firewall/inbound-lockout-guard.sh"
 
     # Desktop integration
     install -Dm644 pkg/colony-firewall.desktop \

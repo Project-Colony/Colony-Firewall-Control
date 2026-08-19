@@ -182,9 +182,13 @@ enum RulesCmd {
     },
     /// Install or remove a named set of allow rules.
     ///
-    /// Every rule in a bundle names an executable - there is no way to write
-    /// "allow tcp/443" here, because a payload phoning home uses 443 exactly
-    /// like a browser does and a port-shaped rule cannot tell them apart.
+    /// Every outbound rule in a bundle names an executable - there is no way
+    /// to write "allow tcp/443" here, because a payload phoning home uses 443
+    /// exactly like a browser does and a port-shaped rule cannot tell them
+    /// apart. Inbound entries are the exception, and not a loophole: the
+    /// connection arrives before any process has accepted it, so there is no
+    /// executable to name and the port itself is the narrowing predicate. An
+    /// inbound entry with neither is refused.
     ///
     /// Entries whose program is not installed on this machine are skipped and
     /// reported, so "4 added, 3 skipped" is a normal outcome.

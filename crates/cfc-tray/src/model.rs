@@ -228,9 +228,12 @@ pub struct PromptNotification {
     /// [`MIN_PROMPT_TIMEOUT_MS`]. When it expires unanswered the daemon
     /// applies its timeout_action; the tray does nothing.
     pub timeout_ms: u32,
-    /// Whether "Block app always" is offered. False when the prompt has
-    /// no exe path: a RuleScope with an empty exe_path would be a
-    /// match-everything deny rule, not an app block.
+    /// Whether the persistent choices are offered. False when the prompt's
+    /// executable cannot scope a rule - see
+    /// [`cfc_client::convert::exe_is_rule_scopable`]. The case that bit: an
+    /// unidentified process is shown as a name, so the bubble happily offered
+    /// "always allow", and the resulting rule matched every flow that could
+    /// not be attributed rather than one program.
     pub offer_block: bool,
 }
 
@@ -269,7 +272,7 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
         summary,
         body,
         timeout_ms,
-        offer_block: !exe.is_empty(),
+        offer_block: cfc_client::convert::exe_is_rule_scopable(exe),
     }
 }
 
@@ -332,6 +335,11 @@ pub fn verdict_for(
     // Both persisted choices are the same rule with the verdict flipped, so
     // they are built the same way rather than written out twice.
     let for_this_exe = |action| {
+        // Falls back to a one-shot verdict rather than writing a rule that
+        // would be wider than the choice the user was offered.
+        if !cfc_client::convert::exe_is_rule_scopable(exe) {
+            return (action, proto::Duration::Once, None);
+        }
         (
             action,
             proto::Duration::Always,
@@ -900,5 +908,50 @@ mod tests {
         assert!(!actions_supported(&caps(&[])));
         // Substrings must not count.
         assert!(!actions_supported(&caps(&["actions-icons"])));
+    }
+
+    #[cfg(test)]
+    mod unknown_exe_tests {
+        use super::*;
+
+        fn ev_with_exe(exe: &str) -> proto::PromptEvent {
+            proto::PromptEvent {
+                process: Some(proto::ProcessInfo {
+                    exe: exe.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// The bubble must not offer a persistent choice it cannot honour. An
+        /// unidentified process is displayed with a name, so nothing on screen
+        /// told the user that "always allow" here meant "allow everything I
+        /// cannot identify" - which, once inbound filtering existed, meant every
+        /// inbound connection.
+        #[test]
+        fn an_unidentified_process_gets_no_persistent_choice() {
+            let n = prompt_notification(&ev_with_exe(cfc_client::convert::UNKNOWN_EXE), 0);
+            assert!(!n.offer_block);
+
+            for choice in [PromptChoice::AllowAlways, PromptChoice::BlockAlways] {
+                let (_, duration, scope) = verdict_for(choice, cfc_client::convert::UNKNOWN_EXE);
+                assert_eq!(
+                    duration,
+                    proto::Duration::Once,
+                    "must degrade to a one-shot verdict"
+                );
+                assert!(scope.is_none(), "must not write a rule");
+            }
+        }
+
+        #[test]
+        fn a_real_program_still_gets_its_persistent_rule() {
+            assert!(prompt_notification(&ev_with_exe("/usr/bin/curl"), 0).offer_block);
+            let (action, duration, scope) = verdict_for(PromptChoice::AllowAlways, "/usr/bin/curl");
+            assert_eq!(action, proto::Action::Allow);
+            assert_eq!(duration, proto::Duration::Always);
+            assert_eq!(scope.unwrap().exe_path, "/usr/bin/curl");
+        }
     }
 }

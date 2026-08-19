@@ -176,6 +176,7 @@ impl TestDaemon {
             policy: DefaultPolicy {
                 no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
+                inbound_action: cfc_core::Action::Deny,
                 prompt_timeout_secs: 3600,
             },
             require_group: false,
@@ -552,6 +553,7 @@ async fn prompt_timeout_falls_back_and_makes_a_late_answer_a_no_op() {
         .policy(DefaultPolicy {
             no_ui_action: Action::Allow,
             timeout_action: Action::Deny,
+            inbound_action: cfc_core::Action::Deny,
             prompt_timeout_secs: 30,
         })
         .build()
@@ -649,6 +651,7 @@ async fn prompt_for_another_uid_is_not_delivered() {
         .policy(DefaultPolicy {
             no_ui_action: Action::Allow,
             timeout_action: Action::Deny,
+            inbound_action: cfc_core::Action::Deny,
             prompt_timeout_secs: 30,
         })
         .build()
@@ -1170,6 +1173,7 @@ async fn status_reports_rules_policy_and_skipped_rows() {
         .policy(DefaultPolicy {
             no_ui_action: Action::Allow,
             timeout_action: Action::Reject,
+            inbound_action: cfc_core::Action::Deny,
             prompt_timeout_secs: 42,
         })
         .build()
@@ -1206,6 +1210,7 @@ async fn status_reports_rules_policy_and_skipped_rows() {
     *d.policy.write().expect("policy lock") = DefaultPolicy {
         no_ui_action: Action::Deny,
         timeout_action: Action::Deny,
+        inbound_action: cfc_core::Action::Deny,
         prompt_timeout_secs: 7,
     };
     let status = client.status().await.expect("status");

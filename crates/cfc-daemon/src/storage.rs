@@ -98,6 +98,27 @@ fn is_unscoped(rule: &Rule) -> bool {
     rule.scope.specificity() == 0
 }
 
+/// A rule scoped to the "we could not identify this program" placeholder.
+///
+/// Treated exactly like an unscoped one, and for the same reason: it looks
+/// narrow and behaves as a wildcard. `Process::unknown` puts
+/// [`cfc_core::UNKNOWN_EXE`] in a `PathBuf`, so answering "always allow" on a
+/// flow that could not be attributed used to write that string as the rule's
+/// executable - and every later unattributable flow compared equal to it.
+/// Inbound flows are always unattributable, so one such rule admitted all
+/// inbound traffic regardless of the rules meant to govern it.
+///
+/// New rules of this shape are refused at the API boundary and the matcher
+/// ignores the placeholder outright; this catches the ones already written to
+/// databases before either lock existed. Disabled in memory, never deleted -
+/// the row is the operator's.
+fn has_placeholder_exe(rule: &Rule) -> bool {
+    rule.scope
+        .exe_path
+        .as_ref()
+        .is_some_and(|p| p.as_os_str() == cfc_core::UNKNOWN_EXE)
+}
+
 impl RuleStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -149,6 +170,7 @@ impl RuleStore {
         let mut skipped_ids = Vec::new();
         let mut healed_ids = Vec::new();
         let mut unscoped_ids = Vec::new();
+        let mut placeholder_ids = Vec::new();
         for r in rows {
             let (id, json) = r?;
             match serde_json::from_str::<Rule>(&json) {
@@ -160,6 +182,10 @@ impl RuleStore {
                         unscoped_ids.push(id.clone());
                         continue;
                     }
+                    if has_placeholder_exe(&rule) {
+                        placeholder_ids.push(id.clone());
+                        continue;
+                    }
                     rules.push(rule);
                 }
                 Err(e) => {
@@ -167,6 +193,19 @@ impl RuleStore {
                     skipped_ids.push(id);
                 }
             }
+        }
+        if !placeholder_ids.is_empty() {
+            tracing::warn!(
+                count = placeholder_ids.len(),
+                ids = ?placeholder_ids,
+                "{} rule(s) are scoped to {} - the placeholder for a program \
+                 that could not be identified, not a path. Such a rule matches \
+                 every unattributable flow, which is every inbound one, so it \
+                 is not applied. The rows are preserved; delete them, or \
+                 rewrite them against a real executable or a port and source.",
+                placeholder_ids.len(),
+                cfc_core::UNKNOWN_EXE
+            );
         }
         if !skipped_ids.is_empty() {
             tracing::error!(
@@ -488,6 +527,40 @@ impl RuleStore {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_rule_scoped_to_the_unknown_placeholder_is_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RuleStore::open(&dir.path().join("rules.db")).unwrap();
+
+        // The exact shape found on a live machine: no predicate except an exe
+        // that is really the "could not identify" placeholder.
+        let mut scope = cfc_core::RuleScope::any();
+        scope.exe_path = Some(std::path::PathBuf::from(cfc_core::UNKNOWN_EXE));
+        let bad = Rule::new("user prompt 111".to_string(), Action::Allow, scope);
+        store.upsert(&bad).unwrap();
+
+        let mut ok_scope = cfc_core::RuleScope::any();
+        ok_scope.exe_path = Some(std::path::PathBuf::from("/usr/bin/curl"));
+        store
+            .upsert(&Rule::new("curl".to_string(), Action::Allow, ok_scope))
+            .unwrap();
+
+        // Reopen: this is the load path a daemon restart takes.
+        let reopened = RuleStore::open(&dir.path().join("rules.db")).unwrap();
+        let names: Vec<String> = reopened
+            .snapshot()
+            .unwrap()
+            .rules
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert!(
+            !names.contains(&"user prompt 111".to_string()),
+            "a placeholder-scoped rule must not be applied: {names:?}"
+        );
+        assert!(names.contains(&"curl".to_string()), "{names:?}");
+    }
 
     #[test]
     fn a_stored_rule_that_constrains_nothing_is_not_applied() {

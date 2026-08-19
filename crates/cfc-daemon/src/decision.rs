@@ -148,6 +148,27 @@ impl Engine {
         None
     }
 
+    /// What an inbound flow gets when no rule matches.
+    ///
+    /// Separate from `no_ui_action` because it answers a different question.
+    /// `no_ui_action` is "nobody is there to ask"; this is "we are not asking,
+    /// by design". Conflating them would mean a machine that starts prompting
+    /// for inbound traffic the moment a GUI connects.
+    ///
+    /// There is no configuration to make this Allow, and that is deliberate:
+    /// the whole point of the inbound chain is that nothing enters without
+    /// having been authorised, and an allow-by-default inbound firewall is an
+    /// accept-everything chain with extra steps. Authorising is what rules are
+    /// for. `Reject` rather than `Deny` is offered because on a LAN an
+    /// immediate refusal is kinder than a timeout, but it is still a refusal.
+    pub fn inbound_default(&self) -> cfc_core::Action {
+        self.inner
+            .default_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inbound_action
+    }
+
     /// The verdict applied when no rule matches and prompting is
     /// impossible (no UI connected, prompt channel saturated, unparseable
     /// packet): the configured `no_ui_action`.
@@ -262,6 +283,7 @@ mod tests {
         DefaultPolicy {
             no_ui_action: Action::Allow,
             timeout_action: Action::Allow,
+            inbound_action: Action::Deny,
             prompt_timeout_secs: 15,
         }
     }
@@ -270,6 +292,7 @@ mod tests {
         DefaultPolicy {
             no_ui_action: Action::Deny,
             timeout_action: Action::Deny,
+            inbound_action: Action::Deny,
             prompt_timeout_secs: 10,
         }
     }
@@ -464,6 +487,7 @@ mod tests {
         let policy = DefaultPolicy {
             no_ui_action: Action::Reject,
             timeout_action: Action::Reject,
+            inbound_action: Action::Deny,
             prompt_timeout_secs: 15,
         };
         let engine = Engine::new(RuleSet::default(), shared(policy));

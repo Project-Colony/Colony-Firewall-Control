@@ -99,6 +99,9 @@ install -Dpm 0644 systemd/colony-firewalld.service \
     %{buildroot}%{_unitdir}/colony-firewalld.service
 install -Dpm 0644 systemd/colony-firewall-nft.service \
     %{buildroot}%{_unitdir}/colony-firewall-nft.service
+%{_unitdir}/colony-firewall-nft-inbound.service
+install -Dpm 0644 systemd/colony-firewall-nft-inbound.service \
+    %{buildroot}%{_unitdir}/colony-firewall-nft-inbound.service
 install -Dpm 0644 systemd/colony-firewall.sysusers \
     %{buildroot}%{_sysusersdir}/colony-firewall.conf
 
@@ -106,6 +109,13 @@ install -Dpm 0644 systemd/daemon.toml.sample \
     %{buildroot}%{_sysconfdir}/colony-firewall/daemon.toml
 install -Dpm 0644 systemd/nftables-snippet.conf \
     %{buildroot}%{_datadir}/colony-firewall/nftables-snippet.conf
+%{_datadir}/colony-firewall/nftables-inbound.conf
+%dir %{_prefix}/lib/colony-firewall
+%attr(0755,root,root) %{_prefix}/lib/colony-firewall/inbound-lockout-guard.sh
+install -Dpm 0644 systemd/nftables-inbound.conf \
+    %{buildroot}%{_datadir}/colony-firewall/nftables-inbound.conf
+install -Dpm 0755 scripts/inbound-lockout-guard.sh \
+    %{buildroot}%{_prefix}/lib/colony-firewall/inbound-lockout-guard.sh
 
 install -Dpm 0644 pkg/colony-firewall.desktop \
     %{buildroot}%{_datadir}/applications/colony-firewall.desktop

@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let policy: SharedPolicy = Arc::new(std::sync::RwLock::new(DefaultPolicy {
         no_ui_action: Action::Allow,
         timeout_action: Action::Deny,
+        inbound_action: cfc_core::Action::Deny,
         prompt_timeout_secs: 45,
     }));
     let engine = Engine::new(store.snapshot()?, policy.clone());

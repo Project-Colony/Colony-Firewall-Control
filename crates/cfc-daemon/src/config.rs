@@ -50,6 +50,13 @@ pub struct DefaultPolicy {
     pub no_ui_action: Action,
     /// What to do if a prompt expires.
     pub timeout_action: Action,
+    /// What an inbound flow gets when no rule matches.
+    ///
+    /// Never `Allow`, and `resolve` refuses to make it one: the inbound chain
+    /// exists so that nothing enters without having been authorised, and
+    /// authorising is what a rule is. An allow-by-default inbound firewall is
+    /// an accept-everything chain with extra steps.
+    pub inbound_action: Action,
     /// Prompt timeout, seconds.
     pub prompt_timeout_secs: u32,
 }
@@ -67,6 +74,7 @@ impl Default for DefaultPolicy {
 pub struct DefaultPolicyToml {
     pub no_ui_action: Option<Action>,
     pub timeout_action: Option<Action>,
+    pub inbound_action: Option<Action>,
     pub prompt_timeout_secs: Option<u32>,
 }
 
@@ -77,6 +85,25 @@ impl DefaultPolicyToml {
         DefaultPolicy {
             no_ui_action: self.no_ui_action.unwrap_or(base.no_ui_action),
             timeout_action: self.timeout_action.unwrap_or(base.timeout_action),
+            // Allow is not on the menu. A config that asks for it gets Deny and
+            // a warning rather than a parse error, for the same reason the
+            // whole of this file is forgiving: a rejected config exits before
+            // READY=1, and against a fail-closed ruleset that is a machine with
+            // no network. Refusing the *value* while keeping the daemon up is
+            // the only shape that is safe in both directions.
+            inbound_action: match self.inbound_action.unwrap_or(base.inbound_action) {
+                Action::Allow => {
+                    tracing::warn!(
+                        "[default_policy] inbound_action = \"Allow\" is not \
+                         supported: inbound is default-deny by design, and \
+                         allowing by default would make the input chain \
+                         decorative. Using Deny; write rules to authorise what \
+                         should get in."
+                    );
+                    Action::Deny
+                }
+                other => other,
+            },
             prompt_timeout_secs: self.prompt_timeout_secs.unwrap_or(base.prompt_timeout_secs),
         }
     }
@@ -127,28 +154,43 @@ impl Profile {
     ///
     /// What the profiles still differ on is how long to wait for an answer.
     ///
-    /// This cannot lock an operator out of a remote machine: the nftables
-    /// table hooks `output` on `ct state new` only, so an inbound SSH session's
+    /// The outbound table cannot lock an operator out of a remote machine: it
+    /// hooks `output` on `ct state new` only, so an inbound SSH session's
     /// replies are `ct state established` and are never queued, and loopback is
     /// accepted outright. Rules can still be added with `cfc-cli` from that
     /// session. What it *does* mean on a fresh headless install is that
     /// outbound traffic — package updates, NTP, backups — is denied until
     /// rules exist for it.
+    ///
+    /// The *inbound* table can, which is why it is a separate opt-in unit with
+    /// an `ExecStartPre` lockout guard rather than something an upgrade turns
+    /// on. Once it is loaded, `inbound_action` below applies to every new
+    /// inbound flow that no rule admits — including the next SSH connection.
+    /// See `systemd/nftables-inbound.conf`.
     pub fn policy(self) -> DefaultPolicy {
         match self {
+            // `Reject` on the relaxed profile: on a LAN an immediate refusal
+            // is kinder than a timeout, and a desktop that is not trying to
+            // hide answers faster. Still a refusal - the profile changes the
+            // *manner*, never the answer.
             Profile::Relaxed => DefaultPolicy {
                 no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
+                inbound_action: Action::Reject,
                 prompt_timeout_secs: 60,
             },
             Profile::Balanced => DefaultPolicy {
                 no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
+                inbound_action: Action::Deny,
                 prompt_timeout_secs: 30,
             },
+            // Strict drops rather than rejects: a refusal tells a scanner the
+            // host is there.
             Profile::Strict => DefaultPolicy {
                 no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
+                inbound_action: Action::Deny,
                 prompt_timeout_secs: 15,
             },
         }
@@ -477,6 +519,42 @@ mod tests {
     }
 
     /// The tri-state, including the compatibility the booleans still have.
+    /// `Allow` is refused as a *value* but must not be refused as a *config*.
+    /// Aborting startup would leave the fail-closed ruleset with nothing
+    /// answering the queue - a machine with no network - so the daemon warns
+    /// and uses Deny instead.
+    #[test]
+    fn inbound_action_allow_is_coerced_to_deny_without_failing_the_parse() {
+        let cfg = Config::from_toml_str("[default_policy]\ninbound_action = \"Allow\"\n")
+            .expect("a bad inbound_action must not abort startup");
+        assert_eq!(cfg.default_policy.inbound_action, Action::Deny);
+    }
+
+    #[test]
+    fn inbound_action_deny_and_reject_are_both_honoured() {
+        let action = |v: &str| {
+            Config::from_toml_str(&format!("[default_policy]\ninbound_action = \"{v}\"\n"))
+                .unwrap()
+                .default_policy
+                .inbound_action
+        };
+        assert_eq!(action("Deny"), Action::Deny);
+        assert_eq!(action("Reject"), Action::Reject);
+    }
+
+    /// No profile may ship an inbound default that admits traffic - the whole
+    /// premise is that nothing enters unless a rule says so.
+    #[test]
+    fn no_profile_allows_inbound_by_default() {
+        for p in [Profile::Relaxed, Profile::Balanced, Profile::Strict] {
+            assert_ne!(
+                p.policy().inbound_action,
+                Action::Allow,
+                "{p:?} would admit unauthorised inbound traffic"
+            );
+        }
+    }
+
     #[test]
     fn ebpf_enabled_is_a_tri_state_defaulting_to_auto() {
         let mode = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.enabled;

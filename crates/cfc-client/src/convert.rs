@@ -82,6 +82,28 @@ pub fn has_provenance(p: &pb::ProcessInfo) -> bool {
             != pb::Provenance::Unspecified
 }
 
+/// Re-exported so a UI can name the placeholder without depending on the core
+/// crate for one string.
+pub use cfc_core::UNKNOWN_EXE;
+
+/// Whether `exe` can be the basis of a program-scoped rule.
+///
+/// Three ways a prompt's executable string fails to be one, and all three
+/// produce a rule that is wider than it reads:
+///
+/// * empty - `exe_path: ""` matches every program on the machine;
+/// * [`cfc_core::UNKNOWN_EXE`] - what is shown when the process could not be
+///   identified. A rule carrying it matches every unattributable flow, and
+///   inbound flows are always unattributable. One such rule, answered once in
+///   a bubble, admitted every inbound connection on a real machine;
+/// * not absolute - rules match absolute paths, so it could never fire.
+///
+/// The daemon refuses all three, but a UI that offers the choice and then
+/// reports a failure is a worse answer than not offering it.
+pub fn exe_is_rule_scopable(exe: &str) -> bool {
+    !exe.is_empty() && exe != cfc_core::UNKNOWN_EXE && std::path::Path::new(exe).is_absolute()
+}
+
 /// Renders a process uid for display.
 ///
 /// `None` means the daemon could not attribute the flow to a process. The

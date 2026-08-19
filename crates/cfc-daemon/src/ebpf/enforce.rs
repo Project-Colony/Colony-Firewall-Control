@@ -790,6 +790,7 @@ mod tests {
                 // the control run failing too.
                 no_ui_action: Action::Deny,
                 timeout_action: Action::Deny,
+                inbound_action: Action::Deny,
                 prompt_timeout_secs: 10,
             })),
         );

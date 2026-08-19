@@ -1,0 +1,38 @@
+# colony-firewall-nft-inbound.service
+#
+# The inbound half, opt-in and separate from colony-firewall-nft.service on
+# purpose. Outbound filtering is what every existing install already has;
+# enabling inbound can strand a machine you reach over the network, so it must
+# be a thing someone does, never a thing an upgrade does to them.
+#
+#     systemctl enable --now colony-firewall-nft-inbound
+#
+# Stopping it removes the table and the machine accepts inbound traffic again,
+# which is the pre-CFC behaviour. PartOf= the daemon for the same reason the
+# outbound unit is: stopping the daemon should not leave a fail-closed chain
+# with nothing on the queue.
+
+[Unit]
+Description=Colony Firewall inbound nftables rules
+Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
+PartOf=colony-firewalld.service
+Wants=colony-firewalld.service
+After=colony-firewalld.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# The seatbelt. Blocks the load when a live inbound session has no rule that
+# could re-admit it after a restart - the deferred lockout described in the
+# script. Override with `systemctl set-environment CFC_INBOUND_FORCE=1` if you
+# have the console and mean it.
+ExecStartPre=/usr/lib/colony-firewall/inbound-lockout-guard.sh
+
+ExecStart=/usr/bin/nft -f /usr/share/colony-firewall/nftables-inbound.conf
+ExecStop=/usr/bin/nft delete table inet colony_firewall_inbound
+
+[Install]
+WantedBy=multi-user.target

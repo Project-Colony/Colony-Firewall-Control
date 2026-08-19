@@ -82,6 +82,38 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(250);
 /// latency an intercepted packet can pick up; see the module docs.
 const RECV_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// `NF_INET_LOCAL_IN` - a packet addressed to this machine.
+const NF_INET_LOCAL_IN: u8 = 1;
+/// `NF_INET_LOCAL_OUT` - a packet this machine is sending.
+const NF_INET_LOCAL_OUT: u8 = 3;
+
+/// Which way a packet is going, from the hook that queued it.
+///
+/// Only `LOCAL_OUT` is outbound; everything else is treated as inbound. That
+/// asymmetry is the fail-closed direction, and it is worth being explicit
+/// about why, because the obvious reading is backwards: inbound is the
+/// *stricter* policy here, not the looser one. An outbound flow can prompt the
+/// user and can be allowed by an outbound rule; an inbound flow does neither -
+/// it matches a rule or it takes `inbound_action`, which cannot be Allow. So
+/// an unexpected hook (someone added a `forward` rule by hand) lands on
+/// default-deny rather than on the path that can end in Allow.
+///
+/// This cannot black-hole ordinary traffic by mistake: the hook number comes
+/// from `nfqnl_msg_packet_hdr`, which the kernel sends with every packet and
+/// which nfq asserts is present before handing us a message. It is never a
+/// zero default, so locally-generated packets are always hook 3 and always
+/// read as outbound.
+fn direction_for_hook(hook: u8) -> Direction {
+    match hook {
+        NF_INET_LOCAL_OUT => Direction::Outbound,
+        NF_INET_LOCAL_IN => Direction::Inbound,
+        // Not one of the two local hooks, so not something the shipped
+        // ruleset produces. Same answer as LOCAL_IN, different reason: this
+        // arm is the fail-closed default, not a classification.
+        _ => Direction::Inbound,
+    }
+}
+
 /// Coarse wall-clock unix milliseconds for the watchdog stamps. Only
 /// differences are compared, so occasional NTP steps are harmless at the
 /// minute-scale staleness threshold.
@@ -133,6 +165,12 @@ trait PacketMessage {
     fn uid(&self) -> Option<u32>;
     /// Socket group from NFQA_GID, when the kernel reported it.
     fn gid(&self) -> Option<u32>;
+    /// Which netfilter hook queued this packet, as `NF_INET_*`.
+    ///
+    /// The kernel tells us, so the daemon does not have to guess from the
+    /// addresses - and guessing would be wrong on a multi-homed or routed
+    /// host. This is what makes one queue able to serve both chains.
+    fn hook(&self) -> u8;
     fn set_verdict(&mut self, verdict: NfqVerdict);
 }
 
@@ -165,6 +203,10 @@ impl PacketMessage for Message {
 
     fn gid(&self) -> Option<u32> {
         self.get_gid()
+    }
+
+    fn hook(&self) -> u8 {
+        self.get_hook()
     }
 
     fn set_verdict(&mut self, verdict: NfqVerdict) {
@@ -344,7 +386,7 @@ enum FlowOrigin {
 
 impl FlowKey {
     fn for_flow(conn: &Connection, proc: &Process) -> Self {
-        let origin = if proc.exe.as_os_str() == "<unknown>" {
+        let origin = if !proc.exe_is_known() {
             FlowOrigin::Pid(proc.pid)
         } else {
             FlowOrigin::Exe(proc.exe.clone())
@@ -573,6 +615,7 @@ impl<Q: PacketQueue> Worker<Q> {
         let meta = PacketMeta {
             uid: msg.uid(),
             gid: msg.gid(),
+            direction: direction_for_hook(msg.hook()),
         };
         let deps = PipelineDeps {
             engine: &self.engine,
@@ -692,7 +735,11 @@ impl<Q: PacketQueue> Worker<Q> {
     /// quoted back in an ICMP error.
     fn inject_refusal(&self, msg: &Q::Msg) {
         let payload = msg.payload();
-        match packet::parse(payload, Direction::Outbound) {
+        // The direction does not change the refusal - `reject` swaps the
+        // 5-tuple to answer whoever sent the packet, which is right both ways -
+        // but pass the true one anyway rather than a literal that happens not
+        // to be read yet.
+        match packet::parse(payload, direction_for_hook(msg.hook())) {
             Ok(conn) => {
                 let outcome = self.rejecter.reject(&conn, payload);
                 trace!(?outcome, dst = %conn.dst_ip, "reject response");
@@ -772,6 +819,8 @@ struct PacketMeta {
     uid: Option<u32>,
     /// Socket group from NFQA_GID; authoritative when present.
     gid: Option<u32>,
+    /// Which way this packet is going, from the netfilter hook.
+    direction: Direction,
 }
 
 /// Environment for [`handle_packet`].
@@ -809,7 +858,7 @@ enum PacketOutcome {
 /// attribution -> hostname attach -> rule evaluation -> outcome. No queue
 /// I/O and no channel sends; the worker loop translates the outcome.
 fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> PacketOutcome {
-    let mut conn = match packet::parse(payload, Direction::Outbound) {
+    let mut conn = match packet::parse(payload, meta.direction) {
         Ok(c) => c,
         Err(e) => {
             // An unparseable packet can't be attributed or matched against
@@ -877,6 +926,33 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
             }
         }
         Decision::NeedsPrompt { fallback } => {
+            // Inbound never asks.
+            //
+            // The decision the owner took, and it is not a shortcut: nothing
+            // comes in without having been authorised, and authorising happens
+            // by writing a rule, not by answering a bubble. A prompt per
+            // inbound SYN would be a denial of service on the user's attention
+            // - an exposed machine is scanned continuously, and the traffic is
+            // not caused by anything they did - and prompt fatigue is already
+            // in this project's own threat model as a way it gets defeated.
+            //
+            // `pause` deliberately does not lift this either: pause means
+            // "stop asking me", and there is nothing here to ask.
+            if conn.direction == Direction::Inbound {
+                let verdict = Verdict::from_policy(deps.engine.inbound_default());
+                debug!(
+                    src = %conn.src_ip,
+                    port = conn.dst_port,
+                    action = ?verdict.action,
+                    "inbound flow matched no rule; applying the inbound default"
+                );
+                record(deps.stats, verdict.action);
+                return PacketOutcome::Deliver {
+                    connection: conn,
+                    process: proc,
+                    verdict,
+                };
+            }
             if deps.stats.is_paused() {
                 // Paused means "stop prompting", not "stop filtering":
                 // rules above still applied; only unmatched flows pass
@@ -944,6 +1020,7 @@ mod tests {
         DefaultPolicy {
             no_ui_action: Action::Allow,
             timeout_action: Action::Allow,
+            inbound_action: Action::Deny,
             prompt_timeout_secs: 15,
         }
     }
@@ -952,6 +1029,7 @@ mod tests {
         DefaultPolicy {
             no_ui_action: Action::Deny,
             timeout_action: Action::Deny,
+            inbound_action: Action::Deny,
             prompt_timeout_secs: 10,
         }
     }
@@ -1021,6 +1099,14 @@ mod tests {
     const NO_META: PacketMeta = PacketMeta {
         uid: None,
         gid: None,
+        direction: Direction::Outbound,
+    };
+
+    /// The same, for a packet the kernel queued from the input hook.
+    const INBOUND_META: PacketMeta = PacketMeta {
+        uid: None,
+        gid: None,
+        direction: Direction::Inbound,
     };
 
     struct TestEnv {
@@ -1054,6 +1140,113 @@ mod tests {
                 resolver: &self.resolver,
             };
             handle_packet(payload, meta, &deps)
+        }
+    }
+
+    // ---- Inbound ----
+    //
+    // The property the owner asked for, in the words they used: nothing comes
+    // in without having been authorised. These pin the three ways that could
+    // silently stop being true.
+
+    /// Only `LOCAL_OUT` is outbound. An unexpected hook must land on the
+    /// inbound side, because that is the side that cannot end in Allow.
+    #[test]
+    fn an_unexpected_hook_is_treated_as_inbound_not_outbound() {
+        assert_eq!(direction_for_hook(NF_INET_LOCAL_OUT), Direction::Outbound);
+        assert_eq!(direction_for_hook(NF_INET_LOCAL_IN), Direction::Inbound);
+        // NF_INET_FORWARD. Someone hand-added a `forward` rule; routed traffic
+        // must not inherit the path that can prompt and can be allowed.
+        assert_eq!(direction_for_hook(2), Direction::Inbound);
+    }
+
+    /// The load-bearing one. `dp_allow()` has `no_ui_action: Allow`, so a
+    /// pipeline that fell through to the ordinary no-UI fallback would accept
+    /// this packet. It must take `inbound_action` instead.
+    #[test]
+    fn an_unmatched_inbound_flow_is_denied_even_when_no_ui_action_is_allow() {
+        let env = TestEnv::new(vec![], dp_allow());
+        match env.handle(&tcp_packet(22), &INBOUND_META) {
+            PacketOutcome::Deliver { verdict, .. } => {
+                assert_eq!(verdict.action, Action::Deny);
+            }
+            other => panic!("inbound must never prompt or accept by default, got {other:?}"),
+        }
+    }
+
+    /// ...and it is genuinely `inbound_action` being read, not a Deny constant
+    /// that happens to agree with it.
+    #[test]
+    fn the_inbound_default_is_the_configured_one() {
+        let policy = DefaultPolicy {
+            no_ui_action: Action::Allow,
+            timeout_action: Action::Allow,
+            inbound_action: Action::Reject,
+            prompt_timeout_secs: 15,
+        };
+        let env = TestEnv::new(vec![], policy);
+        match env.handle(&tcp_packet(22), &INBOUND_META) {
+            PacketOutcome::Deliver { verdict, .. } => {
+                assert_eq!(verdict.action, Action::Reject);
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    /// Authorising is what rules are for: an inbound rule admits the flow.
+    #[test]
+    fn an_inbound_rule_admits_an_inbound_flow() {
+        let mut scope = RuleScope::any();
+        scope.direction = Some(Direction::Inbound);
+        scope.dst_port = Some(22);
+        scope.src_net = Some("1.2.3.0/24".parse().unwrap());
+        let rule = Rule::new("ssh-in".to_string(), Action::Allow, scope);
+
+        // tcp_packet() sources from 1.2.3.4, inside the rule's src_net.
+        match TestEnv::new(vec![rule], dp_deny()).handle(&tcp_packet(22), &INBOUND_META) {
+            PacketOutcome::Deliver { verdict, .. } => {
+                assert_eq!(verdict.action, Action::Allow);
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    /// The direction predicate has to bite in both directions, or every
+    /// pre-existing outbound rule silently becomes an inbound hole the day
+    /// the input chain is enabled. `allow_port_rule` leaves direction unset -
+    /// the shape every rule had before this feature - so this also pins that
+    /// "unset" does not mean "inbound too" for a port that matches.
+    #[test]
+    fn an_outbound_only_rule_does_not_admit_the_same_port_inbound() {
+        let mut scope = RuleScope::any();
+        scope.direction = Some(Direction::Outbound);
+        scope.dst_port = Some(22);
+        let rule = Rule::new("ssh-out".to_string(), Action::Allow, scope);
+
+        match TestEnv::new(vec![rule], dp_deny()).handle(&tcp_packet(22), &INBOUND_META) {
+            PacketOutcome::Deliver { verdict, .. } => {
+                assert_eq!(verdict.action, Action::Deny, "outbound rule leaked inbound");
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    /// The src_net predicate is the only thing standing between "ssh from the
+    /// LAN" and "ssh from anywhere", so a miss must not fall through to allow.
+    #[test]
+    fn an_inbound_rule_does_not_admit_a_peer_outside_its_src_net() {
+        let mut scope = RuleScope::any();
+        scope.direction = Some(Direction::Inbound);
+        scope.dst_port = Some(22);
+        scope.src_net = Some("192.168.0.0/16".parse().unwrap());
+        let rule = Rule::new("ssh-lan".to_string(), Action::Allow, scope);
+
+        // The packet comes from 1.2.3.4, which is not in 192.168.0.0/16.
+        match TestEnv::new(vec![rule], dp_deny()).handle(&tcp_packet(22), &INBOUND_META) {
+            PacketOutcome::Deliver { verdict, .. } => {
+                assert_eq!(verdict.action, Action::Deny);
+            }
+            other => panic!("expected Deliver, got {other:?}"),
         }
     }
 
@@ -1175,6 +1368,7 @@ mod tests {
         let meta = PacketMeta {
             uid: Some(0),
             gid: Some(0),
+            direction: Direction::Outbound,
         };
         match env.handle(&tcp_packet(443), &meta) {
             PacketOutcome::Prompt {
@@ -1198,6 +1392,7 @@ mod tests {
         let meta = PacketMeta {
             uid: Some(1000),
             gid: None,
+            direction: Direction::Outbound,
         };
         match env.handle(&tcp_packet(443), &meta) {
             PacketOutcome::Prompt {
@@ -1299,6 +1494,7 @@ mod tests {
         payload: Vec<u8>,
         uid: Option<u32>,
         gid: Option<u32>,
+        hook: u8,
         verdict: Option<NfqVerdict>,
     }
 
@@ -1309,12 +1505,17 @@ mod tests {
                 payload,
                 uid: None,
                 gid: None,
+                hook: NF_INET_LOCAL_OUT,
                 verdict: None,
             }
         }
     }
 
     impl PacketMessage for FakeMsg {
+        fn hook(&self) -> u8 {
+            self.hook
+        }
+
         fn payload(&self) -> &[u8] {
             &self.payload
         }

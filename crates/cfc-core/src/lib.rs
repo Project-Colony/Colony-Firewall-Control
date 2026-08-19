@@ -10,7 +10,7 @@ pub mod verdict;
 
 pub use connection::{Connection, Direction, Protocol};
 pub use exe_path::Resolved as ResolvedExe;
-pub use process::{Process, Provenance};
+pub use process::{Process, Provenance, UNKNOWN_EXE};
 pub use rule::{Action, Duration, Rule, RuleScope, RuleSet};
 pub use verdict::{Verdict, VerdictSource};
 

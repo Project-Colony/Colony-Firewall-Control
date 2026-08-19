@@ -257,8 +257,11 @@ pub struct Verdict {
 /// * `Once` never carries a scope. The daemon answers a persisted `Once`
 ///   verdict with `invalid_argument`, which the user would see as the
 ///   prompt simply not working.
-/// * a program rule needs a real `exe_path`. An empty one is not a narrow
-///   rule, it is a rule that matches every program on the machine.
+/// * a program rule needs an `exe_path` that can actually scope one. An empty
+///   path matches every program on the machine, and the placeholder shown for
+///   an unidentified process matches every flow that cannot be attributed -
+///   which is every inbound flow. See
+///   [`cfc_client::convert::exe_is_rule_scopable`].
 pub fn verdict_for(choice: PromptAction, ev: &proto::PromptEvent) -> Option<Verdict> {
     let (action, program_scoped) = match choice {
         PromptAction::AllowProgram => (proto::Action::Allow, true),
@@ -285,7 +288,7 @@ pub fn verdict_for(choice: PromptAction, ev: &proto::PromptEvent) -> Option<Verd
 /// Scope matching just the executable.
 fn exe_scope(ev: &proto::PromptEvent) -> Option<proto::RuleScope> {
     let p = ev.process.as_ref()?;
-    if p.exe.is_empty() {
+    if !cfc_client::convert::exe_is_rule_scopable(&p.exe) {
         return None;
     }
     Some(proto::RuleScope {
@@ -300,6 +303,11 @@ fn exe_scope(ev: &proto::PromptEvent) -> Option<proto::RuleScope> {
         has_dst_port: false,
         protocol: 0,
         has_protocol: false,
+        direction: 0,
+        has_direction: false,
+        src_net: String::new(),
+        src_port: 0,
+        has_src_port: false,
     })
 }
 

@@ -137,7 +137,10 @@ V=0.2.0
 tar --zstd -cf "colony-firewall-control-${V}-linux-x86_64.tar.zst" \
     -C target/release colony-firewalld colony-firewall cfc \
     -C ../../systemd colony-firewalld.service colony-firewall-nft.service \
-        daemon.toml.sample nftables-snippet.conf colony-firewall.sysusers \
+        colony-firewall-nft-inbound.service \
+        daemon.toml.sample nftables-snippet.conf nftables-inbound.conf \
+        colony-firewall.sysusers \
+    -C ../scripts inbound-lockout-guard.sh \
     -C ../pkg colony-firewall.desktop colony-firewall-autostart.desktop \
         colony-firewall.svg \
     -C .. README.md CHANGELOG.md LICENSE \

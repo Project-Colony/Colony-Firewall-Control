@@ -281,6 +281,25 @@ pub struct AddArgs {
     #[arg(long, value_enum, default_value_t = DurationArg::Always)]
     pub duration: DurationArg,
 
+    /// Match only this direction. Omit to match both.
+    ///
+    /// Inbound rules are how you authorise traffic *into* this machine:
+    /// nothing gets in without one. Note that inbound, `--dst-port` is the
+    /// port on THIS host and `--src-net` is the peer - `--dst-net` is refused,
+    /// because inbound the destination is you.
+    #[arg(long, value_enum)]
+    pub direction: Option<DirectionArg>,
+
+    /// Match flows whose source IP falls in this CIDR.
+    ///
+    /// The inbound counterpart of --dst-net: "who may reach us".
+    #[arg(long = "src-net")]
+    pub src_net: Option<String>,
+
+    /// Match flows coming from this source port.
+    #[arg(long = "src-port")]
+    pub src_port: Option<u16>,
+
     /// Match flows from this executable path.
     #[arg(long)]
     pub exe: Option<PathBuf>,
@@ -337,6 +356,26 @@ pub enum ProtocolArg {
     Icmp,
 }
 
+/// `--direction in|out`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum DirectionArg {
+    /// Traffic this machine is sending.
+    #[value(alias = "outbound")]
+    Out,
+    /// Traffic arriving at this machine.
+    #[value(alias = "inbound")]
+    In,
+}
+
+impl DirectionArg {
+    fn to_proto(self) -> proto::Direction {
+        match self {
+            DirectionArg::Out => proto::Direction::Outbound,
+            DirectionArg::In => proto::Direction::Inbound,
+        }
+    }
+}
+
 impl ProtocolArg {
     fn to_proto(self) -> proto::Protocol {
         match self {
@@ -351,6 +390,29 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
     if let Some(net) = &args.dst_net {
         net.parse::<ipnet::IpNet>()
             .with_context(|| format!("--dst-net {net} is not a valid CIDR"))?;
+    }
+    if let Some(net) = &args.src_net {
+        net.parse::<ipnet::IpNet>()
+            .with_context(|| format!("--src-net {net} is not a valid CIDR"))?;
+    }
+    // Caught here as well as at the daemon, so the message can name the flag
+    // the user typed rather than the wire field.
+    if matches!(args.direction, Some(DirectionArg::In)) {
+        if args.dst_net.is_some() {
+            return Err(anyhow::anyhow!(
+                "--dst-net cannot be combined with --direction in: inbound, the \
+                 destination is this machine. Use --src-net to say which peers \
+                 may reach you."
+            )
+            .into());
+        }
+        if args.dst_host.is_some() {
+            return Err(anyhow::anyhow!(
+                "--dst-host cannot be combined with --direction in: inbound, the \
+                 destination is this machine."
+            )
+            .into());
+        }
     }
 
     let duration = match args.duration {
@@ -388,6 +450,11 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
         dst_net: args.dst_net.clone().unwrap_or_default(),
         dst_port: args.dst_port.map(u32::from).unwrap_or(0),
         has_dst_port: args.dst_port.is_some(),
+        direction: args.direction.map(|d| d.to_proto() as i32).unwrap_or(0),
+        has_direction: args.direction.is_some(),
+        src_net: args.src_net.clone().unwrap_or_default(),
+        src_port: args.src_port.map(u32::from).unwrap_or(0),
+        has_src_port: args.src_port.is_some(),
         protocol: args.protocol.map(|p| p.to_proto() as i32).unwrap_or(0),
         has_protocol: args.protocol.is_some(),
     };
@@ -629,6 +696,15 @@ pub struct ExportedScope {
     pub dst_port: Option<u16>,
     #[serde(default)]
     pub protocol: Option<String>,
+    /// "in" or "out". Absent means the rule applies to both, which is what
+    /// every rule exported before inbound filtering existed means - so old
+    /// files keep importing unchanged.
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub src_net: Option<String>,
+    #[serde(default)]
+    pub src_port: Option<u16>,
 }
 
 /// `rules show --json`: the export shape plus the read-only bookkeeping
@@ -695,6 +771,31 @@ impl ExportedRule {
             "until-restart" | "until_restart" => proto::Duration::UntilRestart,
             other => return Err(bad("duration", other, "always, once, until-restart")),
         };
+        let direction_idx = match self.scope.direction.as_deref() {
+            None => None,
+            Some(d) => Some(match d.to_ascii_lowercase().as_str() {
+                "out" | "outbound" => proto::Direction::Outbound as i32,
+                "in" | "inbound" => proto::Direction::Inbound as i32,
+                other => return Err(bad("direction", other, "in, out")),
+            }),
+        };
+        if let Some(net) = self.scope.src_net.as_deref() {
+            net.parse::<ipnet::IpNet>()
+                .map_err(|e| format!("rule `{name}`: bad src_net `{net}`: {e}"))?;
+        }
+        // The same trap the daemon rejects, caught here so the message can name
+        // the rule in a 200-line file.
+        if direction_idx == Some(proto::Direction::Inbound as i32)
+            && (self.scope.dst_net.is_some() || self.scope.dst_host.is_some())
+        {
+            return Err(format!(
+                "rule `{name}`: an inbound rule cannot be scoped on dst_net or \
+                 dst_host - inbound, the destination is this machine. Use \
+                 src_net for the peer."
+            ));
+        }
+        let src_net = self.scope.src_net.clone();
+        let src_port = self.scope.src_port;
         let protocol_idx = match self.scope.protocol.as_deref() {
             None => None,
             Some(p) => Some(match p.to_ascii_lowercase().as_str() {
@@ -759,6 +860,11 @@ impl ExportedRule {
             has_dst_port: self.scope.dst_port.is_some(),
             protocol: protocol_idx.unwrap_or(0),
             has_protocol: protocol_idx.is_some(),
+            direction: direction_idx.unwrap_or(0),
+            has_direction: direction_idx.is_some(),
+            src_net: src_net.unwrap_or_default(),
+            src_port: src_port.map(u32::from).unwrap_or(0),
+            has_src_port: src_port.is_some(),
         };
         Ok(proto::RuleInfo {
             id,
@@ -799,6 +905,11 @@ pub fn exported_rule(r: &proto::RuleInfo) -> ExportedRule {
             protocol: scope
                 .and_then(|s| s.has_protocol.then_some(s.protocol))
                 .map(|p| convert::protocol_label(p).to_string()),
+            direction: scope
+                .and_then(|s| s.has_direction.then_some(s.direction))
+                .map(|d| convert::direction_label(d).to_string()),
+            src_net: scope.and_then(|s| opt_string(&s.src_net)),
+            src_port: scope.and_then(|s| s.has_src_port.then_some(s.src_port as u16)),
         },
     }
 }
@@ -1106,10 +1217,19 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
 struct BundleRule {
     name: &'static str,
     /// Absolute paths to try, in order. First one that exists wins.
+    ///
+    /// Empty for an inbound entry: inbound rules are about ports and peers,
+    /// not about which program happens to be listening. Requiring an exe there
+    /// would also make the rule stop working the day the service is replaced -
+    /// exactly when you least want your SSH rule to evaporate.
     exe_candidates: &'static [&'static str],
-    dst_host: Option<&'static str>,
     dst_port: Option<u16>,
     protocol: Option<proto::Protocol>,
+    /// `Some(Inbound)` makes this an inbound rule; `None` leaves the rule
+    /// direction-agnostic, which is what every pre-existing bundle entry is.
+    direction: Option<proto::Direction>,
+    /// Which peers may reach us. Only meaningful with `direction: Inbound`.
+    src_net: Option<&'static str>,
 }
 
 impl BundleRule {
@@ -1121,6 +1241,12 @@ impl BundleRule {
     /// everywhere, so they escaped this by luck rather than design; a
     /// distribution that lays things out differently would not have.
     fn resolve(&self) -> Option<PathBuf> {
+        // An entry with no candidates is not "the program is missing", it is
+        // "this rule is not about a program". Returning an empty path lets it
+        // flow through the same planning and reporting as every other entry.
+        if self.exe_candidates.is_empty() {
+            return Some(PathBuf::new());
+        }
         self.exe_candidates
             .iter()
             .copied()
@@ -1156,9 +1282,10 @@ fn bundles() -> Vec<Bundle> {
                         "/usr/lib/systemd/systemd-resolved",
                         "/lib/systemd/systemd-resolved",
                     ],
-                    dst_host: None,
                     dst_port: Some(53),
                     protocol: None,
+                    direction: None,
+                    src_net: None,
                 },
                 // NTP - timesyncd or chrony.
                 BundleRule {
@@ -1167,39 +1294,44 @@ fn bundles() -> Vec<Bundle> {
                         "/usr/lib/systemd/systemd-timesyncd",
                         "/lib/systemd/systemd-timesyncd",
                     ],
-                    dst_host: None,
                     dst_port: Some(123),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "default-chrony",
                     exe_candidates: &["/usr/bin/chronyd", "/usr/sbin/chronyd"],
-                    dst_host: None,
                     dst_port: Some(123),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
                 // Package managers - HTTPS mirrors.
                 BundleRule {
                     name: "default-pacman-https",
                     exe_candidates: &["/usr/bin/pacman"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "default-paru-https",
                     exe_candidates: &["/usr/bin/paru"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 // SSH client.
                 BundleRule {
                     name: "default-ssh-client",
                     exe_candidates: &["/usr/bin/ssh"],
-                    dst_host: None,
                     dst_port: Some(22),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 // DHCP clients. The units are ordered Before=network-pre.target,
                 // so filtering is live before any interface is configured: these
@@ -1211,30 +1343,34 @@ fn bundles() -> Vec<Bundle> {
                 BundleRule {
                     name: "default-dhcpcd",
                     exe_candidates: &["/usr/bin/dhcpcd", "/usr/sbin/dhcpcd"],
-                    dst_host: None,
                     dst_port: Some(67),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "default-dhcpcd-v6",
                     exe_candidates: &["/usr/bin/dhcpcd", "/usr/sbin/dhcpcd"],
-                    dst_host: None,
                     dst_port: Some(547),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "default-networkmanager-dhcp",
                     exe_candidates: &["/usr/bin/NetworkManager", "/usr/sbin/NetworkManager"],
-                    dst_host: None,
                     dst_port: Some(67),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "default-networkmanager-dhcp6",
                     exe_candidates: &["/usr/bin/NetworkManager", "/usr/sbin/NetworkManager"],
-                    dst_host: None,
                     dst_port: Some(547),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "default-networkd-dhcp",
@@ -1242,9 +1378,10 @@ fn bundles() -> Vec<Bundle> {
                         "/usr/lib/systemd/systemd-networkd",
                         "/lib/systemd/systemd-networkd",
                     ],
-                    dst_host: None,
                     dst_port: Some(67),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "default-networkd-dhcp6",
@@ -1252,9 +1389,10 @@ fn bundles() -> Vec<Bundle> {
                         "/usr/lib/systemd/systemd-networkd",
                         "/lib/systemd/systemd-networkd",
                     ],
-                    dst_host: None,
                     dst_port: Some(547),
                     protocol: Some(Udp),
+                    direction: None,
+                    src_net: None,
                 },
             ],
         },
@@ -1265,39 +1403,44 @@ fn bundles() -> Vec<Bundle> {
                 BundleRule {
                     name: "updates-apt-https",
                     exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/https"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 // Debian mirrors are still commonly plain HTTP; the packages
                 // are signed, so the transport is not what protects them.
                 BundleRule {
                     name: "updates-apt-http",
                     exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/http"],
-                    dst_host: None,
                     dst_port: Some(80),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "updates-dnf-https",
                     exe_candidates: &["/usr/bin/dnf", "/usr/bin/dnf5"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "updates-flatpak-https",
                     exe_candidates: &["/usr/bin/flatpak"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "updates-yay-https",
                     exe_candidates: &["/usr/bin/yay"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
             ],
         },
@@ -1314,44 +1457,109 @@ fn bundles() -> Vec<Bundle> {
                 BundleRule {
                     name: "dev-git-https",
                     exe_candidates: &["/usr/bin/git"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "dev-git-ssh",
                     exe_candidates: &["/usr/bin/git"],
-                    dst_host: None,
                     dst_port: Some(22),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "dev-cargo-https",
                     exe_candidates: &["/usr/bin/cargo"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "dev-npm-https",
                     exe_candidates: &["/usr/bin/npm", "/usr/bin/node"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "dev-pip-https",
                     exe_candidates: &["/usr/bin/pip", "/usr/bin/pip3"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
                 },
                 BundleRule {
                     name: "dev-docker-https",
                     exe_candidates: &["/usr/bin/dockerd", "/usr/bin/podman"],
-                    dst_host: None,
                     dst_port: Some(443),
                     protocol: Some(Tcp),
+                    direction: None,
+                    src_net: None,
+                },
+            ],
+        },
+        // The only bundle whose entries name no executable, because inbound
+        // rules are about ports and peers. Tying "SSH may reach me" to a
+        // particular sshd binary would make the rule evaporate the day the
+        // service is replaced - precisely when you least want it to.
+        //
+        // Everything here is scoped to private networks. A bundle that opened
+        // a port to the whole internet would be the wrong kind of convenient,
+        // and someone who wants that can say so in one command.
+        Bundle {
+            name: "inbound",
+            summary: "the inbound traffic a machine on a home or office LAN normally needs",
+            rules: vec![
+                // Nothing gets in without a rule, so SSH needs one before the
+                // inbound chain is worth enabling. LAN-scoped: this is the
+                // rule that stops you locking yourself out, not an invitation
+                // to the internet.
+                BundleRule {
+                    name: "inbound-ssh-lan",
+                    exe_candidates: &[],
+                    dst_port: Some(22),
+                    protocol: Some(Tcp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("192.168.0.0/16"),
+                },
+                // mDNS and LLMNR: how `.local` names resolve, and how printers,
+                // speakers and phones announce themselves. Denying these is
+                // what makes a LAN feel broken in ways nobody connects back to
+                // the firewall - the symptom is a device that "sometimes"
+                // disappears.
+                BundleRule {
+                    name: "inbound-mdns",
+                    exe_candidates: &[],
+                    dst_port: Some(5353),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: None,
+                },
+                BundleRule {
+                    name: "inbound-llmnr",
+                    exe_candidates: &[],
+                    dst_port: Some(5355),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: None,
+                },
+                // DHCP replies arrive at the client's port 68 from the server.
+                // Without this a lease renewal fails and the machine loses its
+                // address on a timer measured in hours - the slowest possible
+                // way to discover a firewall rule is missing.
+                BundleRule {
+                    name: "inbound-dhcp-client",
+                    exe_candidates: &[],
+                    dst_port: Some(68),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: None,
                 },
             ],
         },
@@ -1392,9 +1600,10 @@ fn browser_rules() -> Vec<BundleRule> {
                 // type for names that live as long as the process anyway.
                 name: Box::leak(format!("web-{stem}-{suffix}").into_boxed_str()),
                 exe_candidates: paths,
-                dst_host: None,
                 dst_port: Some(port),
                 protocol: Some(proto::Protocol::Tcp),
+                direction: None,
+                src_net: None,
             });
         }
     }
@@ -1436,11 +1645,31 @@ fn plan(bundle: &Bundle) -> Planned {
     Planned { present, absent }
 }
 
+/// The rule `bundle add` sends for one entry, resolved to a concrete `exe`.
+///
+/// Exists as its own function so a test can exercise the exact mapping the
+/// install path uses. When this was inlined, the call site passed `None` for
+/// two of the fields and nothing noticed until a rule was read back off disk.
+fn proto_for(spec: &BundleRule, exe: &str) -> proto::RuleInfo {
+    allow_rule(
+        spec.name,
+        exe,
+        spec.dst_port,
+        spec.protocol,
+        spec.direction,
+        spec.src_net,
+    )
+}
+
+/// `direction`/`src_net` are what an inbound bundle entry needs; every
+/// outbound one leaves them unset.
 fn allow_rule(
     name: &str,
     exe: &str,
     port: Option<u16>,
     proto_: Option<proto::Protocol>,
+    direction: Option<proto::Direction>,
+    src_net: Option<&str>,
 ) -> proto::RuleInfo {
     proto::RuleInfo {
         id: String::new(),
@@ -1460,6 +1689,11 @@ fn allow_rule(
             has_dst_port: port.is_some(),
             protocol: proto_.map(|p| p as i32).unwrap_or(0),
             has_protocol: proto_.is_some(),
+            direction: direction.map(|d| d as i32).unwrap_or(0),
+            has_direction: direction.is_some(),
+            src_net: src_net.unwrap_or_default().to_string(),
+            src_port: 0,
+            has_src_port: false,
         }),
         created_at_unix_ms: 0,
         hit_count: 0,
@@ -1524,22 +1758,13 @@ pub async fn bundle_add(
     format: OutputFormat,
 ) -> CliResult {
     let bundle = find_bundle(name)?;
-    let by_name: std::collections::HashMap<String, BundleRule> = bundle
-        .rules
-        .iter()
-        .map(|r| {
-            (
-                r.name.to_string(),
-                BundleRule {
-                    name: r.name,
-                    exe_candidates: r.exe_candidates,
-                    dst_host: r.dst_host,
-                    dst_port: r.dst_port,
-                    protocol: r.protocol,
-                },
-            )
-        })
-        .collect();
+    // Borrow the entries rather than rebuilding them. A field-by-field copy
+    // here silently dropped `direction` and `src_net` once already, turning
+    // "allow ssh inbound from the LAN" into an undirected "allow tcp/22" -
+    // a rule that reads like policy and enforces something wider. A reference
+    // cannot lose a field the next time one is added.
+    let by_name: std::collections::HashMap<&str, &BundleRule> =
+        bundle.rules.iter().map(|r| (r.name, r)).collect();
 
     let existing: std::collections::HashSet<String> = client
         .list_rules()
@@ -1560,12 +1785,7 @@ pub async fn bundle_add(
         let spec = &by_name[*rule_name];
         if !dry_run {
             client
-                .upsert_rule(allow_rule(
-                    rule_name,
-                    &exe.to_string_lossy(),
-                    spec.dst_port,
-                    spec.protocol,
-                ))
+                .upsert_rule(proto_for(spec, &exe.to_string_lossy()))
                 .await?;
         }
         if !format.is_json() {
@@ -1799,6 +2019,9 @@ mod json_tests {
                 dst_net: None,
                 dst_port: None,
                 protocol: None,
+                direction: None,
+                src_net: None,
+                src_port: None,
             },
         }
     }
@@ -1892,6 +2115,11 @@ mod json_tests {
             has_dst_port: true,
             protocol: proto::Protocol::Tcp as i32,
             has_protocol: true,
+            direction: 0,
+            has_direction: false,
+            src_net: String::new(),
+            src_port: 0,
+            has_src_port: false,
         };
         let original = proto::RuleInfo {
             id: "3f1b8a0e-5c4d-4e2a-9b7f-1a2b3c4d5e6f".into(),
@@ -1975,21 +2203,41 @@ mod bundle_tests {
 
     /// The invariant the whole feature rests on.
     ///
-    /// A bundle that installed a bare "allow tcp/443" would re-open exactly
-    /// the hole this program exists to close: a payload phoning home uses 443
-    /// like everything else, and a port-shaped rule cannot tell it from a
-    /// browser. The type makes `exe_candidates` mandatory; this makes "empty
-    /// list" - the way round it - impossible too.
+    /// A bundle that installed a bare "allow tcp/443" outbound would re-open
+    /// exactly the hole this program exists to close: a payload phoning home
+    /// uses 443 like everything else, and a port-shaped rule cannot tell it
+    /// from a browser. The type makes `exe_candidates` mandatory; this makes
+    /// "empty list" - the way round it - impossible too.
+    ///
+    /// Inbound is the one exception, and it is not a loophole. There is no
+    /// executable to name: the connection arrives before any process has
+    /// accepted it, so the thing being authorised is genuinely a port, not a
+    /// program. What replaces the exe as the narrowing predicate is the port
+    /// itself, so an inbound entry that names neither is still refused - that
+    /// would be "accept anything", which no bundle may install in either
+    /// direction.
     #[test]
-    fn every_bundle_rule_names_an_executable() {
+    fn every_bundle_rule_names_an_executable_or_is_a_scoped_inbound_one() {
         for b in bundles() {
             for r in &b.rules {
-                assert!(
-                    !r.exe_candidates.is_empty(),
-                    "{}/{} has no candidate path, so it would match on port alone",
-                    b.name,
-                    r.name
-                );
+                if r.exe_candidates.is_empty() {
+                    assert_eq!(
+                        r.direction,
+                        Some(proto::Direction::Inbound),
+                        "{}/{} names no executable, which is only allowed for an \
+                         inbound entry; outbound it would match on port alone",
+                        b.name,
+                        r.name
+                    );
+                    assert!(
+                        r.dst_port.is_some(),
+                        "{}/{} is inbound with neither an executable nor a port, \
+                         so it would admit any new connection",
+                        b.name,
+                        r.name
+                    );
+                    continue;
+                }
                 for c in r.exe_candidates {
                     assert!(
                         c.starts_with('/'),
@@ -1999,6 +2247,62 @@ mod bundle_tests {
                         r.name
                     );
                 }
+            }
+        }
+    }
+
+    /// Every predicate in a bundle entry must survive the trip to the daemon.
+    ///
+    /// This is a regression test with a scar: `bundle add` used to rebuild the
+    /// entry field-by-field on the way to `allow_rule`, and the rebuild passed
+    /// `None` for `direction` and `src_net`. `cfc rules bundle add inbound`
+    /// reported "4 added" and wrote four rules that said "allow tcp/22" with no
+    /// direction and no source - wider than what the bundle says, and wider in
+    /// the outbound direction too. Nothing caught it because the definitions
+    /// were tested and the wire format was tested, but not the step between.
+    #[test]
+    fn bundle_add_sends_every_predicate_the_entry_declares() {
+        for b in bundles() {
+            for r in &b.rules {
+                let sent = proto_for(r, "/usr/bin/example");
+                let scope = sent.scope.as_ref().expect("a bundle rule must be scoped");
+
+                assert_eq!(
+                    scope.has_direction,
+                    r.direction.is_some(),
+                    "{}/{}: direction lost between the entry and the wire",
+                    b.name,
+                    r.name
+                );
+                if let Some(d) = r.direction {
+                    assert_eq!(scope.direction, d as i32, "{}/{}", b.name, r.name);
+                }
+
+                let sent_src_net = (!scope.src_net.is_empty()).then_some(scope.src_net.as_str());
+                assert_eq!(
+                    sent_src_net, r.src_net,
+                    "{}/{}: src_net lost between the entry and the wire",
+                    b.name, r.name
+                );
+
+                assert_eq!(
+                    scope.has_dst_port,
+                    r.dst_port.is_some(),
+                    "{}/{}: dst_port lost",
+                    b.name,
+                    r.name
+                );
+                if let Some(p) = r.dst_port {
+                    assert_eq!(scope.dst_port, u32::from(p), "{}/{}", b.name, r.name);
+                }
+
+                assert_eq!(
+                    scope.has_protocol,
+                    r.protocol.is_some(),
+                    "{}/{}: protocol lost",
+                    b.name,
+                    r.name
+                );
             }
         }
     }
@@ -2078,9 +2382,10 @@ mod bundle_tests {
         let r = BundleRule {
             name: "t",
             exe_candidates: &["/definitely/not/here", "/proc/self/exe"],
-            dst_host: None,
             dst_port: Some(443),
             protocol: Some(proto::Protocol::Tcp),
+            direction: None,
+            src_net: None,
         };
         // /proc/self/exe is itself a symlink to the running binary, so this
         // also proves the candidate is resolved rather than stored verbatim -

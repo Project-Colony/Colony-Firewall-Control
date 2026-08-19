@@ -126,6 +126,16 @@ message RuleScope {
   bool has_dst_port = 9;
   Protocol protocol = 10;
   bool has_protocol = 11;
+  // Which way the flow goes. Unset matches both, which is what every rule
+  // written before inbound filtering existed means.
+  Direction direction = 12;
+  bool has_direction = 13;
+  // The packet's SOURCE, i.e. the remote peer on an inbound flow. dst_net
+  // cannot express "who may reach us" - inbound the destination is this
+  // machine - so these are the inbound equivalents.
+  string src_net = 14;
+  uint32 src_port = 15;
+  bool has_src_port = 16;
 }
 
 message RuleInfo {

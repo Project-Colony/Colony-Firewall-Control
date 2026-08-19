@@ -1497,6 +1497,11 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         has_dst_port: dst_port.is_some(),
         protocol: ed.protocol.map(|p| p as i32).unwrap_or(0),
         has_protocol: ed.protocol.is_some(),
+        direction: 0,
+        has_direction: false,
+        src_net: String::new(),
+        src_port: 0,
+        has_src_port: false,
     };
 
     Ok(proto::RuleInfo {

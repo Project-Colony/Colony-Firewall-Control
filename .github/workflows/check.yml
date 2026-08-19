@@ -290,8 +290,11 @@ jobs:
           usr/bin/colony-firewalld
           usr/lib/systemd/system/colony-firewalld.service
           usr/lib/systemd/system/colony-firewall-nft.service
+          usr/lib/systemd/system/colony-firewall-nft-inbound.service
           usr/lib/sysusers.d/colony-firewall.conf
           usr/share/colony-firewall/nftables-snippet.conf
+          usr/share/colony-firewall/nftables-inbound.conf
+          usr/lib/colony-firewall/inbound-lockout-guard.sh
           usr/share/applications/colony-firewall.desktop
           etc/xdg/autostart/colony-firewall.desktop
           usr/share/icons/hicolor/scalable/apps/colony-firewall.svg

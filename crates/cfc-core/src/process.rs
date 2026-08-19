@@ -65,14 +65,34 @@ pub struct Process {
     pub provenance: Provenance,
 }
 
+/// The placeholder [`Process::unknown`] puts in `exe`, because the field is a
+/// `PathBuf` and has no way to say "we could not find out".
+///
+/// Public and named because it is load-bearing rather than cosmetic. It is not
+/// a path, it is the *absence* of one, and anything that compares paths has to
+/// know the difference: a rule scoped to this string once meant "allow every
+/// program I cannot identify", which is the opposite of what an exe-scoped rule
+/// is for. See [`Process::exe_is_known`].
+pub const UNKNOWN_EXE: &str = "<unknown>";
+
 impl Process {
+    /// Whether `exe` is a real path rather than [`UNKNOWN_EXE`].
+    ///
+    /// Callers that match on the executable must check this. "I could not
+    /// identify this program" can never satisfy "this program is X" - treating
+    /// the placeholder as a comparable path turns one rule into a wildcard
+    /// over everything unattributable, which inbound traffic always is.
+    pub fn exe_is_known(&self) -> bool {
+        self.exe.as_os_str() != UNKNOWN_EXE
+    }
+
     pub fn unknown(pid: u32) -> Self {
         Self {
             pid,
             ppid: None,
             uid: None,
             gid: None,
-            exe: PathBuf::from("<unknown>"),
+            exe: PathBuf::from(UNKNOWN_EXE),
             cmdline: Vec::new(),
             cwd: None,
             sha256: None,

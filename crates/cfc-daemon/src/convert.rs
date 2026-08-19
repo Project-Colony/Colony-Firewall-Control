@@ -116,6 +116,21 @@ pub fn direction_to_pb(d: Direction) -> pb::Direction {
     }
 }
 
+/// Fails closed, like every other enum crossing this boundary.
+///
+/// `has_direction = true` with an unspecified value is a client that meant to
+/// say something and did not; guessing "outbound" would silently make an
+/// inbound rule fire on the wrong traffic entirely.
+pub fn direction_from_pb(d: i32) -> Result<Direction, String> {
+    match pb::Direction::try_from(d) {
+        Ok(pb::Direction::Outbound) => Ok(Direction::Outbound),
+        Ok(pb::Direction::Inbound) => Ok(Direction::Inbound),
+        Ok(pb::Direction::Unspecified) | Err(_) => {
+            Err(format!("direction unspecified/unknown: {d}"))
+        }
+    }
+}
+
 pub fn duration_to_pb(d: cfc_core::Duration) -> pb::Duration {
     use cfc_core::Duration as D;
     match d {
@@ -205,6 +220,11 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
         dst_net: s.dst_net.map(|n| n.to_string()).unwrap_or_default(),
         dst_port: s.dst_port.map(|p| p as u32).unwrap_or(0),
         has_dst_port: s.dst_port.is_some(),
+        direction: s.direction.map(|d| direction_to_pb(d) as i32).unwrap_or(0),
+        has_direction: s.direction.is_some(),
+        src_net: s.src_net.map(|n| n.to_string()).unwrap_or_default(),
+        src_port: s.src_port.map(|p| p as u32).unwrap_or(0),
+        has_src_port: s.src_port.is_some(),
         protocol: s.protocol.map(|p| protocol_to_pb(p) as i32).unwrap_or(0),
         has_protocol: s.protocol.is_some(),
     }
@@ -243,7 +263,25 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
             })?),
             false => None,
         };
+    let direction = match s.has_direction {
+        true => Some(direction_from_pb(s.direction)?),
+        false => None,
+    };
+    let src_net = match empty_to_none(&s.src_net) {
+        Some(n) => Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad src_net `{n}`: {e}"))?),
+        None => None,
+    };
+    let src_port =
+        match s.has_src_port {
+            true => Some(u16::try_from(s.src_port).map_err(|_| {
+                format!("src_port {} is out of range; a port is 0-65535", s.src_port)
+            })?),
+            false => None,
+        };
     Ok(RuleScope {
+        direction,
+        src_net,
+        src_port,
         exe_path: empty_to_none(&s.exe_path).map(Into::into),
         exe_sha256: empty_to_none(&s.exe_sha256),
         parent_exe: empty_to_none(&s.parent_exe).map(Into::into),
@@ -301,6 +339,8 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
         None => RuleScope::any(),
     };
     reject_unscoped(&scope)?;
+    scope.reject_unmatchable_exe()?;
+    scope.reject_inbound_destination_scope()?;
     let created_at = if r.created_at_unix_ms == 0 {
         chrono::Utc::now()
     } else {
@@ -618,6 +658,9 @@ mod tests {
     #[test]
     fn scope_roundtrip_full() {
         let scope = RuleScope {
+            direction: None,
+            src_net: None,
+            src_port: None,
             exe_path: Some(PathBuf::from("/usr/bin/curl")),
             exe_sha256: Some("abc123".into()),
             parent_exe: Some(PathBuf::from("/bin/bash")),
