@@ -39,6 +39,7 @@
 //! (dev, inode, mtime) with a TTL. A steady-state packet does zero I/O
 //! here.
 
+use anyhow::Context as _;
 use cfc_core::Provenance;
 use flate2::read::GzDecoder;
 use parking_lot::{Mutex, RwLock};
@@ -113,19 +114,35 @@ pub fn enabled() -> bool {
 /// The detected backend for this host, resolved once. `None` on a system
 /// with neither a pacman nor a dpkg database (or when detection raced a
 /// package manager mid-install and found neither).
-static BACKEND: LazyLock<Option<Box<dyn PackageDb>>> =
-    LazyLock::new(|| detect(Path::new(PACMAN_LOCAL_DB), Path::new(DPKG_INFO_DB)));
+static BACKEND: LazyLock<Option<Box<dyn PackageDb>>> = LazyLock::new(|| {
+    detect(
+        Path::new(PACMAN_LOCAL_DB),
+        Path::new(RPM_DB),
+        Path::new(DPKG_INFO_DB),
+    )
+});
 
 #[allow(clippy::type_complexity)]
 static LOOKUP_CACHE: LazyLock<Mutex<TtlCache<(u64, u64, i64, i64), Option<PackageFile>>>> =
     LazyLock::new(|| Mutex::new(TtlCache::new(LOOKUP_CACHE_TTL, LOOKUP_CACHE_CAP)));
 
-/// Picks a backend by which database directory exists. pacman first: it is
-/// the only one of the two that can actually verify, so on the (bizarre but
-/// possible) host carrying both, prefer the answer that means something.
-pub fn detect(pacman_root: &Path, dpkg_root: &Path) -> Option<Box<dyn PackageDb>> {
+/// Picks a backend by which database directory exists.
+///
+/// Ordered by how much the answer is worth, not alphabetically. pacman and rpm
+/// both record SHA-256 and can therefore say something about the *bytes*; dpkg
+/// records MD5 and can only name the package. On the (unusual but real - think
+/// a converted image, or a container with both trees mounted) host carrying
+/// more than one, preferring a backend that can verify is preferring the answer
+/// that means something.
+///
+/// pacman before rpm only because a host with a pacman database is an Arch
+/// host; nothing else ships one.
+pub fn detect(pacman_root: &Path, rpm_root: &Path, dpkg_root: &Path) -> Option<Box<dyn PackageDb>> {
     if pacman_root.is_dir() {
         return Some(Box::new(Pacman::new(pacman_root.to_path_buf())));
+    }
+    if rpm_root.is_dir() {
+        return Some(Box::new(Rpm::new(rpm_root.to_path_buf())));
     }
     if dpkg_root.is_dir() {
         return Some(Box::new(Dpkg::new(dpkg_root.to_path_buf())));
@@ -226,6 +243,18 @@ struct Index {
     /// these are directory names (`"curl-8.21.0-1"`), for dpkg the package
     /// name from `<pkg>.list`.
     packages: Vec<Box<str>>,
+    /// Recorded digest per path hash, for backends that carry one inline.
+    ///
+    /// Empty for pacman, which reads digests lazily out of one package's
+    /// `mtree`, and for dpkg, which records only MD5. Only rpm populates it,
+    /// because `rpm -qa` hands back names, paths and digests in a single pass
+    /// and a second query per binary would mean another subprocess against a
+    /// database `dnf` may be holding open.
+    ///
+    /// Raw 32 bytes rather than the 64-character hex string: on a full RHEL
+    /// install that is ~8 MB instead of ~18 MB, and the hex round trip happens
+    /// once per newly-seen executable rather than 200,000 times at build.
+    digests: HashMap<u64, [u8; 32]>,
     /// Hash of the absolute path -> index into `packages`.
     ///
     /// The paths themselves are *not* stored. A full path table for a
@@ -244,8 +273,21 @@ impl Index {
         Self {
             stamp,
             packages: Vec::new(),
+            digests: HashMap::new(),
             owner: HashMap::new(),
         }
+    }
+
+    /// The digest this backend recorded for `key`, as lowercase hex.
+    fn digest(&self, key: u64) -> Option<String> {
+        self.digests.get(&key).map(|raw| {
+            let mut out = String::with_capacity(64);
+            for b in raw {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{b:02x}");
+            }
+            out
+        })
     }
 
     fn get(&self, key: u64) -> Option<String> {
@@ -270,8 +312,34 @@ impl Index {
         }
     }
 
+    /// Records one file, with the digest the database vouches for when there
+    /// is one this build can compare against.
+    ///
+    /// `package_id` comes from [`Self::intern_package`], so a caller feeding
+    /// files one at a time does not repeat the package name per file.
+    fn add_file(&mut self, package_id: u32, path: &str, digest: Option<[u8; 32]>) {
+        let key = path_hash(Path::new(path));
+        self.owner.insert(key, package_id);
+        if let Some(d) = digest {
+            self.digests.insert(key, d);
+        }
+    }
+
+    /// Reserves a slot for `package` and returns its id.
+    ///
+    /// Unlike [`Self::add_package`] this stores the name unconditionally, so a
+    /// caller that turns out to contribute no files leaves one unused string
+    /// behind. That is the right trade for a streaming parser, which cannot
+    /// know a package's file count before it has read them.
+    fn intern_package(&mut self, package: &str) -> Option<u32> {
+        let id = u32::try_from(self.packages.len()).ok()?;
+        self.packages.push(package.to_string().into_boxed_str());
+        Some(id)
+    }
+
     fn shrink(mut self) -> Self {
         self.packages.shrink_to_fit();
+        self.digests.shrink_to_fit();
         self.owner.shrink_to_fit();
         self
     }
@@ -313,12 +381,23 @@ impl IndexCache {
         exe: &Path,
         build: impl FnOnce(Option<SystemTime>) -> Index,
     ) -> Option<String> {
+        self.record_of(exe, build).map(|(pkg, _)| pkg)
+    }
+
+    /// The package owning `exe` *and* the digest the index carries for it, for
+    /// backends that record one inline. The second element is always `None`
+    /// for pacman and dpkg; see [`Index::digests`].
+    fn record_of(
+        &self,
+        exe: &Path,
+        build: impl FnOnce(Option<SystemTime>) -> Index,
+    ) -> Option<(String, Option<String>)> {
         let stamp = self.stamp();
         let key = path_hash(exe);
 
         if let Some(idx) = self.index.read().as_ref() {
             if idx.stamp == stamp {
-                return idx.get(key);
+                return idx.get(key).map(|p| (p, idx.digest(key)));
             }
         }
 
@@ -346,7 +425,8 @@ impl IndexCache {
             }
             *guard = Some(idx);
         }
-        guard.as_ref()?.get(key)
+        let idx = guard.as_ref()?;
+        idx.get(key).map(|p| (p, idx.digest(key)))
     }
 }
 
@@ -568,6 +648,249 @@ fn path_hash(path: &Path) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.as_os_str().as_encoded_bytes().hash(&mut h);
     h.finish()
+}
+
+// ---------------------------------------------------------------------------
+// rpm
+// ---------------------------------------------------------------------------
+
+/// Canonical location of the rpm database directory.
+pub const RPM_DB: &str = "/var/lib/rpm";
+
+/// How long `rpm -qa` is given before it is killed and the index left empty.
+///
+/// Not a performance knob - a safety one. `dnf` holds the rpmdb open for the
+/// length of a transaction, and a query that arrives mid-upgrade waits for it.
+/// Without a bound, a `dnf update` on a slow disk would block whichever thread
+/// is building the index, and that thread is on the packet path. Ten seconds
+/// is far past any healthy query on the biggest installs and far short of a
+/// package transaction.
+const RPM_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the timeout is re-checked while waiting. Small enough that the
+/// deadline means something, large enough not to spin.
+const RPM_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// RHEL, Rocky, Fedora, SUSE - and the only backend here that can actually
+/// verify a binary.
+///
+/// # Why this one shells out
+///
+/// The other two backends read plain text out of the package database. rpm's
+/// is a binary store whose *format* has changed three times in the versions
+/// this daemon has to run on: Berkeley DB on RHEL 7-8, sqlite on RHEL 9 and
+/// 10, ndb on some SUSE builds. Reading it directly would mean either a sqlite
+/// dependency plus an RPM header decoder, or a promise to track a format that
+/// has not held still. `rpm(8)` reads all three and is on every host that has
+/// the database at all.
+///
+/// The cost is a subprocess, so it is spent **once per index generation**, not
+/// once per lookup: a single `rpm -qa` streams every package, path and digest
+/// in one pass, and [`IndexCache`] rebuilds only when `/var/lib/rpm` changes -
+/// which is to say when something is installed or removed. A per-lookup query
+/// would have been the smaller change and the worse one: every newly-seen
+/// binary would be another process contending for the same database lock.
+///
+/// # Why it can verify when dpkg cannot
+///
+/// rpm has recorded SHA-256 in `FILEDIGESTS` since 4.6 (RHEL 6). Older
+/// packages, and anything built with `%_source_filedigest_algorithm 1`, record
+/// MD5 instead. The two are told apart by length - 64 hex characters against
+/// 32 - and an MD5 digest is dropped rather than compared, which lands that
+/// file in the same "owned, unverifiable" state as everything under dpkg. See
+/// [`parse_rpm_line`].
+pub struct Rpm {
+    cache: IndexCache,
+    /// The `rpm` binary. A field so tests can point it at a stub instead of
+    /// requiring rpm to be installed on whatever runs them.
+    program: PathBuf,
+    /// [`RPM_QUERY_TIMEOUT`] in production. A field so the test that proves the
+    /// bound exists does not have to spend the real ceiling proving it.
+    timeout: Duration,
+}
+
+impl Rpm {
+    pub fn new(root: PathBuf) -> Self {
+        Self::with_program(root, PathBuf::from("rpm"))
+    }
+
+    fn with_program(root: PathBuf, program: PathBuf) -> Self {
+        Self {
+            cache: IndexCache::new(root, "rpm"),
+            program,
+            timeout: RPM_QUERY_TIMEOUT,
+        }
+    }
+
+    /// One `rpm -qa` pass, streamed.
+    ///
+    /// A failure of any kind - rpm missing, the database locked, the query
+    /// timing out - yields an *empty* index rather than propagating. That is
+    /// the same answer this host gave before this backend existed
+    /// (`Unpackaged` everywhere), and it is the only answer that keeps a
+    /// package transaction from being able to stall the firewall.
+    fn build_index(&self, stamp: Option<SystemTime>) -> Index {
+        let mut idx = Index::empty(stamp);
+        let out = match self.run_query() {
+            Ok(out) => out,
+            Err(e) => {
+                warn!(
+                    "rpm provenance query failed: {e}; \
+                     binaries on this host will report as unpackaged"
+                );
+                return idx;
+            }
+        };
+        let mut current: Option<(String, u32)> = None;
+        for line in out.lines() {
+            let Some((package, path, digest)) = parse_rpm_line(line) else {
+                continue;
+            };
+            // Lines arrive grouped by package, so the name is interned once per
+            // group rather than once per file.
+            let id = match &current {
+                Some((name, id)) if name == package => *id,
+                _ => {
+                    let Some(id) = idx.intern_package(package) else {
+                        break;
+                    };
+                    current = Some((package.to_string(), id));
+                    id
+                }
+            };
+            idx.add_file(id, path, digest);
+        }
+        idx.shrink()
+    }
+
+    /// Runs the query with a deadline, killing it if it overruns.
+    fn run_query(&self) -> anyhow::Result<String> {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(&self.program)
+            .arg("-qa")
+            .arg("--dbpath")
+            .arg(&self.cache.root)
+            .arg("--qf")
+            .arg(RPM_QUERY_FORMAT)
+            // Locale affects nothing in this format, but a stray LC_ALL that
+            // makes rpm emit a translated warning on stderr should not end up
+            // parsed as data. stderr is discarded outright for the same reason.
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawning {}", self.program.display()))?;
+
+        // Read on this thread while the child writes: the output is tens of
+        // megabytes on a full install, which is far past a pipe buffer, so
+        // waiting first and reading after would deadlock.
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let reader = std::thread::spawn(move || {
+            let mut buf = String::new();
+            use std::io::Read as _;
+            stdout.read_to_string(&mut buf).map(|_| buf)
+        });
+
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(e) => return Err(anyhow::Error::new(e).context("waiting for rpm")),
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "rpm did not answer within {:?} (a package transaction may hold \
+                     the database); leaving the provenance index empty",
+                    self.timeout
+                );
+            }
+            std::thread::sleep(RPM_POLL_INTERVAL);
+        }
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("rpm output reader panicked"))?
+            .context("reading rpm output")
+    }
+}
+
+/// One line per *file*, not per package.
+///
+/// `[...]` iterates the file arrays together, so the scalar name and version
+/// repeat on every line. That redundancy is the point: it makes the output a
+/// stream that can be parsed without holding a package's file list in memory,
+/// and [`Rpm::build_index`] interns the repeated name once per group.
+///
+/// `%{FILEMODES:perms}` is carried only to drop directories. A directory entry
+/// would otherwise let `/usr/bin` claim ownership of every binary under it -
+/// the same trap the pacman backend avoids by skipping trailing slashes.
+const RPM_QUERY_FORMAT: &str =
+    "[%{NAME} %{VERSION}-%{RELEASE}\t%{FILEMODES:perms}\t%{FILENAMES}\t%{FILEDIGESTS}\n]";
+
+/// Splits one [`RPM_QUERY_FORMAT`] line into `(package, path, digest)`.
+///
+/// Returns `None` for anything that is not a regular file's record: rpm writes
+/// warnings and `(none)` placeholders into the same stream, and a directory
+/// must never be indexed as an owner.
+///
+/// The digest is `Some` only for a 64-character hex string. rpm may record
+/// MD5 (32 characters) on older packages, and an empty field for directories,
+/// symlinks and `%ghost` entries; both become `None`, which [`decide`] renders
+/// as "owned, unverifiable" with the package name still set.
+fn parse_rpm_line(line: &str) -> Option<(&str, &str, Option<[u8; 32]>)> {
+    let mut fields = line.split('\t');
+    let package = fields.next()?;
+    let modes = fields.next()?;
+    let path = fields.next()?;
+    let digest = fields.next().unwrap_or("");
+    if fields.next().is_some() {
+        // A path containing a tab would land here. rpm allows it; indexing a
+        // truncated path would be worse than skipping the file.
+        return None;
+    }
+    // `-rwxr-xr-x` for a regular file; `d`, `l`, `c`, `b`, `s`, `p` otherwise.
+    if !modes.starts_with('-') {
+        return None;
+    }
+    if package.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    Some((package, path, parse_sha256_hex(digest)))
+}
+
+/// Decodes exactly 64 lowercase-or-uppercase hex characters into 32 bytes.
+///
+/// Length is the discriminator between rpm's SHA-256 and MD5 digests, so this
+/// is deliberately strict about it: a 32-character MD5 must come back `None`
+/// rather than being padded into something that would compare unequal to every
+/// real digest and report a clean file as [`Provenance::Modified`].
+fn parse_sha256_hex(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (bytes[i * 2] as char).to_digit(16)?;
+        let lo = (bytes[i * 2 + 1] as char).to_digit(16)?;
+        *slot = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+impl PackageDb for Rpm {
+    fn name(&self) -> &'static str {
+        "rpm"
+    }
+
+    fn lookup(&self, exe: &Path) -> Option<PackageFile> {
+        let (package, sha256) = self.cache.record_of(exe, |s| self.build_index(s))?;
+        Some(PackageFile { package, sha256 })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,23 +1314,199 @@ mod tests {
         );
     }
 
+    // --- rpm ------------------------------------------------------------
+
+    const SHA_CURL: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const MD5_OLD: &str = "22222222222222222222222222222222";
+
+    /// A stand-in for `rpm(8)` that prints `out` and exits.
+    ///
+    /// The real binary is not required to test this: what is being tested is
+    /// the parse and the timeout, not rpm itself. A shell script also lets a
+    /// test make rpm hang, which no installed rpm would do on demand.
+    fn fake_rpm(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("fake-rpm");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn rpm_with_output(dir: &Path, lines: &str) -> Rpm {
+        let db = dir.join("rpmdb");
+        std::fs::create_dir_all(&db).unwrap();
+        // `cat <<'EOF'` keeps tabs and avoids any quoting of the payload.
+        let prog = fake_rpm(dir, &format!("cat <<'CFCEOF'\n{lines}CFCEOF"));
+        Rpm::with_program(db, prog)
+    }
+
     #[test]
-    fn detection_prefers_pacman_and_gives_up_cleanly() {
+    fn rpm_reports_the_package_and_verifies_against_a_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = rpm_with_output(
+            tmp.path(),
+            &format!(
+                "curl 8.0.1-1.el9\t-rwxr-xr-x\t/usr/bin/curl\t{SHA_CURL}\n\
+                 curl 8.0.1-1.el9\tdrwxr-xr-x\t/usr/share/doc/curl\t\n"
+            ),
+        );
+        let rec = db.lookup(Path::new("/usr/bin/curl")).expect("owned");
+        assert_eq!(rec.package, "curl 8.0.1-1.el9");
+        assert_eq!(rec.sha256.as_deref(), Some(SHA_CURL));
+
+        // The directory in that output must not have been indexed: if it had,
+        // /usr/share/doc/curl would answer for its whole subtree.
+        assert!(db.lookup(Path::new("/usr/share/doc/curl")).is_none());
+        assert!(db.lookup(Path::new("/usr/bin/wget")).is_none());
+    }
+
+    #[test]
+    fn rpm_drops_an_md5_digest_rather_than_comparing_it() {
+        // An old package, or one built with %_source_filedigest_algorithm 1.
+        // Reporting the MD5 as if it were a SHA-256 would make `decide` compare
+        // it against the running digest and call a clean file Modified.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = rpm_with_output(
+            tmp.path(),
+            &format!("ancient 1.0-1\t-rwxr-xr-x\t/usr/bin/ancient\t{MD5_OLD}\n"),
+        );
+        let rec = db.lookup(Path::new("/usr/bin/ancient")).expect("owned");
+        assert_eq!(rec.package, "ancient 1.0-1");
+        assert_eq!(
+            rec.sha256, None,
+            "an MD5 must land in the owned-but-unverifiable state, not be compared"
+        );
+        assert_eq!(
+            decide(Some(&rec), Some("whatever")),
+            Provenance::Unknown,
+            "and it must read as Unknown, never Modified"
+        );
+    }
+
+    #[test]
+    fn rpm_that_does_not_answer_leaves_the_index_empty_rather_than_blocking() {
+        // The `dnf` case: a transaction holds the database and the query waits.
+        // The firewall must not wait with it - the thread building this index
+        // is on the packet path.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("rpmdb");
+        std::fs::create_dir_all(&db).unwrap();
+        let prog = fake_rpm(tmp.path(), "sleep 30");
+        let mut rpm = Rpm::with_program(db, prog);
+        // The shipped ceiling is 10s; there is nothing to learn from spending
+        // it here. What matters is that a deadline exists, is honoured, and is
+        // far below the child's own lifetime.
+        rpm.timeout = Duration::from_millis(300);
+
+        let started = Instant::now();
+        assert!(rpm.run_query().is_err(), "a hung rpm must be an error");
+        let took = started.elapsed();
+        assert!(
+            took >= rpm.timeout,
+            "it gave up before the deadline: took {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(10),
+            "the query was not bounded: took {took:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_rpm_binary_is_an_empty_index_not_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("rpmdb");
+        std::fs::create_dir_all(&db).unwrap();
+        let rpm = Rpm::with_program(db, tmp.path().join("no-such-rpm"));
+        assert!(rpm.lookup(Path::new("/usr/bin/curl")).is_none());
+    }
+
+    #[test]
+    fn rpm_line_parsing_rejects_what_is_not_a_file_record() {
+        // Warnings and placeholders share the stream with real records.
+        assert!(parse_rpm_line("").is_none());
+        assert!(parse_rpm_line("warning: something happened").is_none());
+        assert!(parse_rpm_line("pkg 1.0-1\tdrwxr-xr-x\t/usr/bin\t").is_none());
+        assert!(
+            parse_rpm_line("pkg 1.0-1\tlrwxrwxrwx\t/usr/bin/link\t").is_none(),
+            "a symlink is not the file whose bytes are running"
+        );
+        assert!(
+            parse_rpm_line("pkg 1.0-1\t-rwxr-xr-x\trelative/path\t").is_none(),
+            "rpm paths are absolute; anything else is a parse that went wrong"
+        );
+        assert!(
+            parse_rpm_line("pkg 1.0-1\t-rwxr-xr-x\t/usr/bin/a\tb\textra").is_none(),
+            "a tab inside a path truncates it; skipping the file is the safe half"
+        );
+
+        let line = format!("pkg 1.0-1\t-rwxr-xr-x\t/usr/bin/a\t{SHA_CURL}");
+        let (pkg, path, digest) = parse_rpm_line(&line).unwrap();
+        assert_eq!((pkg, path), ("pkg 1.0-1", "/usr/bin/a"));
+        assert!(digest.is_some());
+
+        // No digest at all: a %ghost file, or one rpm chose not to record.
+        let (_, _, none) = parse_rpm_line("pkg 1.0-1\t-rw-r--r--\t/var/log/x\t").unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn sha256_hex_is_decoded_strictly() {
+        assert_eq!(parse_sha256_hex(SHA_CURL).unwrap()[0], 0x11);
+        assert_eq!(
+            parse_sha256_hex(&SHA_CURL.to_uppercase()).unwrap()[0],
+            0x11,
+            "rpm has emitted both cases over the years"
+        );
+        assert!(parse_sha256_hex("").is_none());
+        assert!(parse_sha256_hex(MD5_OLD).is_none(), "32 chars is MD5");
+        assert!(
+            parse_sha256_hex(&"z".repeat(64)).is_none(),
+            "right length, not hex"
+        );
+    }
+
+    #[test]
+    fn the_index_round_trips_a_digest_through_hex() {
+        // The index stores 32 raw bytes and hands back a hex string; a bug in
+        // either direction would compare unequal to every running digest and
+        // report every packaged binary as Modified.
+        let mut idx = Index::empty(None);
+        let id = idx.intern_package("curl 8.0.1-1.el9").unwrap();
+        idx.add_file(id, "/usr/bin/curl", parse_sha256_hex(SHA_CURL));
+        let key = path_hash(Path::new("/usr/bin/curl"));
+        assert_eq!(idx.digest(key).as_deref(), Some(SHA_CURL));
+    }
+
+    #[test]
+    fn detection_prefers_a_backend_that_can_verify_and_gives_up_cleanly() {
         let tmp = tempfile::tempdir().unwrap();
         let pac = tmp.path().join("pacman");
+        let rpm = tmp.path().join("rpm");
         let deb = tmp.path().join("dpkg");
         let none = tmp.path().join("nothing");
 
-        assert!(detect(&none, &none).is_none(), "no database anywhere");
+        assert!(
+            detect(&none, &none, &none).is_none(),
+            "no database anywhere"
+        );
 
         std::fs::create_dir_all(&deb).unwrap();
-        assert_eq!(detect(&none, &deb).map(|d| d.name()), Some("dpkg"));
+        assert_eq!(detect(&none, &none, &deb).map(|d| d.name()), Some("dpkg"));
+
+        // rpm records SHA-256 and dpkg records MD5, so on a host carrying both
+        // trees the one that can say something about the bytes must win.
+        std::fs::create_dir_all(&rpm).unwrap();
+        assert_eq!(
+            detect(&none, &rpm, &deb).map(|d| d.name()),
+            Some("rpm"),
+            "rpm wins over dpkg: only one of them can verify"
+        );
 
         std::fs::create_dir_all(&pac).unwrap();
         assert_eq!(
-            detect(&pac, &deb).map(|d| d.name()),
+            detect(&pac, &rpm, &deb).map(|d| d.name()),
             Some("pacman"),
-            "pacman wins: it is the only backend that can verify"
+            "a pacman database means an Arch host; nothing else ships one"
         );
     }
 
