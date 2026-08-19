@@ -1,0 +1,38 @@
+# Verifier instruction ceilings for the kernel-side programs.
+#
+# The kernel gives a BPF program 1,000,000 instructions and refuses it at
+# 1,000,001. `cfc_dns_ingress` has been on the wrong side of that line before:
+# in-kernel DNS name parsing came out at 1,000,001 and the parsing had to move
+# to userspace (see README.md). Nothing warned first - it simply stopped
+# loading, and it would have stopped loading on a user's machine rather than
+# here if the numbers had been a little different.
+#
+# So these are tripwires, not targets. Each `max` is roughly 2x the observed
+# cost: enough headroom that ordinary edits do not trip it, tight enough that
+# a change with a runaway cost is caught in the commit that introduced it.
+#
+# Read by `loads_and_attaches_on_this_kernel` via `include_str!`, NOT by
+# reading this path at run time: the qemu matrix runs the test binary inside a
+# guest that has no source tree and no CARGO_MANIFEST_DIR.
+#
+# `observed` is what the verifier actually reported on the kernel named below.
+# It is documentation, not a check - kernels legitimately differ. `max` is the
+# check.
+
+measured_on = "7.1.8"
+
+[cfc_sched_process_exec]
+observed = 257
+max = 600
+
+[cfc_sched_process_exit]
+observed = 25
+max = 200
+
+[cfc_dns_ingress]
+# The expensive one, and the reason this file exists. 17,058 is 1.7% of the
+# budget; the ceiling is deliberately well under the point where a rewrite
+# would be needed, so "this got much more expensive" is a test failure rather
+# than a discovery someone makes six months later.
+observed = 17058
+max = 40000

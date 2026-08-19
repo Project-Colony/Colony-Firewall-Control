@@ -1,0 +1,393 @@
+# FIRST-RUN NOTE. Every job below is written but has never executed - a
+# workflow cannot be validated from a working tree. Treat the first push as the
+# real test, and expect the items marked `VERIFY` to need one round of
+# correction against real output.
+
+name: ebpf
+
+# The ring-0 layer's own gate. Split out of check.yml because it needs a
+# pinned nightly, bpf-linker, a matching LLVM, and - for the interesting
+# half - kernels that are not the runner's.
+#
+# What each job is for:
+#
+#   object        can the kernel-side crate still be built at all, and does the
+#                 result contain what the loader looks up by name?
+#   runner-kernel does it load and attach on a real, current kernel?
+#   capabilities  does it do that WITHOUT CAP_SYS_ADMIN? (the claim the unit
+#                 file makes)
+#   vm            does it still do that on the kernels users actually run, and
+#                 on mainline, so a future kernel breaking us is caught here
+#                 rather than by them?
+
+on:
+  push:
+    branches: [main]
+    paths: &ebpf-paths
+      - "crates/cfc-ebpf/**"
+      - "crates/cfc-ebpf-common/**"
+      - "crates/cfc-daemon/src/ebpf/**"
+      - "crates/cfc-daemon/src/ebpf.rs"
+      - "crates/xtask/**"
+      - ".github/workflows/ebpf.yml"
+  pull_request:
+    branches: [main]
+    paths: *ebpf-paths
+  # Mainline moves whether or not this repo does, so the whole point of the
+  # matrix is a run that happens without a push. Sunday 05:00 UTC.
+  schedule:
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the object once and hand it to every other job.
+  # ---------------------------------------------------------------------------
+  object:
+    runs-on: ubuntu-24.04
+    outputs:
+      nightly: ${{ steps.pins.outputs.nightly }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Read the toolchain pins
+        id: pins
+        run: |
+          NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cfc-ebpf/rust-toolchain.toml)"
+          LINKER="$(tr -d '[:space:]' < crates/cfc-ebpf/bpf-linker-version)"
+          # An empty parse would install "latest" for both and produce an
+          # object built by an unknown toolchain, which is worse than failing.
+          if [ -z "${NIGHTLY}" ] || [ -z "${LINKER}" ]; then
+            echo "::error::could not read the eBPF toolchain pins (nightly='${NIGHTLY}' bpf-linker='${LINKER}')"
+            exit 1
+          fi
+          echo "nightly=${NIGHTLY}" >> "${GITHUB_OUTPUT}"
+          echo "linker=${LINKER}" >> "${GITHUB_OUTPUT}"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ steps.pins.outputs.nightly }}
+          components: rust-src
+
+      # Keyed on BOTH pins: bumping either one must invalidate this, or a
+      # cached bpf-linker built against the old LLVM silently survives.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: bpf-${{ steps.pins.outputs.nightly }}-${{ steps.pins.outputs.linker }}
+
+      - name: Install bpf-linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev
+          cargo install bpf-linker --version "${{ steps.pins.outputs.linker }}" --locked
+
+      # `bpfel-unknown-none` sets obj-is-bitcode: rustc hands bpf-linker raw
+      # LLVM bitcode, so rustc's LLVM must not be NEWER than bpf-linker's or
+      # the link dies with `Invalid record`. Pinning the rustc that *compiles*
+      # bpf-linker does not make this true - bpf-linker links whatever libLLVM
+      # the system provides - so assert it rather than assume it.
+      - name: Assert the LLVM versions pair
+        run: |
+          RUSTC_LLVM="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+          LINKER_LLVM="$(bpf-linker --version 2>/dev/null | sed -n 's/.*LLVM \([0-9]*\).*/\1/p')"
+          echo "rustc LLVM=${RUSTC_LLVM}  bpf-linker LLVM=${LINKER_LLVM}"
+          if [ -z "${RUSTC_LLVM}" ]; then
+            echo "::error::could not determine rustc's LLVM version"; exit 1
+          fi
+          if [ -n "${LINKER_LLVM}" ] && [ "${RUSTC_LLVM}" -gt "${LINKER_LLVM}" ]; then
+            echo "::error::rustc LLVM ${RUSTC_LLVM} is newer than bpf-linker's ${LINKER_LLVM}; the link will fail with 'Invalid record'. Bump crates/cfc-ebpf/bpf-linker-version or move the nightly pin back."
+            exit 1
+          fi
+
+      - name: Build and check the object
+        run: |
+          cargo xtask build-ebpf
+          cargo xtask ebpf-check
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cfc-ebpf-object
+          path: crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Load it for real on the runner's own kernel.
+  # ---------------------------------------------------------------------------
+  runner-kernel:
+    needs: object
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cfc-ebpf-object
+          path: obj
+
+      - run: uname -a
+
+      # The test binds 127.0.0.1:53 to impersonate a resolver. Fail naming
+      # whoever holds it rather than blindly stopping systemd-resolved.
+      - name: Preflight - port 53 must be free
+        run: |
+          if ss -lunp 'sport = :53' 2>/dev/null | tail -n +2 | grep -q .; then
+            echo "::error::something is listening on udp/53 on this runner:"
+            ss -lunp 'sport = :53'
+            exit 1
+          fi
+
+      # Ask cargo where the binary is rather than globbing target/*/deps/*.
+      # A glob picks up stale binaries from a previous compile and runs the
+      # wrong one, silently.
+      - name: Locate the test binary
+        id: bin
+        run: |
+          echo "path=$(./scripts/ebpf-test-binary.sh)" >> "${GITHUB_OUTPUT}"
+
+      - name: Load and attach
+        env:
+          # Two getent calls against a possibly-unreachable resolver cost ~40s
+          # and assert nothing; the hermetic half of the test is the one that
+          # must hold.
+          CFC_SKIP_LIVE_RESOLUTION: "1"
+        run: |
+          sudo -E CFC_EBPF_OBJECT="${PWD}/obj/cfc-ebpf.o" \
+            "${{ steps.bin.outputs.path }}" --ignored --nocapture --test-threads=1 \
+            loads_and_attaches
+
+  # ---------------------------------------------------------------------------
+  # The claim systemd/colony-firewalld.service makes, tested.
+  # ---------------------------------------------------------------------------
+  capabilities:
+    needs: object
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev util-linux
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cfc-ebpf-object
+          path: obj
+
+      - name: Locate the test binary
+        id: bin
+        run: |
+          echo "path=$(./scripts/ebpf-test-binary.sh)" >> "${GITHUB_OUTPUT}"
+
+      # dac_override is NOT a sixth grant the unit needs - it stands in for the
+      # DAC bypass the daemon gets by running as uid 0, because /sys/kernel/
+      # tracing is 0700 root. The test drops to a non-root uid precisely so
+      # that capabilities are the only privilege in play, and refuses to pass
+      # if it finds itself running as root or holding CAP_SYS_ADMIN.
+      - name: Attach with the unit's capabilities and no CAP_SYS_ADMIN
+        run: |
+          CAPS='+net_admin,+net_raw,+sys_ptrace,+bpf,+perfmon,+dac_override'
+          sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups \
+            --bounding-set "-all,${CAPS}" --inh-caps "${CAPS}" --ambient-caps "${CAPS}" \
+            env CFC_EBPF_OBJECT="${PWD}/obj/cfc-ebpf.o" \
+            "${{ steps.bin.outputs.path }}" --ignored --nocapture --test-threads=1 \
+            only_the_units_capabilities
+
+  # ---------------------------------------------------------------------------
+  # The kernels users actually run, plus mainline.
+  # ---------------------------------------------------------------------------
+  vm:
+    needs: object
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Roles, not an arbitrary spread:
+          #   6.12  the oldest LTS worth supporting today
+          #   6.18  the newest LTS
+          #   7.1   the kernel every verified-instruction number in
+          #         crates/cfc-ebpf/README.md was measured on
+          #   main  the whole point: catch a future kernel breaking us here
+          #         rather than on a user's machine
+          - kernel: "6.12"
+            role: floor-lts
+          - kernel: "6.18"
+            role: newest-lts
+          - kernel: "7.1"
+            role: measured-on
+          - kernel: "mainline"
+            role: future
+    # Mainline is expected to break sometimes and must not redden a PR that did
+    # not cause it. On the schedule it is a real failure worth an issue.
+    continue-on-error: ${{ matrix.kernel == 'mainline' && github.event_name != 'schedule' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libnfnetlink-dev \
+            libnetfilter-queue-dev qemu-system-x86 e2fsprogs
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cfc-ebpf-object
+          path: obj
+
+      - name: Locate the test binary
+        id: bin
+        run: |
+          echo "path=$(./scripts/ebpf-test-binary.sh)" >> "${GITHUB_OUTPUT}"
+
+      # VERIFY (first run): the exact image reference and the path the vmlinuz
+      # lands on. Once confirmed, replace the tag with a sha256 digest - every
+      # other action in this repo is SHA-pinned, and this one executes a
+      # third-party kernel binary in a job that also has the repo checkout.
+      - name: Fetch the kernel
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}"
+          docker create --name k "${IMG}"
+          docker cp k:/boot/vmlinuz ./vmlinuz
+          docker rm k
+          ls -l ./vmlinuz
+
+      # docker export -> mke2fs -d builds the image from a directory, so the
+      # test binary and the object are just files placed there beforehand.
+      # That removes the guest-transport problem entirely, and needs only
+      # virtio_blk + ext4 in the guest - both built in. virtiofs and 9p are
+      # MODULES on Ubuntu mainline builds, so any design that mounts the host
+      # rootfs that way needs an initramfs; this one does not.
+      - name: Build the guest rootfs
+        run: |
+          set -euo pipefail
+          mkdir -p rootfs
+          docker create --name rfs debian:bookworm-slim
+          docker export rfs | tar -C rootfs -xf -
+          docker rm rfs
+
+          install -D -m0755 "${{ steps.bin.outputs.path }}" rootfs/cfc-test
+          install -D -m0644 obj/cfc-ebpf.o rootfs/cfc-ebpf.o
+
+          cat > rootfs/init <<'INIT'
+          #!/bin/sh
+          # Minimal PID 1. Everything the loader touches has to be mounted here:
+          # tracefs for the tracepoint id/format files, cgroup2 for the DNS
+          # program's attach point, sysfs for /sys/kernel/btf/vmlinux.
+          set -x
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mount -t devtmpfs devtmpfs /dev
+          mount -t tmpfs tmpfs /tmp
+          mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || \
+            mount -t debugfs debugfs /sys/kernel/debug
+          mount -t cgroup2 cgroup2 /sys/fs/cgroup
+          ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+
+          echo "guest glibc: $(ldd --version 2>&1 | head -1)"
+          echo "guest kernel: $(uname -r)"
+
+          CFC_EBPF_OBJECT=/cfc-ebpf.o /cfc-test --ignored --nocapture \
+            --test-threads=1 loads_and_attaches
+          echo "CFC_EXIT=$?"
+          poweroff -f
+          INIT
+          chmod +x rootfs/init
+
+          # Slack for the binary; the base image is ~80 MiB.
+          mke2fs -t ext4 -d rootfs -F rootfs.ext4 2G
+
+      - name: Boot and run
+        run: |
+          set -euo pipefail
+          START=$(date +%s)
+          timeout 600 qemu-system-x86_64 \
+            -nographic -no-reboot -m 2G -smp 2 \
+            -kernel ./vmlinuz \
+            -drive file=rootfs.ext4,if=virtio,format=raw \
+            -append "root=/dev/vda rw init=/init console=ttyS0 panic=1" \
+            | tee guest.log
+          ELAPSED=$(( $(date +%s) - START ))
+
+          # A guest that never printed the marker did not run the test - a
+          # boot failure must not read as a pass.
+          if ! grep -q 'CFC_EXIT=' guest.log; then
+            echo "::error::the guest never reached the test (no CFC_EXIT marker)"
+            exit 1
+          fi
+          CODE="$(sed -n 's/.*CFC_EXIT=\([0-9]*\).*/\1/p' guest.log | tail -1)"
+
+          {
+            echo "### kernel ${{ matrix.kernel }} (${{ matrix.role }})"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| exit | ${CODE} |"
+            echo "| boot+test wall clock | ${ELAPSED}s |"
+            grep -o 'verified_insns: [^ ]* = [0-9]*' guest.log | while read -r _ p _ n; do
+              echo "| \`${p}\` verified insns | ${n} |"
+            done
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # Wall clock, not just instruction count. They are different
+          # quantities, and after ebpf::start moved behind READY=1 it is the
+          # wall clock that decides whether automatic mode is safe on a boot
+          # path. 120s is generous for a VM; a real regression is 10x.
+          if [ "${ELAPSED}" -gt 120 ]; then
+            echo "::warning::boot+test took ${ELAPSED}s"
+          fi
+          exit "${CODE}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: guest-log-${{ matrix.kernel }}
+          path: guest.log
+          if-no-files-found: warn
+
+  # A scheduled mainline failure is a real finding and must not sink silently
+  # into a red square nobody looks at on a Sunday.
+  mainline-alert:
+    needs: vm
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const title = 'ebpf: the kernel matrix failed on the scheduled run';
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'ebpf-matrix',
+            });
+            if (existing.data.length > 0) return;
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title,
+              labels: ['ebpf-matrix'],
+              body: `The scheduled eBPF kernel matrix failed.\n\n` +
+                    `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n` +
+                    `Mainline moving is the expected cause. Check the guest-log-* artifacts ` +
+                    `for which kernel and which program.`,
+            });

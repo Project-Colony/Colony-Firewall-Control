@@ -52,6 +52,20 @@ TimeoutStopSec=15
 # most of root, to enable a feature whose kernel requirements (ring buffers,
 # BTF) start at 5.8 anyway. On such a kernel the load fails, the daemon warns
 # and carries on without it, which is the correct outcome.
+#
+# That CAP_SYS_ADMIN is genuinely unnecessary is tested, not assumed:
+# `attaches_with_only_the_units_capabilities` drops to a non-root uid holding
+# exactly this set, asserts CAP_SYS_ADMIN is absent from its own effective set,
+# and requires all three programs to attach.
+#
+# One thing that test surfaced and this unit relies on without saying so: the
+# daemon runs as **uid 0** (there is no User= here), and it needs that for
+# more than capabilities. /sys/kernel/tracing is drwx------ root, so reading
+# the tracepoint id/format files is a discretionary-access question that no
+# capability in the list above answers - root's implicit DAC bypass does.
+# Adding User= to this unit, without also granting CAP_DAC_OVERRIDE, would
+# silently cost the daemon both tracepoints (process tracking) while leaving
+# the cgroup program (DNS capture) working.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_BPF CAP_PERFMON
 NoNewPrivileges=true

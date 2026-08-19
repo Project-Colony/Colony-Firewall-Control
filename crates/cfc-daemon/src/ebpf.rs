@@ -431,7 +431,13 @@ pub fn start(cfg: &EbpfConfig, dns: DnsCache, table: proc_table::KernelProcTable
             report: Report::inert(
                 cfg.enabled,
                 cfg!(feature = "ebpf"),
-                "disabled in config ([ebpf] enabled = false); using sock_diag + /proc only",
+                // Deliberately does not name a cause. `start` is handed an
+                // already-resolved mode and cannot tell `[ebpf] enabled = false`
+                // from `--dry-run` forcing it off, and a note that guesses is
+                // worse than one that does not: it would send someone to edit a
+                // config file that says nothing of the sort. Whoever forced it
+                // says so themselves - see main.rs.
+                "switched off; using sock_diag + /proc only",
             ),
             #[cfg(feature = "ebpf")]
             _attached: None,

@@ -921,6 +921,200 @@ mod tests {
         assert_eq!(decode::<ExitEvent>(&bytes).unwrap().pid, 7);
     }
 
+    /// The ceilings, compiled in rather than read from disk.
+    ///
+    /// `include_str!` and not `std::fs::read`: the qemu matrix runs this very
+    /// binary inside a guest that has no source tree, so a runtime path would
+    /// turn the check into a skip on exactly the kernels it exists to watch.
+    const VERIFIER_BUDGET: &str = include_str!("../../../cfc-ebpf/verifier-budget.toml");
+
+    /// Fails if any program cost more than its ceiling.
+    ///
+    /// The budget is 1,000,000 and `cfc_dns_ingress` has been over it before -
+    /// it simply stopped loading, with no warning first. These ceilings are
+    /// tripwires so that happens in the commit that caused it rather than on
+    /// someone else's kernel.
+    ///
+    /// A program with no entry is a hard failure, not a pass: adding a program
+    /// and forgetting its ceiling would silently leave the new one unwatched.
+    fn assert_within_verifier_budget(measured: &[(String, u32)]) {
+        // A three-line parse rather than a toml dependency: cfc-daemon has no
+        // toml crate in its non-dev graph, and this file's shape is fixed.
+        let mut section = String::new();
+        let mut ceilings: Vec<(String, u32)> = Vec::new();
+        for line in VERIFIER_BUDGET.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = name.to_string();
+            } else if let Some(v) = line.strip_prefix("max") {
+                let v = v.trim_start_matches([' ', '=']).trim();
+                if let Ok(n) = v.parse::<u32>() {
+                    ceilings.push((section.clone(), n));
+                }
+            }
+        }
+        assert!(
+            !ceilings.is_empty(),
+            "verifier-budget.toml parsed to nothing; the format changed"
+        );
+
+        for (program, insns) in measured {
+            let max = ceilings
+                .iter()
+                .find(|(name, _)| name == program)
+                .map(|(_, m)| *m)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{program} has no ceiling in crates/cfc-ebpf/verifier-budget.toml; \
+                         add one rather than leaving a program unwatched"
+                    )
+                });
+            assert!(
+                *insns <= max,
+                "{program} cost {insns} verified instructions, over its ceiling of {max}. \
+                 The kernel's own limit is 1,000,000 and this program has been over it \
+                 before. Either the change is more expensive than intended, or the \
+                 ceiling in crates/cfc-ebpf/verifier-budget.toml needs raising on purpose."
+            );
+            println!("budget: {program} = {insns} (max {max})");
+        }
+    }
+
+    /// Capability bit numbers, from `include/uapi/linux/capability.h`.
+    const CAP_DAC_OVERRIDE: u32 = 1;
+    const CAP_NET_ADMIN: u32 = 12;
+    const CAP_SYS_PTRACE: u32 = 19;
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_PERFMON: u32 = 38;
+    const CAP_BPF: u32 = 39;
+
+    /// The effective capability set of this process, from `/proc/self/status`.
+    fn effective_caps() -> u64 {
+        let status =
+            std::fs::read_to_string("/proc/self/status").expect("reading /proc/self/status");
+        let line = status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .expect("no CapEff line in /proc/self/status");
+        u64::from_str_radix(line.trim(), 16).expect("CapEff is hex")
+    }
+
+    fn has_cap(set: u64, bit: u32) -> bool {
+        set & (1u64 << bit) != 0
+    }
+
+    /// Proves what `systemd/colony-firewalld.service` claims: the five
+    /// capabilities it grants are **enough**, and `CAP_SYS_ADMIN` is not
+    /// needed. Until now that was a comment in a unit file.
+    ///
+    /// Run it as an ordinary user holding the unit's set:
+    ///
+    /// ```sh
+    /// CAPS='+net_admin,+net_raw,+sys_ptrace,+bpf,+perfmon,+dac_override'
+    /// cargo xtask build-ebpf
+    /// cargo build -p cfc-daemon --tests --profile fast
+    /// sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups \
+    ///     --bounding-set "-all,${CAPS}" --inh-caps "$CAPS" --ambient-caps "$CAPS" \
+    ///     env CFC_EBPF_OBJECT="$(cargo xtask ebpf-path)" \
+    ///     ./target/fast/deps/cfc_daemon-<hash> --ignored --nocapture only_the_units_capabilities
+    /// ```
+    ///
+    /// # Why `dac_override` is in that list and not in the unit
+    ///
+    /// It is **not** a sixth thing the daemon needs granted. `/sys/kernel/tracing`
+    /// is `drwx------ root`, so reading the tracepoint `id` and `format` files
+    /// is a *discretionary access* question, not a capability one, and the
+    /// daemon answers it by being uid 0 - the unit sets no `User=`, and root
+    /// bypasses DAC implicitly. This test deliberately drops to a non-root uid
+    /// so that capabilities are the only privilege in play, which means it has
+    /// to ask for that bypass explicitly. Substituting for root's DAC bypass is
+    /// exactly what `CAP_DAC_OVERRIDE` is.
+    ///
+    /// Verified by removing it: without `dac_override` the cgroup program still
+    /// loads and attaches, and both tracepoints fail with "tracefs not found".
+    /// That is the shape of a DAC refusal, not a missing capability - and it is
+    /// worth knowing, because it means running this daemon as a non-root user
+    /// would silently cost it process tracking while leaving DNS capture
+    /// working.
+    ///
+    /// It refuses to pass by accident: running it as root, or with
+    /// `CAP_SYS_ADMIN` in the effective set, fails before it loads anything.
+    /// A test that silently proves nothing when misrun is worse than no test.
+    ///
+    /// Deliberately narrower than `loads_and_attaches_on_this_kernel`: it
+    /// stops at "all three attached". The end-to-end DNS probe there binds
+    /// `127.0.0.1:53`, and a port below 1024 needs `CAP_NET_BIND_SERVICE`,
+    /// which the unit does **not** grant and the daemon never needs - only the
+    /// test harness does, to impersonate a resolver. Requiring it here would
+    /// quietly turn this into "six capabilities are enough".
+    #[tokio::test]
+    #[ignore = "run under setpriv with the unit's capability set; see the doc comment"]
+    async fn attaches_with_only_the_units_capabilities() {
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(
+            uid, 0,
+            "running as root proves nothing about which capabilities are needed; \
+             re-run under setpriv (see this test's doc comment)"
+        );
+
+        let caps = effective_caps();
+        println!("euid={uid} CapEff={caps:#018x}");
+        assert!(
+            !has_cap(caps, CAP_SYS_ADMIN),
+            "CAP_SYS_ADMIN is in the effective set, so a pass here would not \
+             show that the unit's narrower grant is sufficient"
+        );
+        // And the ones the unit does grant really are present, or the test is
+        // measuring a differently-broken environment.
+        for (bit, name) in [
+            (CAP_BPF, "CAP_BPF"),
+            (CAP_PERFMON, "CAP_PERFMON"),
+            (CAP_NET_ADMIN, "CAP_NET_ADMIN"),
+            (CAP_SYS_PTRACE, "CAP_SYS_PTRACE"),
+        ] {
+            assert!(
+                has_cap(caps, bit),
+                "{name} is missing from the effective set"
+            );
+        }
+        // Standing in for root's implicit DAC bypass, so that capabilities are
+        // the only privilege being measured. See the doc comment.
+        assert!(
+            has_cap(caps, CAP_DAC_OVERRIDE),
+            "CAP_DAC_OVERRIDE is missing; /sys/kernel/tracing is 0700 root, so \
+             without it the tracepoints fail on file permissions and this test \
+             would be measuring DAC rather than capabilities"
+        );
+
+        let path = std::env::var("CFC_EBPF_OBJECT").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o"
+            )
+            .to_string()
+        });
+        let (attached, report) = load_and_attach(
+            Path::new(&path),
+            DnsCache::new(),
+            KernelProcTable::new(),
+            Trust::Warn,
+        )
+        .expect("the unit's capability set must be enough to load the object");
+
+        for note in &report.notes {
+            println!("note: {note}");
+        }
+        for (program, insns) in &report.verified_insns {
+            println!("verified_insns: {program} = {insns}");
+        }
+        assert!(report.exec_tracking, "exec: {:?}", report.notes);
+        assert!(report.exit_tracking, "exit: {:?}", report.notes);
+        assert!(report.dns_capture, "cgroup_skb/ingress: {:?}", report.notes);
+        println!("all three programs attached without CAP_SYS_ADMIN");
+
+        drop(attached);
+    }
+
     /// Actually loads and attaches on this machine. Needs root (or
     /// CAP_BPF+CAP_PERFMON+CAP_NET_ADMIN), a BTF-enabled kernel, cgroup v2,
     /// and the object built by `cargo xtask build-ebpf`.
@@ -984,6 +1178,7 @@ mod tests {
             !report.verified_insns.is_empty(),
             "this kernel reports verified instruction counts; they should be recorded"
         );
+        assert_within_verifier_budget(&report.verified_insns);
         println!("dns_capture = {}", report.dns_capture);
         assert!(
             report.dns_capture,
@@ -1057,7 +1252,12 @@ mod tests {
         // not this process's - the program is attached to the cgroup root, so
         // it sees the whole machine.) It prints what it saw and asserts
         // nothing; the hermetic check above is the one that must hold.
-        if Path::new("/usr/bin/getent").exists() {
+        // Two `getent` calls against a possibly-unreachable resolver cost about
+        // 40 seconds and assert nothing - the hermetic half above is the one
+        // that must hold. CI sets this; a human running it by hand wants the
+        // output.
+        let skip_live = std::env::var_os("CFC_SKIP_LIVE_RESOLUTION").is_some();
+        if !skip_live && Path::new("/usr/bin/getent").exists() {
             // `ahostsv4` forces an A query and `ahosts` will take the AAAA, so
             // a run that goes to the wire at all exercises both record types.
             let mut resolved = Vec::new();

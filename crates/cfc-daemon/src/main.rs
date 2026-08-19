@@ -247,6 +247,9 @@ async fn run() -> anyhow::Result<()> {
         // machine". Creating BPF maps and claiming the exclusive root-cgroup
         // slot is emphatically touching the machine.
         &if args.dry_run {
+            // Say it here rather than leaving the layer's own note to guess:
+            // it reports what it did, not who decided.
+            info!("--dry-run set: not loading the eBPF layer");
             let mut c = cfg.ebpf.clone();
             c.enabled = config::EbpfMode::Off;
             c

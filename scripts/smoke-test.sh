@@ -101,6 +101,34 @@ if [[ ! -S "${SOCKET}" ]]; then
     echo "daemon never created ${SOCKET}"; tail "${LOG}"; exit 1
 fi
 
+# --- the ring-0 layer must degrade quietly, and must not have run at all ----
+#
+# This runs as an ordinary user on a stock runner: no CAP_BPF, no installed
+# object, and `--dry-run`. It is the cheapest possible check of the promise
+# the whole eBPF layer is built on - that it never stops the daemon starting -
+# and it needs no VM, no root and no BPF toolchain.
+#
+# Two distinct things are asserted, and both matter:
+#   1. the daemon came up at all (the socket exists, checked above);
+#   2. it did not SHOUT about it. A layer that is off by circumstance must not
+#      emit warnings or errors on every start, or operators learn to scroll
+#      past this daemon's warnings - which is worse than the layer being off.
+say "eBPF layer degrades quietly"
+if grep -qiE '^.*(WARN|ERROR).*eBPF' "${LOG}"; then
+    echo "the eBPF layer logged a warning or error on a host that plainly"
+    echo "cannot run it; under the automatic default that must be an info line:"
+    grep -iE '^.*(WARN|ERROR).*eBPF' "${LOG}"
+    exit 1
+fi
+# --dry-run is meant to touch nothing. If it ever reports ring0 as anything
+# but off, it created BPF maps and claimed the exclusive root-cgroup slot on
+# a machine whose owner asked what it *would* do.
+if grep -qE 'ring0="?(active|partial|unavailable)' "${LOG}"; then
+    echo "--dry-run attempted to bring the eBPF layer up; it must be inert:"
+    grep -E 'ring0=' "${LOG}"
+    exit 1
+fi
+
 say "cfc status"
 "${CFC}" --socket "${SOCKET}" status
 
