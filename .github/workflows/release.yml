@@ -57,6 +57,59 @@ jobs:
       - name: Build (release profile)
         run: cargo build --workspace --profile release --locked
 
+      # The kernel-side BPF object. Built here rather than in makepkg because
+      # on Arch `rustup` conflicts with `rust`, which the packaging containers
+      # install -- without rustup the crate's rust-toolchain.toml is inert and
+      # `-Z build-std` dies on stable.
+      - name: Read the eBPF toolchain pins
+        id: bpfpins
+        run: |
+          NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cfc-ebpf/rust-toolchain.toml)"
+          LINKER="$(tr -d '[:space:]' < crates/cfc-ebpf/bpf-linker-version)"
+          # An empty parse would silently install "latest" for both and produce
+          # an object built by an unknown toolchain. Refuse instead.
+          if [ -z "${NIGHTLY}" ] || [ -z "${LINKER}" ]; then
+            echo "::error::could not read the eBPF toolchain pins (nightly='${NIGHTLY}' bpf-linker='${LINKER}')"
+            exit 1
+          fi
+          echo "nightly=${NIGHTLY}" >> "${GITHUB_OUTPUT}"
+          echo "linker=${LINKER}" >> "${GITHUB_OUTPUT}"
+          echo "nightly=${NIGHTLY} bpf-linker=${LINKER}"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ steps.bpfpins.outputs.nightly }}
+          components: rust-src
+
+      - name: Install bpf-linker
+        run: |
+          sudo apt-get install -y llvm-dev libpolly-19-dev || sudo apt-get install -y llvm-dev
+          cargo install bpf-linker --version "${{ steps.bpfpins.outputs.linker }}" --locked
+
+      # `bpfel-unknown-none` sets obj-is-bitcode, so rustc hands bpf-linker raw
+      # LLVM bitcode and rustc's LLVM must not be NEWER than bpf-linker's, or
+      # the link fails with `Invalid record`. Pinning the *rustc* that compiles
+      # bpf-linker does not make this true by construction -- bpf-linker links
+      # whatever libLLVM the system provides -- so assert it rather than assume.
+      - name: Assert the LLVM versions pair
+        run: |
+          RUSTC_LLVM="$(rustc +${{ steps.bpfpins.outputs.nightly }} -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+          LINKER_LLVM="$(bpf-linker --version 2>/dev/null | sed -n 's/.*LLVM \([0-9]*\).*/\1/p')"
+          echo "rustc LLVM=${RUSTC_LLVM}  bpf-linker LLVM=${LINKER_LLVM}"
+          if [ -z "${RUSTC_LLVM}" ]; then
+            echo "::error::could not determine rustc's LLVM version"
+            exit 1
+          fi
+          if [ -n "${LINKER_LLVM}" ] && [ "${RUSTC_LLVM}" -gt "${LINKER_LLVM}" ]; then
+            echo "::error::rustc LLVM ${RUSTC_LLVM} is newer than bpf-linker's ${LINKER_LLVM}; the link will fail with 'Invalid record'. Bump crates/cfc-ebpf/bpf-linker-version or move the nightly pin back."
+            exit 1
+          fi
+
+      - name: Build the BPF object
+        run: |
+          cargo xtask build-ebpf
+          cargo xtask ebpf-check
+
       - name: Assemble tarball
         id: assemble
         run: |
@@ -89,6 +142,13 @@ jobs:
             pkg/colony-firewall-autostart.desktop \
             pkg/colony-firewall-tray-autostart.desktop \
             pkg/colony-firewall.svg \
+            "${STAGE}/"
+
+          # The kernel-side object. Fatal if absent: colony.json's postInstall
+          # cannot express an optional file, so a tarball without it produces a
+          # package whose install step fails outright.
+          install -m644 \
+            crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o \
             "${STAGE}/"
 
           # Docs, for parity with what the AUR package puts in

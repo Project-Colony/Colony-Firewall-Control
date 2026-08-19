@@ -26,9 +26,15 @@
 # When bumping this pin, check `rustc +<pin> -Vv | grep LLVM` against
 # `llvm-config --version` (or whatever LLVM your bpf-linker links) first.
 #
+# The bpf-linker version is pinned in a machine-readable sibling file,
+# `crates/cfc-ebpf/bpf-linker-version`, because CI has to install exactly it and
+# a number living only in the comment above cannot be parsed. Keep the two in
+# step when bumping either.
+#
 # Install with:
 #   rustup toolchain install nightly-2026-07-01 --profile minimal
 #   rustup component add rust-src --toolchain nightly-2026-07-01
+#   cargo install bpf-linker --version "$(cat crates/cfc-ebpf/bpf-linker-version)" --locked
 [toolchain]
 channel = "nightly-2026-07-01"
 components = ["rust-src"]

@@ -39,6 +39,16 @@ fn main() -> ExitCode {
             println!("{}", object_path(&opts).display());
             ExitCode::SUCCESS
         }
+        "ebpf-check" => {
+            let opts = Options::parse(&args[1..]);
+            match ebpf_check(&object_path(&opts)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         "help" | "--help" | "-h" => {
             print_help();
             ExitCode::SUCCESS
@@ -57,8 +67,218 @@ fn print_help() {
          \n\
          Tasks:\n  \
            build-ebpf [--debug] [--target <triple>]   build the BPF object\n  \
-           ebpf-path  [--debug] [--target <triple>]   print the object path\n"
+           ebpf-path  [--debug] [--target <triple>]   print the object path\n  \
+           ebpf-check [--debug] [--target <triple>]   check the object is loadable\n"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ebpf-check
+// ---------------------------------------------------------------------------
+
+/// `EM_BPF`.
+const EM_BPF: u16 = 247;
+/// `SHT_SYMTAB`.
+const SHT_SYMTAB: u32 = 2;
+
+/// Everything the daemon's loader looks up by name. If any of these is missing
+/// the object will fail at run time on a user's machine; this turns that into a
+/// build failure here.
+const REQUIRED_SYMBOLS: &[&str] = &[
+    // programs (aya keys `program_mut` on the symbol, not the section)
+    "cfc_sched_process_exec",
+    "cfc_sched_process_exit",
+    "cfc_dns_ingress",
+    // maps
+    "EXEC_EVENTS",
+    "EXIT_EVENTS",
+    "DNS_PACKETS",
+    // patchable .rodata globals
+    "TASK_REAL_PARENT_OFFSET",
+    "TASK_TGID_OFFSET",
+    "EXEC_FILENAME_DATA_LOC",
+    // the ABI stamp the loader requires with must_exist = true. Keep in step
+    // with `cfc_ebpf_common::ABI_SYMBOL`.
+    "CFC_EBPF_ABI_V1",
+];
+
+/// Sections whose absence would break loading or diagnostics.
+const REQUIRED_SECTIONS: &[&str] = &[".BTF", ".BTF.ext", "license"];
+
+/// Structural checks on the built object.
+///
+/// Deliberately thresholdless: it answers "would the loader find what it looks
+/// for?", not "is this program cheap?". Static section size is a poor proxy for
+/// verifier cost anyway - `cfc_dns_ingress` is 355 instructions on disk and
+/// 17,058 through the verifier, and it is the second number that meets the
+/// kernel's budget. Numeric ceilings belong in the daemon's root test, which
+/// has the real count.
+///
+/// No dependencies, per this crate's rule, so the ELF is parsed by hand. That
+/// is ~60 lines of fixed-offset reads and is worth it: a `readelf` dependency
+/// would make the check silently skip on a machine without binutils.
+fn ebpf_check(path: &Path) -> Result<(), String> {
+    let buf = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let rd = Elf::parse(&buf)?;
+
+    if rd.machine != EM_BPF {
+        return Err(format!(
+            "{} is e_machine {}, not EM_BPF ({EM_BPF}) - wrong target?",
+            path.display(),
+            rd.machine
+        ));
+    }
+
+    let sections = rd.section_names(&buf)?;
+    let symbols = rd.symbol_names(&buf)?;
+
+    let mut missing = Vec::new();
+    for want in REQUIRED_SYMBOLS {
+        if !symbols.iter().any(|s| s == want) {
+            missing.push(format!("symbol `{want}`"));
+        }
+    }
+    for want in REQUIRED_SECTIONS {
+        if !sections.iter().any(|(n, _)| n == want) {
+            missing.push(format!("section `{want}`"));
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} is missing {} the loader needs:\n  {}",
+            path.display(),
+            if missing.len() == 1 {
+                "something"
+            } else {
+                "things"
+            },
+            missing.join("\n  ")
+        ));
+    }
+
+    println!("{}: ok", path.display());
+    println!("  e_machine EM_BPF, {} symbols", symbols.len());
+    for (name, size) in &sections {
+        if name.starts_with(".BTF") || name.starts_with("tracepoint") || name.starts_with("cgroup")
+        {
+            println!("  {name}: {size} bytes");
+        }
+    }
+    Ok(())
+}
+
+/// The handful of ELF64 fields this check needs.
+struct Elf {
+    machine: u16,
+    shoff: usize,
+    shentsize: usize,
+    shnum: usize,
+    shstrndx: usize,
+}
+
+impl Elf {
+    fn parse(buf: &[u8]) -> Result<Self, String> {
+        if buf.len() < 64 || &buf[0..4] != b"\x7fELF" {
+            return Err("not an ELF file".to_string());
+        }
+        if buf[4] != 2 {
+            return Err("not ELF64".to_string());
+        }
+        // Little-endian only: `bpfel-unknown-none`. A big-endian object would
+        // need byte-swapping throughout, and this project does not build one.
+        if buf[5] != 1 {
+            return Err("not little-endian (bpfeb objects are not checked here)".to_string());
+        }
+        Ok(Self {
+            machine: u16le(buf, 18),
+            shoff: u64le(buf, 40) as usize,
+            shentsize: u16le(buf, 58) as usize,
+            shnum: u16le(buf, 60) as usize,
+            shstrndx: u16le(buf, 62) as usize,
+        })
+    }
+
+    fn section(&self, buf: &[u8], i: usize) -> Result<(u32, u32, usize, usize, usize), String> {
+        let off = self
+            .shoff
+            .checked_add(
+                i.checked_mul(self.shentsize)
+                    .ok_or("section index overflow")?,
+            )
+            .ok_or("section table overflow")?;
+        if off + 64 > buf.len() {
+            return Err(format!("section header {i} runs past the end of the file"));
+        }
+        Ok((
+            u32le(buf, off),               // sh_name
+            u32le(buf, off + 4),           // sh_type
+            u64le(buf, off + 24) as usize, // sh_offset
+            u64le(buf, off + 32) as usize, // sh_size
+            u32le(buf, off + 40) as usize, // sh_link
+        ))
+    }
+
+    fn section_names(&self, buf: &[u8]) -> Result<Vec<(String, usize)>, String> {
+        let (_, _, stroff, strsize, _) = self.section(buf, self.shstrndx)?;
+        let mut out = Vec::with_capacity(self.shnum);
+        for i in 0..self.shnum {
+            let (name, _, _, size, _) = self.section(buf, i)?;
+            out.push((str_at(buf, stroff, strsize, name as usize), size));
+        }
+        Ok(out)
+    }
+
+    fn symbol_names(&self, buf: &[u8]) -> Result<Vec<String>, String> {
+        let mut out = Vec::new();
+        for i in 0..self.shnum {
+            let (_, kind, off, size, link) = self.section(buf, i)?;
+            if kind != SHT_SYMTAB {
+                continue;
+            }
+            let (_, _, stroff, strsize, _) = self.section(buf, link)?;
+            // Elf64_Sym is 24 bytes: st_name u32, st_info u8, st_other u8,
+            // st_shndx u16, st_value u64, st_size u64.
+            let mut p = off;
+            while p + 24 <= off + size && p + 24 <= buf.len() {
+                let name = u32le(buf, p) as usize;
+                if name != 0 {
+                    out.push(str_at(buf, stroff, strsize, name));
+                }
+                p += 24;
+            }
+        }
+        if out.is_empty() {
+            return Err("no symbol table (was the object stripped?)".to_string());
+        }
+        Ok(out)
+    }
+}
+
+fn u16le(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+
+fn u32le(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+fn u64le(b: &[u8], o: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[o..o + 8]);
+    u64::from_le_bytes(a)
+}
+
+/// NUL-terminated string at `off + idx` inside a string table, clamped to the
+/// table so a corrupt index cannot walk off the end.
+fn str_at(buf: &[u8], off: usize, size: usize, idx: usize) -> String {
+    let start = off.saturating_add(idx);
+    let end = off.saturating_add(size).min(buf.len());
+    if start >= end {
+        return String::new();
+    }
+    let slice = &buf[start..end];
+    let n = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    String::from_utf8_lossy(&slice[..n]).into_owned()
 }
 
 struct Options {

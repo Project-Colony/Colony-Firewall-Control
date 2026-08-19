@@ -91,23 +91,26 @@ use crate::dns::DnsCache;
 
 /// Where the BPF object is expected to live.
 ///
-/// TODO(packaging): `pkg/` is out of scope for this change, so the packaging
-/// side is written down here instead of done. A package that ships the eBPF
-/// backend must install, in addition to today's files:
+/// The Colony package installs it here (`pkg/colony.json` postInstall, 0644
+/// root:root, which is also what `loader::vet_object` requires before loading
+/// it unasked). `.github/workflows/release.yml` builds it with
+/// `cargo xtask build-ebpf` and stages it into the tarball;
+/// `scripts/check-release-assets.sh` fails the build if the manifest and the
+/// tarball ever disagree about it.
 ///
-/// ```text
-///   crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o
-///     -> /usr/lib/colony-firewall/cfc-ebpf.o      (0644 root:root)
-/// ```
+/// Building needs `bpf-linker` and the nightly pinned in
+/// `crates/cfc-ebpf/rust-toolchain.toml` at **build** time only - the object
+/// itself has no runtime dependencies.
 ///
-/// built with `cargo xtask build-ebpf`, which needs `bpf-linker` and the
-/// nightly pinned in `crates/cfc-ebpf/rust-toolchain.toml` at *build* time
-/// only - the object has no runtime dependencies. The daemon binary must be
-/// built with the `ebpf` feature, which is on by default, and
-/// `/etc/colony-firewall/daemon.toml` must carry `[ebpf] enabled = true`. Any
-/// of those missing degrades cleanly, so
-/// shipping the object without flipping the config is a safe default for a
-/// first release.
+/// The AUR package deliberately does *not* build it: on Arch `rustup`
+/// conflicts with `rust`, which the packaging containers install, so
+/// `rust-toolchain.toml` would be inert and `-Z build-std` would fail on
+/// stable. An AUR install therefore has no object, `Degrade::ObjectMissing`,
+/// and the firewall runs on `sock_diag` + `/proc` exactly as it always has.
+///
+/// This string is duplicated by `pkg/colony.json`, both PKGBUILDs and
+/// `systemd/daemon.toml.sample`; `default_object_path_matches_the_packaging`
+/// is what keeps them honest.
 pub const DEFAULT_OBJECT_PATH: &str = "/usr/lib/colony-firewall/cfc-ebpf.o";
 
 /// Why the ring-0 layer did not fully come up.
@@ -507,6 +510,40 @@ mod tests {
             !table.is_live(),
             "a failed load must not leave the table claiming to be live"
         );
+    }
+
+    /// The path is written down in five places and they must agree.
+    ///
+    /// This is the guard that was missing when the packaging side became a
+    /// `TODO(packaging)` comment instead of code: nothing connected the
+    /// constant the daemon looks at to the string the package installs to, so
+    /// they could drift silently and the only symptom would be a firewall
+    /// quietly running without ring 0 on every installed machine.
+    #[test]
+    fn default_object_path_matches_the_packaging() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crates/cfc-daemon is two levels below the repo root")
+            .to_path_buf();
+
+        // pkg/PKGBUILD is deliberately absent from this list: the AUR package
+        // does not ship the object at all (on Arch `rustup` conflicts with
+        // `rust`, so the pinned nightly is unavailable inside makepkg). An AUR
+        // install gets Degrade::ObjectMissing and runs on sock_diag + /proc,
+        // which is a supported configuration - so requiring the path to appear
+        // there would assert a promise the package does not make.
+        for rel in ["pkg/colony.json", "systemd/daemon.toml.sample"] {
+            let path = root.join(rel);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            assert!(
+                text.contains(DEFAULT_OBJECT_PATH),
+                "{rel} does not mention {DEFAULT_OBJECT_PATH}; the daemon would \
+                 look somewhere the package never installs to"
+            );
+        }
     }
 
     #[test]

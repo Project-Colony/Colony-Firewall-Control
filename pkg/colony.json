@@ -25,6 +25,7 @@
         "install -D -m 0644 colony-firewall-autostart.desktop /etc/xdg/autostart/colony-firewall.desktop",
         "install -D -m 0644 colony-firewall-tray-autostart.desktop /etc/xdg/autostart/colony-firewall-tray.desktop",
         "install -D -m 0644 colony-firewall.svg /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
+        "install -D -m 0644 cfc-ebpf.o /usr/lib/colony-firewall/cfc-ebpf.o",
         "systemd-sysusers",
         "systemctl daemon-reload"
       ],
@@ -36,6 +37,8 @@
         "rm -f /usr/share/colony-firewall/nftables-snippet.conf",
         "rm -f /usr/share/applications/colony-firewall.desktop /etc/xdg/autostart/colony-firewall.desktop /etc/xdg/autostart/colony-firewall-tray.desktop",
         "rm -f /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
+        "rm -f /usr/lib/colony-firewall/cfc-ebpf.o",
+        "rmdir --ignore-fail-on-non-empty /usr/lib/colony-firewall || true",
         "systemctl daemon-reload"
       ]
     }
