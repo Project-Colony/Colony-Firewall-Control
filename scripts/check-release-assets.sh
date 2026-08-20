@@ -45,7 +45,7 @@ staged_paths="$(awk '
     /^      - / { if (in_step) exit }
     in_step { print }
 ' "${WORKFLOW}" \
-    | grep -oE '(^|[[:space:]])(target/release/[A-Za-z0-9._-]+|crates/cfc-ebpf/target/[A-Za-z0-9._/-]+|(systemd|pkg|docs)/[A-Za-z0-9._-]+|(README|CHANGELOG)\.md|LICENSE)' \
+    | grep -oE '(^|[[:space:]])(target/release/[A-Za-z0-9._-]+|crates/cfc-ebpf/target/[A-Za-z0-9._/-]+|(systemd|pkg|docs|scripts)/[A-Za-z0-9._-]+|(README|CHANGELOG)\.md|LICENSE)' \
     | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sort -u)"
 
 if [[ -z "${staged_paths}" ]]; then
@@ -82,7 +82,10 @@ is_generated() {
 # Resolve a flat tarball basename back to its path in the repo.
 repo_path_for() {
     local base="$1" dir
-    for dir in systemd pkg docs .; do
+    # scripts/ belongs here: inbound-lockout-guard.sh lives there, and without
+    # it this reports "does not exist in the repo" for a file that does, which
+    # sends whoever reads the failure looking for the wrong bug.
+    for dir in systemd pkg docs scripts .; do
         if [[ -f "${ROOT}/${dir}/${base}" ]]; then
             printf '%s/%s\n' "${dir#./}" "${base}"
             return 0

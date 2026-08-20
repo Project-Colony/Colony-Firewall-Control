@@ -125,6 +125,13 @@ jobs:
             target/release/cfc \
             "${STAGE}/"
 
+          # Executable, and not a binary: systemd execs it as the inbound
+          # unit's ExecStartPre. colony.json re-applies 0755 on install, but
+          # staging it 644 here would be a lie about what it is.
+          install -m755 \
+            scripts/inbound-lockout-guard.sh \
+            "${STAGE}/"
+
           # Everything pkg/colony.json's postInstall installs. The tarball
           # layout is FLAT: postInstall runs with the extracted directory
           # as its working directory, so each file must be present under
@@ -135,9 +142,11 @@ jobs:
           install -m644 \
             systemd/colony-firewalld.service \
             systemd/colony-firewall-nft.service \
+            systemd/colony-firewall-nft-inbound.service \
             systemd/colony-firewall.sysusers \
             systemd/daemon.toml.sample \
             systemd/nftables-snippet.conf \
+            systemd/nftables-inbound.conf \
             pkg/colony-firewall.desktop \
             pkg/colony-firewall-autostart.desktop \
             pkg/colony-firewall-tray-autostart.desktop \
