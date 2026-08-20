@@ -156,6 +156,35 @@ impl RuleScope {
     /// The matcher no longer honours it either, so this is the second of two
     /// locks: one stops the rule being written, one stops it mattering if an
     /// older database already holds it.
+    /// Refuse a scope carrying `parent_exe`.
+    ///
+    /// The field exists, `specificity` counts it, and `matches_process` never
+    /// compares it - so a rule scoped on it matches **every** process
+    /// regardless of its parent, while sorting ahead of rules that are
+    /// genuinely narrower. "Deny whatever bash launched" would deny
+    /// everything, and the extra predicate is what pushes it to the front.
+    ///
+    /// Honouring it means resolving the parent's executable at match time,
+    /// which `Process` cannot do today: it carries `ppid`, not the parent's
+    /// path. Until it can, accepting the predicate is a fail-open dressed as a
+    /// narrowing, so it is refused instead.
+    ///
+    /// Nothing creates one - there is no CLI flag and no UI path - but the
+    /// proto API and `cfc rules import` both take the field, which is exactly
+    /// how the `<unknown>` rule got onto a real machine.
+    pub fn reject_unmatchable_parent(&self) -> Result<(), String> {
+        let Some(parent) = &self.parent_exe else {
+            return Ok(());
+        };
+        Err(format!(
+            "cannot scope a rule on parent_exe ({}): the predicate is not \
+             evaluated, so the rule would match every process rather than the \
+             ones launched by it - and it would outrank narrower rules while \
+             doing so. Scope on the executable itself.",
+            parent.display()
+        ))
+    }
+
     pub fn reject_unmatchable_exe(&self) -> Result<(), String> {
         let Some(exe) = &self.exe_path else {
             return Ok(());
@@ -1063,5 +1092,42 @@ mod content_binding_tests {
         scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         assert!(scope.matches_process(&hashed("/usr/bin/curl", Some(&"bb".repeat(32)))));
         assert!(scope.matches_process(&hashed("/usr/bin/curl", None)));
+    }
+}
+
+#[cfg(test)]
+mod parent_exe_tests {
+    use super::*;
+    use crate::Process;
+
+    /// `parent_exe` is scored but never compared, so a rule carrying it matches
+    /// everything while sorting ahead of rules that actually are narrower.
+    #[test]
+    fn a_parent_scoped_rule_is_refused_because_it_would_match_everything() {
+        let mut scope = RuleScope::any();
+        scope.parent_exe = Some(PathBuf::from("/bin/bash"));
+
+        // The trap, demonstrated: it matches a process bash never launched.
+        let unrelated = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            ..Process::unknown(1)
+        };
+        assert!(
+            scope.matches_process(&unrelated),
+            "precondition: the predicate is not evaluated"
+        );
+        // And it scores as though it narrowed something.
+        assert!(scope.specificity() > RuleScope::any().specificity());
+
+        let err = scope
+            .reject_unmatchable_parent()
+            .expect_err("must be refused");
+        assert!(err.contains("parent_exe"), "{err}");
+        assert!(!err.contains("  "), "collapsed continuation: {err:?}");
+    }
+
+    #[test]
+    fn a_scope_without_a_parent_is_untouched() {
+        assert!(RuleScope::any().reject_unmatchable_parent().is_ok());
     }
 }

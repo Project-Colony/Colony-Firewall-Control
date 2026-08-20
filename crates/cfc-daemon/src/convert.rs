@@ -340,6 +340,7 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
     };
     reject_unscoped(&scope)?;
     scope.reject_unmatchable_exe()?;
+    scope.reject_unmatchable_parent()?;
     scope.reject_inbound_destination_scope()?;
     let created_at = if r.created_at_unix_ms == 0 {
         chrono::Utc::now()
