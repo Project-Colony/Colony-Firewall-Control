@@ -1586,33 +1586,116 @@ fn bundles() -> Vec<Bundle> {
                 // what makes a LAN feel broken in ways nobody connects back to
                 // the firewall - the symptom is a device that "sometimes"
                 // disappears.
-                BundleRule {
-                    name: "inbound-mdns",
-                    exe_candidates: &[],
-                    dst_port: Some(5353),
-                    protocol: Some(Udp),
-                    direction: Some(proto::Direction::Inbound),
-                    src_net: None,
-                },
-                BundleRule {
-                    name: "inbound-llmnr",
-                    exe_candidates: &[],
-                    dst_port: Some(5355),
-                    protocol: Some(Udp),
-                    direction: Some(proto::Direction::Inbound),
-                    src_net: None,
-                },
                 // DHCP replies arrive at the client's port 68 from the server.
                 // Without this a lease renewal fails and the machine loses its
                 // address on a timer measured in hours - the slowest possible
                 // way to discover a firewall rule is missing.
+                // One entry per private range, because `src_net` holds one
+                // CIDR and an unscoped entry is not "the LAN" - it is the
+                // internet. These three ports were shipped with `src_net: None`
+                // and admitted unicast UDP from any address on earth; mDNS and
+                // LLMNR are well-known reflection and spoofing surfaces, so
+                // that was the guarantee this bundle exists to uphold being
+                // handed away by the bundle itself.
+                //
+                // A LAN outside RFC1918 needs a hand-written rule. That is the
+                // right trade: a missing rule is a visible symptom, an
+                // internet-wide hole is not.
                 BundleRule {
-                    name: "inbound-dhcp-client",
+                    name: "inbound-mdns-lan",
+                    exe_candidates: &[],
+                    dst_port: Some(5353),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("192.168.0.0/16"),
+                },
+                BundleRule {
+                    name: "inbound-mdns-10",
+                    exe_candidates: &[],
+                    dst_port: Some(5353),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("10.0.0.0/8"),
+                },
+                BundleRule {
+                    name: "inbound-mdns-172",
+                    exe_candidates: &[],
+                    dst_port: Some(5353),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("172.16.0.0/12"),
+                },
+                BundleRule {
+                    name: "inbound-mdns-linklocal",
+                    exe_candidates: &[],
+                    dst_port: Some(5353),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("169.254.0.0/16"),
+                },
+                BundleRule {
+                    name: "inbound-llmnr-lan",
+                    exe_candidates: &[],
+                    dst_port: Some(5355),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("192.168.0.0/16"),
+                },
+                BundleRule {
+                    name: "inbound-llmnr-10",
+                    exe_candidates: &[],
+                    dst_port: Some(5355),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("10.0.0.0/8"),
+                },
+                BundleRule {
+                    name: "inbound-llmnr-172",
+                    exe_candidates: &[],
+                    dst_port: Some(5355),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("172.16.0.0/12"),
+                },
+                BundleRule {
+                    name: "inbound-llmnr-linklocal",
+                    exe_candidates: &[],
+                    dst_port: Some(5355),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("169.254.0.0/16"),
+                },
+                BundleRule {
+                    name: "inbound-dhcp-client-lan",
                     exe_candidates: &[],
                     dst_port: Some(68),
                     protocol: Some(Udp),
                     direction: Some(proto::Direction::Inbound),
-                    src_net: None,
+                    src_net: Some("192.168.0.0/16"),
+                },
+                BundleRule {
+                    name: "inbound-dhcp-client-10",
+                    exe_candidates: &[],
+                    dst_port: Some(68),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("10.0.0.0/8"),
+                },
+                BundleRule {
+                    name: "inbound-dhcp-client-172",
+                    exe_candidates: &[],
+                    dst_port: Some(68),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("172.16.0.0/12"),
+                },
+                BundleRule {
+                    name: "inbound-dhcp-client-linklocal",
+                    exe_candidates: &[],
+                    dst_port: Some(68),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("169.254.0.0/16"),
                 },
             ],
         },
@@ -2314,6 +2397,50 @@ mod bundle_tests {
                         r.name
                     );
                 }
+            }
+        }
+    }
+
+    /// No inbound bundle entry may admit the whole internet.
+    ///
+    /// The `inbound` bundle shipped with `src_net: None` on mDNS, LLMNR and
+    /// DHCP - three permanent Allow rules taking unicast UDP from any address
+    /// on earth, on ports that are well-known reflection and spoofing
+    /// surfaces. The bundle's own comment promised the opposite. An unscoped
+    /// inbound entry is not "the LAN", it is the internet, and nothing in the
+    /// type system says so.
+    #[test]
+    fn every_inbound_bundle_entry_names_a_source_network() {
+        for b in bundles() {
+            for r in &b.rules {
+                if r.direction != Some(proto::Direction::Inbound) {
+                    continue;
+                }
+                let net = r.src_net.unwrap_or_else(|| {
+                    panic!(
+                        "{}/{} admits any source: an inbound allow with no src_net \
+                         is open to the internet",
+                        b.name, r.name
+                    )
+                });
+                let net: ipnet::IpNet = net
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{}/{}: bad src_net {net:?}: {e}", b.name, r.name));
+                // And it must be a range a LAN actually lives in.
+                let private = [
+                    "192.168.0.0/16",
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "169.254.0.0/16",
+                ]
+                .iter()
+                .map(|s| s.parse::<ipnet::IpNet>().unwrap())
+                .any(|p| p.contains(&net));
+                assert!(
+                    private,
+                    "{}/{}: src_net {net} is not a private range",
+                    b.name, r.name
+                );
             }
         }
     }
