@@ -174,6 +174,29 @@ impl Engine {
         self.inner.rules.read().rules.len()
     }
 
+    /// The distinct executables enabled rules name, under one read lock.
+    ///
+    /// `snapshot()` would answer this too, and answer it expensively: it deep
+    /// clones every rule - names, `PathBuf`s, every `Option<String>` in every
+    /// scope - and merges hit counts on the way, none of which the caller
+    /// wants. This clones the paths it is actually asked for and nothing else.
+    ///
+    /// Deliberately does not evaluate anything while holding the lock: the
+    /// caller re-enters through `process_wide_action`, which takes its own read
+    /// lock, and nesting reads on a `std::sync::RwLock` can deadlock against a
+    /// waiting writer.
+    pub fn enabled_exe_paths(&self) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        self.inner
+            .rules
+            .read()
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
+            .filter_map(|r| r.scope.exe_path.clone())
+            .collect()
+    }
+
     /// What an inbound flow gets when no rule matches.
     ///
     /// Separate from `no_ui_action` because it answers a different question.

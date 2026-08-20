@@ -160,6 +160,9 @@ pub(super) struct VerdictSink {
     exe_rules: Option<Arc<Mutex<BpfHashMap<MapData, u64, u32>>>>,
     /// The gate the exec program reads before hashing. `None` likewise.
     exe_rules_on: Option<Arc<Mutex<aya::maps::Array<MapData, u32>>>>,
+    /// What was last written to the kernel, so an unchanged recompute costs no
+    /// syscalls. `None` until the first compile.
+    last_compiled: Arc<Mutex<Option<std::collections::HashMap<u64, u32>>>>,
 }
 
 impl VerdictSink {
@@ -198,6 +201,7 @@ impl VerdictSink {
             table,
             exe_rules,
             exe_rules_on,
+            last_compiled: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -330,14 +334,7 @@ impl VerdictSink {
 
         // Every executable any enabled rule names. A path nothing mentions
         // cannot produce a deny, so it need not be asked about.
-        let exes: std::collections::BTreeSet<PathBuf> = self
-            .engine
-            .snapshot()
-            .rules
-            .iter()
-            .filter(|r| r.enabled)
-            .filter_map(|r| r.scope.exe_path.clone())
-            .collect();
+        let exes = self.engine.enabled_exe_paths();
 
         let mut wanted: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for exe in &exes {
@@ -352,6 +349,19 @@ impl VerdictSink {
                 let key = cfc_ebpf_common::hash_exe_path(exe.as_os_str().as_encoded_bytes());
                 wanted.insert(key, cfc_ebpf_common::verdict::DENY);
             }
+        }
+
+        // Nothing to do when the answer has not moved, and usually it has not:
+        // this runs on every rule change, and most of them - a port, a host, an
+        // allow, a hit count - do not touch which executables are denied
+        // outright. Skipping here is the difference between a rule edit costing
+        // a handful of `bpf(2)` syscalls and costing none.
+        {
+            let mut last = self.last_compiled.lock();
+            if last.as_ref() == Some(&wanted) {
+                return;
+            }
+            *last = Some(wanted.clone());
         }
 
         // Drop what is no longer wanted before adding, so a full table cannot
