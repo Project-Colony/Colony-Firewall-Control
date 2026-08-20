@@ -988,3 +988,65 @@ mod placeholder_exe_tests {
         assert!(RuleScope::any().reject_unmatchable_exe().is_ok());
     }
 }
+
+#[cfg(test)]
+mod content_binding_tests {
+    use super::*;
+    use crate::Process;
+
+    fn hashed(exe: &str, sha: Option<&str>) -> Process {
+        Process {
+            exe: PathBuf::from(exe),
+            sha256: sha.map(str::to_string),
+            ..Process::unknown(1)
+        }
+    }
+
+    /// The property `--pin-hash` sells: the rule follows the *contents*, so a
+    /// binary swapped in at the same path does not inherit the permission.
+    #[test]
+    fn a_replaced_binary_does_not_inherit_the_rule() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        scope.exe_sha256 = Some("aa".repeat(32));
+
+        assert!(
+            scope.matches_process(&hashed("/usr/bin/curl", Some(&"aa".repeat(32)))),
+            "the pinned binary must still match"
+        );
+        assert!(
+            !scope.matches_process(&hashed("/usr/bin/curl", Some(&"bb".repeat(32)))),
+            "a different binary at the same path must not match"
+        );
+    }
+
+    /// An unknown hash is not a match, and must never be read as one. This is
+    /// the direction that matters: treating "cannot say" as "yes" would let a
+    /// replaced binary keep an allow.
+    #[test]
+    fn an_unknown_hash_never_satisfies_a_pinned_rule() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        scope.exe_sha256 = Some("aa".repeat(32));
+        assert!(!scope.matches_process(&hashed("/usr/bin/curl", None)));
+    }
+
+    /// ...but it must abstain rather than decide, so a lower-precedence deny
+    /// cannot be applied in its place at exec time.
+    #[test]
+    fn an_unknown_hash_makes_the_scope_undecidable() {
+        let mut scope = RuleScope::any();
+        scope.exe_sha256 = Some("aa".repeat(32));
+        assert!(scope.undecidable_for(&hashed("/usr/bin/curl", None)));
+        assert!(!scope.undecidable_for(&hashed("/usr/bin/curl", Some(&"aa".repeat(32)))));
+    }
+
+    /// A rule with no hash is unaffected: path binding stays the default.
+    #[test]
+    fn a_rule_without_a_hash_still_matches_by_path() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        assert!(scope.matches_process(&hashed("/usr/bin/curl", Some(&"bb".repeat(32)))));
+        assert!(scope.matches_process(&hashed("/usr/bin/curl", None)));
+    }
+}

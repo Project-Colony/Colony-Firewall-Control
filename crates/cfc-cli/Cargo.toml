@@ -13,6 +13,7 @@ name = "cfc"
 path = "src/main.rs"
 
 [dependencies]
+sha2 = { workspace = true }
 cfc-core = { path = "../cfc-core" }
 cfc-proto = { path = "../cfc-proto" }
 cfc-client = { path = "../cfc-client" }

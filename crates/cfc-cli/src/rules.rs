@@ -304,6 +304,27 @@ pub struct AddArgs {
     #[arg(long)]
     pub exe: Option<PathBuf>,
 
+    /// Bind the rule to the executable's *contents*, not just its path.
+    ///
+    /// Reads `--exe` now, hashes it, and stores that digest in the rule. The
+    /// rule then stops applying the moment the file at that path changes -
+    /// a package update, a rebuild, or someone putting a different program
+    /// there. Without this, a rule follows the path: replace the file and the
+    /// replacement inherits the permission.
+    ///
+    /// The cost is that an ordinary update revokes the rule too, so this is
+    /// per-rule and off by default. Use it where the answer matters more than
+    /// the convenience.
+    #[arg(long = "pin-hash", requires = "exe")]
+    pub pin_hash: bool,
+
+    /// Bind the rule to this exact sha256, given as 64 hex characters.
+    ///
+    /// The explicit form of `--pin-hash`, for a digest you already have -
+    /// from `cfc rules show`, from a build, or from a vendor.
+    #[arg(long = "sha256", conflicts_with = "pin_hash")]
+    pub sha256: Option<String>,
+
     /// Match flows owned by this uid.
     #[arg(long)]
     pub uid: Option<u32>,
@@ -440,9 +461,41 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
         None => String::new(),
     };
 
+    // Resolve the digest before building the scope: a `--pin-hash` that cannot
+    // read the file must fail loudly rather than quietly write a path-only rule
+    // the user believes is content-bound.
+    let exe_sha256 = match (&args.sha256, args.pin_hash) {
+        (Some(hex), _) => {
+            let hex = hex.trim().to_ascii_lowercase();
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(CliError::Runtime(anyhow::anyhow!(
+                    "--sha256 takes 64 hexadecimal characters; got {} of them",
+                    hex.len()
+                )));
+            }
+            hex
+        }
+        (None, true) => {
+            let path = std::path::Path::new(&exe);
+            match sha256_of(path) {
+                Ok(hex) => {
+                    eprintln!("note: pinned to sha256 {hex}");
+                    hex
+                }
+                Err(e) => {
+                    return Err(CliError::Runtime(anyhow::anyhow!(
+                        "--pin-hash could not read {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        (None, false) => String::new(),
+    };
+
     let scope = proto::RuleScope {
         exe_path: exe,
-        exe_sha256: String::new(),
+        exe_sha256,
         parent_exe: String::new(),
         uid: args.uid.unwrap_or(0),
         has_uid: args.uid.is_some(),
@@ -1748,6 +1801,20 @@ pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult
     }
     println!("\n`available` counts entries whose program is installed on this machine.");
     Ok(())
+}
+
+/// Streaming sha256 of a file, as lowercase hex.
+///
+/// Matches what the daemon computes for a running process: it hashes
+/// `/proc/<pid>/exe`, which is the same bytes as the file on disk for an
+/// unmodified binary. A rule pinned here and a process running that file
+/// therefore agree.
+fn sha256_of(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// `cfc rules bundle add <name>`
