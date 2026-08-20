@@ -334,7 +334,10 @@ impl VerdictSink {
 
         // Every executable any enabled rule names. A path nothing mentions
         // cannot produce a deny, so it need not be asked about.
-        let exes = self.engine.enabled_exe_paths();
+        // `None` means a uid-scoped rule names no executable and so could apply
+        // to any program: nothing can be compiled safely. Empty the table
+        // rather than leave a stale one behind.
+        let exes = self.engine.compilable_exe_paths().unwrap_or_default();
 
         let mut wanted: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for exe in &exes {
@@ -356,12 +359,8 @@ impl VerdictSink {
         // allow, a hit count - do not touch which executables are denied
         // outright. Skipping here is the difference between a rule edit costing
         // a handful of `bpf(2)` syscalls and costing none.
-        {
-            let mut last = self.last_compiled.lock();
-            if last.as_ref() == Some(&wanted) {
-                return;
-            }
-            *last = Some(wanted.clone());
+        if self.last_compiled.lock().as_ref() == Some(&wanted) {
+            return;
         }
 
         // Drop what is no longer wanted before adding, so a full table cannot
@@ -382,6 +381,13 @@ impl VerdictSink {
             }
         }
         drop(table);
+
+        // Memoised only now, and only when every write landed. Recording it
+        // before would mean a failed insert was remembered as done and never
+        // retried on a later identical recompute.
+        if written == wanted.len() {
+            *self.last_compiled.lock() = Some(wanted);
+        }
 
         // The gate the exec program reads before hashing anything.
         if let Some(on) = self.exe_rules_on.as_ref() {

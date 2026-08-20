@@ -197,6 +197,54 @@ impl Engine {
             .collect()
     }
 
+    /// Executables safe to compile into the kernel's table, and the ones that
+    /// are not.
+    ///
+    /// Returns `None` when *no* executable can be compiled, because some
+    /// enabled rule carries a uid predicate and names no executable - such a
+    /// rule can apply to any program, and nothing here can tell whether it
+    /// would.
+    ///
+    /// The uid is the whole reason this is not just "every exe a rule names".
+    /// `process_wide_action` is asked about a synthetic process that has an
+    /// executable and no uid, and a uid-scoped rule simply does not match such
+    /// a process - `undecidable_for` abstains on `exe_sha256` and on nothing
+    /// else. So a higher-precedence `allow --exe X --uid 1000` is *skipped*,
+    /// and the `deny --exe X` beneath it is what would be compiled - a kernel
+    /// refusal for the very uid the allow exempted, which is exactly the
+    /// "refuses what the daemon would have allowed" this table must never do.
+    ///
+    /// So an executable any uid-scoped rule could touch is left out entirely.
+    /// It then has no kernel entry, which means "ask the packet path" - where
+    /// the uid is known and the answer is right.
+    pub fn compilable_exe_paths(&self) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let rules = self.inner.rules.read();
+        let live = || {
+            rules
+                .rules
+                .iter()
+                .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
+        };
+
+        // A uid-scoped rule with no executable can apply to anything.
+        if live().any(|r| r.scope.uid.is_some() && r.scope.exe_path.is_none()) {
+            return None;
+        }
+        let uid_scoped: std::collections::BTreeSet<&std::path::PathBuf> = live()
+            .filter(|r| r.scope.uid.is_some())
+            .filter_map(|r| r.scope.exe_path.as_ref())
+            .collect();
+
+        Some(
+            live()
+                .filter_map(|r| r.scope.exe_path.as_ref())
+                .filter(|p| !uid_scoped.contains(p))
+                .cloned()
+                .collect(),
+        )
+    }
+
     /// What an inbound flow gets when no rule matches.
     ///
     /// Separate from `no_ui_action` because it answers a different question.
@@ -396,6 +444,69 @@ mod tests {
     // answers before a destination exists. Every case below is about the same
     // question: when is it safe to precommit an answer the packet path will
     // never get to revise?
+
+    #[test]
+    fn an_exe_a_uid_rule_could_touch_is_not_compilable() {
+        // The shape that broke the safety claim. `process_wide_action` is asked
+        // about a synthetic process with an exe and no uid, and a uid-scoped
+        // rule simply does not match one - `undecidable_for` abstains on
+        // exe_sha256 and on nothing else. So the allow is skipped and the deny
+        // beneath it would be compiled into the kernel, refusing the very uid
+        // the allow exempted.
+        let mut allow = RuleScope::any();
+        allow.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        allow.uid = Some(1000);
+        let mut deny = RuleScope::any();
+        deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+
+        let engine = engine_with(vec![
+            Rule::new("allow-for-user".to_string(), Action::Allow, allow),
+            Rule::new("deny-everyone".to_string(), Action::Deny, deny),
+        ]);
+
+        // The trap, reproduced exactly as `compile_rules` would hit it: the
+        // synthetic process it asks about carries an exe and no uid.
+        let uidless = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            ..Process::unknown(0)
+        };
+        assert_eq!(
+            engine.process_wide_action(&uidless),
+            Some(Action::Deny),
+            "precondition: with no uid, the allow does not match and is skipped"
+        );
+        // ...so the exe must be excluded from the kernel table entirely.
+        let compilable = engine.compilable_exe_paths().expect("some are compilable");
+        assert!(
+            !compilable.contains(&PathBuf::from("/usr/bin/curl")),
+            "an exe a uid rule could touch must never reach the kernel table"
+        );
+    }
+
+    /// A uid rule naming no executable can apply to anything, so nothing is
+    /// safe to compile.
+    #[test]
+    fn a_uid_rule_with_no_exe_disables_the_whole_table() {
+        let mut wide = RuleScope::any();
+        wide.uid = Some(0);
+        let mut deny = RuleScope::any();
+        deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let engine = engine_with(vec![
+            Rule::new("root-allow".to_string(), Action::Allow, wide),
+            Rule::new("deny-curl".to_string(), Action::Deny, deny),
+        ]);
+        assert!(engine.compilable_exe_paths().is_none());
+    }
+
+    /// Ordinary exe-only rules still compile, or the feature does nothing.
+    #[test]
+    fn plain_exe_rules_are_compilable() {
+        let mut deny = RuleScope::any();
+        deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let engine = engine_with(vec![Rule::new("d".to_string(), Action::Deny, deny)]);
+        let c = engine.compilable_exe_paths().expect("compilable");
+        assert!(c.contains(&PathBuf::from("/usr/bin/curl")));
+    }
 
     #[test]
     fn an_inbound_rule_does_not_switch_off_in_kernel_enforcement() {

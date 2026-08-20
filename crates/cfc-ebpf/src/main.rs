@@ -395,16 +395,25 @@ fn precommit_verdict(tgid: u32, event: &ExecEvent) {
 
     let len = event.filename_len as usize;
     if len == 0 || len > FILENAME_LEN {
+        // No path to judge. Clear rather than leave whatever the pid carried
+        // from the program it just replaced.
+        let _ = VERDICTS.remove(&tgid);
         return;
     }
     // The slice bound is what lets the verifier prove every index is in range.
     let key = cfc_ebpf_common::hash_exe_path(&event.filename[..len]);
-    let action = match unsafe { EXE_RULES.get(&key) } {
-        Some(a) => *a,
-        None => return,
-    };
-    if action == cfc_ebpf_common::verdict::DENY {
-        let _ = VERDICTS.insert(&tgid, &cfc_ebpf_common::verdict::DENY, 0);
+    // Clear as well as write, mirroring userspace's `on_exec`. A pid that
+    // re-execs *out* of a denied binary must not keep the denial: the tgid is
+    // the same, so an entry written for the old program would go on refusing
+    // the new one. Only the write half was here at first, which made the
+    // failure look like the pid-reuse rot this layer was built to remove.
+    match unsafe { EXE_RULES.get(&key) } {
+        Some(a) if *a == cfc_ebpf_common::verdict::DENY => {
+            let _ = VERDICTS.insert(&tgid, &cfc_ebpf_common::verdict::DENY, 0);
+        }
+        _ => {
+            let _ = VERDICTS.remove(&tgid);
+        }
     }
 }
 
