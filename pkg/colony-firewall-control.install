@@ -39,6 +39,27 @@ pre_remove() {
     # Stop enforcement BEFORE the binaries and the snippet disappear, so
     # the fail-closed NFQUEUE table can never outlive the daemon and
     # blackhole all new outbound traffic.
-    systemctl disable --now colony-firewall-nft.service colony-firewalld.service 2>/dev/null || true
+    #
+    # The inbound pair belongs here too, and used not to be. Removing the
+    # package on a host where the inbound chain had been enabled left
+    # 'table inet colony_firewall_inbound' loaded with nothing left to manage
+    # it — on a machine reached over the network, exactly the lockout that
+    # keeping inbound in its own opt-in unit was meant to avoid. pkg/colony.json
+    # has always taken both down; this is the pacman side catching up.
+    systemctl disable --now \
+        colony-firewall-nft-inbound.service \
+        colony-firewall-nft.service \
+        colony-firewalld.service 2>/dev/null || true
     nft delete table inet colony_firewall 2>/dev/null || true
+    nft delete table inet colony_firewall_inbound 2>/dev/null || true
+
+    # Stopping the daemon no longer stops CFC. The pinned programs are
+    # evaluated by the kernel on their own and keep returning EPERM to
+    # processes started after the daemon died — the property the pinning
+    # exists for, and the reason removal has to be explicit about it.
+    #
+    # This package ships no eBPF object, so ordinarily there is nothing here.
+    # A distribution that ships one separately (Arch Colony does) leaves pins
+    # behind that this would otherwise orphan.
+    rm -rf /sys/fs/bpf/colony-firewall
 }
