@@ -81,7 +81,7 @@ dns-lookup = "2.0"
 # Process / system
 nix = { version = "0.31", features = ["process", "user", "signal"] }
 libc = "0.2"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # UI
 iced = { version = "0.14", features = ["tokio", "advanced", "image", "lazy"] }
