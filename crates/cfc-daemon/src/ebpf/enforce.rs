@@ -262,6 +262,42 @@ impl VerdictSink {
                 warn!(pid = proc.pid, deny, "verdict resync failed: {e}");
             }
         }
+        // And the entries the live list does not cover.
+        //
+        // `live_processes` only returns pids the proc table has seen exec
+        // recently; its entries expire on a TTL and are never refreshed. So a
+        // long-running process drops off that list while its verdict stays in
+        // a *pinned* map, and deleting the rule that put it there would never
+        // lift it - the kernel would go on refusing a program the daemon now
+        // allows, which is the one thing this layer must never do.
+        //
+        // The map holds only denials, so this sweep is over a handful of keys.
+        let known: std::collections::HashSet<u32> = live.iter().map(|p| p.pid).collect();
+        let orphans: Vec<u32> = map
+            .keys()
+            .flatten()
+            .filter(|pid| !known.contains(pid))
+            .collect();
+        for pid in orphans {
+            // Read the exe from /proc rather than the table that forgot it. A
+            // pid that is gone reads as an error, and clearing is right then
+            // too: the entry could otherwise be inherited by a recycled pid.
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+            let still_denied = exe.is_some_and(|exe| {
+                let proc = Process {
+                    exe,
+                    ..Process::unknown(pid)
+                };
+                matches!(
+                    self.engine.process_wide_action(&proc),
+                    Some(Action::Deny | Action::Reject)
+                )
+            });
+            if !still_denied {
+                let _ = clear(&mut map, pid);
+            }
+        }
+
         debug!(
             processes = live.len(),
             denied, "resynced in-kernel verdicts after a rule change"

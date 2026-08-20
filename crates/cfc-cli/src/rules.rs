@@ -322,7 +322,7 @@ pub struct AddArgs {
     ///
     /// The explicit form of `--pin-hash`, for a digest you already have -
     /// from `cfc rules show`, from a build, or from a vendor.
-    #[arg(long = "sha256", conflicts_with = "pin_hash")]
+    #[arg(long = "sha256", conflicts_with = "pin_hash", requires = "exe")]
     pub sha256: Option<String>,
 
     /// Match flows owned by this uid.
@@ -1886,6 +1886,11 @@ pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult
     Ok(())
 }
 
+/// Largest binary the daemon will hash, mirrored here so `--pin-hash` cannot
+/// write a rule the daemon can never satisfy. Keep in step with
+/// `process_resolve::SHA256_MAX_LEN`.
+const SHA256_MAX_LEN: u64 = 64 * 1024 * 1024;
+
 /// Streaming sha256 of a file, as lowercase hex.
 ///
 /// Matches what the daemon computes for a running process: it hashes
@@ -1894,7 +1899,23 @@ pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult
 /// therefore agree.
 fn sha256_of(path: &std::path::Path) -> std::io::Result<String> {
     use sha2::{Digest as _, Sha256};
-    let mut f = std::fs::File::open(path)?;
+    let f = std::fs::File::open(path)?;
+    // The daemon refuses to hash anything over this, so a rule pinned to a
+    // larger binary could never match: `proc.sha256` would be `None` and
+    // `matches_process` would answer false forever. For a *deny* that is a
+    // rule that silently never fires - the CLI would confirm success and the
+    // program would keep its network. Refuse here instead of writing it.
+    let len = f.metadata()?.len();
+    if len > SHA256_MAX_LEN {
+        return Err(std::io::Error::other(format!(
+            "{} is {:.1} MiB; the daemon does not hash anything over {} MiB, so a \
+             rule pinned to it could never match",
+            path.display(),
+            len as f64 / (1024.0 * 1024.0),
+            SHA256_MAX_LEN / (1024 * 1024)
+        )));
+    }
+    let mut f = f;
     let mut hasher = Sha256::new();
     std::io::copy(&mut f, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))

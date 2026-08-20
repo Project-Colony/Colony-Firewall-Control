@@ -906,8 +906,18 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
             // rules, and there is nothing meaningful to prompt about;
             // apply the configured default policy instead of blindly
             // accepting.
-            debug!("unparseable packet: {e}; applying default policy");
-            return PacketOutcome::Silent(nfq_verdict_for(deps.engine.fallback_verdict().action));
+            // The direction is known even when the bytes are not, and the two
+            // defaults are not interchangeable: `no_ui_action` may be Allow,
+            // while `inbound_action` cannot be - config refuses it precisely so
+            // inbound can never default-permit. A crafted inbound packet that
+            // fails to parse must not be the way round that.
+            let action = if meta.direction == Direction::Inbound {
+                deps.engine.inbound_default()
+            } else {
+                deps.engine.fallback_verdict().action
+            };
+            debug!(?meta.direction, "unparseable packet: {e}; applying the default for its direction");
+            return PacketOutcome::Silent(nfq_verdict_for(action));
         }
     };
 
@@ -1300,6 +1310,63 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// An undirected rule is outbound-only.
+    ///
+    /// Every rule written before inbound filtering left the direction unset,
+    /// and every one was about traffic leaving. Treating unset as "both"
+    /// reinterpreted all of them the day the input chain was enabled: a
+    /// port-only allow stops meaning "we may reach 8080" and starts also
+    /// meaning "anyone may reach 8080 here", because inbound `dst_port` is
+    /// *our* port.
+    #[test]
+    fn an_undirected_rule_does_not_admit_inbound() {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+        let rule = Rule::new("port-only".to_string(), Action::Allow, scope);
+
+        // Outbound: it applies, as it always did.
+        match TestEnv::new(vec![rule.clone()], dp_deny()).handle(&tcp_packet(443), &NO_META) {
+            PacketOutcome::Deliver { verdict, .. } => assert_eq!(verdict.action, Action::Allow),
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+        // Inbound: it must not.
+        match TestEnv::new(vec![rule], dp_deny()).handle(&tcp_packet(443), &INBOUND_META) {
+            PacketOutcome::Deliver { verdict, .. } => assert_eq!(
+                verdict.action,
+                Action::Deny,
+                "an undirected rule admitted inbound traffic"
+            ),
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+
+    /// An unparseable *inbound* packet takes `inbound_action`, which cannot be
+    /// Allow - not `no_ui_action`, which can.
+    #[test]
+    fn an_unparseable_inbound_packet_cannot_default_to_allow() {
+        let policy = DefaultPolicy {
+            no_ui_action: Action::Allow,
+            timeout_action: Action::Allow,
+            inbound_action: Action::Deny,
+            prompt_timeout_secs: 15,
+        };
+        let env = TestEnv::new(vec![], policy);
+        // Two bytes: a version nibble and nothing else to parse.
+        match env.handle(&[0x45, 0x00], &INBOUND_META) {
+            PacketOutcome::Silent(v) => assert_eq!(
+                v,
+                NfqVerdict::Drop,
+                "a crafted inbound packet must not be the way round the inbound default"
+            ),
+            other => panic!("expected Silent, got {other:?}"),
+        }
+        // Outbound keeps taking no_ui_action, which here is Allow.
+        match env.handle(&[0x45, 0x00], &NO_META) {
+            PacketOutcome::Silent(v) => assert_eq!(v, NfqVerdict::Accept),
+            other => panic!("expected Silent, got {other:?}"),
+        }
     }
 
     /// An inbound flow must not pay for socket attribution.

@@ -275,10 +275,25 @@ impl RuleScope {
         }
         // First, because it is the cheapest and the most likely to exclude:
         // an inbound rule must never fire on outbound traffic or the reverse.
-        if let Some(d) = self.direction {
-            if conn.direction != d {
-                return false;
-            }
+        // An unset direction means **outbound**, not "both".
+        //
+        // It reads like a widening and it is the opposite. Every rule written
+        // before inbound filtering existed left this unset, and every one of
+        // them was written about traffic leaving this machine. Treating unset
+        // as "both" silently reinterpreted all of them the day the input chain
+        // was enabled: `allow --protocol tcp --dst-port 8080` with no exe stops
+        // meaning "this machine may reach 8080 anywhere" and starts also
+        // meaning "anyone may reach 8080 here", because inbound `dst_port` is
+        // *our* port.
+        //
+        // So unset keeps the meaning it always had, and admitting traffic needs
+        // `--direction in` - which is how the CLI, the bundles and the docs
+        // already describe it. Nothing that was written can change meaning
+        // under its author.
+        match self.direction {
+            Some(d) if conn.direction != d => return false,
+            None if conn.direction != crate::Direction::Outbound => return false,
+            _ => {}
         }
         if let Some(net) = self.src_net {
             if !net.contains(&conn.src_ip) {
