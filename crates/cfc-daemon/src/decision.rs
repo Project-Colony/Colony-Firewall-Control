@@ -469,6 +469,55 @@ mod tests {
     /// overstate a denial - but it would keep overstating it after the daemon
     /// is gone, which is the state this whole layer exists to make trustworthy.
     #[test]
+    fn an_abstention_is_not_an_allow() {
+        // The distinction the orphan sweep now turns on. A hash-scoped rule the
+        // caller cannot decide returns None, and None must never be read as
+        // "not denied" - doing so lifts a refusal nobody replaced.
+        let mut hashed = RuleScope::any();
+        hashed.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        hashed.exe_sha256 = Some("aa".repeat(32));
+        let engine = engine_with(vec![Rule::new("h".to_string(), Action::Allow, hashed)]);
+
+        let no_hash = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            ..Process::unknown(1)
+        };
+        assert_eq!(engine.process_wide_action(&no_hash), None);
+        assert_ne!(
+            engine.process_wide_action(&no_hash),
+            Some(Action::Allow),
+            "an abstention must be distinguishable from an allow"
+        );
+    }
+
+    /// The uid changes the answer, which is why the sweep must read the real
+    /// one instead of evaluating a stripped-down process.
+    #[test]
+    fn the_uid_changes_what_process_wide_action_answers() {
+        let mut allow = RuleScope::any();
+        allow.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        allow.uid = Some(1000);
+        let mut deny = RuleScope::any();
+        deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let engine = engine_with(vec![
+            Rule::new("allow-user".to_string(), Action::Allow, allow),
+            Rule::new("deny-rest".to_string(), Action::Deny, deny),
+        ]);
+
+        let with_uid = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            uid: Some(1000),
+            ..Process::unknown(1)
+        };
+        let without = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            ..Process::unknown(1)
+        };
+        assert_eq!(engine.process_wide_action(&with_uid), Some(Action::Allow));
+        assert_eq!(engine.process_wide_action(&without), Some(Action::Deny));
+    }
+
+    #[test]
     fn an_expired_rule_is_not_compilable() {
         let mut scope = RuleScope::any();
         scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));

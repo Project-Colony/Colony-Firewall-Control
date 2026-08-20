@@ -281,7 +281,13 @@ pub struct AddArgs {
     #[arg(long, value_enum, default_value_t = DurationArg::Always)]
     pub duration: DurationArg,
 
-    /// Match only this direction. Omit to match both.
+    /// Which direction this rule is about. Omitted means **outbound**.
+    ///
+    /// Not "both". Every rule written before inbound filtering existed omitted
+    /// this and every one was about traffic leaving, so unset keeps that
+    /// meaning - otherwise enabling the input chain would silently reinterpret
+    /// all of them. Admitting traffic into this machine needs `--direction in`,
+    /// always.
     ///
     /// Inbound rules are how you authorise traffic *into* this machine:
     /// nothing gets in without one. Note that inbound, `--dst-port` is the

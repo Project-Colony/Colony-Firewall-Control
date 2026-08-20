@@ -29,7 +29,7 @@ pub enum Duration {
 /// fields (unknown fields are ignored, missing fields fall back to `None`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleScope {
-    /// Which way the flow goes. `None` matches both.
+    /// Which way the flow goes. `None` means **outbound**, not both.
     ///
     /// Load-bearing for inbound rules, and the reason `src_net`/`src_port`
     /// exist below: `dst_*` is the packet's destination, so it means the remote

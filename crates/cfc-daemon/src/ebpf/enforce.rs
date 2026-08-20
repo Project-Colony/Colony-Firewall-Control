@@ -271,29 +271,48 @@ impl VerdictSink {
         // lift it - the kernel would go on refusing a program the daemon now
         // allows, which is the one thing this layer must never do.
         //
-        // The map holds only denials, so this sweep is over a handful of keys.
+        // Not "a handful": after a restart the proc table is empty while the
+        // pinned map still holds every inherited entry, so the first rule
+        // change makes all of them orphans. The lock is therefore dropped
+        // before the per-pid work - `on_exec` and `on_exit` block on this same
+        // mutex from inside the ring consumers, and a stalled exec ring is a
+        // dropped record, which is a process with no in-kernel verdict.
         let known: std::collections::HashSet<u32> = live.iter().map(|p| p.pid).collect();
         let orphans: Vec<u32> = map
             .keys()
             .flatten()
             .filter(|pid| !known.contains(pid))
             .collect();
+        drop(map);
+
+        let mut doomed = Vec::new();
         for pid in orphans {
-            // Read the exe from /proc rather than the table that forgot it. A
-            // pid that is gone reads as an error, and clearing is right then
-            // too: the entry could otherwise be inherited by a recycled pid.
-            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-            let still_denied = exe.is_some_and(|exe| {
-                let proc = Process {
-                    exe,
-                    ..Process::unknown(pid)
-                };
-                matches!(
-                    self.engine.process_wide_action(&proc),
-                    Some(Action::Deny | Action::Reject)
-                )
-            });
-            if !still_denied {
+            // Evaluate the process as it actually is, not as a stripped-down
+            // guess. Reading the uid matters: `process_wide_action` answers
+            // about the process it is given, and a uid-less one does not match
+            // a uid-scoped allow - so guessing would clear a denial the allow
+            // was never meant to lift, which is the fail-open direction.
+            let Some(exe) = std::fs::read_link(format!("/proc/{pid}/exe")).ok() else {
+                // Gone. Clear, or a recycled pid inherits its answer.
+                doomed.push(pid);
+                continue;
+            };
+            let proc = Process {
+                exe,
+                uid: proc_uid(pid),
+                ..Process::unknown(pid)
+            };
+            // Only a positive "not denied" clears. An abstention - a
+            // hash-scoped rule the exec path cannot decide - leaves the entry
+            // alone, because removing it would lift a refusal nobody replaced.
+            if self.engine.process_wide_action(&proc) == Some(Action::Allow) {
+                doomed.push(pid);
+            }
+        }
+
+        if !doomed.is_empty() {
+            let mut map = self.map.lock();
+            for pid in doomed {
                 let _ = clear(&mut map, pid);
             }
         }
@@ -449,6 +468,23 @@ impl VerdictSink {
             warn!(pid, "could not evict the in-kernel verdict: {e}");
         }
     }
+}
+
+/// Real uid of a live process, from `/proc/<pid>/status`.
+///
+/// `None` when the process is gone or the line is missing, and the caller must
+/// treat that as "cannot decide" rather than "no uid": a uid-scoped allow does
+/// not match a process with no uid, so guessing turns an exemption into a
+/// refusal that stands.
+fn proc_uid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Removes `pid`'s entry, treating "there was no entry" as success.

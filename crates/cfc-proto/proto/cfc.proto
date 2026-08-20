@@ -126,8 +126,13 @@ message RuleScope {
   bool has_dst_port = 9;
   Protocol protocol = 10;
   bool has_protocol = 11;
-  // Which way the flow goes. Unset matches both, which is what every rule
-  // written before inbound filtering existed means.
+  // Which way the flow goes. Unset means OUTBOUND.
+  //
+  // Not "both". Every rule written before inbound filtering existed left this
+  // unset and every one was about traffic leaving, so unset keeps that
+  // meaning; treating it as "both" would silently reinterpret all of them the
+  // day an input chain is enabled, because inbound `dst_port` is the port on
+  // *this* host. Admitting inbound traffic requires setting this explicitly.
   Direction direction = 12;
   bool has_direction = 13;
   // The packet's SOURCE, i.e. the remote peer on an inbound flow. dst_net
