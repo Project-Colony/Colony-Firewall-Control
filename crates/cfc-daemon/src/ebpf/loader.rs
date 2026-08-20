@@ -856,15 +856,26 @@ fn attach_tracepoint(
         return Ok(insns);
     };
 
-    // Pinning is best-effort, and a failure here must not cost the attachment.
+    // Pinning is best-effort, and making that true takes work, because the
+    // obvious spelling of it is a trap.
     //
-    // A tracepoint link is only fd-based - and therefore pinnable - on a kernel
-    // with `BPF_LINK_TYPE_PERF_EVENT`. On an older one aya hands back a raw
-    // perf link that cannot be pinned at all. Losing the pin costs the "keeps
-    // evicting while the daemon is dead" property and nothing else: the program
-    // is attached either way, and everything works normally while the daemon
-    // runs. Refusing to attach over it would trade a live feature for a
-    // fallback one.
+    // `take_link` hands ownership out of aya's registry, and *both* failure
+    // paths below then consume what they were given: aya's `TryFrom<_> for
+    // FdLink` does `value.into_inner()` and drops the value on the non-fd
+    // branch, and `FdLink::pin` takes `self` by value. So a link that cannot be
+    // pinned - an older kernel without `BPF_LINK_TYPE_PERF_EVENT`, or a
+    // read-only /sys/fs/bpf, which is exactly the systemd behaviour this
+    // project has already been bitten by - is not merely left unpinned. It is
+    // closed, and the tracepoint is detached.
+    //
+    // That would be strictly worse than not pinning at all: nothing would evict
+    // `VERDICTS` or `PROCS` *while the daemon runs*, which is the rot this
+    // whole change exists to prevent, and it would happen on the failure path
+    // that was supposed to be harmless.
+    //
+    // So a failed pin re-attaches. Losing the pin then costs only the "keeps
+    // evicting after the daemon dies" property, which is what best-effort was
+    // meant to mean.
     let pinned = prog
         .take_link(id)
         .map_err(anyhow::Error::new)
@@ -880,12 +891,21 @@ fn attach_tracepoint(
         });
     match pinned {
         Ok(_) => debug!(program = name, path = %pin.display(), "tracepoint link pinned"),
-        Err(e) => warn!(
-            program = name,
-            "could not pin the tracepoint link ({e}); verdicts will stop being \
-             evicted if this daemon dies, so a long run without it can leave \
-             stale denials on recycled pids"
-        ),
+        Err(e) => {
+            // The link is gone; put the program back on the tracepoint.
+            prog.attach(category, event).with_context(|| {
+                format!(
+                    "could not pin the tracepoint link ({e}), and re-attaching                      after it failed too"
+                )
+            })?;
+            warn!(
+                program = name,
+                "could not pin the tracepoint link ({e}); re-attached unpinned, \
+                 so eviction works normally while this daemon runs and stops \
+                 when it exits - a machine left on a dead daemon can then \
+                 accumulate stale denials on recycled pids"
+            );
+        }
     }
     Ok(insns)
 }

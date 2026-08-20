@@ -345,7 +345,18 @@ impl Enforcement {
 ///
 /// A plain atomic rather than a channel: it is written once at startup and read
 /// by whoever asks, and it must stay readable even if everything else is wedged.
-static ENFORCEMENT_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Sentinel for "startup has not answered yet".
+///
+/// Not the same as `Off`, and the difference is load-bearing. The IPC server
+/// binds and starts answering before `ebpf::start` has run, so for the first
+/// moments of a daemon's life the honest answer is "ask again". Reporting
+/// `Off` there would be a lie in the dangerous direction on the inherited
+/// path, where a previous daemon's pinned programs are refusing `connect()`
+/// machine-wide at that very instant.
+const LEVEL_UNKNOWN: u8 = u8::MAX;
+
+static ENFORCEMENT_LEVEL: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(LEVEL_UNKNOWN);
 
 /// Records what [`start`] achieved. Called once, at the end of startup.
 pub fn set_enforcement_level(level: Enforcement) {
@@ -354,8 +365,11 @@ pub fn set_enforcement_level(level: Enforcement) {
 
 /// What the in-kernel layer is doing right now, for `cfc status` and anything
 /// else that should not have to read the journal to find out.
-pub fn enforcement_level() -> Enforcement {
-    Enforcement::from_u8(ENFORCEMENT_LEVEL.load(std::sync::atomic::Ordering::Relaxed))
+pub fn enforcement_level() -> Option<Enforcement> {
+    match ENFORCEMENT_LEVEL.load(std::sync::atomic::Ordering::Relaxed) {
+        LEVEL_UNKNOWN => None,
+        v => Some(Enforcement::from_u8(v)),
+    }
 }
 
 /// What actually came up. Reported once at startup and otherwise inert.
@@ -919,12 +933,26 @@ mod enforcement_level_tests {
             set_enforcement_level(level);
             assert_eq!(
                 enforcement_level(),
-                level,
+                Some(level),
                 "{} did not survive",
                 level.as_str()
             );
         }
         set_enforcement_level(Enforcement::Off);
+    }
+
+    /// Before startup answers, the level must be *absent*, not `Off`.
+    ///
+    /// On the inherited path a previous daemon's pinned programs are refusing
+    /// `connect()` machine-wide during this window, so reporting "no in-kernel
+    /// enforcement" would be false in the direction that matters.
+    #[test]
+    fn unknown_is_distinguishable_from_a_real_off() {
+        assert_ne!(LEVEL_UNKNOWN, Enforcement::Off.as_u8());
+        assert_eq!(
+            Enforcement::from_u8(Enforcement::Pinned.as_u8()),
+            Enforcement::Pinned
+        );
     }
 
     /// Only these two mean "still refusing after this process is gone".

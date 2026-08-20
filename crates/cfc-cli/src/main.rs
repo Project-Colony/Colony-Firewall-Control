@@ -425,6 +425,11 @@ fn enforcement_cell(level: &str) -> String {
         "process" => "yes (this process only - lifted when it stops)".to_string(),
         "unavailable" => "no (the kernel refused the programs)".to_string(),
         "off" => "no (not enabled, or the object never loaded)".to_string(),
+        "starting" => "not decided yet (the daemon is still starting)".to_string(),
+        // A daemon that predates this field sends the proto3 default. Saying
+        // nothing at all would read as an empty answer rather than an absent
+        // one.
+        "" => "unknown (this daemon is too old to say)".to_string(),
         // A daemon newer than this CLI. Say what it said rather than guess.
         other => other.to_string(),
     }
