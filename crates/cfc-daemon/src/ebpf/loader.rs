@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context as _};
 use aya::maps::{HashMap as BpfHashMap, MapData, RingBuf};
+use aya::programs::links::FdLink;
 use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, ProgramError, TracePoint};
 use aya::{Btf, Ebpf, EbpfLoader};
 use cfc_core::Process;
@@ -480,9 +481,25 @@ pub(super) fn load_and_attach(
 
     // --- attach, each independently ------------------------------------
 
-    let r = attach_tracepoint(&mut bpf, PROG_EXEC, "sched", "sched_process_exec");
+    let r = attach_tracepoint(&mut bpf, PROG_EXEC, "sched", "sched_process_exec", None);
     report.exec_tracking = record_attach(&mut report, PROG_EXEC, "sched_process_exec", r);
-    let r = attach_tracepoint(&mut bpf, PROG_EXIT, "sched", "sched_process_exit");
+
+    // The exit link is pinned; the exec link is not, and that asymmetry is the
+    // point of this step rather than an oversight. Pinning exec is what would
+    // let a *new* process get an in-kernel verdict without the daemon, and it
+    // needs the ring-buffer lifecycle reworked first - see the milestone notes.
+    // Pinning exit only keeps the map from rotting, which needs nothing.
+    let exit_pin = pin_dir.as_deref().map(|d| d.join(enforce::LINK_EXIT));
+    if let Some(p) = exit_pin.as_deref() {
+        drop_stale_link_pin(p);
+    }
+    let r = attach_tracepoint(
+        &mut bpf,
+        PROG_EXIT,
+        "sched",
+        "sched_process_exit",
+        exit_pin.as_deref(),
+    );
     report.exit_tracking = record_attach(&mut report, PROG_EXIT, "sched_process_exit", r);
     let r = attach_dns(&mut bpf);
     report.dns_capture = record_attach(&mut report, PROG_DNS, "cgroup_skb/ingress", r);
@@ -820,6 +837,7 @@ fn attach_tracepoint(
     name: &str,
     category: &str,
     event: &str,
+    pin: Option<&Path>,
 ) -> anyhow::Result<Option<u32>> {
     let prog: &mut TracePoint = bpf
         .program_mut(name)
@@ -830,9 +848,64 @@ fn attach_tracepoint(
     // verifier speaks. Classification of the error belongs to the caller.
     prog.load().context("verifier rejected the program")?;
     let insns = verifier_cost(name, prog.info());
-    prog.attach(category, event)
+    let id = prog
+        .attach(category, event)
         .with_context(|| format!("attaching to {category}:{event}"))?;
+
+    let Some(pin) = pin else {
+        return Ok(insns);
+    };
+
+    // Pinning is best-effort, and a failure here must not cost the attachment.
+    //
+    // A tracepoint link is only fd-based - and therefore pinnable - on a kernel
+    // with `BPF_LINK_TYPE_PERF_EVENT`. On an older one aya hands back a raw
+    // perf link that cannot be pinned at all. Losing the pin costs the "keeps
+    // evicting while the daemon is dead" property and nothing else: the program
+    // is attached either way, and everything works normally while the daemon
+    // runs. Refusing to attach over it would trade a live feature for a
+    // fallback one.
+    let pinned = prog
+        .take_link(id)
+        .map_err(anyhow::Error::new)
+        .and_then(|link| {
+            let fd_link: FdLink = link
+                .try_into()
+                .map_err(anyhow::Error::new)
+                .context("link is not fd-based (needs a kernel with bpf_link perf support)")?;
+            fd_link
+                .pin(pin)
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("pinning to {}", pin.display()))
+        });
+    match pinned {
+        Ok(_) => debug!(program = name, path = %pin.display(), "tracepoint link pinned"),
+        Err(e) => warn!(
+            program = name,
+            "could not pin the tracepoint link ({e}); verdicts will stop being \
+             evicted if this daemon dies, so a long run without it can leave \
+             stale denials on recycled pids"
+        ),
+    }
     Ok(insns)
+}
+
+/// Removes a stale tracepoint pin, detaching whatever it still holds.
+///
+/// See [`enforce::LINK_EXIT`]: the pin exists to cover the gap between two
+/// daemons, not to be inherited across it. The program behind it references the
+/// previous run's `PROCS` and `EXIT_EVENTS`, both rebuilt on every start, so
+/// adopting it would leave the new daemon's tables uncleaned.
+fn drop_stale_link_pin(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => debug!(path = %path.display(), "removed a previous run's tracepoint pin"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            path = %path.display(),
+            "could not remove the previous tracepoint pin ({e}); the old program \
+             stays attached alongside the new one"
+        ),
+    }
 }
 
 /// Logs how many instructions the verifier walked to accept a program.

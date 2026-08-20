@@ -142,6 +142,7 @@ impl Firewall for FakeDaemon {
             prompt_timeout_secs: 15,
             skipped_rules: 2,
             enforcing: false,
+            enforcement: "pinned".to_string(),
         }))
     }
 

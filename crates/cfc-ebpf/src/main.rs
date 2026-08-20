@@ -384,6 +384,20 @@ pub fn cfc_sched_process_exit(_ctx: TracePointContext) -> u32 {
 
     let _ = PROCS.remove(&tgid);
 
+    // And the verdict, here in the kernel rather than only from userspace.
+    //
+    // `VERDICTS` is pinned, so an entry outlives the daemon. Userspace evicts
+    // on exit too (`enforce::VerdictSink::on_exit`), which is enough while the
+    // daemon is alive and is exactly nothing when it is not - and "when it is
+    // not" is the whole reason the map is pinned. Without this line: the daemon
+    // dies, a refused process exits, its DENY stays, Linux recycles the pid,
+    // and an unrelated program silently loses the network. It fails closed, so
+    // nothing breaks loudly; the protection just rots.
+    //
+    // Cheap and idempotent: one map delete, in a program that already does one,
+    // and deleting a key that is not there is not an error.
+    let _ = VERDICTS.remove(&tgid);
+
     // Publish the eviction so the userspace cache drops the pid too. Without
     // this, a recycled pid would be attributed to the process that died.
     if let Some(mut entry) = EXIT_EVENTS.reserve::<ExitEvent>(0) {

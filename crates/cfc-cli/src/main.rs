@@ -352,6 +352,7 @@ struct StatusJson {
     version: String,
     uptime_seconds: u64,
     enforcing: bool,
+    enforcement: String,
     paused: bool,
     resume_at_unix_ms: i64,
     resume_at: Option<String>,
@@ -373,6 +374,7 @@ fn status_json(s: &proto::StatusResponse, now_unix_ms: i64) -> StatusJson {
         version: s.version.clone(),
         uptime_seconds: s.uptime_seconds,
         enforcing: s.enforcing,
+        enforcement: s.enforcement.clone(),
         paused: s.paused,
         resume_at_unix_ms: s.resume_at_unix_ms,
         resume_at: output::rfc3339(s.resume_at_unix_ms),
@@ -410,6 +412,24 @@ fn status_warnings(s: &proto::StatusResponse) -> Vec<String> {
 }
 
 /// The paused cell: "no", or "yes (resumes in 4m 30s at 18:20:11)".
+/// Says where enforcement lives, and whether it outlives the daemon.
+///
+/// Spelled out rather than printed raw because the word alone does not carry
+/// the consequence. "process" and "pinned" both mean the kernel is refusing
+/// connect() - the difference is only what happens when this daemon stops, and
+/// that difference is the whole reason the layer exists.
+fn enforcement_cell(level: &str) -> String {
+    match level {
+        "pinned" => "yes (pinned - survives this daemon)".to_string(),
+        "inherited" => "yes (inherited from a previous daemon's pins)".to_string(),
+        "process" => "yes (this process only - lifted when it stops)".to_string(),
+        "unavailable" => "no (the kernel refused the programs)".to_string(),
+        "off" => "no (not enabled, or the object never loaded)".to_string(),
+        // A daemon newer than this CLI. Say what it said rather than guess.
+        other => other.to_string(),
+    }
+}
+
 fn paused_cell(s: &proto::StatusResponse, now_unix_ms: i64) -> String {
     if !s.paused {
         return "no".to_string();
@@ -442,6 +462,7 @@ async fn cmd_status(client: &mut Client, format: OutputFormat) -> CliResult {
         "enforcing        {}",
         if s.enforcing { "yes" } else { "no" }
     );
+    println!("  in-kernel      {}", enforcement_cell(&s.enforcement));
     println!("paused           {}", paused_cell(&s, now));
     println!("rules            {}", s.rules_count);
     println!("prompts pending  {}", s.prompts_pending);
@@ -527,6 +548,7 @@ mod tests {
             prompt_timeout_secs: 15,
             skipped_rules: 0,
             enforcing: true,
+            enforcement: "pinned".to_string(),
         }
     }
 

@@ -202,6 +202,21 @@ message StatusResponse {
   // daemon is running but probably not in the packet path (nft/iptables
   // rule not loaded), or it was started with --dry-run.
   bool enforcing = 14;
+
+  // Where in-kernel enforcement stands: "off", "unavailable", "process",
+  // "pinned" or "inherited".
+  //
+  // Reported because losing this layer is silent. Every decision falls back to
+  // the userspace packet path, nothing errors, no test fails - the firewall
+  // just quietly stops being able to refuse a connect() before a packet
+  // exists, and stops surviving its own death. The ways to lose it are all
+  // external: a systemd release that remounts /sys read-only under the pins,
+  // an SELinux denial on `bpf { prog_load }`, a kernel built without BTF. So
+  // it can vanish on a machine whose own code never changed, and the only way
+  // to notice was to read the journal from startup.
+  //
+  // "pinned" and "inherited" are the two that survive the daemon.
+  string enforcement = 15;
 }
 
 message SetPausedRequest {

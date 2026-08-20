@@ -311,6 +311,51 @@ impl Enforcement {
     pub fn survives_daemon(self) -> bool {
         matches!(self, Self::Pinned | Self::Inherited)
     }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Unavailable,
+            2 => Self::Process,
+            3 => Self::Pinned,
+            4 => Self::Inherited,
+            _ => Self::Off,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Unavailable => 1,
+            Self::Process => 2,
+            Self::Pinned => 3,
+            Self::Inherited => 4,
+        }
+    }
+}
+
+/// The enforcement level this daemon actually reached, readable at any time.
+///
+/// It exists because losing the in-kernel layer is *silent*. It was switched
+/// off machine-wide for hours during development and not one thing failed: the
+/// packet path picked up every decision, the tests passed, the logs said
+/// nothing after startup. A property nobody can read is a property nobody can
+/// rely on - and the ways to lose it are all external (a systemd release that
+/// remounts /sys read-only, an SELinux denial on `prog_load`, a kernel without
+/// BTF), so it can go away on a machine whose own code never changed.
+///
+/// A plain atomic rather than a channel: it is written once at startup and read
+/// by whoever asks, and it must stay readable even if everything else is wedged.
+static ENFORCEMENT_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Records what [`start`] achieved. Called once, at the end of startup.
+pub fn set_enforcement_level(level: Enforcement) {
+    ENFORCEMENT_LEVEL.store(level.as_u8(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What the in-kernel layer is doing right now, for `cfc status` and anything
+/// else that should not have to read the journal to find out.
+pub fn enforcement_level() -> Enforcement {
+    Enforcement::from_u8(ENFORCEMENT_LEVEL.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// What actually came up. Reported once at startup and otherwise inert.
@@ -851,5 +896,44 @@ mod tests {
         let r = Report::default();
         assert!(!r.any_active());
         r.log();
+    }
+}
+
+#[cfg(test)]
+mod enforcement_level_tests {
+    use super::*;
+
+    /// The level travels through an atomic as a byte. A variant that lost its
+    /// number would report the wrong thing to `cfc status`, and reporting the
+    /// wrong enforcement level is worse than reporting none: it would say the
+    /// protection survives the daemon when it does not.
+    #[test]
+    fn every_level_round_trips_through_the_atomic() {
+        for level in [
+            Enforcement::Off,
+            Enforcement::Unavailable,
+            Enforcement::Process,
+            Enforcement::Pinned,
+            Enforcement::Inherited,
+        ] {
+            set_enforcement_level(level);
+            assert_eq!(
+                enforcement_level(),
+                level,
+                "{} did not survive",
+                level.as_str()
+            );
+        }
+        set_enforcement_level(Enforcement::Off);
+    }
+
+    /// Only these two mean "still refusing after this process is gone".
+    #[test]
+    fn the_surviving_levels_are_the_pinned_ones() {
+        assert!(Enforcement::Pinned.survives_daemon());
+        assert!(Enforcement::Inherited.survives_daemon());
+        assert!(!Enforcement::Process.survives_daemon());
+        assert!(!Enforcement::Unavailable.survives_daemon());
+        assert!(!Enforcement::Off.survives_daemon());
     }
 }

@@ -636,6 +636,7 @@ impl Firewall for FirewallService {
             prompt_timeout_secs: policy.prompt_timeout_secs,
             skipped_rules: self.store.skipped_rules() as u64,
             enforcing: enforcing_heuristic(self.dry_run, connections_seen, uptime_seconds),
+            enforcement: crate::ebpf::enforcement_level().as_str().to_string(),
         }))
     }
 

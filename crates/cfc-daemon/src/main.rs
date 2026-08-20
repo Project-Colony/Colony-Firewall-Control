@@ -343,6 +343,9 @@ async fn run() -> anyhow::Result<()> {
         Some(engine.clone()),
     );
     _ebpf.report.log();
+    // Publish it so `cfc status` can say where enforcement lives without anyone
+    // having to go and read the journal.
+    ebpf::set_enforcement_level(_ebpf.report.enforcement);
 
     // Persistent signal streams (not per-iteration futures) so nothing is
     // dropped and re-registered while the SIGHUP arm re-arms the loop.

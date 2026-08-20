@@ -102,6 +102,27 @@ pub(super) const MAP_VERDICTS: &str = "VERDICTS";
 pub(super) const MAP_STATS: &str = "ENFORCE_STATS";
 pub(super) const MAP_DENY_EVENTS: &str = "DENY_EVENTS";
 
+/// Pin name for the `sched_process_exit` link.
+///
+/// Pinned for one reason, and it is not the reason the connect links are.
+/// Those are pinned so enforcement *continues* without the daemon; this one is
+/// pinned so enforcement does not silently **rot** without it.
+///
+/// `VERDICTS` outlives the daemon, so an entry written for a pid stays there
+/// after that pid is gone. Linux recycles pids. Without a live exit program to
+/// evict them, a machine running with a dead daemon accumulates denials
+/// attached to nothing, and unrelated programs start losing the network as
+/// they inherit recycled pids. It fails closed, so nothing breaks loudly - the
+/// protection just decays into noise.
+///
+/// Deliberately *not* adopted on restart, unlike the connect links. The exit
+/// program touches `PROCS` and `EXIT_EVENTS`, both unpinned and both rebuilt
+/// every start; a program adopted from the previous run would go on clearing
+/// the *old* `PROCS` while the new daemon filled a new one. So startup removes
+/// a stale pin - which detaches the old program - and pins a fresh one. The pin
+/// is there to cover the gap between two daemons, not to be inherited across it.
+pub(super) const LINK_EXIT: &str = "exit";
+
 /// Writes precomputed verdicts into the pinned map.
 ///
 /// Handed to the exec consumer, which is the only place that can populate it:
@@ -671,6 +692,105 @@ mod tests {
         // Leave the machine as we found it. The pins are the durable part, so
         // they have to be removed explicitly - that is the feature.
         drop(listener);
+        let _ = std::fs::remove_dir_all(Path::new(BPFFS).join(PIN_NAMESPACE));
+    }
+
+    /// The kernel evicts a verdict on process exit, with no daemon alive.
+    ///
+    /// This is the property that makes a pinned `VERDICTS` map safe to leave
+    /// behind. Userspace evicts on exit too, which is enough while the daemon
+    /// runs and is exactly nothing when it does not - and "when it does not" is
+    /// the only reason the map is pinned at all.
+    ///
+    /// Without the in-kernel delete *and* a pinned exit link, a machine running
+    /// on a dead daemon accumulates denials attached to pids that no longer
+    /// exist. Linux recycles pids; unrelated programs then inherit refusals.
+    /// It fails closed, so nothing breaks loudly - the protection just rots,
+    /// and nothing anywhere says so.
+    ///
+    /// ```text
+    /// sudo -E cargo test -p cfc-daemon --lib -- --ignored --nocapture \
+    ///     evicts_a_verdict_on_exit
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs root and a BPF-capable kernel"]
+    async fn the_kernel_evicts_a_verdict_on_exit_with_no_daemon_alive() {
+        use std::process::{Command, Stdio};
+
+        if !nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping: not root");
+            return;
+        }
+        let object = std::env::var("CFC_EBPF_OBJECT")
+            .unwrap_or_else(|_| super::super::DEFAULT_OBJECT_PATH.to_string());
+        if !Path::new(&object).exists() || !Path::new("/bin/sleep").exists() {
+            eprintln!("skipping: no object at {object}, or no /bin/sleep");
+            return;
+        }
+        let _ = std::fs::remove_dir_all(Path::new(BPFFS).join(PIN_NAMESPACE));
+
+        let (attached, report) = super::super::loader::load_and_attach(
+            Path::new(&object),
+            crate::dns::DnsCache::new(),
+            super::super::proc_table::KernelProcTable::new(),
+            None,
+            super::super::loader::Trust::Warn,
+        )
+        .expect("load");
+        assert_eq!(
+            report.enforcement,
+            super::super::Enforcement::Pinned,
+            "the point of the test is the pin: {:?}",
+            report.notes
+        );
+        assert!(
+            pin_dir().join(LINK_EXIT).exists(),
+            "the exit link was not pinned, so nothing will evict once the daemon goes"
+        );
+
+        // A process that will sit still until told otherwise, so its pid is
+        // stable while the verdict is written.
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        {
+            let pin = pin_dir().join(MAP_VERDICTS);
+            let data = MapData::from_pin(&pin).expect("reopen the pinned VERDICTS map");
+            let mut verdicts = BpfHashMap::<_, u32, u32>::try_from(aya::maps::Map::HashMap(data))
+                .expect("VERDICTS is a hash map");
+            verdicts
+                .insert(pid, cfc_ebpf_common::verdict::DENY, 0)
+                .expect("write the verdict");
+            assert_eq!(
+                verdicts.get(&pid, 0).ok(),
+                Some(cfc_ebpf_common::verdict::DENY)
+            );
+        }
+
+        // Take the daemon away. Every fd, every link this process owns, the
+        // whole aya object. What is left is bpffs and the kernel.
+        drop(attached);
+
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+        // The tracepoint fires during exit; give the kernel a moment to run it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let pin = pin_dir().join(MAP_VERDICTS);
+        let data = MapData::from_pin(&pin).expect("reopen the pinned VERDICTS map");
+        let verdicts = BpfHashMap::<_, u32, u32>::try_from(aya::maps::Map::HashMap(data))
+            .expect("VERDICTS is a hash map");
+        assert!(
+            verdicts.get(&pid, 0).is_err(),
+            "pid {pid} kept its verdict after exiting with no daemon alive; a \
+             recycled pid would inherit it"
+        );
+
         let _ = std::fs::remove_dir_all(Path::new(BPFFS).join(PIN_NAMESPACE));
     }
 
