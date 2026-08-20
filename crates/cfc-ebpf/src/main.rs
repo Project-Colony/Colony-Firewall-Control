@@ -222,6 +222,34 @@ static EXEC_FILENAME_DATA_LOC: Global<u32> = Global::new(8);
 /// gone wrong, not a kernel that reorganised its tracepoints.
 const EXEC_FILENAME_DATA_LOC_MAX: u32 = 64;
 
+/// Byte offset of `group_dead` in `sched_process_exit`'s record, or
+/// [`EXIT_GROUP_DEAD_ABSENT`] when this kernel does not carry it.
+///
+/// `group_dead` is the kernel saying the *process* is gone rather than one of
+/// its threads, and nothing else in the record says that. The substitute this
+/// code used - "the exiting task is the thread-group leader" - is wrong in both
+/// directions, and both of them matter:
+///
+///   * a leader can exit first, via `pthread_exit()` from `main`, while its
+///     workers keep running under the same tgid. Evicting there hands a denied
+///     process its network back while it is still running - a fail-open;
+///   * a worker can be the last thread out, and then the leader-only check
+///     never fires at all, so the entry is never evicted.
+///
+/// Overridden by the loader from the live format file. Defaulting to "absent"
+/// is the safe direction: an object loaded by something that does not set it
+/// keeps the old leader-only behaviour rather than reading a byte at a guessed
+/// offset and evicting on garbage.
+#[unsafe(no_mangle)]
+static EXIT_GROUP_DEAD_OFF: Global<u32> = Global::new(EXIT_GROUP_DEAD_ABSENT);
+
+/// Sentinel for "this kernel's record has no readable `group_dead`".
+const EXIT_GROUP_DEAD_ABSENT: u32 = u32::MAX;
+
+/// Largest plausible offset for it, bounding the read the same way the exec
+/// filename offset is bounded.
+const EXIT_GROUP_DEAD_MAX: u32 = 64;
+
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 pub fn cfc_sched_process_exec(ctx: TracePointContext) -> u32 {
     // Never fail the tracepoint: a dropped event is a monitoring gap, an error
@@ -364,21 +392,43 @@ fn current_ppid() -> u32 {
 // tracepoint/sched/sched_process_exit
 // ---------------------------------------------------------------------------
 
+/// Whether this exit is the last one for its thread group.
+///
+/// Prefers the kernel's own `group_dead`. Falls back to "the exiting task is
+/// the thread-group leader" only when the offset was never resolved, which is
+/// the pre-existing behaviour and no worse than it was.
+#[inline(always)]
+fn process_is_gone(ctx: &TracePointContext, tgid: u32, tid: u32) -> bool {
+    let off = EXIT_GROUP_DEAD_OFF.load();
+    if off == EXIT_GROUP_DEAD_ABSENT || off > EXIT_GROUP_DEAD_MAX {
+        return tgid == tid;
+    }
+    match unsafe { ctx.read_at::<u8>(off as usize) } {
+        Ok(v) => v != 0,
+        // The read failed on a record we were told the shape of. Treating that
+        // as "not gone" leaks an entry; treating it as "gone" evicts a live
+        // process's verdict. Leak, and let the daemon's own exit handling and
+        // the next resync clean up.
+        Err(_) => false,
+    }
+}
+
 #[tracepoint(name = "sched_process_exit", category = "sched")]
-pub fn cfc_sched_process_exit(_ctx: TracePointContext) -> u32 {
+pub fn cfc_sched_process_exit(ctx: TracePointContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
     let tid = pid_tgid as u32;
 
-    // This tracepoint fires for every *thread*. Only the thread-group leader's
-    // exit means the process is gone; evicting on any thread exit would blind
-    // us to a still-running multithreaded process.
+    // This tracepoint fires for every *thread*, and what we want is the
+    // *process* being gone. The kernel says so directly - `group_dead` in the
+    // record - so ask it when this kernel carries the field, and fall back to
+    // the leader-only approximation when it does not.
     //
-    // Deliberately read from `bpf_get_current_pid_tgid()` rather than from the
-    // tracepoint record: the record layout for `sched_process_exit` could not
-    // be verified on the build host (`/sys/kernel/tracing` is root-only), and
-    // the helper is layout-independent.
-    if tgid != tid {
+    // The approximation is wrong in both directions, which is why it is only
+    // the fallback: a leader that calls `pthread_exit()` leaves its workers
+    // running under the same tgid (evicting there is a fail-open), and a worker
+    // that exits last never satisfies it at all (so nothing is ever evicted).
+    if !process_is_gone(&ctx, tgid, tid) {
         return 0;
     }
 

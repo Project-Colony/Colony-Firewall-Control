@@ -121,6 +121,61 @@ pub fn exec_filename_offset() -> Result<Resolution, TracefsError> {
     parse_exec_filename_offset(&text)
 }
 
+/// Byte offset of `group_dead` in `sched_process_exit`'s record.
+///
+/// `group_dead` is the kernel telling us the *process* is gone, as opposed to
+/// one of its threads. Nothing else in the record says that, and the obvious
+/// substitute - "the exiting task is the thread-group leader" - is wrong in
+/// both directions: a leader can exit first via `pthread_exit()` while its
+/// workers keep running, and a worker can be the last thread out.
+///
+/// `None` when the field is absent or not a 1-byte bool, which is how a kernel
+/// too old to carry it reports itself.
+pub fn exit_group_dead_offset() -> Result<Option<u32>, TracefsError> {
+    let tracefs = find_tracefs().ok_or(TracefsError::NotMounted)?;
+    let path = tracefs.join("events/sched/sched_process_exit/format");
+    let text = std::fs::read_to_string(&path).map_err(TracefsError::Unreadable)?;
+    Ok(parse_exit_group_dead_offset(&text))
+}
+
+/// The parser, split out so it can be tested against fixture text.
+///
+/// Keyed on the field name and its declared width. A `group_dead` that is not
+/// a 1-byte bool is one this program does not know how to read, and reading it
+/// wrong would evict verdicts for processes that are still running.
+pub fn parse_exit_group_dead_offset(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("field:") else {
+            continue;
+        };
+        let mut decl = None;
+        let mut offset = None;
+        let mut size = None;
+        for part in rest.split(';') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("offset:") {
+                offset = v.trim().parse::<u32>().ok();
+            } else if let Some(v) = part.strip_prefix("size:") {
+                size = v.trim().parse::<u32>().ok();
+            } else if !part.is_empty() && decl.is_none() {
+                decl = Some(part);
+            }
+        }
+        let Some(decl) = decl else { continue };
+        // `bool group_dead` - match the name at the end of the declaration so a
+        // differently-spelled type still resolves.
+        if decl.split_whitespace().last() != Some("group_dead") {
+            continue;
+        }
+        return match (offset, size) {
+            (Some(off), Some(1)) => Some(off),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// The parser, split out so it can be tested against fixture text.
 ///
 /// Keyed on the field **name**, not on "the first `__data_loc`". Those happen
@@ -321,5 +376,60 @@ print fmt: \"filename=%s pid=%d old_pid=%d\", __get_str(filename), REC->pid, REC
             Ok(r) => println!("this kernel: {r:?}"),
             Err(e) => panic!("could not resolve: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod group_dead_tests {
+    use super::*;
+
+    /// The real record from a 7.1 kernel.
+    const REAL: &str = "\
+name: sched_process_exit
+ID: 307
+format:
+\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;
+\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;
+
+\tfield:char comm[16];\toffset:8;\tsize:16;\tsigned:0;
+\tfield:pid_t pid;\toffset:24;\tsize:4;\tsigned:1;
+\tfield:int prio;\toffset:28;\tsize:4;\tsigned:1;
+\tfield:bool group_dead;\toffset:32;\tsize:1;\tsigned:0;
+";
+
+    #[test]
+    fn finds_group_dead_in_a_real_record() {
+        assert_eq!(parse_exit_group_dead_offset(REAL), Some(32));
+    }
+
+    /// A kernel too old to carry the field. The caller must fall back rather
+    /// than read a byte at a guessed offset.
+    #[test]
+    fn absent_field_resolves_to_none() {
+        let older = REAL
+            .lines()
+            .filter(|l| !l.contains("group_dead"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_exit_group_dead_offset(&older), None);
+    }
+
+    /// A `group_dead` that is not a 1-byte bool is one this program cannot
+    /// read. Reading it anyway would evict verdicts for live processes.
+    #[test]
+    fn a_field_of_the_wrong_width_is_refused() {
+        let odd = REAL.replace("size:1;\tsigned:0;\n", "size:4;\tsigned:0;\n");
+        assert_eq!(parse_exit_group_dead_offset(&odd), None);
+    }
+
+    /// The offset must come from the field named `group_dead`, not from
+    /// whatever happens to sit at 32 in some other kernel's layout.
+    #[test]
+    fn a_reordered_record_still_resolves_by_name() {
+        let moved = REAL.replace(
+            "\tfield:bool group_dead;\toffset:32;\tsize:1;\tsigned:0;",
+            "\tfield:int extra;\toffset:32;\tsize:4;\tsigned:1;\n\tfield:bool group_dead;\toffset:36;\tsize:1;\tsigned:0;",
+        );
+        assert_eq!(parse_exit_group_dead_offset(&moved), Some(36));
     }
 }

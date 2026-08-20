@@ -359,6 +359,37 @@ pub(super) fn load_and_attach(
     for (name, path) in &pinned_map_paths {
         loader.map_pin_path(name, path.as_path());
     }
+    // Where `group_dead` sits in the sched_process_exit record.
+    //
+    // It is what tells the exit program that the *process* is gone rather than
+    // one of its threads, and getting it wrong is not symmetric: reading a
+    // wrong byte as "gone" evicts the verdict of a process that is still
+    // running. So an offset that cannot be confirmed is not guessed - the
+    // global keeps its "absent" default and the kernel side falls back to the
+    // leader-only check it used before.
+    let group_dead_off: u32 = match tracefs::exit_group_dead_offset() {
+        Ok(Some(off)) => {
+            debug!(offset = off, "sched_process_exit carries group_dead");
+            off
+        }
+        Ok(None) => {
+            report.notes.push(
+                "this kernel's sched_process_exit has no readable `group_dead`; \
+                 process exit is approximated by thread-group leader exit"
+                    .to_string(),
+            );
+            u32::MAX
+        }
+        Err(e) => {
+            debug!(
+                "could not read the sched_process_exit format file ({e}); \
+                    keeping the leader-only check"
+            );
+            u32::MAX
+        }
+    };
+    loader.override_global("EXIT_GROUP_DEAD_OFF", &group_dead_off, false);
+
     // The ABI gate, before anything else the loader does.
     //
     // `must_exist = true` is the whole mechanism: if the object does not
