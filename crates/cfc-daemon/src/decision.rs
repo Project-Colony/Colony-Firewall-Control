@@ -77,6 +77,23 @@ impl Engine {
         *self.inner.on_change.write() = Some(f);
     }
 
+    /// Tells the in-kernel layer that time has moved past a rule's deadline.
+    ///
+    /// The kernel's rule table is rebuilt on `upsert_rule` and `remove_rule`,
+    /// and wall-clock expiry is neither. Without this a `deny --for 1h` stays
+    /// compiled past its deadline: the packet path is unaffected - `lookup` is
+    /// passed the time and skips expired rules - but the kernel would go on
+    /// refusing on its own, which overstates the denial and, worse, keeps doing
+    /// it after the daemon is gone.
+    ///
+    /// Called from the flush task, which already knows whether anything has
+    /// expired. Reuses the ordinary change path, so the recompute is the same
+    /// one a rule edit triggers - and its "nothing moved" check means a tick
+    /// with no real change still costs no syscalls.
+    pub fn notify_rules_expired(&self) {
+        self.notify_changed();
+    }
+
     fn notify_changed(&self) {
         if let Some(f) = self.inner.on_change.read().as_ref() {
             f();
@@ -444,6 +461,28 @@ mod tests {
     // answers before a destination exists. Every case below is about the same
     // question: when is it safe to precommit an answer the packet path will
     // never get to revise?
+
+    /// An expired rule must drop out of what gets compiled into the kernel.
+    ///
+    /// The kernel table is rebuilt on rule edits, and expiry is not one. The
+    /// packet path already skips expired rules, so a stale entry would only
+    /// overstate a denial - but it would keep overstating it after the daemon
+    /// is gone, which is the state this whole layer exists to make trustworthy.
+    #[test]
+    fn an_expired_rule_is_not_compilable() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let mut rule = Rule::new("temporary".to_string(), Action::Deny, scope);
+        rule.duration = cfc_core::Duration::Seconds(1);
+        rule.created_at = chrono::Utc::now() - chrono::Duration::hours(2);
+
+        let engine = engine_with(vec![rule]);
+        let compilable = engine.compilable_exe_paths().expect("some are compilable");
+        assert!(
+            !compilable.contains(&PathBuf::from("/usr/bin/curl")),
+            "an expired rule must not reach the kernel table"
+        );
+    }
 
     #[test]
     fn an_exe_a_uid_rule_could_touch_is_not_compilable() {

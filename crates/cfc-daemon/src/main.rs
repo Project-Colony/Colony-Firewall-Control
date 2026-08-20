@@ -230,6 +230,10 @@ async fn run() -> anyhow::Result<()> {
             if !any_expired {
                 continue;
             }
+            // Something's deadline has passed. Rebuild the kernel's rule table
+            // before dropping the rows: expiry is not a rule edit, so nothing
+            // else would tell it.
+            flush_engine.notify_rules_expired();
             match flush_store.purge_expired(now_ms) {
                 Ok(n) if n > 0 => tracing::debug!(removed = n, "purged expired rules"),
                 Ok(_) => {}
