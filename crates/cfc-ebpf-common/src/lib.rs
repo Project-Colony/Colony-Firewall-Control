@@ -184,6 +184,31 @@ pub mod enforce_stat {
 }
 
 /// Length of the kernel's `task_struct::comm` field, including the NUL.
+/// FNV-1a of an executable path, used as the key of the kernel's rule table.
+///
+/// Lives here because **both sides must agree exactly**. The kernel hashes the
+/// path `execve` was handed; userspace hashes the path a rule names. A private
+/// copy on either side that drifted by one constant would not fail loudly - it
+/// would simply stop matching, and the in-kernel refusals would quietly never
+/// fire again. One function, compiled into both.
+///
+/// FNV rather than something stronger because the kernel side has to pass the
+/// verifier: a bounded loop, one load and two arithmetic ops per byte, no
+/// tables and no branches on data.
+///
+/// A collision can only cause a *refusal* for the wrong program, never an
+/// allow, because only denials are ever written. That is the closed direction.
+pub fn hash_exe_path(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
 pub const COMM_LEN: usize = 16;
 
 /// Maximum executable path captured from the `sched_process_exec` tracepoint.

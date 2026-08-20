@@ -329,6 +329,13 @@ pub(super) fn load_and_attach(
                 (enforce::MAP_VERDICTS, dir.join(enforce::MAP_VERDICTS)),
                 (enforce::MAP_STATS, dir.join(enforce::MAP_STATS)),
                 (enforce::MAP_DENY_EVENTS, dir.join(enforce::MAP_DENY_EVENTS)),
+                // The rule table and its gate: an adopted exec program has to
+                // read the same ones the daemon writes.
+                (enforce::MAP_EXE_RULES, dir.join(enforce::MAP_EXE_RULES)),
+                (
+                    enforce::MAP_EXE_RULES_ON,
+                    dir.join(enforce::MAP_EXE_RULES_ON),
+                ),
             ]
         })
         .unwrap_or_default();
@@ -512,14 +519,22 @@ pub(super) fn load_and_attach(
 
     // --- attach, each independently ------------------------------------
 
-    let r = attach_tracepoint(&mut bpf, PROG_EXEC, "sched", "sched_process_exec", None);
+    let exec_pin = pin_dir.as_deref().map(|d| d.join(enforce::LINK_EXEC));
+    if let Some(p) = exec_pin.as_deref() {
+        drop_stale_link_pin(p);
+    }
+    let r = attach_tracepoint(
+        &mut bpf,
+        PROG_EXEC,
+        "sched",
+        "sched_process_exec",
+        exec_pin.as_deref(),
+    );
     report.exec_tracking = record_attach(&mut report, PROG_EXEC, "sched_process_exec", r);
 
-    // The exit link is pinned; the exec link is not, and that asymmetry is the
-    // point of this step rather than an oversight. Pinning exec is what would
-    // let a *new* process get an in-kernel verdict without the daemon, and it
-    // needs the ring-buffer lifecycle reworked first - see the milestone notes.
-    // Pinning exit only keeps the map from rotting, which needs nothing.
+    // Both tracepoints are pinned, for different reasons: exec so a process
+    // that starts without a daemon still gets a verdict, exit so the map it
+    // writes cannot rot. Both are replaced rather than inherited on restart.
     let exit_pin = pin_dir.as_deref().map(|d| d.join(enforce::LINK_EXIT));
     if let Some(p) = exit_pin.as_deref() {
         drop_stale_link_pin(p);
@@ -653,6 +668,11 @@ pub(super) fn load_and_attach(
                     // engine a Weak that is dead on arrival and a resync that
                     // silently never runs.
                     let sink = std::sync::Arc::new(sink);
+                    // Once at startup, before any rule changes. Without this the
+                    // kernel's table stays empty until someone edits a rule, and
+                    // a daemon that starts and is then killed would leave nothing
+                    // behind - which is the case this whole layer exists for.
+                    sink.compile_rules();
                     let weak = std::sync::Arc::downgrade(&sink);
                     engine.set_on_change(Box::new(move || {
                         if let Some(sink) = weak.upgrade() {

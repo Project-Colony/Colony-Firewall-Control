@@ -32,12 +32,12 @@ use aya_ebpf::helpers::{
     bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
 };
 use aya_ebpf::macros::{cgroup_skb, cgroup_sock_addr, map, tracepoint};
-use aya_ebpf::maps::{HashMap, LruHashMap, PerCpuArray, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::{SkBuffContext, SockAddrContext, TracePointContext};
 use aya_ebpf::{EbpfContext as _, Global};
 use cfc_ebpf_common::dns::DNS_HEADER_LEN;
 use cfc_ebpf_common::net::{self, IPV4_MIN_HEADER_LEN, UDP_HEADER_LEN};
-use cfc_ebpf_common::{ConnectDeny, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent};
+use cfc_ebpf_common::{ConnectDeny, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent, FILENAME_LEN};
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -83,6 +83,30 @@ static VERDICTS: HashMap<u32, u32> = HashMap::with_max_entries(10_240, 0);
 /// live-but-old entry costs one fallback walk, not a wrong answer.
 #[map]
 static SOCK_PIDS: LruHashMap<u64, u32> = LruHashMap::with_max_entries(16_384, 0);
+
+/// The daemon's process-wide rules, compiled into a form the kernel can
+/// evaluate alone: `hash_exe_path(exe) -> action`.
+///
+/// This is what lets a process started while no daemon runs still get an
+/// answer. `VERDICTS` holds decisions already made *about a pid*; this holds
+/// the decision *about a program*, so the exec program can reach one without
+/// asking anybody.
+///
+/// Only rules that constrain nothing but the executable are here - the same
+/// set `Engine::process_wide_action` already precommits - because the connect
+/// hooks answer before a destination exists.
+#[map]
+static EXE_RULES: HashMap<u64, u32> = HashMap::with_max_entries(4_096, 0);
+
+/// Whether `EXE_RULES` holds anything, so the hash below can be skipped.
+///
+/// A map, not a `.rodata` global, because rules change while the daemon runs
+/// and a global is fixed at load. One array lookup is tens of nanoseconds; the
+/// hash it guards is a 256-iteration loop, on **every execve on the machine**.
+/// A host with no exe-scoped deny - the common case - must not pay for a table
+/// that is empty.
+#[map]
+static EXE_RULES_ON: Array<u32> = Array::with_max_entries(1, 0);
 
 /// Counters for the connect path. See `cfc_ebpf_common::enforce_stat`.
 #[map]
@@ -292,6 +316,11 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
 
     read_exec_filename(ctx, event);
 
+    // Answer for this process without asking anybody. This is the half that
+    // keeps working when there is no daemon - the case the pinned `VERDICTS`
+    // map exists for and could not previously cover, because nothing wrote it.
+    precommit_verdict(tgid, event);
+
     // Insert first, publish second: by the time userspace sees the ring buffer
     // entry, the map lookup is already guaranteed to succeed.
     let _ = PROCS.insert(&tgid, &*event, u64::from(BPF_ANY));
@@ -348,6 +377,35 @@ fn read_exec_filename(ctx: &TracePointContext, event: &mut ExecEvent) {
         Err(_) => 0,
     };
     event.filename_len = copied as u16;
+}
+
+/// Precommits a verdict for a freshly exec'd process, from the kernel's own
+/// rule table.
+///
+/// The whole point: no daemon is consulted, so this keeps working when there
+/// is none. Writes only denials - an allow would buy nothing, because the
+/// absence of an entry already means "ask the packet path".
+#[inline(always)]
+fn precommit_verdict(tgid: u32, event: &ExecEvent) {
+    // Cheap gate first. See `EXE_RULES_ON`.
+    match EXE_RULES_ON.get(0) {
+        Some(&on) if on != 0 => {}
+        _ => return,
+    }
+
+    let len = event.filename_len as usize;
+    if len == 0 || len > FILENAME_LEN {
+        return;
+    }
+    // The slice bound is what lets the verifier prove every index is in range.
+    let key = cfc_ebpf_common::hash_exe_path(&event.filename[..len]);
+    let action = match unsafe { EXE_RULES.get(&key) } {
+        Some(a) => *a,
+        None => return,
+    };
+    if action == cfc_ebpf_common::verdict::DENY {
+        let _ = VERDICTS.insert(&tgid, &cfc_ebpf_common::verdict::DENY, 0);
+    }
 }
 
 /// Best-effort parent tgid.

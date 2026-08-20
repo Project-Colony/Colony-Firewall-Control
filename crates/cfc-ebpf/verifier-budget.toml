@@ -22,8 +22,23 @@
 measured_on = "7.1.8"
 
 [cfc_sched_process_exec]
-observed = 257
-max = 600
+# Raised from 600 on purpose, and the number is worth reading rather than
+# rubber-stamping.
+#
+# The program now hashes the executable path so it can consult the kernel's own
+# rule table and precommit a verdict without the daemon. That is a bounded loop
+# over the path - one load, one xor, one multiply per byte - and the verifier
+# walks every iteration it cannot fold, so the cost is roughly linear in
+# FILENAME_LEN (256).
+#
+# What this budget guards is not the kernel's limit, which is 1,000,000 and
+# nowhere near: it is *noticing*. A jump like this one should be a decision,
+# and the runtime cost is the part that actually matters - this program runs on
+# every execve on the machine. The `EXE_RULES_ON` gate exists for exactly that:
+# the loop is skipped entirely on a host with no exe-scoped deny rule, which is
+# the common case.
+observed = 2355
+max = 3000
 
 [cfc_sched_process_exit]
 observed = 25

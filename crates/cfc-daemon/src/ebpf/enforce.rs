@@ -101,6 +101,8 @@ pub(super) const MAP_SOCK_PIDS: &str = "SOCK_PIDS";
 pub(super) const MAP_VERDICTS: &str = "VERDICTS";
 pub(super) const MAP_STATS: &str = "ENFORCE_STATS";
 pub(super) const MAP_DENY_EVENTS: &str = "DENY_EVENTS";
+pub(super) const MAP_EXE_RULES: &str = "EXE_RULES";
+pub(super) const MAP_EXE_RULES_ON: &str = "EXE_RULES_ON";
 
 /// Pin name for the `sched_process_exit` link.
 ///
@@ -123,6 +125,23 @@ pub(super) const MAP_DENY_EVENTS: &str = "DENY_EVENTS";
 /// is there to cover the gap between two daemons, not to be inherited across it.
 pub(super) const LINK_EXIT: &str = "exit";
 
+/// Pin name for the `sched_process_exec` link.
+///
+/// Pinned for the reason the exit link is not: so a process that execs while
+/// no daemon is running still gets a verdict. The exec program reads
+/// `EXE_RULES` - the daemon's process-wide rules compiled into the kernel -
+/// and writes `VERDICTS` itself, which is the whole of what makes enforcement
+/// outlive its control plane.
+///
+/// That only works if the table it reads is pinned too, hence `EXE_RULES` and
+/// `EXE_RULES_ON` alongside it. Not pinning them would leave an adopted
+/// program consulting a map the new daemon cannot see - the exact failure the
+/// pinned `DENY_EVENTS` exists to avoid.
+///
+/// Replaced on restart rather than inherited, exactly like [`LINK_EXIT`]: the
+/// program also writes `PROCS` and `EXEC_EVENTS`, both rebuilt every start.
+pub(super) const LINK_EXEC: &str = "exec";
+
 /// Writes precomputed verdicts into the pinned map.
 ///
 /// Handed to the exec consumer, which is the only place that can populate it:
@@ -137,6 +156,10 @@ pub(super) struct VerdictSink {
     map: Arc<Mutex<BpfHashMap<MapData, u32, u32>>>,
     engine: Engine,
     table: KernelProcTable,
+    /// The kernel's own rule table, `None` when the object predates it.
+    exe_rules: Option<Arc<Mutex<BpfHashMap<MapData, u64, u32>>>>,
+    /// The gate the exec program reads before hashing. `None` likewise.
+    exe_rules_on: Option<Arc<Mutex<aya::maps::Array<MapData, u32>>>>,
 }
 
 impl VerdictSink {
@@ -151,10 +174,30 @@ impl VerdictSink {
             .ok_or_else(|| anyhow!("no map named `{MAP_VERDICTS}` in the object"))?;
         let map = BpfHashMap::<_, u32, u32>::try_from(map)
             .with_context(|| format!("{MAP_VERDICTS} is not a hash map"))?;
+        // Both are optional so a daemon can still drive an older object: a
+        // missing table means no in-kernel precommit, which is the behaviour
+        // before this existed, not a failure.
+        let exe_rules = bpf
+            .take_map(MAP_EXE_RULES)
+            .and_then(|m| BpfHashMap::<_, u64, u32>::try_from(m).ok())
+            .map(|m| Arc::new(Mutex::new(m)));
+        let exe_rules_on = bpf
+            .take_map(MAP_EXE_RULES_ON)
+            .and_then(|m| aya::maps::Array::<_, u32>::try_from(m).ok())
+            .map(|m| Arc::new(Mutex::new(m)));
+        if exe_rules.is_none() || exe_rules_on.is_none() {
+            warn!(
+                "this object has no in-kernel rule table; processes that exec \
+                 while the daemon is down will not get a verdict"
+            );
+        }
+
         Ok(Self {
             map: Arc::new(Mutex::new(map)),
             engine,
             table,
+            exe_rules,
+            exe_rules_on,
         })
     }
 
@@ -176,6 +219,10 @@ impl VerdictSink {
     /// handler, never the packet path. A few thousand map operations at worst,
     /// and only when a human or the CLI actually changed something.
     pub(super) fn resync(&self) {
+        // The kernel's table first: it governs processes that do not exist yet,
+        // and it is what survives this daemon.
+        self.compile_rules();
+
         let live = self.table.live_processes(Instant::now());
         if live.is_empty() {
             // Either nothing is tracked or the exec tracepoint is not feeding
@@ -251,6 +298,93 @@ impl VerdictSink {
         } else if deny {
             debug!(pid, exe = %proc.exe.display(), "in-kernel deny installed");
         }
+    }
+
+    /// Compiles the process-wide rules into the kernel's own table.
+    ///
+    /// After this, a process that execs while no daemon is running still gets
+    /// an answer: the exec program hashes the path it was handed, finds it
+    /// here, and writes `VERDICTS` itself.
+    ///
+    /// **The precedence is not reimplemented.** For each executable any rule
+    /// mentions, this asks `Engine::process_wide_action` - the same function
+    /// the live path uses - and writes an entry only when it says Deny. So the
+    /// kernel can never refuse something the daemon would have allowed: a
+    /// higher-precedence allow, a destination-scoped rule, an expired or
+    /// disabled one all come back through the same code that governs the
+    /// packet path.
+    ///
+    /// The synthetic process carries the exe and nothing else, which makes the
+    /// abstentions land the safe way round: a uid-scoped rule cannot match a
+    /// process with no uid, and a hash-scoped rule makes `process_wide_action`
+    /// abstain entirely. Both mean "no entry", which means "ask the packet
+    /// path" - never "allow".
+    ///
+    /// Full rebuild rather than a diff: the table is one entry per exe-scoped
+    /// rule, and a diff would have to reason about which removals are safe.
+    pub(super) fn compile_rules(&self) {
+        let Some(rules) = self.exe_rules.as_ref() else {
+            return;
+        };
+        let mut table = rules.lock();
+
+        // Every executable any enabled rule names. A path nothing mentions
+        // cannot produce a deny, so it need not be asked about.
+        let exes: std::collections::BTreeSet<PathBuf> = self
+            .engine
+            .snapshot()
+            .rules
+            .iter()
+            .filter(|r| r.enabled)
+            .filter_map(|r| r.scope.exe_path.clone())
+            .collect();
+
+        let mut wanted: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for exe in &exes {
+            let proc = Process {
+                exe: exe.clone(),
+                ..Process::unknown(0)
+            };
+            if matches!(
+                self.engine.process_wide_action(&proc),
+                Some(Action::Deny | Action::Reject)
+            ) {
+                let key = cfc_ebpf_common::hash_exe_path(exe.as_os_str().as_encoded_bytes());
+                wanted.insert(key, cfc_ebpf_common::verdict::DENY);
+            }
+        }
+
+        // Drop what is no longer wanted before adding, so a full table cannot
+        // reject the additions.
+        let stale: Vec<u64> = table
+            .keys()
+            .flatten()
+            .filter(|k| !wanted.contains_key(k))
+            .collect();
+        for k in stale {
+            let _ = table.remove(&k);
+        }
+        let mut written = 0usize;
+        for (k, v) in &wanted {
+            match table.insert(k, v, 0) {
+                Ok(()) => written += 1,
+                Err(e) => warn!(key = k, "could not write an in-kernel exe rule: {e}"),
+            }
+        }
+        drop(table);
+
+        // The gate the exec program reads before hashing anything.
+        if let Some(on) = self.exe_rules_on.as_ref() {
+            let value: u32 = u32::from(written > 0);
+            if let Err(e) = on.lock().set(0, value, 0) {
+                warn!("could not update the in-kernel exe-rule gate: {e}");
+            }
+        }
+        debug!(
+            rules = written,
+            executables = exes.len(),
+            "compiled process-wide rules into the kernel"
+        );
     }
 
     /// Evicts a dead pid.
