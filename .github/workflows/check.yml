@@ -245,9 +245,13 @@ jobs:
         run: |
           # Both makedepends and depends: without -s, makepkg aborts on any
           # missing dependency rather than installing it.
+          #
+          # This list MIRRORS pkg/PKGBUILD-git. Adding an entry to depends= there
+          # and not here fails the job with "Could not resolve all dependencies"
+          # — which is how hicolor-icon-theme announced itself.
           pacman -Syu --noconfirm --needed \
             rust protobuf pkgconf git \
-            nftables libxkbcommon wayland
+            nftables libxkbcommon wayland hicolor-icon-theme
 
       - name: Prepare the -git recipe against the local checkout
         run: |
