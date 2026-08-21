@@ -18,8 +18,12 @@ pkgdesc="Application-aware outbound firewall for Linux, written in Rust (git ver
 arch=('x86_64')
 url="https://github.com/Project-Colony/Colony-Firewall-Control"
 license=('GPL-3.0-or-later')
-depends=('gcc-libs' 'glibc' 'nftables' 'libxkbcommon' 'wayland')
+depends=('gcc-libs' 'glibc' 'nftables' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
 makedepends=('cargo' 'protobuf' 'pkgconf' 'git')
+# See the note in pkg/PKGBUILD: makepkg's global LTO turns the bundled sqlite3.c
+# into GCC bitcode that ld.lld cannot read, and every sqlite3_* symbol comes back
+# undefined in a clean chroot.
+options=('!lto')
 optdepends=(
     'libnotify: desktop notifications on new prompts'
     'libx11: run the GUI in X11/XWayland sessions'
@@ -84,6 +88,11 @@ package() {
         "$pkgdir/usr/lib/systemd/system/colony-firewalld.service"
     install -Dm644 systemd/colony-firewall-nft.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewall-nft.service"
+    # Inbound: shipped, never enabled. Turning it on can strand a machine that
+    # is only reachable over the network, so it must stay something a person
+    # chooses rather than something an install does to them.
+    install -Dm644 systemd/colony-firewall-nft-inbound.service \
+        "$pkgdir/usr/lib/systemd/system/colony-firewall-nft-inbound.service"
 
     # sysusers: creates the 'colony-firewall' group for gRPC socket access
     install -Dm644 systemd/colony-firewall.sysusers \
@@ -96,6 +105,14 @@ package() {
     # nftables snippet, loaded by colony-firewall-nft.service
     install -Dm644 systemd/nftables-snippet.conf \
         "$pkgdir/usr/share/colony-firewall/nftables-snippet.conf"
+    # inbound chain, loaded by colony-firewall-nft-inbound.service
+    install -Dm644 systemd/nftables-inbound.conf \
+        "$pkgdir/usr/share/colony-firewall/nftables-inbound.conf"
+
+    # The lockout pre-flight, run as the inbound unit's ExecStartPre. 0755:
+    # systemd execs it directly.
+    install -Dm755 scripts/inbound-lockout-guard.sh \
+        "$pkgdir/usr/lib/colony-firewall/inbound-lockout-guard.sh"
 
     # Desktop integration
     install -Dm644 pkg/colony-firewall.desktop \

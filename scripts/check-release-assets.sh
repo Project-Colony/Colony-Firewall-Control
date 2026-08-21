@@ -35,6 +35,15 @@ done
 
 problems=()
 
+# The directories a packaging recipe may install from. THREE places below need
+# this list — the staged-path grep, repo_path_for(), and check 3's PKGBUILD grep
+# — and they have to agree. They did not: `scripts` was added to the first two
+# and missed in the third, which meant check 3 silently stopped looking at
+# pkg/PKGBUILD's install of scripts/inbound-lockout-guard.sh. A check that
+# passes by not looking is worse than no check, so the list lives here once.
+SEARCH_DIRS=(systemd pkg docs scripts)
+DIR_ALT="$(IFS='|'; printf '%s' "${SEARCH_DIRS[*]}")"
+
 # --- what release.yml stages -------------------------------------------------
 #
 # Everything between "name: Assemble tarball" and the next step. Any
@@ -45,7 +54,7 @@ staged_paths="$(awk '
     /^      - / { if (in_step) exit }
     in_step { print }
 ' "${WORKFLOW}" \
-    | grep -oE '(^|[[:space:]])(target/release/[A-Za-z0-9._-]+|crates/cfc-ebpf/target/[A-Za-z0-9._/-]+|(systemd|pkg|docs|scripts)/[A-Za-z0-9._-]+|(README|CHANGELOG)\.md|LICENSE)' \
+    | grep -oE "(^|[[:space:]])(target/release/[A-Za-z0-9._-]+|crates/cfc-ebpf/target/[A-Za-z0-9._/-]+|(${DIR_ALT})/[A-Za-z0-9._-]+|(README|CHANGELOG)\.md|LICENSE)" \
     | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sort -u)"
 
 if [[ -z "${staged_paths}" ]]; then
@@ -82,10 +91,7 @@ is_generated() {
 # Resolve a flat tarball basename back to its path in the repo.
 repo_path_for() {
     local base="$1" dir
-    # scripts/ belongs here: inbound-lockout-guard.sh lives there, and without
-    # it this reports "does not exist in the repo" for a file that does, which
-    # sends whoever reads the failure looking for the wrong bug.
-    for dir in systemd pkg docs scripts .; do
+    for dir in "${SEARCH_DIRS[@]}" .; do
         if [[ -f "${ROOT}/${dir}/${base}" ]]; then
             printf '%s/%s\n' "${dir#./}" "${base}"
             return 0
@@ -179,7 +185,7 @@ for pkgbuild in pkg/PKGBUILD pkg/PKGBUILD-git; do
         if [[ ! -f "${ROOT}/${src}" ]]; then
             problems+=("${pkgbuild} installs '${src}', which does not exist in the repo")
         fi
-    done < <(grep -oE '(^|[[:space:]])((systemd|pkg|docs)/[A-Za-z0-9._/-]+|(README|CHANGELOG)\.md|LICENSE)([[:space:]]|$)' "${ROOT}/${pkgbuild}" \
+    done < <(grep -oE "(^|[[:space:]])((${DIR_ALT})/[A-Za-z0-9._/-]+|(README|CHANGELOG)\.md|LICENSE)([[:space:]]|\$)" "${ROOT}/${pkgbuild}" \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sort -u)
 done
 

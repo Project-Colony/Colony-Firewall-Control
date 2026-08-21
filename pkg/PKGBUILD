@@ -17,8 +17,19 @@ license=('GPL-3.0-or-later')
 # - No 'sqlite': rusqlite is built with the 'bundled' feature.
 # - No 'libnetfilter_queue'/'libnfnetlink': the nfq crate speaks netlink
 #   directly in pure Rust.
-depends=('gcc-libs' 'glibc' 'nftables' 'libxkbcommon' 'wayland')
+depends=('gcc-libs' 'glibc' 'nftables' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
 makedepends=('cargo' 'protobuf' 'pkgconf')
+# !lto is required for this recipe to link at all in a clean chroot, which is
+# where the AUR and every rebuilder actually build it. Arch's makepkg.conf turns
+# LTO on globally, so -flto=auto lands in CFLAGS; rusqlite is built `bundled`, so
+# libsqlite3-sys compiles sqlite3.c through the cc crate, and the resulting
+# archive is GCC LTO bitcode that ld.lld cannot read. Every sqlite3_* symbol
+# comes back undefined while libsqlite3.a sits in the build directory, correctly
+# built, with cargo:rustc-link-lib=static=sqlite3 duly emitted.
+#
+# It builds on a developer machine because a warm target dir hides it. Measured
+# in a clean chroot on 2026-08-21.
+options=('!lto')
 optdepends=(
     'libnotify: desktop notifications on new prompts'
     'libx11: run the GUI in X11/XWayland sessions'
