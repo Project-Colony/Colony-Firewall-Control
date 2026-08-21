@@ -136,12 +136,29 @@ PrivateTmp=true
 # A new top-level directory in a future kernel's sysfs would be writable to
 # this unit until it is added here. That is the cost of the trade, and it is
 # smaller than losing the pin.
+#
+# EVERY path is prefixed with "-", and that is not defensive tidiness. Without
+# it, systemd treats a missing path as a fatal error and the unit dies at
+# 226/NAMESPACE before the daemon is ever executed:
+#
+#   Failed to set up mount namespacing: /sys/fs/resctrl: No such file or directory
+#   Failed at step NAMESPACE spawning /usr/bin/colony-firewalld
+#
+# Reported from a real Arch Colony install on 2026-08-21. Almost none of these
+# paths is guaranteed: /sys/fs/resctrl needs CONFIG_X86_CPU_RESCTRL *and* a CPU
+# exposing RDT, /sys/fs/btrfs, ext4, fuse, pstore and virtiofs each need their
+# subsystem present, /sys/hypervisor is Xen-only, /proc/acpi needs ACPI. This
+# unit was written against a kernel that happened to have them all.
+#
+# ProtectKernelTunables=yes, which these lines replace, tolerates missing paths
+# on its own. Reimplementing it by hand meant reimplementing that too, and this
+# is the half that was missed.
 ProtectKernelTunables=false
-ReadOnlyPaths=/proc/sys /proc/sysrq-trigger /proc/irq /proc/acpi /proc/fs
-ReadOnlyPaths=/sys/block /sys/bus /sys/class /sys/dev /sys/devices /sys/firmware
-ReadOnlyPaths=/sys/hypervisor /sys/kernel /sys/module /sys/power
-ReadOnlyPaths=/sys/fs/btrfs /sys/fs/cgroup /sys/fs/ext4 /sys/fs/fuse
-ReadOnlyPaths=/sys/fs/pstore /sys/fs/resctrl /sys/fs/tmpfs /sys/fs/virtiofs
+ReadOnlyPaths=-/proc/sys -/proc/sysrq-trigger -/proc/irq -/proc/acpi -/proc/fs
+ReadOnlyPaths=-/sys/block -/sys/bus -/sys/class -/sys/dev -/sys/devices -/sys/firmware
+ReadOnlyPaths=-/sys/hypervisor -/sys/kernel -/sys/module -/sys/power
+ReadOnlyPaths=-/sys/fs/btrfs -/sys/fs/cgroup -/sys/fs/ext4 -/sys/fs/fuse
+ReadOnlyPaths=-/sys/fs/pstore -/sys/fs/resctrl -/sys/fs/tmpfs -/sys/fs/virtiofs
 ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictNamespaces=true
