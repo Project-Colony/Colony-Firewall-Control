@@ -32,6 +32,22 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Refuse to load a fail-closed table when there is no daemon to answer the
+# queue. Wants= above is deliberate and stays: a daemon that crashes and is
+# restarted by Restart=on-failure should NOT get a window where traffic flows
+# unfiltered. But Wants= also tolerates a daemon that never started at all, and
+# then the table is loaded with nobody on NFQUEUE 0 and every new outbound
+# connection is dropped, permanently.
+#
+# That is not hypothetical. On 2026-08-21 an Arch Colony machine ran
+# `systemctl enable --now colony-firewalld colony-firewall-nft`; the daemon died
+# at 226/NAMESPACE, this unit started anyway, and the machine lost DNS and every
+# mirror — including the one that would have delivered the fix.
+#
+# The daemon is Type=notify, so After= means it has signalled readiness by the
+# time this runs. ExecStartPre only runs on start, so a later crash still leaves
+# the table in place, which is the property Wants= exists to keep.
+ExecStartPre=/usr/bin/systemctl is-active --quiet colony-firewalld.service
 ExecStart=/usr/bin/nft -f /usr/share/colony-firewall/nftables-snippet.conf
 ExecStop=/usr/bin/nft delete table inet colony_firewall
 
