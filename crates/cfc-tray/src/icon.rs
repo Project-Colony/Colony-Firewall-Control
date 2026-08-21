@@ -91,7 +91,9 @@ impl Pixmap {
     /// one generator feeding both.
     pub fn to_rgba(&self) -> Vec<u8> {
         self.argb
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[1], p[2], p[3], p[0]])
             .collect()
     }
@@ -148,7 +150,9 @@ mod tests {
             let p = shield_pixmap(size);
             let has = |rgb: [u8; 3]| {
                 p.argb
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|c| c[0] == 0xff && [c[1], c[2], c[3]] == rgb)
             };
             assert!(has(BURGUNDY), "{size}px: no burgundy shield pixel");
@@ -180,7 +184,7 @@ mod tests {
         // Both fully transparent and fully opaque pixels must exist,
         // otherwise the "ARGB" is a lie.
         for p in all() {
-            let alphas: Vec<u8> = p.argb.chunks_exact(4).map(|c| c[0]).collect();
+            let alphas: Vec<u8> = p.argb.as_chunks::<4>().0.iter().map(|c| c[0]).collect();
             assert!(alphas.contains(&0x00));
             assert!(alphas.contains(&0xff));
         }
