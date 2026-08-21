@@ -261,7 +261,7 @@ impl KernelProcTable {
             .filter(|(_, e)| now.saturating_duration_since(e.seen_at) <= ENTRY_TTL)
             .map(|(pid, e)| (*pid, e.seen_at))
             .collect();
-        entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.1));
         entries.truncate(limit);
         entries.into_iter().map(|(pid, _)| pid).collect()
     }
