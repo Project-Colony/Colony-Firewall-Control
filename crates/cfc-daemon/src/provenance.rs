@@ -1847,9 +1847,25 @@ mod tests {
     #[cfg(test)]
     fn sha256_of(path: &Path) -> String {
         use sha2::{Digest, Sha256};
+        use std::io::Read as _;
         let mut f = std::fs::File::open(path).unwrap();
         let mut h = Sha256::new();
-        std::io::copy(&mut f, &mut h).unwrap();
-        format!("{:x}", h.finalize())
+        // Same shape as sha256_file in process_resolve: io::copy and `{:x}`
+        // both stop compiling under RustCrypto 0.11. This one only fails under
+        // --all-targets, which is why it outlived the other two.
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = f.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        let mut out = String::with_capacity(64);
+        for byte in h.finalize() {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
     }
 }

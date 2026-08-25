@@ -1922,9 +1922,31 @@ fn sha256_of(path: &std::path::Path) -> std::io::Result<String> {
         )));
     }
     let mut f = f;
+    // Read in a loop rather than io::copy, and hex-encode by hand rather than
+    // with `{:x}`. RustCrypto 0.11 drops `io::Write` on the hashers and returns
+    // an `Array` that no longer implements `LowerHex`, so both idioms stop
+    // compiling — which is what Dependabot #8 surfaced. This form compiles
+    // against 0.10 and 0.11 alike, so the bump becomes a version bump again.
+    //
+    // Worth the care: this digest is what `--pin-hash` binds a rule to. A rule
+    // that hashes differently from the daemon does not fail loudly, it simply
+    // never matches.
     let mut hasher = Sha256::new();
-    std::io::copy(&mut f, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        use std::io::Read as _;
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let mut out = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
 }
 
 /// `cfc rules bundle add <name>`
