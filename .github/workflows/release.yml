@@ -81,10 +81,31 @@ jobs:
           toolchain: ${{ steps.bpfpins.outputs.nightly }}
           components: rust-src
 
+      # Same trap ebpf.yml hit on 2026-08-23: `llvm-dev` is whatever the runner
+      # image defaults to, and ubuntu's default is older than anything
+      # bpf-linker 0.11 supports — it carries llvm-21, 22 and 23 and nothing
+      # else. The major is derived from the pinned nightly rather than written
+      # down, because the assert below requires the two to be equal and a
+      # second hardcoded number could only drift away from the first.
       - name: Install bpf-linker
         run: |
-          sudo apt-get install -y llvm-dev libpolly-19-dev || sudo apt-get install -y llvm-dev
-          cargo install bpf-linker --version "${{ steps.bpfpins.outputs.linker }}" --locked
+          LLVM_MAJOR="$(rustc +${{ steps.bpfpins.outputs.nightly }} -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+          if [ -z "${LLVM_MAJOR}" ]; then
+            echo "::error::could not read rustc's LLVM version"; exit 1
+          fi
+          echo "pinned nightly uses LLVM ${LLVM_MAJOR}; building bpf-linker against it"
+
+          sudo apt-get update
+          sudo apt-get install -y lsb-release wget software-properties-common gnupg
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "${LLVM_MAJOR}"
+          sudo apt-get install -y "llvm-${LLVM_MAJOR}-dev" "libpolly-${LLVM_MAJOR}-dev"
+
+          export "LLVM_SYS_${LLVM_MAJOR}1_PREFIX=/usr/lib/llvm-${LLVM_MAJOR}"
+          export PATH="/usr/lib/llvm-${LLVM_MAJOR}/bin:${PATH}"
+          cargo install bpf-linker --version "${{ steps.bpfpins.outputs.linker }}" --locked \
+            --no-default-features --features "llvm-${LLVM_MAJOR}"
 
       # `bpfel-unknown-none` sets obj-is-bitcode, so rustc hands bpf-linker raw
       # LLVM bitcode and rustc's LLVM must not be NEWER than bpf-linker's, or
