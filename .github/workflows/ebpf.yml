@@ -81,11 +81,38 @@ jobs:
         with:
           key: bpf-${{ steps.pins.outputs.nightly }}-${{ steps.pins.outputs.linker }}
 
+      # `llvm-dev` is whatever LLVM the runner image defaults to, and on
+      # ubuntu-24.04 that is 18 — a version bpf-linker 0.11 dropped. The build
+      # then found no libLLVM to link against and died with
+      # `rust-lld: error: unable to find library -lLLVM`, which reads like a
+      # path problem and is a version problem. The scheduled run failed this
+      # way on 2026-08-23; the runner image moved, not mainline.
+      #
+      # The major is derived from the pinned nightly rather than written down.
+      # It has to equal rustc's, because bpfel-unknown-none is obj-is-bitcode
+      # and the assert below enforces exactly that — so a second hardcoded
+      # number could only ever drift away from the first.
       - name: Install bpf-linker
         run: |
+          LLVM_MAJOR="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+          if [ -z "${LLVM_MAJOR}" ]; then
+            echo "::error::could not read rustc's LLVM version"; exit 1
+          fi
+          echo "pinned nightly uses LLVM ${LLVM_MAJOR}; building bpf-linker against it"
+
           sudo apt-get update
-          sudo apt-get install -y llvm-dev
-          cargo install bpf-linker --version "${{ steps.pins.outputs.linker }}" --locked
+          sudo apt-get install -y lsb-release wget software-properties-common gnupg
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh "${LLVM_MAJOR}"
+          sudo apt-get install -y "llvm-${LLVM_MAJOR}-dev" "libpolly-${LLVM_MAJOR}-dev"
+
+          # llvm-sys keys its prefix variable on the version it wraps: LLVM 22
+          # is llvm-sys 221.x, hence LLVM_SYS_221_PREFIX.
+          export "LLVM_SYS_${LLVM_MAJOR}1_PREFIX=/usr/lib/llvm-${LLVM_MAJOR}"
+          export PATH="/usr/lib/llvm-${LLVM_MAJOR}/bin:${PATH}"
+          cargo install bpf-linker --version "${{ steps.pins.outputs.linker }}" --locked \
+            --no-default-features --features "llvm-${LLVM_MAJOR}"
 
       # `bpfel-unknown-none` sets obj-is-bitcode: rustc hands bpf-linker raw
       # LLVM bitcode, so rustc's LLVM must not be NEWER than bpf-linker's or
