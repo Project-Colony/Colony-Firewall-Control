@@ -235,6 +235,19 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
+      # BEFORE checkout, and that is the whole point. base-devel does not
+      # include git, and actions/checkout silently falls back to fetching a
+      # tarball through the REST API when git is missing: the files arrive, the
+      # repository does not. makepkg then tries to clone a directory with no
+      # .git in it and reports
+      #
+      #   fatal: '/__w/…/…' does not appear to be a git repository
+      #
+      # which reads like a path or permissions problem. This job had never
+      # passed for that reason.
+      - name: git, before anything wants a repository
+        run: pacman -Sy --noconfirm --needed git
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # makepkg clones the source with `git clone --mirror`, which
