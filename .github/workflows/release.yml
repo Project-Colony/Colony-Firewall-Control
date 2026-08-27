@@ -315,7 +315,16 @@ jobs:
       - name: namcap the built package
         working-directory: pkg
         run: |
-          namcap ./*.pkg.tar.* | tee namcap-pkg.log
+          # Lint the package this recipe defines, not the -debug split makepkg
+          # generates beside it. The debug package's .build-id symlinks point
+          # into the MAIN package's tree, and namcap checks each package in
+          # isolation - so every one of them is flagged E: as dangling. That is
+          # the linter being wrong about a structure makepkg itself created,
+          # and it killed the third v0.2.3 tag run. The debug split is not
+          # shipped anywhere: only PKGBUILD and .SRCINFO are attached to the
+          # release, so nothing the user installs goes unlinted.
+          # The [0-9] is what excludes it: "-debug-" cannot match a digit.
+          namcap ./colony-firewall-control-[0-9]*.pkg.tar.* | tee namcap-pkg.log
           if grep -q ' E: ' namcap-pkg.log; then
             echo "::error::namcap reported errors in the built package"
             exit 1
