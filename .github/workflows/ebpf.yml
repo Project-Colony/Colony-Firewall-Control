@@ -329,10 +329,13 @@ jobs:
           # carriers with no CMD, and the docker shipped in runner images since
           # 2026-08-23 refuses `docker create` without a command ("no command
           # specified") - which broke all five matrix entries at once. create
-          # never executes the command, so any word satisfies it.
-          docker create --name k "${{ matrix.image }}" unused
-          docker cp k:/boot/vmlinuz ./vmlinuz
-          docker rm k
+          # never executes the command, so any word satisfies it. The same
+          # docker also began rejecting single-character container names
+          # ("Invalid container name (k)"), hence the longer name - two
+          # environment breakages stacked on one line.
+          docker create --name kernelsrc "${{ matrix.image }}" unused
+          docker cp kernelsrc:/boot/vmlinuz ./vmlinuz
+          docker rm kernelsrc
           ls -l ./vmlinuz
           file ./vmlinuz || true
 
