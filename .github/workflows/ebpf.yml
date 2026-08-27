@@ -353,7 +353,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p rootfs
-          docker create --name rfs debian:bookworm-slim
+          # trixie, not bookworm, and the constraint is the builder's glibc:
+          # the test binary is compiled on the ubuntu-noble runner (glibc 2.39)
+          # and bookworm's 2.36 refuses to load it - the guest said so plainly
+          # once it had a console: "version GLIBC_2.39 not found". The guest
+          # userland must be at least as new as the build host's.
+          docker create --name rfs debian:trixie-slim
           docker export rfs | tar -C rootfs -xf -
           docker rm rfs
 

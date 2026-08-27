@@ -233,9 +233,9 @@ manage_sock_files_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_
 # three different failures, all inside interface machinery this module does
 # not control. var_run_t is a *type*, aliased across every rename, and raw
 # allow/type_transition statements owe nothing to any header's health.
-gen_require(`
+require {
 	type var_run_t;
-')
+}
 allow colony_firewalld_t var_run_t:dir { getattr search open read write add_name remove_name };
 type_transition colony_firewalld_t var_run_t:dir colony_firewall_runtime_t;
 type_transition colony_firewalld_t var_run_t:file colony_firewall_runtime_t;

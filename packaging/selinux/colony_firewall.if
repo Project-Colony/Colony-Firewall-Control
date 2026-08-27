@@ -31,9 +31,8 @@ interface(`colony_firewall_stream_connect',`
 	')
 
 	# Raw statement; see the .te's var_run_t note for why no files_* interface.
-	gen_require(`
-		type var_run_t;
-	')
+	# The type is required by the .te's own require block; callers outside this
+	# module must require var_run_t themselves.
 	allow $1 var_run_t:dir search;
 	stream_connect_pattern($1, colony_firewall_runtime_t, colony_firewall_runtime_t, colony_firewalld_t)
 ')
@@ -97,9 +96,6 @@ interface(`colony_firewall_admin',`
 	files_search_var_lib($1)
 	admin_pattern($1, colony_firewall_var_lib_t)
 
-	gen_require(`
-		type var_run_t;
-	')
 	allow $1 var_run_t:dir search;
 	admin_pattern($1, colony_firewall_runtime_t)
 
