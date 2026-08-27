@@ -30,13 +30,8 @@ interface(`colony_firewall_stream_connect',`
 		type colony_firewall_runtime_t;
 	')
 
-	# Same rename family as files_runtime_filetrans in the .te: current CI
-	# containers' policy-devel headers define only the pids spelling.
-	ifdef(`files_search_runtime', `
-	files_search_runtime($1)
-	', `
+	# Classic spelling on purpose; see the .te's files_pid_filetrans note.
 	files_search_pids($1)
-	')
 	stream_connect_pattern($1, colony_firewall_runtime_t, colony_firewall_runtime_t, colony_firewalld_t)
 ')
 
@@ -99,11 +94,7 @@ interface(`colony_firewall_admin',`
 	files_search_var_lib($1)
 	admin_pattern($1, colony_firewall_var_lib_t)
 
-	ifdef(`files_search_runtime', `
-	files_search_runtime($1)
-	', `
 	files_search_pids($1)
-	')
 	admin_pattern($1, colony_firewall_runtime_t)
 
 	logging_search_logs($1)

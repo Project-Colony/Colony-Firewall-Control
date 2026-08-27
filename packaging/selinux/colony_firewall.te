@@ -225,17 +225,15 @@ logging_log_filetrans(colony_firewalld_t, colony_firewall_log_t, { dir file })
 manage_dirs_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
 manage_files_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
 manage_sock_files_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
-# Two names for one interface, picked at build time. Fedora's selinux-policy
-# renamed files_pid_filetrans to files_runtime_filetrans when /var/run became
-# /run, but the policy-devel headers in both current CI containers (rocky-9
-# AND fedora-latest) still define only the pid spelling - an unknown interface
-# is a hard parse error, so naming just one breaks on the other side of the
-# rename. m4's ifdef sees whichever the build host defines.
-ifdef(`files_runtime_filetrans', `
-files_runtime_filetrans(colony_firewalld_t, colony_firewall_runtime_t, { dir file sock_file })
-', `
+# The pid spelling, deliberately. Fedora renamed files_pid_filetrans to
+# files_runtime_filetrans with the /var/run -> /run migration, but the
+# policy-devel headers in both CI containers (rocky-9 AND fedora-latest)
+# define only the classic name, and an unknown interface is a hard parse
+# error. An ifdef around the interface was tried and broke m4 itself -
+# refpolicy's line-counting machinery does not survive an interface call
+# nested in ifdef arguments. If a future policy drops the compat spelling,
+# the error will name this line plainly; that beats clever.
 files_pid_filetrans(colony_firewalld_t, colony_firewall_runtime_t, { dir file sock_file })
-')
 
 ########################################
 #
