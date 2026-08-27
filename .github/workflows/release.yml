@@ -252,9 +252,15 @@ jobs:
           # Both makedepends and depends: without -s, makepkg aborts on any
           # missing dependency rather than installing it. pacman-contrib
           # provides updpkgsums.
+          # This list MIRRORS pkg/PKGBUILD depends= + makedepends=, the same
+          # way check.yml's pkgbuild-build mirrors PKGBUILD-git. 4fe0509 added
+          # hicolor-icon-theme to THAT copy when makepkg refused the build; this
+          # copy was missed, and the first tag run to get this far failed on
+          # exactly the same missing dependency. Two hand-kept copies of one
+          # list: when one learns something, the other must be taught too.
           pacman -Syu --noconfirm --needed \
             rust protobuf pkgconf git \
-            nftables libxkbcommon wayland \
+            nftables libxkbcommon wayland hicolor-icon-theme \
             namcap pacman-contrib
 
       - name: Prepare unprivileged build user
