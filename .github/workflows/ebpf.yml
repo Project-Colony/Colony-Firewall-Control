@@ -169,10 +169,17 @@ jobs:
 
       # The test binds 127.0.0.1:53 to impersonate a resolver. Fail naming
       # whoever holds it rather than blindly stopping systemd-resolved.
-      - name: Preflight - port 53 must be free
+      - name: Preflight - 127.0.0.1:53 must be free
+        # The DNS probe binds 127.0.0.1:53 and nothing else, so that address is
+        # the only one this check may claim. It used to refuse port 53 on ANY
+        # address, and the runner image now ships systemd-resolved listening on
+        # 127.0.0.53 and 127.0.0.54 - stub addresses that do not collide with
+        # the probe's bind at all. That over-broad check is why this job has
+        # been red on every branch since 2026-08-25 while the test it guards
+        # would have passed.
         run: |
-          if ss -lunp 'sport = :53' 2>/dev/null | tail -n +2 | grep -q .; then
-            echo "::error::something is listening on udp/53 on this runner:"
+          if ss -lunp 'sport = :53' 2>/dev/null | tail -n +2 | grep -F '127.0.0.1:53' | grep -q .; then
+            echo "::error::something is listening on udp 127.0.0.1:53 on this runner:"
             ss -lunp 'sport = :53'
             exit 1
           fi
