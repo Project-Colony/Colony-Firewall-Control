@@ -365,10 +365,17 @@ jobs:
           # Minimal PID 1. Everything the loader touches has to be mounted here:
           # tracefs for the tracepoint id/format files, cgroup2 for the DNS
           # program's attach point, sysfs for /sys/kernel/btf/vmlinux.
+          #
+          # /dev FIRST, then grab the console. A docker-export rootfs has no
+          # device nodes (tar cannot mknod unprivileged), so until devtmpfs is
+          # mounted this script runs with no stdout at all - an entire round of
+          # this matrix executed invisibly and died on its last line, and the
+          # only witness was exit_group(127) in the panic's register dump.
+          mount -t devtmpfs devtmpfs /dev
+          exec > /dev/console 2>&1
           set -x
           mount -t proc proc /proc
           mount -t sysfs sysfs /sys
-          mount -t devtmpfs devtmpfs /dev
           mount -t tmpfs tmpfs /tmp
           mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || \
             mount -t debugfs debugfs /sys/kernel/debug
@@ -381,7 +388,11 @@ jobs:
           CFC_EBPF_OBJECT=/cfc-ebpf.o /cfc-test --ignored --nocapture \
             --test-threads=1 loads_and_attaches
           echo "CFC_EXIT=$?"
-          poweroff -f
+          # No poweroff: bookworm-slim ships no init system, so the binary does
+          # not exist - it was the 127 that killed PID 1 above. Exiting is the
+          # shutdown mechanism here: panic=1 reboots when init dies, and qemu's
+          # -no-reboot turns that reboot into an exit. The marker is already out.
+          exit 0
           INIT
           chmod +x rootfs/init
 

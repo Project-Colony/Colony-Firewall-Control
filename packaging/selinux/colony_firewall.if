@@ -30,8 +30,11 @@ interface(`colony_firewall_stream_connect',`
 		type colony_firewall_runtime_t;
 	')
 
-	# Classic spelling on purpose; see the .te's files_pid_filetrans note.
-	files_search_pids($1)
+	# Raw statement; see the .te's var_run_t note for why no files_* interface.
+	gen_require(`
+		type var_run_t;
+	')
+	allow $1 var_run_t:dir search;
 	stream_connect_pattern($1, colony_firewall_runtime_t, colony_firewall_runtime_t, colony_firewalld_t)
 ')
 
@@ -94,7 +97,10 @@ interface(`colony_firewall_admin',`
 	files_search_var_lib($1)
 	admin_pattern($1, colony_firewall_var_lib_t)
 
-	files_search_pids($1)
+	gen_require(`
+		type var_run_t;
+	')
+	allow $1 var_run_t:dir search;
 	admin_pattern($1, colony_firewall_runtime_t)
 
 	logging_search_logs($1)

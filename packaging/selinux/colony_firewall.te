@@ -225,15 +225,21 @@ logging_log_filetrans(colony_firewalld_t, colony_firewall_log_t, { dir file })
 manage_dirs_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
 manage_files_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
 manage_sock_files_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
-# The pid spelling, deliberately. Fedora renamed files_pid_filetrans to
-# files_runtime_filetrans with the /var/run -> /run migration, but the
-# policy-devel headers in both CI containers (rocky-9 AND fedora-latest)
-# define only the classic name, and an unknown interface is a hard parse
-# error. An ifdef around the interface was tried and broke m4 itself -
-# refpolicy's line-counting machinery does not survive an interface call
-# nested in ifdef arguments. If a future policy drops the compat spelling,
-# the error will name this line plainly; that beats clever.
-files_pid_filetrans(colony_firewalld_t, colony_firewall_runtime_t, { dir file sock_file })
+# Raw statements, not an interface, and the history earns the verbosity.
+# The runtime spelling (files_runtime_filetrans) is an unknown token in both
+# CI containers' devel headers; the pid spelling exists but its deprecation
+# shim leaks a literal file:line into the m4 stream and breaks the parse;
+# and wrapping either in ifdef broke m4's own line counting. Three rounds,
+# three different failures, all inside interface machinery this module does
+# not control. var_run_t is a *type*, aliased across every rename, and raw
+# allow/type_transition statements owe nothing to any header's health.
+gen_require(`
+	type var_run_t;
+')
+allow colony_firewalld_t var_run_t:dir { getattr search open read write add_name remove_name };
+type_transition colony_firewalld_t var_run_t:dir colony_firewall_runtime_t;
+type_transition colony_firewalld_t var_run_t:file colony_firewall_runtime_t;
+type_transition colony_firewalld_t var_run_t:sock_file colony_firewall_runtime_t;
 
 ########################################
 #
