@@ -1622,10 +1622,19 @@ mod tests {
         for (program, insns) in &report.verified_insns {
             println!("verified_insns: {program} = {insns}");
         }
-        assert!(
-            !report.verified_insns.is_empty(),
-            "this kernel reports verified instruction counts; they should be recorded"
-        );
+        // `bpf_prog_info.verified_insns` exists since kernel 5.16; before
+        // that, an empty report is the correct answer, not a recording
+        // failure. The assertion exists to catch the loader silently losing
+        // the counts on kernels that do provide them.
+        let kernel_reports_counts = aya::util::KernelVersion::current()
+            .map(|v| v >= aya::util::KernelVersion::new(5, 16, 0))
+            .unwrap_or(true);
+        if kernel_reports_counts {
+            assert!(
+                !report.verified_insns.is_empty(),
+                "this kernel reports verified instruction counts; they should be recorded"
+            );
+        }
         assert_within_verifier_budget(&report.verified_insns);
         println!("dns_capture = {}", report.dns_capture);
         assert!(
