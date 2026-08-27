@@ -76,7 +76,7 @@ nfq = "0.2"
 procfs = "0.18"
 
 # DNS reverse lookup
-dns-lookup = "2.0"
+dns-lookup = "3.0"
 
 # Process / system
 nix = { version = "0.31", features = ["process", "user", "signal"] }
