@@ -71,6 +71,10 @@ jobs:
         run: |
           set -eux
           cd packaging/selinux
+          # Ground truth first: if the build below fails, this output is what
+          # ends four rounds of guessing what these headers actually define.
+          grep -n "interface(\`files_search_pids\|interface(\`files_search_runtime\|interface(\`files_pid_filetrans\|interface(\`files_runtime_filetrans" \
+            /usr/share/selinux/devel/include/kernel/files.if || true
           make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
           ls -l colony_firewall.pp
 

@@ -578,9 +578,12 @@ fn is_bpffs(path: &Path) -> io::Result<bool> {
 pub(super) fn prepare() -> anyhow::Result<PathBuf> {
     let root = Path::new(BPFFS);
     if !is_bpffs(root).with_context(|| format!("stat {BPFFS}"))? {
+        // States the fact only. The caller in the loader wraps every error
+        // from here with the consequence ("cannot be pinned; it will stop
+        // when this daemon does") - repeating it here printed the clause
+        // twice in one note.
         return Err(anyhow!(
-            "{BPFFS} is not a bpffs mount (mount -t bpf bpffs {BPFFS}); \
-             enforcement cannot be pinned and will stop when this daemon does"
+            "{BPFFS} is not a bpffs mount (mount -t bpf bpffs {BPFFS})"
         ));
     }
     let ns = root.join(PIN_NAMESPACE);

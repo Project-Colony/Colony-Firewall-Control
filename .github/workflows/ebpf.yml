@@ -307,7 +307,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libnfnetlink-dev \
-            libnetfilter-queue-dev qemu-system-x86 e2fsprogs
+            libnetfilter-queue-dev qemu-system-x86 cpio busybox-static
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -325,27 +325,49 @@ jobs:
       - name: Fetch the kernel
         run: |
           set -euo pipefail
-          docker create --name k "${{ matrix.image }}"
-          docker cp k:/boot/vmlinuz ./vmlinuz
-          docker rm k
+          # The trailing word is load-bearing. ci-kernels images are file
+          # carriers with no CMD, and the docker shipped in runner images since
+          # 2026-08-23 refuses `docker create` without a command ("no command
+          # specified") - which broke all five matrix entries at once. create
+          # never executes the command, so any word satisfies it. The same
+          # docker also began rejecting single-character container names
+          # ("Invalid container name (k)"), hence the longer name - two
+          # environment breakages stacked on one line.
+          docker create --name kernelsrc "${{ matrix.image }}" unused
+          docker cp kernelsrc:/boot/vmlinuz ./vmlinuz
+          docker rm kernelsrc
           ls -l ./vmlinuz
           file ./vmlinuz || true
 
-      # docker export -> mke2fs -d builds the image from a directory, so the
-      # test binary and the object are just files placed there beforehand.
-      # That removes the guest-transport problem entirely, and needs only
-      # virtio_blk + ext4 in the guest - both built in. virtiofs and 9p are
-      # MODULES on Ubuntu mainline builds, so any design that mounts the host
-      # rootfs that way needs an initramfs; this one does not.
+      # docker export -> cpio builds a full-rootfs initramfs, so the guest
+      # needs NO filesystem driver at all: the kernel unpacks it into ramfs
+      # and runs /init. This replaced an ext4 disk image after the guest's own
+      # panic message listed what these kernels can actually mount -
+      # "No filesystem could mount root, tried: vfat msdos iso9660". The
+      # previous comment here claimed ext4 was built in; nobody had checked,
+      # and the matrix had never once been green. An earlier revision also
+      # rejected "an initramfs" on the belief it implied 9p/virtiofs modules -
+      # backwards: a self-contained initramfs is exactly what removes every
+      # driver requirement.
       - name: Build the guest rootfs
         run: |
           set -euo pipefail
           mkdir -p rootfs
-          docker create --name rfs debian:bookworm-slim
+          # trixie, not bookworm, and the constraint is the builder's glibc:
+          # the test binary is compiled on the ubuntu-noble runner (glibc 2.39)
+          # and bookworm's 2.36 refuses to load it - the guest said so plainly
+          # once it had a console: "version GLIBC_2.39 not found". The guest
+          # userland must be at least as new as the build host's.
+          docker create --name rfs debian:trixie-slim
           docker export rfs | tar -C rootfs -xf -
           docker rm rfs
 
           install -D -m0755 "${{ steps.bin.outputs.path }}" rootfs/cfc-test
+          # Static busybox from the runner: trixie-slim ships neither ip nor
+          # ifconfig, so the init line that brings loopback up was failing into
+          # its own `|| true` - and the DNS probe then got ENETUNREACH on
+          # 127.0.0.1. A static binary owes the guest libc nothing.
+          install -D -m0755 "$(command -v busybox)" rootfs/busybox
           install -D -m0644 obj/cfc-ebpf.o rootfs/cfc-ebpf.o
 
           cat > rootfs/init <<'INIT'
@@ -353,15 +375,22 @@ jobs:
           # Minimal PID 1. Everything the loader touches has to be mounted here:
           # tracefs for the tracepoint id/format files, cgroup2 for the DNS
           # program's attach point, sysfs for /sys/kernel/btf/vmlinux.
+          #
+          # /dev FIRST, then grab the console. A docker-export rootfs has no
+          # device nodes (tar cannot mknod unprivileged), so until devtmpfs is
+          # mounted this script runs with no stdout at all - an entire round of
+          # this matrix executed invisibly and died on its last line, and the
+          # only witness was exit_group(127) in the panic's register dump.
+          mount -t devtmpfs devtmpfs /dev
+          exec > /dev/console 2>&1
           set -x
           mount -t proc proc /proc
           mount -t sysfs sysfs /sys
-          mount -t devtmpfs devtmpfs /dev
           mount -t tmpfs tmpfs /tmp
           mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || \
             mount -t debugfs debugfs /sys/kernel/debug
           mount -t cgroup2 cgroup2 /sys/fs/cgroup
-          ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+          /busybox ip link set lo up
 
           echo "guest glibc: $(ldd --version 2>&1 | head -1)"
           echo "guest kernel: $(uname -r)"
@@ -369,24 +398,39 @@ jobs:
           CFC_EBPF_OBJECT=/cfc-ebpf.o /cfc-test --ignored --nocapture \
             --test-threads=1 loads_and_attaches
           echo "CFC_EXIT=$?"
-          poweroff -f
+          # No poweroff: bookworm-slim ships no init system, so the binary does
+          # not exist - it was the 127 that killed PID 1 above. Exiting is the
+          # shutdown mechanism here: panic=1 reboots when init dies, and qemu's
+          # -no-reboot turns that reboot into an exit. The marker is already out.
+          exit 0
           INIT
           chmod +x rootfs/init
 
-          # Slack for the binary; the base image is ~80 MiB.
-          mke2fs -t ext4 -d rootfs -F rootfs.ext4 2G
+          # newc is the format the kernel's initramfs unpacker speaks;
+          # --owner=0:0 because the runner user's uid must not leak into the
+          # guest's idea of who owns /init. gzip -1: this is unpacked once.
+          (cd rootfs && find . | cpio -o -H newc --owner=0:0 | gzip -1) > rootfs.cpio.gz
+          ls -lh rootfs.cpio.gz
 
       - name: Boot and run
         run: |
           set -euo pipefail
           START=$(date +%s)
+          # qemu's exit code is not the verdict; the CFC_EXIT marker below is.
+          # The shutdown here is a deliberate panic (init exits under panic=1)
+          # and how qemu reports the resulting reset request varies by guest
+          # kernel: the 6.x reboot path exits 0, the 5.10 one exits 1, for the
+          # same healthy shutdown. A hang or a crashed qemu is still caught -
+          # either way the marker never got printed.
+          QEMU_RC=0
           timeout 600 qemu-system-x86_64 \
             -nographic -no-reboot -m 2G -smp 2 \
             -kernel ./vmlinuz \
-            -drive file=rootfs.ext4,if=virtio,format=raw \
-            -append "root=/dev/vda rw init=/init console=ttyS0 panic=1" \
-            | tee guest.log
+            -initrd rootfs.cpio.gz \
+            -append "rdinit=/init console=ttyS0 panic=1" \
+            | tee guest.log || QEMU_RC=$?
           ELAPSED=$(( $(date +%s) - START ))
+          echo "qemu exit: ${QEMU_RC} (informational)"
 
           # A guest that never printed the marker did not run the test - a
           # boot failure must not read as a pass.
@@ -403,9 +447,15 @@ jobs:
             echo "|---|---|"
             echo "| exit | ${CODE} |"
             echo "| boot+test wall clock | ${ELAPSED}s |"
+            # `|| true`: kernels before 5.16 report no verified-insn counts,
+            # so on 5.10 this grep matches nothing - which under pipefail was
+            # exit 1, and as the last command of this group it took the whole
+            # step down after the suite had already passed. Same lesson as the
+            # test assertion this round fixed: no counts is what an old kernel
+            # reporting honestly looks like.
             grep -o 'verified_insns: [^ ]* = [0-9]*' guest.log | while read -r _ p _ n; do
               echo "| \`${p}\` verified insns | ${n} |"
-            done
+            done || true
           } >> "${GITHUB_STEP_SUMMARY}"
 
           # Wall clock, not just instruction count. They are different
