@@ -121,8 +121,12 @@ jobs:
           set -eux
           rpmdev-setuptree
           # `%prep` needs the tarball to exist even for a source RPM. Its
-          # contents are irrelevant here: nothing is unpacked.
-          touch ~/rpmbuild/SOURCES/colony-firewall-control-0.2.0.tar.gz
+          # contents are irrelevant here: nothing is unpacked. The name is
+          # derived from the spec rather than hardcoded - a hardcoded 0.2.0
+          # here is what broke this job on the first real version bump, in the
+          # one repo whose check-versions.sh exists to prevent exactly that.
+          SRC="$(rpmspec -q --srpm --qf '%{name}-%{version}\n' packaging/rpm/colony-firewall-control.spec | head -1)"
+          touch ~/rpmbuild/SOURCES/"${SRC}.tar.gz"
           rpmbuild -bs packaging/rpm/colony-firewall-control.spec
           ls -l ~/rpmbuild/SRPMS/
 
