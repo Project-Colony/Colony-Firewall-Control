@@ -29,6 +29,13 @@ RemainAfterExit=yes
 # could re-admit it after a restart - the deferred lockout described in the
 # script. Override with `systemctl set-environment CFC_INBOUND_FORCE=1` if you
 # have the console and mean it.
+# Same guard as colony-firewall-nft.service, same incident behind it: Wants=
+# tolerates a daemon that never started, and this table is fail-closed too -
+# `policy drop` plus a queue nobody answers. Outbound got this check after an
+# Arch Colony machine lost its network to exactly that; inbound was missed.
+# Order matters: check the daemon first - the lockout guard below asks `cfc`
+# for the rule list, which needs the daemon anyway.
+ExecStartPre=/usr/bin/systemctl is-active --quiet colony-firewalld.service
 ExecStartPre=/usr/lib/colony-firewall/inbound-lockout-guard.sh
 
 ExecStart=/usr/bin/nft -f /usr/share/colony-firewall/nftables-inbound.conf
