@@ -325,7 +325,12 @@ jobs:
       - name: Fetch the kernel
         run: |
           set -euo pipefail
-          docker create --name k "${{ matrix.image }}"
+          # The trailing word is load-bearing. ci-kernels images are file
+          # carriers with no CMD, and the docker shipped in runner images since
+          # 2026-08-23 refuses `docker create` without a command ("no command
+          # specified") - which broke all five matrix entries at once. create
+          # never executes the command, so any word satisfies it.
+          docker create --name k "${{ matrix.image }}" unused
           docker cp k:/boot/vmlinuz ./vmlinuz
           docker rm k
           ls -l ./vmlinuz
