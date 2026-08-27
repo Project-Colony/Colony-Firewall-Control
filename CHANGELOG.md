@@ -6,7 +6,34 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-27
+
 ### Added
+
+- **Inbound filtering.** CFC now filters both directions, under one policy:
+  nothing enters without a rule, and inbound never prompts - an exposed
+  machine is scanned continuously, and a bubble per inbound SYN would be a
+  denial of service on the user's attention. A separate opt-in unit
+  (`colony-firewall-nft-inbound`) loads a fail-closed chain (`policy drop`),
+  guarded twice at start: the daemon must be active, and a lockout pre-flight
+  refuses to load if a live remote session has no rule to readmit it after a
+  restart. The `inbound` bundle seeds mDNS/LLMNR/DHCP/SSH scoped to private
+  ranges only.
+- **In-kernel enforcement that survives the daemon - for new processes too.**
+  The daemon compiles its process-wide deny rules into a pinned kernel table
+  (`EXE_RULES`); the exec tracepoint consults it and writes verdicts itself.
+  Kill the daemon: processes it knew keep their EPERM, and a denied binary
+  *launched afterwards* is refused in 0 ms by the kernel alone. The daemon
+  became a control plane. The exit tracepoint now evicts its own verdicts
+  (using the kernel's `group_dead`, resolved from the live tracepoint format),
+  so the pinned map cannot rot through pid recycling.
+- **Content-bound rules.** `cfc rules add --exe <path> --pin-hash` binds a
+  rule to the binary's sha256: replace the file and the rule stops applying,
+  instead of the replacement inheriting the permission. Per-rule and off by
+  default - a package update revokes such a rule too, by design.
+- `cfc status` now reports *where* enforcement lives (`pinned`, `inherited`,
+  `process`, `unavailable`) - losing the kernel layer is otherwise silent.
+
 - **eBPF backend**. Compiled into the daemon by default; still gated at
   runtime by `[ebpf] enabled`, which remains off. Build without it with
   `cargo build -p cfc-daemon --no-default-features`.
@@ -33,6 +60,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   these are what let a `strict` machine get a lease at boot.
 
 ### Changed
+
+- Inbound connect latency 2.78 ms -> 0.13 ms (the packet path no longer
+  performs a socket lookup that cannot succeed for an inbound SYN); daemon
+  RSS 78 MB -> ~31 MB; 18 threads -> 7; SQLite in WAL at full durability,
+  2.5x faster event batches. Measured on a veth pair, method in the repo.
+
 - **Filtering now starts before the network does.** Both units are
   ordered `Before=network-pre.target` (the systemd firewall convention)
   instead of after it: the daemon is listening on the queue and the
@@ -40,6 +73,26 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dhcpcd configure a single interface. There is no window at boot where
   the network is up but filtering is not. The nft unit also `Wants=` the
   daemon, so enabling enforcement alone pulls the daemon in.
+
+### Fixed
+
+- **The inbound bundle opened three UDP ports to the whole internet.** Its
+  mDNS, LLMNR and DHCP entries shipped without a source network, admitting
+  unicast UDP from any address on earth; the comment above them promised the
+  opposite. Now one entry per private range, with a bundle-wide test.
+- A rule scoped to `exe_path = "<unknown>"` - the display placeholder for an
+  unattributable process - matched every unattributable flow, which is every
+  inbound flow. Four locks: the matcher, the API, load-time, and both UIs.
+- `parent_exe` was counted in rule precedence but never compared, so a rule
+  carrying it matched every process while outranking narrower rules. Refused
+  at the API boundary until it can actually be evaluated.
+- An unset rule direction now means outbound - its meaning before inbound
+  filtering existed - instead of silently widening every pre-existing rule
+  into an inbound admission the day the input chain is enabled.
+- An unparseable inbound packet takes `inbound_action` (which cannot be
+  Allow) instead of `no_ui_action` (which can).
+- Deleting a deny rule now reliably lifts its in-kernel verdict, including
+  for processes older than the attribution table's TTL.
 
 ## [0.2.0] - 2026-08-18
 
