@@ -337,6 +337,11 @@ fn evict_if_full(cache: &mut HashMap<IpAddr, Entry>) {
 fn forward_confirm(name: &str, ip: IpAddr) -> bool {
     match dns_lookup::lookup_host(name) {
         Ok(addrs) => {
+            // dns-lookup 3.x returns an iterator where 2.x returned a Vec.
+            // Collected rather than threading the iterator through: this runs
+            // once per PTR confirmation on the blocking resolver task, and the
+            // result set is a handful of addresses.
+            let addrs: Vec<IpAddr> = addrs.collect();
             let confirmed = addrs_contain(&addrs, ip);
             if !confirmed {
                 tracing::debug!(
