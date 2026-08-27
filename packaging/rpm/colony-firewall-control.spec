@@ -3,7 +3,7 @@
 %global modulename colony_firewall
 
 Name:           colony-firewall-control
-Version:        0.2.0
+Version:        0.2.3
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -219,6 +219,12 @@ fi
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 
 %changelog
+* Thu Aug 27 2026 MotherSphere <linhajahad@gmail.com> - 0.2.3-1
+- Inbound filtering, default-deny with no prompts
+- In-kernel enforcement that survives the daemon, for new processes too
+- Rules can bind to a binary's contents (--pin-hash)
+- The inbound bundle no longer opens mDNS/LLMNR/DHCP to the internet
+
 * Wed Aug 19 2026 MotherSphere <linhajahad@gmail.com> - 0.2.0-1
 - First RPM packaging, with an SELinux policy module.
 - rpm provenance backend: binaries on this platform can now be verified
