@@ -416,13 +416,21 @@ jobs:
         run: |
           set -euo pipefail
           START=$(date +%s)
+          # qemu's exit code is not the verdict; the CFC_EXIT marker below is.
+          # The shutdown here is a deliberate panic (init exits under panic=1)
+          # and how qemu reports the resulting reset request varies by guest
+          # kernel: the 6.x reboot path exits 0, the 5.10 one exits 1, for the
+          # same healthy shutdown. A hang or a crashed qemu is still caught -
+          # either way the marker never got printed.
+          QEMU_RC=0
           timeout 600 qemu-system-x86_64 \
             -nographic -no-reboot -m 2G -smp 2 \
             -kernel ./vmlinuz \
             -initrd rootfs.cpio.gz \
             -append "rdinit=/init console=ttyS0 panic=1" \
-            | tee guest.log
+            | tee guest.log || QEMU_RC=$?
           ELAPSED=$(( $(date +%s) - START ))
+          echo "qemu exit: ${QEMU_RC} (informational)"
 
           # A guest that never printed the marker did not run the test - a
           # boot failure must not read as a pass.
