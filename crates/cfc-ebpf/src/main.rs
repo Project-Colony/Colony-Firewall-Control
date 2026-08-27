@@ -387,10 +387,18 @@ fn read_exec_filename(ctx: &TracePointContext, event: &mut ExecEvent) {
 /// absence of an entry already means "ask the packet path".
 #[inline(always)]
 fn precommit_verdict(tgid: u32, event: &ExecEvent) {
-    // Cheap gate first. See `EXE_RULES_ON`.
+    // Cheap gate - but the *clear* half runs regardless. Userspace's
+    // `on_exec` writes denials this table knows nothing about (a uid-scoped
+    // deny is not compilable, so the gate can be off while entries exist), and
+    // a pid that re-execs out of such a binary with no daemon alive must not
+    // carry the old refusal into the new program. A delete on an absent key is
+    // a hash-miss, far cheaper than the loop the gate exists to skip.
     match EXE_RULES_ON.get(0) {
         Some(&on) if on != 0 => {}
-        _ => return,
+        _ => {
+            let _ = VERDICTS.remove(&tgid);
+            return;
+        }
     }
 
     let len = event.filename_len as usize;

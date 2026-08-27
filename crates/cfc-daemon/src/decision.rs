@@ -187,6 +187,32 @@ impl Engine {
     /// `Option<String>` in every scope - which is right for `ListRules` and
     /// absurd for `GetStatus`, which wanted `.len()` and was called about
     /// once a second per connected client, forever.
+    /// Whether any enabled rule abstains for this process - the reason
+    /// `process_wide_action` can return `None` for a reason other than
+    /// "nothing matched".
+    ///
+    /// The orphan sweep turns on this distinction. `None` covers two opposite
+    /// situations: a hash-scoped rule the caller cannot decide (keep the
+    /// kernel entry - clearing would lift a refusal nobody replaced), and a
+    /// rule that was simply *deleted* (clear it - keeping it means the kernel
+    /// goes on refusing a program no rule denies, which is the one thing the
+    /// sweep exists to prevent, and the case it silently failed at until this
+    /// existed: nobody replaces a deny with an explicit allow, they delete it).
+    ///
+    /// Mirrors `process_wide_action`'s filters, the inbound skip included, so
+    /// the two cannot disagree about which rules are in play.
+    pub fn has_undecidable_rule_for(&self, proc: &Process) -> bool {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        self.inner
+            .rules
+            .read()
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
+            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
+            .any(|r| r.scope.undecidable_for(proc))
+    }
+
     pub fn rule_count(&self) -> usize {
         self.inner.rules.read().rules.len()
     }
@@ -468,6 +494,38 @@ mod tests {
     /// packet path already skips expired rules, so a stale entry would only
     /// overstate a denial - but it would keep overstating it after the daemon
     /// is gone, which is the state this whole layer exists to make trustworthy.
+    #[test]
+    fn a_deleted_rule_is_distinguishable_from_an_abstention() {
+        // The two meanings of `None`, which the orphan sweep must not conflate.
+        let mut hashed = RuleScope::any();
+        hashed.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        hashed.exe_sha256 = Some("aa".repeat(32));
+        let engine = engine_with(vec![Rule::new("h".to_string(), Action::Deny, hashed)]);
+
+        let no_hash = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            ..Process::unknown(1)
+        };
+        // Abstention: a rule is in play but cannot be decided. Keep.
+        assert_eq!(engine.process_wide_action(&no_hash), None);
+        assert!(engine.has_undecidable_rule_for(&no_hash));
+
+        // The same rule pinned to a DIFFERENT binary is decidable for this
+        // process, so it must not block the sweep from clearing.
+        let other = Process {
+            exe: PathBuf::from("/usr/bin/wget"),
+            ..Process::unknown(1)
+        };
+        assert_eq!(engine.process_wide_action(&other), None);
+        assert!(!engine.has_undecidable_rule_for(&other));
+
+        // And a rule set with nothing in it - the deleted-rule case - is the
+        // one the sweep exists for: None, nothing undecidable, clear.
+        let empty = engine_with(vec![]);
+        assert_eq!(empty.process_wide_action(&no_hash), None);
+        assert!(!empty.has_undecidable_rule_for(&no_hash));
+    }
+
     #[test]
     fn an_abstention_is_not_an_allow() {
         // The distinction the orphan sweep now turns on. A hash-scoped rule the

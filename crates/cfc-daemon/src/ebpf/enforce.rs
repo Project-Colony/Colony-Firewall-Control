@@ -302,11 +302,21 @@ impl VerdictSink {
                 uid: proc_uid(pid),
                 ..Process::unknown(pid)
             };
-            // Only a positive "not denied" clears. An abstention - a
-            // hash-scoped rule the exec path cannot decide - leaves the entry
-            // alone, because removing it would lift a refusal nobody replaced.
-            if self.engine.process_wide_action(&proc) == Some(Action::Allow) {
-                doomed.push(pid);
+            // `None` is two opposite answers and they must not be conflated.
+            // An abstention - a hash-scoped rule the sweep cannot decide -
+            // keeps the entry: clearing would lift a refusal nobody replaced.
+            // But "no rule matched at all" is the *deleted rule*, and that is
+            // the case this sweep exists for - nobody replaces a deny with an
+            // explicit allow, they delete it. Reading `None` as "keep" made
+            // the sweep fail at its one job whenever a rule was removed.
+            match self.engine.process_wide_action(&proc) {
+                Some(Action::Deny | Action::Reject) => {}
+                Some(_) => doomed.push(pid),
+                None => {
+                    if !self.engine.has_undecidable_rule_for(&proc) {
+                        doomed.push(pid);
+                    }
+                }
             }
         }
 
@@ -373,11 +383,14 @@ impl VerdictSink {
     /// disabled one all come back through the same code that governs the
     /// packet path.
     ///
-    /// The synthetic process carries the exe and nothing else, which makes the
-    /// abstentions land the safe way round: a uid-scoped rule cannot match a
-    /// process with no uid, and a hash-scoped rule makes `process_wide_action`
-    /// abstain entirely. Both mean "no entry", which means "ask the packet
-    /// path" - never "allow".
+    /// The synthetic process carries the exe and nothing else. That is safe
+    /// only because `compilable_exe_paths` already excluded every executable a
+    /// uid-scoped rule could touch - a uid-less process does *not* match a
+    /// uid-scoped allow, so evaluating one here would compile the deny that
+    /// allow was meant to outrank (the exact defect fixed in e56429b; the
+    /// earlier version of this comment claimed the opposite). Hash-scoped
+    /// rules still make `process_wide_action` abstain, which means "no entry",
+    /// which means "ask the packet path" - never "allow".
     ///
     /// Full rebuild rather than a diff: the table is one entry per exe-scoped
     /// rule, and a diff would have to reason about which removals are safe.
