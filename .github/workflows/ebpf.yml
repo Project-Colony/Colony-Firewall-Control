@@ -447,9 +447,15 @@ jobs:
             echo "|---|---|"
             echo "| exit | ${CODE} |"
             echo "| boot+test wall clock | ${ELAPSED}s |"
+            # `|| true`: kernels before 5.16 report no verified-insn counts,
+            # so on 5.10 this grep matches nothing - which under pipefail was
+            # exit 1, and as the last command of this group it took the whole
+            # step down after the suite had already passed. Same lesson as the
+            # test assertion this round fixed: no counts is what an old kernel
+            # reporting honestly looks like.
             grep -o 'verified_insns: [^ ]* = [0-9]*' guest.log | while read -r _ p _ n; do
               echo "| \`${p}\` verified insns | ${n} |"
-            done
+            done || true
           } >> "${GITHUB_STEP_SUMMARY}"
 
           # Wall clock, not just instruction count. They are different
