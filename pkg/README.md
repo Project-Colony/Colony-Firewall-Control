@@ -133,7 +133,7 @@ To reproduce the tarball locally:
 
 ```sh
 cargo build --workspace --release
-V=0.2.0
+V=0.2.3
 tar --zstd -cf "colony-firewall-control-${V}-linux-x86_64.tar.zst" \
     -C target/release colony-firewalld colony-firewall cfc \
     -C ../../systemd colony-firewalld.service colony-firewall-nft.service \
