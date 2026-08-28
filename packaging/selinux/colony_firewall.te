@@ -60,15 +60,32 @@ systemd_unit_file(colony_firewall_unit_file_t)
 #
 # Capabilities
 #
-# The same five the unit grants, and no more. CAP_SYS_ADMIN is deliberately
+# The same seven the unit grants, and no more. CAP_SYS_ADMIN is deliberately
 # absent: that it is unnecessary is proven by a test that drops to uid 1000
-# holding exactly this set and requires all five BPF programs to attach
+# holding the unit's set and requires all five BPF programs to attach
 # (`attaches_with_only_the_units_capabilities`). If an AVC here ever asks for
 # sys_admin, something regressed - do not add it.
 #
+# The two DAC-bypass grants are the ones whose absence does not look like an
+# SELinux problem, which is why they were once missing from this very file:
+#
+#   dac_read_search  the /proc/<pid>/fd walk that maps a socket inode to a
+#                    pid. Those directories are 0500 and owned by each
+#                    process's own user, so uid 0 needs the capability - and
+#                    SELinux checks it separately from the file-class rules
+#                    below. Without it every connection resolves to
+#                    exe=<unknown> pid=0, no exe-scoped rule can match, and a
+#                    fail-closed ruleset denies the whole machine's traffic.
+#                    That exact outage happened on a real install (the commit
+#                    that added the capability to the unit); this line is the
+#                    same fix at the second lock on the same door.
+#   chown            the control socket is chgrped to colony-firewall after
+#                    bind. Denied, the socket stays root:root 0660 and every
+#                    client is locked out with the daemon reporting healthy.
+#
 ########################################
 
-allow colony_firewalld_t self:capability { net_admin net_raw sys_ptrace };
+allow colony_firewalld_t self:capability { chown dac_read_search net_admin net_raw sys_ptrace };
 allow colony_firewalld_t self:capability2 { bpf perfmon };
 
 allow colony_firewalld_t self:process { getsched setsched signal_perms };
@@ -154,8 +171,14 @@ optional_policy(`
 	gen_require(`
 		type bpf_t;
 	')
-	allow colony_firewalld_t bpf_t:dir { search_dir_perms create_dir_perms rmdir };
-	allow colony_firewalld_t bpf_t:file { create_file_perms map };
+	# manage, not create: pinning writes entries into the directory
+	# (add_name + write), re-pinning after an ABI change unlinks the old
+	# pins, and the pinned maps are reopened read/write on the next start.
+	# The earlier { search create } grants let the daemon make the
+	# directory and then denied every actual pin into it - a degrade the
+	# daemon reports as quietly as any other.
+	allow colony_firewalld_t bpf_t:dir manage_dir_perms;
+	allow colony_firewalld_t bpf_t:file { manage_file_perms map };
 	allow colony_firewalld_t bpf_t:filesystem getattr;
 ')
 
@@ -216,6 +239,12 @@ allow colony_firewalld_t colony_firewall_conf_t:dir list_dir_perms;
 
 manage_dirs_pattern(colony_firewalld_t, colony_firewall_var_lib_t, colony_firewall_var_lib_t)
 manage_files_pattern(colony_firewalld_t, colony_firewall_var_lib_t, colony_firewall_var_lib_t)
+# map is not part of manage_file_perms, and SQLite in WAL mode mmaps the
+# -shm file next to the database. The pragma is advisory (storage.rs tune):
+# denied, the store silently keeps the slow journal mode at debug level -
+# a 2.5x write regression that exists only on the module target platform
+# and never surfaces as an error anywhere.
+allow colony_firewalld_t colony_firewall_var_lib_t:file map;
 files_var_lib_filetrans(colony_firewalld_t, colony_firewall_var_lib_t, { dir file })
 
 manage_dirs_pattern(colony_firewalld_t, colony_firewall_log_t, colony_firewall_log_t)

@@ -19,3 +19,4 @@
 
 /usr/lib/systemd/system/colony-firewalld\.service	--	gen_context(system_u:object_r:colony_firewall_unit_file_t,s0)
 /usr/lib/systemd/system/colony-firewall-nft\.service	--	gen_context(system_u:object_r:colony_firewall_unit_file_t,s0)
+/usr/lib/systemd/system/colony-firewall-nft-inbound\.service	--	gen_context(system_u:object_r:colony_firewall_unit_file_t,s0)

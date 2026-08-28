@@ -28,11 +28,13 @@ interface(`colony_firewall_stream_connect',`
 	gen_require(`
 		type colony_firewalld_t;
 		type colony_firewall_runtime_t;
+		type var_run_t;
 	')
 
 	# Raw statement; see the var_run_t note in the te file for why no files_*
-	# interface is used. The type is required by that same require block;
-	# callers outside this module must require var_run_t themselves.
+	# interface is used. var_run_t sits in the gen_require above so a caller
+	# in another module compiles without knowing this detail - an interface
+	# that documents a prerequisite instead of requiring it is a landmine.
 	# NO APOSTROPHES in comments inside interface bodies: refpolicy disables
 	# the m4 comment character, so inside the backtick quotes of a body an
 	# apostrophe TERMINATES the quote. One possessive apostrophe here cost
@@ -86,6 +88,7 @@ interface(`colony_firewall_admin',`
 		type colony_firewall_runtime_t;
 		type colony_firewall_log_t;
 		type colony_firewall_unit_file_t;
+		type var_run_t;
 	')
 
 	allow $1 colony_firewalld_t:process { signal_perms ptrace };
