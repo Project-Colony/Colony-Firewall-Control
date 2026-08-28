@@ -71,6 +71,14 @@ for r in rules:
         continue
     if str(r.get("action", "")).lower() != "allow":
         continue
+    # Only rules that survive a restart can vouch for a persistent unit.
+    # A `once` or `until-restart` allow admits the port today and is gone
+    # at the next boot, when the fail-closed inbound table comes back
+    # without it - approving on its word is a delayed lockout. Unknown
+    # values fail the same safe way: the rule is not counted, and the
+    # guard refuses rather than gambles.
+    if str(r.get("duration", "")).lower() != "always":
+        continue
     scope = r.get("scope") or {}
     if str(scope.get("direction", "")).lower() not in ("in", "inbound"):
         continue

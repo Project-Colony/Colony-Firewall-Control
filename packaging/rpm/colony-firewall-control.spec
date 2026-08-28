@@ -158,7 +158,7 @@ cargo test --workspace --locked --no-fail-fast
 %sysusers_create_compat %{_sysusersdir}/colony-firewall.conf
 
 %preun
-%systemd_preun colony-firewalld.service colony-firewall-nft.service
+%systemd_preun colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service
 
 %postun
 %systemd_postun_with_restart colony-firewalld.service
@@ -166,8 +166,12 @@ if [ $1 -eq 0 ]; then
     # The ruleset is fail-closed, so leaving the table behind on uninstall
     # would leave the machine with no outbound network and no daemon to
     # explain why. The BPF pins are the same story: they hold denials in the
-    # kernel and nothing would be left to steer or remove them.
+    # kernel and nothing would be left to steer or remove them. The inbound
+    # table is the same story a third time, aimed the other way: left
+    # loaded, it silently drops every new inbound connection - SSH first -
+    # on a machine that no longer has the package.
     nft delete table inet colony_firewall 2>/dev/null || :
+    nft delete table inet colony_firewall_inbound 2>/dev/null || :
     rm -rf /sys/fs/bpf/colony-firewall 2>/dev/null || :
 fi
 
