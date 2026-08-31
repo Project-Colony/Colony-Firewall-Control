@@ -129,6 +129,15 @@ pub struct CarriedScope {
     pub parent_exe: String,
     pub uid: u32,
     pub has_uid: bool,
+    // The flow-side predicates the editor has no widgets for. Before they
+    // were carried, saving any edit rebuilt them as unset - and an unset
+    // direction means outbound, so renaming an inbound rule silently turned
+    // it into an outbound one with its source scope gone.
+    pub direction: i32,
+    pub has_direction: bool,
+    pub src_net: String,
+    pub src_port: u32,
+    pub has_src_port: bool,
 }
 
 impl CarriedScope {
@@ -139,6 +148,11 @@ impl CarriedScope {
                 parent_exe: s.parent_exe.clone(),
                 uid: s.uid,
                 has_uid: s.has_uid,
+                direction: s.direction,
+                has_direction: s.has_direction,
+                src_net: s.src_net.clone(),
+                src_port: s.src_port,
+                has_src_port: s.has_src_port,
             },
             None => Self::default(),
         }
@@ -148,12 +162,33 @@ impl CarriedScope {
     /// the view can tell the user rather than let them assume the visible
     /// fields are the whole rule.
     pub fn is_set(&self) -> bool {
-        self.has_uid || !self.exe_sha256.is_empty() || !self.parent_exe.is_empty()
+        self.has_uid
+            || !self.exe_sha256.is_empty()
+            || !self.parent_exe.is_empty()
+            || self.has_direction
+            || !self.src_net.is_empty()
+            || self.has_src_port
     }
 
     /// One-line human summary of the hidden predicates, for that notice.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
+        if self.has_direction {
+            parts.push(
+                match proto::Direction::try_from(self.direction) {
+                    Ok(proto::Direction::Inbound) => "inbound",
+                    Ok(proto::Direction::Outbound) => "outbound",
+                    _ => "direction ?",
+                }
+                .to_string(),
+            );
+        }
+        if !self.src_net.is_empty() {
+            parts.push(format!("from {}", self.src_net));
+        }
+        if self.has_src_port {
+            parts.push(format!("src port {}", self.src_port));
+        }
         if self.has_uid {
             parts.push(format!("uid {}", self.uid));
         }
@@ -1497,11 +1532,16 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         has_dst_port: dst_port.is_some(),
         protocol: ed.protocol.map(|p| p as i32).unwrap_or(0),
         has_protocol: ed.protocol.is_some(),
-        direction: 0,
-        has_direction: false,
-        src_net: String::new(),
-        src_port: 0,
-        has_src_port: false,
+        // Carried like exe_sha256 above, and for the same reason - these
+        // three used to be rebuilt as unset here, two lines under the comment
+        // explaining why that must not happen. Unset direction means
+        // outbound, so the visible casualty was every inbound rule touched by
+        // this editor.
+        direction: ed.carried_scope.direction,
+        has_direction: ed.carried_scope.has_direction,
+        src_net: ed.carried_scope.src_net.clone(),
+        src_port: ed.carried_scope.src_port,
+        has_src_port: ed.carried_scope.has_src_port,
     };
 
     Ok(proto::RuleInfo {
