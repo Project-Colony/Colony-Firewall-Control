@@ -336,16 +336,27 @@ pub(super) fn load_and_attach(
                     enforce::MAP_EXE_RULES_ON,
                     dir.join(enforce::MAP_EXE_RULES_ON),
                 ),
+                // Attribution rather than enforcement, but the same restart
+                // split applies; see the SOCK_PIDS paragraph below.
+                (enforce::MAP_SOCK_PIDS, dir.join(enforce::MAP_SOCK_PIDS)),
             ]
         })
         .unwrap_or_default();
 
+    // Read before `load`, which creates any pin that is missing: on the
+    // inherited path "the pin was already there" is the difference between
+    // opening the map the still-attached programs write and creating a fresh
+    // one they cannot see.
+    let sock_pids_was_pinned = pin_dir
+        .as_deref()
+        .is_some_and(|d| d.join(enforce::MAP_SOCK_PIDS).exists());
+
     let mut loader = EbpfLoader::new();
-    // Pin the three enforcement maps by name, so they are the *same* kernel
-    // objects across a daemon restart. Without this the pinned programs would
-    // go on consulting the map the dead daemon created while the new one wrote
-    // to a fresh one nobody reads - enforcement frozen at whatever it held when
-    // the daemon died, which is a far worse failure than not pinning at all.
+    // Pin the enforcement maps by name, so they are the *same* kernel objects
+    // across a daemon restart. Without this the pinned programs would go on
+    // consulting the map the dead daemon created while the new one wrote to a
+    // fresh one nobody reads - enforcement frozen at whatever it held when the
+    // daemon died, which is a far worse failure than not pinning at all.
     //
     // aya's `create_pinned_by_name` opens an existing pin when there is one and
     // creates it otherwise, so this is both the first-run and the restart path.
@@ -360,7 +371,21 @@ pub(super) fn load_and_attach(
     // the backlog on startup is then a bonus: it says what was refused while
     // nothing was listening.
     //
-    // `PROCS` and the other two ring buffers stay unpinned. They are rebuilt
+    // `SOCK_PIDS` is the same split seen from the attribution side, and it
+    // was missing from this list long enough to reproduce it: on the
+    // inherited path the previous daemon's still-attached connect programs
+    // write cookie -> tgid into the map *they* captured at their own load, so
+    // an unpinned SOCK_PIDS handed this daemon a fresh map nothing writes.
+    // Every cookie_pid() lookup missed for the life of the process, and every
+    // new connection paid the 37-44 ms /proc walk the map exists to remove -
+    // silently, with nothing in the report to say so. That is byte-for-byte
+    // the v2 failure the ABI v3 bump documents, rebuilt inside v3 by an
+    // ordinary restart. Unlike `VERDICTS` there is no startup sweep to do
+    // here: the key is the kernel's socket cookie, a counter that is never
+    // reused, so a stale entry from a previous run can never be looked up by
+    // a new socket - it costs an LRU slot until eviction, not a wrong answer.
+    //
+    // `PROCS` and the other three ring buffers stay unpinned. They are rebuilt
     // from scratch every start, and pinning them really would leak the previous
     // run's backlog into this one.
     for (name, path) in &pinned_map_paths {
@@ -375,6 +400,21 @@ pub(super) fn load_and_attach(
     // global keeps its "absent" default and the kernel side falls back to the
     // leader-only check it used before.
     let group_dead_off: u32 = match tracefs::exit_group_dead_offset() {
+        Ok(Some(off)) if off > cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX => {
+            // The program bounds this read with the same constant and falls
+            // back to the leader-only check without a word - it has nowhere
+            // to say one. Patching the value through used to leave the debug
+            // line below claiming `group_dead` is carried while the kernel
+            // side never read it; report the fallback instead, as the `None`
+            // arm does, and send the sentinel the program acts on.
+            report.notes.push(format!(
+                "sched_process_exit puts `group_dead` at offset {off}, past \
+                 the {}-byte bound the program enforces; process exit is \
+                 approximated by thread-group leader exit",
+                cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX
+            ));
+            u32::MAX
+        }
         Ok(Some(off)) => {
             debug!(offset = off, "sched_process_exit carries group_dead");
             off
@@ -456,6 +496,33 @@ pub(super) fn load_and_attach(
     // DNS can attach, and failing the whole load over it would trade three
     // working programs for one unread field.
     match tracefs::exec_filename_offset() {
+        Ok(tracefs::Resolution::Parsed(off))
+            if off > cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX =>
+        {
+            // The program bounds its read with the same constant and treats
+            // anything past it as "read nothing" - silently, because a BPF
+            // program has nowhere to say so. This arm used to not exist, and
+            // its absence was a lie in waiting: the loader patched the value
+            // in, warned "patched it in", and reported `Parsed` while every
+            // exec event arrived with no filename - `Suppressed` behaviour
+            // wearing a `Parsed` label. Send the sentinel the program acts
+            // on, and report what will actually happen.
+            exec_off = 0;
+            loader.override_global("EXEC_FILENAME_DATA_LOC", &exec_off, false);
+            warn!(
+                offset = off,
+                "sched_process_exec puts `filename` past the {}-byte bound \
+                 the program enforces; exec events will carry no filename",
+                cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX
+            );
+            report.notes.push(format!(
+                "sched_process_exec filename offset {off} is past the \
+                 program's {}-byte bound; exec events will carry no path, \
+                 and attribution falls back to /proc",
+                cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX
+            ));
+            report.exec_offset = ExecOffset::Suppressed;
+        }
         Ok(tracefs::Resolution::Parsed(off)) => {
             exec_off = off;
             // Unconditionally, not "only when it differs from the built-in 8".
@@ -583,7 +650,9 @@ pub(super) fn load_and_attach(
         }
     };
 
-    // The socket-cookie -> pid map, for O(1) attribution. Taken whenever it
+    // The socket-cookie -> pid map, for O(1) attribution - the pinned one
+    // when there is a pin directory, which is what lets an inherited connect
+    // program's writes land somewhere this daemon can read. Taken whenever it
     // exists: with the `_basic` fallback attached nothing writes it and every
     // lookup simply misses, which costs one syscall before the walk the caller
     // was going to do anyway. A OnceLock because attribution is called from
@@ -598,6 +667,24 @@ pub(super) fn load_and_attach(
                     .notes
                     .push(format!("{} unusable: {e}", enforce::MAP_SOCK_PIDS)),
             }
+        }
+        // The one restart the pin cannot rescue: pins made before SOCK_PIDS
+        // joined `pinned_map_paths` hold everything *except* it, so the
+        // inherited programs go on writing the anonymous map they captured at
+        // their own load, which no fd in this process can reach. Detected and
+        // said out loud rather than repaired - replacing the inherited attach
+        // to fix attribution would open an enforcement gap, which is the
+        // wrong trade - and bpffs does not survive a reboot, so the state
+        // heals itself.
+        if inherited && !sock_pids_was_pinned {
+            report.notes.push(
+                "the inherited enforcement predates the SOCK_PIDS pin: its \
+                 cookie->pid writes land in a map this daemon cannot open, so \
+                 attribution falls back to the /proc walk until the pins are \
+                 remade (a reboot, or remove /sys/fs/bpf/colony-firewall and \
+                 restart the daemon)"
+                    .to_string(),
+            );
         }
     }
 
@@ -1549,6 +1636,19 @@ mod tests {
             "cgroup/connect4|6 must load, attach *and* pin with this set: {:?}",
             report.notes
         );
+        // The attribution map must be pinned with the rest, and this is the
+        // one test that can prove it (the matrix guests have no bpffs). It
+        // went unpinned for a while, and the failure was the quiet kind: on
+        // the inherited path the previous daemon's programs write the
+        // SOCK_PIDS *they* captured, so an unpinned copy split the map across
+        // a restart - every cookie lookup missed, and every new connection
+        // paid the /proc walk the map exists to remove.
+        let sock_pids_pin = enforce::pin_dir().join(enforce::MAP_SOCK_PIDS);
+        assert!(
+            sock_pids_pin.exists(),
+            "{} must be pinned alongside the verdict maps",
+            sock_pids_pin.display()
+        );
         println!("all five programs attached and pinned without CAP_SYS_ADMIN");
 
         drop(attached);
@@ -1622,26 +1722,73 @@ mod tests {
         for (program, insns) in &report.verified_insns {
             println!("verified_insns: {program} = {insns}");
         }
-        // `bpf_prog_info.verified_insns` exists since kernel 5.16; before
-        // that, an empty report is the correct answer, not a recording
-        // failure. The assertion exists to catch the loader silently losing
-        // the counts on kernels that do provide them.
-        let kernel_reports_counts = aya::util::KernelVersion::current()
-            .map(|v| v >= aya::util::KernelVersion::new(5, 16, 0))
-            .unwrap_or(true);
-        if kernel_reports_counts {
-            assert!(
-                !report.verified_insns.is_empty(),
-                "this kernel reports verified instruction counts; they should be recorded"
-            );
-        }
-        assert_within_verifier_budget(&report.verified_insns);
         println!("dns_capture = {}", report.dns_capture);
         assert!(
             report.dns_capture,
             "cgroup_skb/ingress should load and attach: {:?}",
             report.notes
         );
+        // The one layer that decides rather than observes. `load_and_attach`
+        // deliberately degrades on an enforce failure - a note, a `Degrade`,
+        // and `Ok` - so nothing else in this test would notice
+        // cgroup/connect4|6 being rejected, and for a long time nothing here
+        // did either: the kernel matrix was green while asserting only the
+        // observers, which is exactly how a verifier change on a new kernel
+        // would have shipped with enforcement silently absent. Attachment is
+        // asserted, not pinning: the qemu guests mount cgroup2 but no bpffs,
+        // so `Process` is the honest outcome there and `Pinned` on a real
+        // host. cgroup sock_addr attach has existed since 4.17 and the matrix
+        // floor is 5.10, so there is no kernel in the matrix where degrading
+        // is acceptable.
+        println!("enforcement = {:?}", report.enforcement);
+        assert!(
+            report.enforcement.is_live(),
+            "cgroup/connect4|6 must load and attach on every matrix kernel: {:?}",
+            report.notes
+        );
+        // `bpf_prog_info.verified_insns` exists since kernel 5.16; before
+        // that, an empty report is the correct answer, not a recording
+        // failure. On a kernel that does report counts, every program that
+        // attached above must have one. This used to be a bare
+        // `!verified_insns.is_empty()`, which only caught losing every count
+        // at once: one program's count going missing (`verifier_cost` logs at
+        // debug and returns `None`) left the vec non-empty, and the budget
+        // loop below skips unmeasured programs by design - the `_basic` twins
+        // carry ceilings with no measurement - so a single unwatched program,
+        // including cfc_dns_ingress, the one the budget file exists for, had
+        // no signal anywhere.
+        let kernel_reports_counts = aya::util::KernelVersion::current()
+            .map(|v| v >= aya::util::KernelVersion::new(5, 16, 0))
+            .unwrap_or(true);
+        if kernel_reports_counts {
+            let measured = |name: &str| report.verified_insns.iter().any(|(p, _)| p == name);
+            for name in [PROG_EXEC, PROG_EXIT, PROG_DNS] {
+                assert!(
+                    measured(name),
+                    "this kernel reports verified instruction counts and \
+                     `{name}` attached, but no count was recorded for it: {:?}",
+                    report.verified_insns
+                );
+            }
+            // Whichever connect variant this kernel's verifier accepted is
+            // the one that was loaded and must be measured; the two are never
+            // attached together. On the inherited path this run loaded
+            // neither, so there is nothing the verifier walked.
+            if report.enforcement != Enforcement::Inherited {
+                for (cookie, basic) in [
+                    (enforce::PROG_CONNECT4, enforce::PROG_CONNECT4_BASIC),
+                    (enforce::PROG_CONNECT6, enforce::PROG_CONNECT6_BASIC),
+                ] {
+                    assert!(
+                        measured(cookie) || measured(basic),
+                        "neither `{cookie}` nor `{basic}` has a verified \
+                         instruction count: {:?}",
+                        report.verified_insns
+                    );
+                }
+            }
+        }
+        assert_within_verifier_budget(&report.verified_insns);
 
         table.set_live(true);
 
@@ -1711,8 +1858,13 @@ mod tests {
         // nothing; the hermetic check above is the one that must hold.
         // Two `getent` calls against a possibly-unreachable resolver cost about
         // 40 seconds and assert nothing - the hermetic half above is the one
-        // that must hold. CI sets this; a human running it by hand wants the
-        // output.
+        // that must hold. "CI sets this" is what this comment used to say
+        // while only one job in six did: the qemu guests ran this block on
+        // all five kernels, kept fast only by the accident of an empty
+        // resolv.conf failing on ECONNREFUSED - one rootfs edit away from 40
+        // TCG-emulated seconds per kernel. Both runner-kernel and the guest
+        // init export the variable now (.github/workflows/ebpf.yml, both
+        // call sites). A human running this by hand wants the output.
         let skip_live = std::env::var_os("CFC_SKIP_LIVE_RESOLUTION").is_some();
         if !skip_live && Path::new("/usr/bin/getent").exists() {
             // `ahostsv4` forces an A query and `ahosts` will take the AAAA, so
@@ -1788,5 +1940,13 @@ mod tests {
         );
 
         drop(attached);
+        // Pins outlive the process by design, so this test takes its own away
+        // - the same courtesy `attaches_with_only_the_units_capabilities`
+        // extends. Left behind, every run on a bpffs host parks in-kernel
+        // enforcement on the machine, and the *next* run inherits it instead
+        // of exercising the attach path it exists to prove. A no-op in the
+        // qemu guests, which have no bpffs to begin with.
+        let _ =
+            std::fs::remove_dir_all(std::path::Path::new("/sys/fs/bpf").join("colony-firewall"));
     }
 }

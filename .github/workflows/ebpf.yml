@@ -419,7 +419,13 @@ jobs:
           echo "guest glibc: $(ldd --version 2>&1 | head -1)"
           echo "guest kernel: $(uname -r)"
 
-          CFC_EBPF_OBJECT=/cfc-ebpf.o /cfc-test --ignored --nocapture \
+          # CFC_SKIP_LIVE_RESOLUTION: the live-resolver block asserts nothing
+          # here (no uplink) and stays fast only by the accident of an empty
+          # resolv.conf failing on ECONNREFUSED. A rootfs that ever named an
+          # unreachable resolver would stall 40s per kernel in TCG. Skip it
+          # the way runner-kernel does; the hermetic DNS test still runs.
+          CFC_EBPF_OBJECT=/cfc-ebpf.o CFC_SKIP_LIVE_RESOLUTION=1 \
+            /cfc-test --ignored --nocapture \
             --test-threads=1 loads_and_attaches
           echo "CFC_EXIT=$?"
           # No poweroff: bookworm-slim ships no init system, so the binary does
