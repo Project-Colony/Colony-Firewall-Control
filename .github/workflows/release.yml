@@ -291,11 +291,23 @@ jobs:
 
       - name: Generate .SRCINFO
         working-directory: pkg
-        run: runuser -u builder -- makepkg --printsrcinfo | tee .SRCINFO
+        # pipefail, because the pipeline's status is otherwise tee's 0: a
+        # failed printsrcinfo would tee an empty .SRCINFO that the attach
+        # step below happily uploads. The grep is check.yml's twin - a file
+        # without `pkgbase =` is not a .SRCINFO, whatever makepkg exited.
+        run: |
+          set -o pipefail
+          runuser -u builder -- makepkg --printsrcinfo | tee .SRCINFO
+          grep -q '^pkgbase = colony-firewall-control$' .SRCINFO
 
       - name: namcap the PKGBUILD
         working-directory: pkg
+        # pipefail: namcap exits 0 even when it prints E: lines, so its
+        # nonzero exit means namcap itself crashed - traceback to stderr,
+        # nothing in the log, and without pipefail the grep below would wave
+        # through a run where zero linting happened.
         run: |
+          set -o pipefail
           namcap PKGBUILD | tee namcap.log
           # Warnings are advisory; errors are not.
           if grep -q ' E: ' namcap.log; then
@@ -324,6 +336,11 @@ jobs:
           # shipped anywhere: only PKGBUILD and .SRCINFO are attached to the
           # release, so nothing the user installs goes unlinted.
           # The [0-9] is what excludes it: "-debug-" cannot match a digit.
+          # pipefail for the same reason as the PKGBUILD lint above: a
+          # crashed namcap must not pass as a clean log. It also makes an
+          # unmatched glob fatal (namcap errors on the literal pattern)
+          # instead of silently linting nothing.
+          set -o pipefail
           namcap ./colony-firewall-control-[0-9]*.pkg.tar.* | tee namcap-pkg.log
           if grep -q ' E: ' namcap-pkg.log; then
             echo "::error::namcap reported errors in the built package"

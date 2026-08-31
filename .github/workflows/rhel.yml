@@ -78,10 +78,16 @@ jobs:
           make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
           ls -l colony_firewall.pp
 
-      - name: Show what it granted
-        # `sedismod`/`sedispol` are not installed here, so this is the cheap
-        # version: prove the module loads far enough to be listed, and print
-        # its declared types so a diff in review shows a widened policy.
+      - name: Show what the source declares
+        # Nothing in this job LOADS the module: a container has no policy
+        # store for `semodule` to install into, and `sedismod`/`sedispol` are
+        # not packaged here. What is proven is the step above - the .pp
+        # compiles and links against this release's headers - and nothing
+        # more; loading and AVC behavior stay untested, exactly as the file
+        # header says. This step only prints the source's type and allow
+        # lines so a widened policy shows in a review diff. Grants that come
+        # from interface macros expand only in the compiled .pp, so they are
+        # not visible here either.
         run: |
           set -eux
           cd packaging/selinux
