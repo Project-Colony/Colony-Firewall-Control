@@ -55,22 +55,11 @@ pub(super) enum Trust {
     Refuse,
 }
 
-/// Whether a *directory* on the way to the object is safe.
-///
-/// Root-owned and not group/world-writable, or root-owned, world-writable and
-/// **sticky** - the `/tmp` shape, where a non-root user still cannot rename or
-/// remove root's files. Kept as a pure function so the policy can be tested
-/// exhaustively without needing root or a filesystem that can express every
-/// case.
-fn dir_is_safe(uid: u32, mode: u32) -> bool {
-    uid == 0 && (mode & 0o022 == 0 || mode & 0o1000 != 0)
-}
-
-/// Whether the object file itself is safe. No sticky exception: the bit means
-/// nothing on a regular file.
-fn file_is_safe(uid: u32, mode: u32) -> bool {
-    uid == 0 && mode & 0o022 == 0
-}
+// The (uid, mode) policy lives in cfc-core (`exe_path::{dir,file}_is_sealed`)
+// because rule hash-binding asks the identical question about executables:
+// "can a non-root user swap the bytes behind this path". One authority; the
+// exhaustive tests below stay here, where the policy was first earned.
+use cfc_core::exe_path::{dir_is_sealed as dir_is_safe, file_is_sealed as file_is_safe};
 
 /// Decides whether a file is one we are willing to hand to `bpf(2)`.
 ///

@@ -137,6 +137,19 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
             rows.push(plain("Working dir", p.cwd.clone()));
         }
 
+        // Before the buttons, because it changes what Allow means here:
+        // the daemon judged this path rewritable by a non-root user, so an
+        // always-allow will bind to the binary's current hash and a
+        // replaced file will prompt again instead of inheriting the access.
+        if ev.binds_to_hash {
+            rows.push(DetailRow {
+                label: "Rule binding",
+                value: "Allow always will pin to this binary".to_string(),
+                note: "(user-writable path)",
+                copy: None,
+            });
+        }
+
         rows.push(if p.sha256.is_empty() {
             DetailRow {
                 label: "Checksum",
@@ -574,6 +587,7 @@ mod tests {
             connection: Some(connection()),
             process: Some(process()),
             deadline_unix_ms: 1_700_000_015_000,
+            binds_to_hash: false,
         }
     }
 

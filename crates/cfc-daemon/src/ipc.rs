@@ -405,14 +405,16 @@ impl Firewall for FirewallService {
         // user was told did nothing, and prompt ids restart at 1 on every daemon
         // start, so a stale card can carry a live id. A verdict that reached
         // nothing should leave nothing behind.
-        let accepted = self.router.submit(&req.prompt_id, verdict);
+        let binding = self.router.submit(&req.prompt_id, verdict);
+        let accepted = binding.is_some();
         if let Some(id) = numeric_id {
             self.audience.forget(id);
         }
 
         let mut persisted_rule = None;
         let mut persist_error = String::new();
-        if let (true, Some(scope_pb)) = (accepted, req.persist_scope.clone()) {
+        let mut persist_note = String::new();
+        if let (Some(binding), Some(scope_pb)) = (binding, req.persist_scope.clone()) {
             // One authority on what a storable rule is: `rule_from_pb`, the
             // same conversion the UpsertRule path runs, gates and all. This
             // path used to replicate a single gate of the list by hand
@@ -443,6 +445,50 @@ impl Firewall for FirewallService {
                     // whatever string was passed to execve() and may well be
                     // `/bin/curl`.
                     resolve_exe_off_thread(&mut rule.scope).await;
+                    // Bind a persisted ALLOW to the running image's digest
+                    // when the prompt promised it would (the executable lives
+                    // somewhere a non-root user could rewrite - see
+                    // `compute_binding`). A path-keyed allow on such a path
+                    // outlives its binary: whoever writes the file next
+                    // inherits the network access the previous bytes earned.
+                    // Only when the scope still names the prompt's executable
+                    // - a user who edited the scope gets exactly what they
+                    // wrote - and never for a deny, which path-keyed covers
+                    // whatever bytes sit there next while hash-keyed is one
+                    // file swap from covering nothing.
+                    if rule.action == cfc_core::Action::Allow
+                        && rule.scope.exe_sha256.is_none()
+                        && rule.scope.exe_path.is_some()
+                        && rule.scope.exe_path == binding.exe
+                    {
+                        match &binding.sha256 {
+                            Some(sha) => {
+                                rule.scope.exe_sha256 = Some(sha.clone());
+                                persist_note = format!(
+                                    "the allow is bound to the binary's \
+                                     current sha256 ({}…): a changed file at \
+                                     that path will prompt again",
+                                    &sha[..12]
+                                );
+                            }
+                            // The prompt said it would bind and could not
+                            // (unreadable or oversized image). Persisting a
+                            // silent path-only allow here would be the exact
+                            // hole binding exists to close - with a promise
+                            // attached. Say it instead. The judgment is the
+                            // one made at prompt time, carried in the
+                            // binding - re-statting now would judge whatever
+                            // file sits at the path today, which is exactly
+                            // the thing that cannot be trusted.
+                            None if binding.hash_expected => {
+                                persist_note = "the executable is under a \
+                                     user-writable path but its hash could \
+                                     not be read; the rule follows the path"
+                                    .to_string();
+                            }
+                            None => {}
+                        }
+                    }
                     match self.store.upsert(&rule) {
                         Ok(()) => {
                             persisted_rule = Some(rule.id);
@@ -497,6 +543,7 @@ impl Firewall for FirewallService {
             accepted,
             persisted_rule_id: persisted_rule.map(|id| id.to_string()).unwrap_or_default(),
             persist_error,
+            persist_note,
             error: if accepted {
                 String::new()
             } else {

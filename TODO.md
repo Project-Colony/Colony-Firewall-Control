@@ -44,19 +44,37 @@ Mostly done in `8db949b` and `b05eefc`: the SELinux module, the RPM provenance
 backend, the `.spec`, and a 5.10 entry in the kernel matrix that sits *below*
 RHEL 9's backported 5.14.
 
-What remains is the part that cannot be done from here:
+What remains needs a real enforcing machine - except 2b, which turned out to
+be doable from CI after all:
 
 **2a. The SELinux policy has never met an enforcing system.** It compiles
 against the real `selinux-policy-devel` on Rocky 9 and Fedora, which proves
-every type and interface it names exists there. It does not prove the rules are
-*sufficient*. Someone has to install it on an enforcing host, run the daemon
-under load, and report what `audit2allow -w` asks for. A missing rule is a bug
-in `packaging/selinux/colony_firewall.te`, not something to add locally.
+every type and interface it names exists there. It does not prove the rules
+are *sufficient*, and nothing that runs in a container can. The protocol for
+whoever has an enforcing VM is written and ready to run:
+`packaging/selinux/TESTING.md` - permissive-domain first (a missing netlink
+rule enforced is an outage, not a log line), one exercise per policy group,
+`audit2allow -w -a` as the report. Open until someone actually runs it; a
+missing rule it finds is a bug in `packaging/selinux/colony_firewall.te`,
+not something to add locally.
 
-**2b. Nothing has built the RPM end to end.** CI parses the spec and builds a
-source RPM; a full `rpmbuild -ba` needs Rust >= 1.88, which Rocky 9 does not
-ship in its default repos. Either a `rust-toolset` module dependency or a
-build in a Fedora container, and neither has been tried.
+**2b. Written, awaiting its first green run - the `rpm end to end (fedora)`
+job in `rhel.yml` builds, installs and verifies the RPM end to end.** This
+file has been burned once by declaring CI verified before it ran (see
+section 6: "expect one round" became nine), so: the job exists, every local
+check passes, and "done" is one green run away, not here yet.
+`rpmbuild -ba` in a Fedora container (the
+tarball laid out the way `%autosetup` expects, built as an unprivileged
+user), then a real `dnf install` of both packages: binaries report the
+packaged version, units and the sysusers file land where the spec says, the
+sysusers scriptlet really created the group, `rpm -V` comes back clean. The
+caveat that keeps this honest: it proves the spec builds *on Fedora's
+toolchain*. Rocky 9's own path - the `rust-toolset` module, since its
+default repos stop short of the 1.88 MSRV - remains untried, so "the
+deployment target can build this package" is still an assumption. Found
+along the way: the release profile's `strip = true` leaves find-debuginfo
+nothing to extract, which is a hard rpmbuild error on Fedora, not a warning;
+the spec now sets `%global debug_package %{nil}` and says why.
 
 **2c. The provenance subprocess is untested inside the unit's sandbox.** The
 rpm backend runs `rpm -qa`, and the daemon's own `SystemCallFilter`,
@@ -86,47 +104,84 @@ are worth stating rather than discovering:
 
 ---
 
-## 4. Rules should bind to the binary, not to its path
+## 4. Rules bind to the binary where the path cannot be trusted
 
-A rule created from a prompt carries `exe_path` and leaves `exe_sha256` empty
-(`crates/cfc-tray/src/model.rs`, `verdict_for`). The rule therefore follows the
-*path*: replace the file at that path and the allow follows.
+Done, along the exact line sketched here: bind on hash when the binary lives
+somewhere a non-root user can write, bind on path otherwise, and say which in
+the prompt. The seal judgment is the BPF-object vetting's own policy
+(root-owned file, root-sealed ancestors, the sticky exception), moved to
+`cfc_core::exe_path::is_root_sealed` so the two cannot drift. The hash is
+taken at *prompt* time from `/proc/<pid>/exe` - the bytes the human is
+deciding about - and carried by the router until the answer arrives
+(`PromptBinding`), because at submit time the process may be gone or exec'd
+into something else. The prompt announces it (`binds_to_hash` in the proto,
+shown by all three clients), the response says what was stored
+(`persist_note`), and a promised binding that falls through is spoken, never
+silent.
 
-For `/usr/bin/*` this needs root, so it matters less. It matters a lot for any
-allowed binary under a user-writable path.
+Two boundaries drawn on purpose:
 
-The field and the machinery both already exist - provenance hashes the running
-image. What is missing is a decision about *when* to bind to the hash, because
-binding always means every package update invalidates every rule. Probably:
-bind on hash when the binary lives somewhere a non-root user can write, bind on
-path otherwise, and say which in the prompt.
+- **Denies never bind.** A hash-bound deny is one file swap away from
+  covering nothing, while the path-bound one covers whatever bytes sit
+  there next. The threat this feature answers is inherited *allows*.
+- **CLI `rules add` does not auto-bind.** An explicit command gets exactly
+  what it wrote; `--pin-hash` exists for the intent, and package updates
+  invalidating hash-bound rules is a cost someone should choose knowingly.
+  Prompts are different: nobody answering a bubble has made that choice, so
+  the daemon makes the safe one and says so.
 
 ---
 
-## 5. The tray icon fallback does not work where it is needed
+## 5. The tray icon fallback did not work where it was needed
 
 `icon_pixmap` carries an embedded raster precisely so the tray is usable before
 the package installs the theme SVG. Observed on quickshell/Noctalia: the host
-honours `icon_name` only, so an uninstalled CFC shows a broken-image
+honours `icon_name` only, so an uninstalled CFC showed a broken-image
 placeholder rather than the fallback.
 
-Either the fallback needs to work on hosts that behave this way, or the tray
-should notice it has no resolvable theme icon and say so.
+Fixed with the spec's own escape hatch, `IconThemePath`
+(`crates/cfc-tray/src/theme.rs`). When "colony-firewall" is not installed
+where icon lookup searches - probed across `$HOME/.icons`,
+`$XDG_DATA_HOME/icons`, every `$XDG_DATA_DIRS` entry, and pixmaps - the tray
+writes the packaged SVG (embedded at compile time from `pkg/`, so it is the
+same artwork byte for byte) into `$XDG_RUNTIME_DIR/cfc-tray/icons` and exports
+that directory, in both layouts hosts are known to use: a flat file for GTK's
+unthemed lookup and a `hicolor` tree with an `index.theme` for strict Qt
+lookup. With the theme installed nothing engages and the exported property is
+the same empty string as before, so hosts that already worked see nothing new.
+Without `$XDG_RUNTIME_DIR`, or when the write fails, the tray says so in one
+warning naming the fix instead of leaving a placeholder to be puzzled over
+(`/tmp` is deliberately not a fallback: a predictable name in a world-shared
+directory is a symlink game).
+
+The probe and the written tree are unit-tested; what is not verified is the
+one thing that prompted this: nobody has yet watched quickshell/Noctalia
+render the runtime path on a machine without the package. If it still shows a
+placeholder there, the remaining suspect is how that host consumes
+`IconThemePath`, not whether CFC exports it.
 
 ---
 
 ## 6. Verify the CI that was written for this
 
-Neither `.github/workflows/ebpf.yml` nor `.github/workflows/rhel.yml` has ever
-executed - a workflow cannot be run from a working tree. The YAML parses, the
-shell helpers run clean locally, and every ci-kernels digest (including the new
-5.10 entry) was resolved against the registry by hand. **Expect one round of
-correction on the first push**, most likely in the Rocky container's `dnf`
-invocation or in an interface name the SELinux module gets wrong.
+Done, the hard way. "Expect one round of correction on the first push" was
+optimistic by a factor of nine: the vm matrix and selinux jobs took nine
+rounds (#23), and nearly every round's error was another bug's mask - a
+docker invocation, an ext4 guest that became a cpio initramfs, a mute
+console, a glibc floor, a loopback nobody raised, one possessive apostrophe
+inside an m4-quoted interface body, and a guest verdict that trusted qemu's
+exit code. The predicted failure points (the Rocky dnf invocation, a wrong
+interface name) were not among them. Every job has since run green
+repeatedly, including the five-kernel matrix with enforcement-attach
+assertions and both selinux containers; `release.yml`'s eBPF steps and the
+Arch packaging path (`makepkg`, `namcap`, `50-strip.sh` on the BPF object)
+were exercised for real by the v0.2.3 release, which took five tag attempts
+of its own.
 
-Also unverified: the eBPF build steps added to `release.yml`, and Arch
-packaging end to end (`makepkg`, `namcap`, and what `50-strip.sh` does to a BPF
-object).
+What this bought beyond green squares: the CI now asserts things it only
+appeared to before - the LLVM pairing check could never fire, CFC_EXIT=0
+covered a test filter matching zero tests, and the kernel matrix never
+checked that enforcement attached. All three assert for real now.
 
 ---
 

@@ -93,8 +93,10 @@ const PROCESS_CACHE_TTL: Duration = Duration::from_secs(5);
 /// rule predicate, and a hash-scoped rule abstains when the hash is unknown.
 const SHA_CACHE_TTL: Duration = Duration::from_secs(u64::MAX / 2);
 
-/// Don't hash executables larger than this.
-const SHA256_MAX_LEN: u64 = 64 * 1024 * 1024;
+/// Don't hash executables larger than this. Shared with the CLI's
+/// `--pin-hash` (`cfc_core::rule`), which must refuse to create what this
+/// side would refuse to compute.
+const SHA256_MAX_LEN: u64 = cfc_core::rule::SHA256_MAX_LEN;
 
 const CACHE_CAP: usize = 1024;
 
@@ -667,7 +669,7 @@ fn exe_sha256(pid: u32) -> Option<String> {
 
 /// Streaming sha256 of a file; None on I/O error or if the file exceeds
 /// `max_len` (checked up front so we never read an oversized file).
-fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
+pub(crate) fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
     let mut f = fs::File::open(path).ok()?;
     if f.metadata().ok()?.len() > max_len {
         return None;

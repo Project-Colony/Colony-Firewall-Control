@@ -10,6 +10,7 @@
 
 mod icon;
 mod model;
+mod theme;
 
 use anyhow::Context as _;
 use cfc_client::{proto, Client, StreamItem};
@@ -38,7 +39,7 @@ const APP_NAME: &str = "Colony Firewall";
 /// resolves once the package has installed the SVG and the desktop's
 /// icon cache has picked it up, and a firewall prompt showing a generic
 /// bell is a prompt the user does not recognise.
-const NOTIFY_ICON: &str = "colony-firewall";
+const NOTIFY_ICON: &str = theme::ICON_NAME;
 
 /// The embedded shield, built once and reused by every bubble.
 fn notification_image() -> Option<notify_rust::Image> {
@@ -120,6 +121,9 @@ struct TrayApp {
     view: DaemonView,
     tx: mpsc::UnboundedSender<Cmd>,
     icons: Vec<ksni::Icon>,
+    /// Runtime directory exported as the SNI `IconThemePath`; `None`
+    /// (the common case) exports nothing. See [`theme`].
+    icon_theme_path: Option<PathBuf>,
 }
 
 impl TrayApp {
@@ -157,8 +161,19 @@ impl ksni::Tray for TrayApp {
     }
 
     fn icon_name(&self) -> String {
-        // Installed by the package to hicolor/scalable/apps.
-        "colony-firewall".into()
+        // Installed by the package to hicolor/scalable/apps; when it is
+        // not, `icon_theme_path` below makes the same name resolvable.
+        theme::ICON_NAME.into()
+    }
+
+    fn icon_theme_path(&self) -> String {
+        // Empty (the ksni default, what the tray always exported) unless
+        // the startup probe found no installed theme icon - the fallback
+        // for hosts that honour icon_name only and never read the pixmap.
+        self.icon_theme_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -168,7 +183,7 @@ impl ksni::Tray for TrayApp {
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            icon_name: "colony-firewall".into(),
+            icon_name: theme::ICON_NAME.into(),
             icon_pixmap: Vec::new(),
             title: "Colony Firewall".into(),
             description: model::tooltip_description(&self.view, now_unix_ms()),
@@ -454,6 +469,19 @@ fn notify_pending(count: u64) {
     });
 }
 
+/// Appends the daemon's persist note to a confirmation, when there is one.
+///
+/// The note is a fact about the stored rule (today: it was bound to the
+/// binary's hash, or a promised binding fell through) - never a failure,
+/// which takes the rule_not_saved branch instead.
+fn with_note(mut msg: String, note: &Option<String>) -> String {
+    if let Some(n) = note.as_deref() {
+        msg.push('\n');
+        msg.push_str(n);
+    }
+    msg
+}
+
 /// A short, non-actionable follow-up ("rule created", "too late"). 5s,
 /// normal urgency.
 fn notify_brief(body: String) {
@@ -723,10 +751,15 @@ async fn submit_prompt_verdict(
                 // Reporting a loss on silence would cry wolf on every single
                 // answer.
                 (PromptChoice::BlockAlways, Some(true) | None) => {
-                    notify_brief(model::block_confirmation(exe))
+                    notify_brief(with_note(model::block_confirmation(exe), &o.persist_note))
                 }
                 (PromptChoice::AllowAlways, Some(true) | None) => {
-                    notify_brief(model::allow_confirmation(exe))
+                    // The note is the daemon telling the user something true
+                    // about the rule it just stored - today, that a
+                    // user-writable binary was hash-bound and a swapped file
+                    // will prompt again. Dropping it would leave "Allowed
+                    // always" quietly meaning less than it reads.
+                    notify_brief(with_note(model::allow_confirmation(exe), &o.persist_note))
                 }
                 (_, Some(false)) => {
                     warn!(prompt_id, ?choice, "verdict applied but no rule was saved");
@@ -867,6 +900,9 @@ async fn run() -> anyhow::Result<()> {
                 data: p.argb,
             })
             .collect(),
+        // Resolved before the tray registers, so the host's first
+        // property read already sees it.
+        icon_theme_path: theme::runtime_icon_theme_path(),
     };
 
     // assume_sni_available: at login this process may beat the desktop's

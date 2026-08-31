@@ -83,6 +83,7 @@ impl Firewall for FakeDaemon {
                 }),
                 // Far enough out that a slow CI box cannot expire it.
                 deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+                binds_to_hash: false,
             };
             let _ = tx.send(Ok(ev)).await;
             // Hold the stream open; the CLI is expected to leave on its own
@@ -120,6 +121,7 @@ impl Firewall for FakeDaemon {
             } else {
                 String::new()
             },
+            persist_note: String::new(),
         }))
     }
 

@@ -7,7 +7,7 @@
 //!
 //! Exactly-once resolution: for every prompt, precisely one of {user
 //! answer, timeout sweeper, no-UI fast path, vanished-subscriber reclaim}
-//! sends the `PromptVerdict`. The `pending` set is the arbiter - whichever
+//! sends the `PromptVerdict`. The `pending` map is the arbiter - whichever
 //! path removes the id first wins, the loser is ignored.
 //!
 //! # Uid-scoped delivery
@@ -29,7 +29,7 @@ use crate::stats::Stats;
 use cfc_core::Verdict;
 use cfc_proto::v1 as pb;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -70,11 +70,39 @@ pub struct PromptRouter {
     inner: Arc<RouterInner>,
 }
 
+/// What the daemon remembers about a prompt between showing it and hearing
+/// the answer.
+///
+/// The router used to keep only the id, which made `SubmitVerdict` decide
+/// about a process it could no longer see. The binding restores exactly the
+/// two facts the persist path needs: which executable the prompt was about
+/// (so a scope the user edited away from it is left alone), and the sha256
+/// of the *running image* when that executable lives somewhere a non-root
+/// user could rewrite. The hash is computed at prompt time, from
+/// `/proc/<pid>/exe` - the bytes the human is actually deciding about - not
+/// at submit time, when the process may be gone or may have exec'd into
+/// something else, and not from the on-disk path, which can be swapped in
+/// the window between exec and prompt.
+#[derive(Debug, Clone, Default)]
+pub struct PromptBinding {
+    /// The resolved executable the prompt was about, when known.
+    pub exe: Option<std::path::PathBuf>,
+    /// True when the path was judged rewritable by a non-root user at prompt
+    /// time, i.e. a persisted allow *should* be hash-bound. Carried so the
+    /// submit path can tell "never promised" from "promised and the hash
+    /// below is missing" without re-judging a path whose file may have
+    /// changed since the judgment that mattered.
+    pub hash_expected: bool,
+    /// The running image's digest, present only when `hash_expected` and the
+    /// bytes could be read within the shared size cap.
+    pub sha256: Option<String>,
+}
+
 struct RouterInner {
-    /// Prompt ids broadcast to the UI and not yet resolved. Present means
-    /// "unresolved"; the first resolution path to remove an id sends the
-    /// verdict.
-    pending: Mutex<HashSet<u64>>,
+    /// Prompts broadcast to the UI and not yet resolved, with what was known
+    /// about each at prompt time. Present means "unresolved"; the first
+    /// resolution path to remove an id sends the verdict.
+    pending: Mutex<HashMap<u64, PromptBinding>>,
     broadcast_tx: broadcast::Sender<pb::PromptEvent>,
     /// Census of live `StreamPrompts` subscribers: peer uid -> how many
     /// streams that uid has open. Maintained by [`PromptSubscription`],
@@ -138,7 +166,7 @@ impl PromptRouter {
         let (broadcast_tx, _) = broadcast::channel(64);
         Self {
             inner: Arc::new(RouterInner {
-                pending: Mutex::new(HashSet::new()),
+                pending: Mutex::new(HashMap::new()),
                 broadcast_tx,
                 subscribers: Mutex::new(HashMap::new()),
                 default_policy,
@@ -163,25 +191,22 @@ impl PromptRouter {
         }
     }
 
-    /// Resolves a pending prompt with the user's verdict. Returns false if
-    /// the id is unknown or the prompt already resolved another way (e.g.
-    /// it timed out first), in which case the verdict is discarded.
-    pub fn submit(&self, prompt_id: &str, verdict: Verdict) -> bool {
-        let Ok(id) = prompt_id.parse::<u64>() else {
-            return false;
-        };
-        if !self.inner.pending.lock().remove(&id) {
-            return false;
-        }
+    /// Resolves a pending prompt with the user's verdict. Returns what the
+    /// prompt remembered about its process, or `None` if the id is unknown or
+    /// the prompt already resolved another way (e.g. it timed out first), in
+    /// which case the verdict is discarded.
+    pub fn submit(&self, prompt_id: &str, verdict: Verdict) -> Option<PromptBinding> {
+        let id = prompt_id.parse::<u64>().ok()?;
+        let binding = self.inner.pending.lock().remove(&id)?;
         self.inner.stats.prompts_dec();
         let _ = self.inner.verdict_tx.send(PromptVerdict {
             prompt_id: id,
             verdict,
         });
-        true
+        Some(binding)
     }
 
-    fn enqueue(&self, req: PromptRequest) {
+    fn enqueue(&self, req: PromptRequest, binding: PromptBinding) {
         let prompt_id = req.prompt_id;
         let owner_uid = req.process.uid;
         // Read the shared policy at prompt-creation time so a SIGHUP
@@ -215,15 +240,18 @@ impl PromptRouter {
             connection: Some(convert::connection_to_pb(&req.connection)),
             process: Some(convert::process_to_pb(&req.process)),
             deadline_unix_ms: chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64,
+            // Said before the user answers, because "your allow will follow
+            // the hash, not the path" changes what clicking Allow means.
+            binds_to_hash: binding.sha256.is_some(),
         };
 
-        self.inner.pending.lock().insert(prompt_id);
+        self.inner.pending.lock().insert(prompt_id, binding);
         self.inner.stats.prompts_inc();
 
         if self.inner.broadcast_tx.send(event).is_err() {
             // All receivers vanished between the census check and the
             // send. Reclaim and fall back.
-            if self.inner.pending.lock().remove(&prompt_id) {
+            if self.inner.pending.lock().remove(&prompt_id).is_some() {
                 self.inner.stats.prompts_dec();
                 let _ = self.inner.verdict_tx.send(PromptVerdict {
                     prompt_id,
@@ -238,7 +266,7 @@ impl PromptRouter {
         let inner = self.inner.clone();
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            if inner.pending.lock().remove(&prompt_id) {
+            if inner.pending.lock().remove(&prompt_id).is_some() {
                 inner.stats.prompts_dec();
                 debug!(prompt_id, "prompt timed out");
                 let _ = inner.verdict_tx.send(PromptVerdict {
@@ -282,9 +310,70 @@ impl Drop for PromptSubscription {
 /// Pumps `PromptRequest`s from the NFQUEUE worker into the router.
 pub async fn run_router_task(mut prompt_rx: mpsc::Receiver<PromptRequest>, router: PromptRouter) {
     while let Some(req) = prompt_rx.recv().await {
-        router.enqueue(req);
+        // Off the async threads: the sealed check is a handful of stats, but
+        // the hash behind it reads up to the shared size cap. Prompts are
+        // sequential through this channel anyway, and the packet the prompt
+        // is about is parked waiting on a *human* - milliseconds of hashing
+        // are free here and would not be on the NFQUEUE worker.
+        let process = req.process.clone();
+        let binding = tokio::task::spawn_blocking(move || compute_binding(&process))
+            .await
+            .unwrap_or_default();
+        router.enqueue(req, binding);
     }
     warn!("prompt router channel closed");
+}
+
+/// What to remember about this prompt's process, judged now, while it runs.
+///
+/// The digest is taken from `/proc/<pid>/exe` - the running image - only when
+/// the executable's own path is not root-sealed. A sealed path (root-owned,
+/// unwritable ancestors all the way up) keeps path-keyed rules meaningful; an
+/// unsealed one means anyone who can write the file inherits every allow its
+/// path has earned, which is what binding exists to stop. Denies never bind
+/// (see the persist path): a hash-bound deny is one file swap away from not
+/// applying, while the path-bound one covers whatever bytes sit there next.
+fn compute_binding(process: &cfc_core::Process) -> PromptBinding {
+    compute_binding_from(
+        process,
+        std::path::Path::new(&format!("/proc/{}/exe", process.pid)),
+    )
+}
+
+/// The image path is a parameter so tests can point it at a file of their
+/// own making: the real one is `/proc/<pid>/exe`, whose size and ownership
+/// are whatever the machine running the tests happens to be - the first
+/// version asserted against the test binary itself and learned that a debug
+/// build is over the hashing cap.
+fn compute_binding_from(process: &cfc_core::Process, image: &std::path::Path) -> PromptBinding {
+    if !process.exe_is_known() || !process.exe.is_absolute() {
+        return PromptBinding::default();
+    }
+    let exe = process.exe.clone();
+    // Stat failure reads as unsealed: a path that cannot even be examined is
+    // certainly not root-sealed, and the hash below answers from /proc
+    // regardless of what the on-disk path is doing.
+    if cfc_core::exe_path::is_root_sealed(&exe).unwrap_or(false) {
+        return PromptBinding {
+            exe: Some(exe),
+            hash_expected: false,
+            sha256: None,
+        };
+    }
+    let sha256 = crate::process_resolve::sha256_file(image, cfc_core::rule::SHA256_MAX_LEN);
+    if sha256.is_none() {
+        debug!(
+            pid = process.pid,
+            exe = %exe.display(),
+            "user-writable executable could not be hashed; a persisted allow \
+             will follow the path"
+        );
+    }
+    PromptBinding {
+        exe: Some(exe),
+        hash_expected: true,
+        sha256,
+    }
 }
 
 #[cfg(test)]
@@ -382,7 +471,7 @@ mod tests {
         let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
         let _sub = router.subscribe(1000);
 
-        router.enqueue(req_owned_by(5, 1001));
+        router.enqueue(req_owned_by(5, 1001), PromptBinding::default());
 
         let pv = rx.try_recv().expect("verdict should already be queued");
         assert_eq!(pv.prompt_id, 5);
@@ -390,7 +479,7 @@ mod tests {
         assert_eq!(pv.verdict.source, VerdictSource::DefaultPolicy);
         // It never became pending, so nothing can answer it late.
         assert_eq!(stats.prompts_pending(), 0);
-        assert!(!router.submit("5", user_allow()));
+        assert!(router.submit("5", user_allow()).is_none());
     }
 
     #[tokio::test]
@@ -400,7 +489,7 @@ mod tests {
         let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
         let mut sub = router.subscribe(1000);
 
-        router.enqueue(req_owned_by(6, 1000));
+        router.enqueue(req_owned_by(6, 1000), PromptBinding::default());
 
         assert_eq!(sub.recv().await.unwrap().prompt_id, "6");
         assert_eq!(stats.prompts_pending(), 1);
@@ -413,7 +502,7 @@ mod tests {
         let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
         let mut sub = router.subscribe(0);
 
-        router.enqueue(req_owned_by(8, 1001));
+        router.enqueue(req_owned_by(8, 1001), PromptBinding::default());
 
         assert_eq!(sub.recv().await.unwrap().prompt_id, "8");
         assert!(rx.try_recv().is_err(), "root's UI owes us an answer");
@@ -429,11 +518,11 @@ mod tests {
         let sub_a = router.subscribe(1000);
         let sub_b = router.subscribe(1000);
         drop(sub_a);
-        router.enqueue(req_owned_by(1, 1000));
+        router.enqueue(req_owned_by(1, 1000), PromptBinding::default());
         assert!(rx.try_recv().is_err(), "uid 1000 still has a UI open");
 
         drop(sub_b);
-        router.enqueue(req_owned_by(2, 1000));
+        router.enqueue(req_owned_by(2, 1000), PromptBinding::default());
         assert_eq!(
             rx.try_recv().expect("no UI left; answer now").prompt_id,
             2,
@@ -456,7 +545,7 @@ mod tests {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let router = PromptRouter::new(shared(policy), Stats::new(), tx);
-        router.enqueue(req(11));
+        router.enqueue(req(11), PromptBinding::default());
         let pv = rx.try_recv().expect("verdict should already be queued");
         assert_eq!(pv.verdict.action, Action::Reject);
         assert_eq!(pv.verdict.source, VerdictSource::DefaultPolicy);
@@ -466,12 +555,12 @@ mod tests {
     async fn no_ui_answers_immediately_with_no_ui_action() {
         let (tx, rx) = std::sync::mpsc::channel();
         let router = PromptRouter::new(shared(dp(15)), Stats::new(), tx);
-        router.enqueue(req(7));
+        router.enqueue(req(7), PromptBinding::default());
         let pv = rx.try_recv().expect("verdict should already be queued");
         assert_eq!(pv.prompt_id, 7);
         assert_eq!(pv.verdict.action, Action::Deny);
         // Nothing is pending: a late submit is rejected.
-        assert!(!router.submit("7", user_allow()));
+        assert!(router.submit("7", user_allow()).is_none());
     }
 
     #[tokio::test]
@@ -481,19 +570,19 @@ mod tests {
         let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
         let mut sub = router.subscribe(1000);
 
-        router.enqueue(req(1));
+        router.enqueue(req(1), PromptBinding::default());
         let event = sub.recv().await.unwrap();
         assert_eq!(event.prompt_id, "1");
         assert_eq!(stats.prompts_pending(), 1);
 
-        assert!(router.submit("1", user_allow()));
+        assert!(router.submit("1", user_allow()).is_some());
         assert_eq!(stats.prompts_pending(), 0);
         let pv = rx.try_recv().unwrap();
         assert_eq!(pv.prompt_id, 1);
         assert_eq!(pv.verdict.action, Action::Allow);
 
         // A second answer loses: rejected, no duplicate verdict.
-        assert!(!router.submit("1", user_allow()));
+        assert!(router.submit("1", user_allow()).is_none());
         assert!(rx.try_recv().is_err());
     }
 
@@ -501,8 +590,8 @@ mod tests {
     async fn unknown_or_malformed_prompt_id_rejected() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let router = PromptRouter::new(shared(dp(15)), Stats::new(), tx);
-        assert!(!router.submit("12345", user_allow()));
-        assert!(!router.submit("not-a-number", user_allow()));
+        assert!(router.submit("12345", user_allow()).is_none());
+        assert!(router.submit("not-a-number", user_allow()).is_none());
     }
 
     #[tokio::test]
@@ -512,13 +601,13 @@ mod tests {
         let router = PromptRouter::new(policy.clone(), Stats::new(), tx);
 
         // No UI subscribed: the fast path answers with no_ui_action.
-        router.enqueue(req(1));
+        router.enqueue(req(1), PromptBinding::default());
         assert_eq!(rx.try_recv().unwrap().verdict.action, Action::Deny);
 
         // Swap the shared policy in place (what SIGHUP does in main).
         policy.write().unwrap().no_ui_action = Action::Allow;
 
-        router.enqueue(req(2));
+        router.enqueue(req(2), PromptBinding::default());
         assert_eq!(rx.try_recv().unwrap().verdict.action, Action::Allow);
     }
 
@@ -529,7 +618,7 @@ mod tests {
         let router = PromptRouter::new(shared(dp(1)), stats.clone(), tx);
         let _sub = router.subscribe(1000); // keep a UI "connected"
 
-        router.enqueue(req(9));
+        router.enqueue(req(9), PromptBinding::default());
         assert_eq!(stats.prompts_pending(), 1);
 
         // Paused time auto-advances past the sweeper's deadline.
@@ -540,7 +629,123 @@ mod tests {
         assert_eq!(pv.verdict.action, Action::Deny);
         assert_eq!(stats.prompts_pending(), 0);
         // The user answering afterwards is a no-op.
-        assert!(!router.submit("9", user_allow()));
+        assert!(router.submit("9", user_allow()).is_none());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_user_writable_binary_earns_a_hash_binding() {
+        // A file of the test's own making stands in for both the rule path
+        // and the running image - the ~/.local/bin shape binding exists for.
+        // Under root the ancestry judgment flips, so the test skips rather
+        // than asserts a coin toss.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").expect("write");
+        if cfc_core::exe_path::is_root_sealed(&exe).unwrap_or(false) {
+            return;
+        }
+        let proc = Process {
+            pid: 4242,
+            exe: exe.clone(),
+            ..Process::unknown(4242)
+        };
+        let binding = compute_binding_from(&proc, &exe);
+        assert!(
+            binding.hash_expected,
+            "a user-writable path must expect a hash"
+        );
+        let sha = binding
+            .sha256
+            .expect("the image is readable and under the cap");
+        assert_eq!(sha.len(), 64);
+        assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(binding.exe.as_deref(), Some(exe.as_path()));
+    }
+
+    #[test]
+    fn an_oversized_image_expects_a_hash_it_cannot_have() {
+        // The over-the-cap path: hash_expected stays true - the persist
+        // side turns that into a spoken note instead of a silent
+        // path-keyed allow - but no digest is produced. Exercised with the
+        // real cap by pointing the image at a file that does not exist,
+        // which takes the same None path without writing 64 MiB in a test.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"x").expect("write");
+        if cfc_core::exe_path::is_root_sealed(&exe).unwrap_or(false) {
+            return;
+        }
+        let proc = Process {
+            pid: 4242,
+            exe: exe.clone(),
+            ..Process::unknown(4242)
+        };
+        let binding = compute_binding_from(&proc, &dir.path().join("gone"));
+        assert!(binding.hash_expected);
+        assert!(binding.sha256.is_none());
+    }
+
+    #[test]
+    fn a_root_sealed_binary_is_left_path_keyed() {
+        // /usr/bin/env is root-owned 0755 under root-owned ancestors on any
+        // machine these tests run on; if this one is somehow not, the test
+        // has nothing true to assert.
+        let sealed = std::path::Path::new("/usr/bin/env");
+        if !cfc_core::exe_path::is_root_sealed(sealed).unwrap_or(false) {
+            return;
+        }
+        let proc = Process {
+            pid: std::process::id(),
+            exe: sealed.to_path_buf(),
+            ..Process::unknown(std::process::id())
+        };
+        let binding = compute_binding(&proc);
+        assert!(!binding.hash_expected);
+        assert!(binding.sha256.is_none(), "sealed paths never hash");
+    }
+
+    #[test]
+    fn an_unattributed_process_earns_no_binding() {
+        let binding = compute_binding(&Process::unknown(1));
+        assert!(!binding.hash_expected);
+        assert!(binding.sha256.is_none());
+        assert!(binding.exe.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_returns_the_binding_the_prompt_stored() {
+        // What travels: enqueue remembers, the event announces, submit
+        // returns - the three legs the persist path stands on.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+        let mut sub = router.subscribe(1000);
+
+        let binding = PromptBinding {
+            exe: Some(std::path::PathBuf::from("/home/u/.local/bin/tool")),
+            hash_expected: true,
+            sha256: Some("ab".repeat(32)),
+        };
+        router.enqueue(req_owned_by(9, 1000), binding);
+
+        let event = sub.recv().await.unwrap();
+        assert!(event.binds_to_hash, "the prompt must announce the binding");
+
+        let got = router.submit("9", user_allow()).expect("pending");
+        assert_eq!(got.sha256.as_deref(), Some("ab".repeat(32).as_str()));
+        assert_eq!(
+            got.exe.as_deref(),
+            Some(std::path::Path::new("/home/u/.local/bin/tool"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sealed_prompt_does_not_announce_a_binding() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+        let mut sub = router.subscribe(1000);
+        router.enqueue(req_owned_by(10, 1000), PromptBinding::default());
+        let event = sub.recv().await.unwrap();
+        assert!(!event.binds_to_hash);
     }
 }

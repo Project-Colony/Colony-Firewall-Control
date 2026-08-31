@@ -2,6 +2,14 @@
 %global selinuxtype targeted
 %global modulename colony_firewall
 
+# No -debuginfo subpackage, and not as an oversight: the workspace's release
+# profile strips in the linker (Cargo.toml, `strip = true`), so find-debuginfo
+# has nothing to extract, and rpmbuild treats the resulting empty
+# debugfiles.list as an error rather than a warning - a full `rpmbuild -ba`
+# on Fedora dies there. Shipping real debuginfo would mean unstripping the
+# release profile, which is a Cargo.toml decision, not a spec one.
+%global debug_package %{nil}
+
 Name:           colony-firewall-control
 Version:        0.2.3
 Release:        1%{?dist}

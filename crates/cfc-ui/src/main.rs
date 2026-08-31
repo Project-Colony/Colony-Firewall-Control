@@ -423,7 +423,7 @@ pub enum Message {
         scope: Option<proto::RuleScope>,
         duration: proto::Duration,
     },
-    VerdictSubmitted(Result<(String, bool), String>),
+    VerdictSubmitted(Result<(String, bool, Option<String>), String>),
     OpenEditor,
     EditExistingRule(String),
     CloseEditor,
@@ -797,13 +797,21 @@ impl App {
                     Message::VerdictSubmitted,
                 )
             }
-            Message::VerdictSubmitted(Ok((_, true))) => {
+            Message::VerdictSubmitted(Ok((_, true, note))) => {
+                // The daemon telling the user something true about the rule
+                // it stored - today, that a user-writable binary was
+                // hash-bound and a swapped file will prompt again. Shown in
+                // the log line the verdict already earns; silence would
+                // leave "always" quietly meaning less than it reads.
+                if let Some(note) = note {
+                    self.log.info(note, self.now_ms);
+                }
                 // A verdict may have persisted a rule; refresh so the Rules
                 // tab shows it now rather than after some unrelated action.
                 let socket = self.socket_path.clone();
                 Task::perform(fetch_rules(socket), Message::RulesLoaded)
             }
-            Message::VerdictSubmitted(Ok((_, false))) => {
+            Message::VerdictSubmitted(Ok((_, false, _))) => {
                 // The daemon had already answered this prompt itself. The
                 // old code swallowed this, so the user believed they had
                 // allowed something the timeout had actually decided.
@@ -1575,7 +1583,7 @@ async fn submit_verdict(
     action: proto::Action,
     scope: Option<proto::RuleScope>,
     duration: proto::Duration,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool, Option<String>), String> {
     let wanted_rule = scope.is_some();
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
     let outcome = client
@@ -1590,7 +1598,7 @@ async fn submit_verdict(
             .persist_error
             .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()));
     }
-    Ok((prompt_id, outcome.accepted))
+    Ok((prompt_id, outcome.accepted, outcome.persist_note))
 }
 
 #[cfg(test)]
@@ -1827,6 +1835,7 @@ mod tests {
                 ..Default::default()
             }),
             deadline_unix_ms: 1_700_000_015_000,
+            binds_to_hash: false,
         }
     }
 

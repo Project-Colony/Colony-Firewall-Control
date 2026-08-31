@@ -239,6 +239,62 @@ pub fn resolve_scope(scope: &mut crate::RuleScope) -> Option<Resolved> {
     Some(outcome)
 }
 
+/// Whether a *directory* on the way to an executable is sealed against
+/// non-root replacement.
+///
+/// Root-owned and not group/world-writable, or root-owned, world-writable and
+/// **sticky** - the `/tmp` shape, where a non-root user still cannot rename
+/// or remove root's files. A pure function of (uid, mode) so the policy can
+/// be tested exhaustively without root or a filesystem that can express
+/// every case.
+///
+/// This pair started life in the daemon's BPF-object vetting and moved here
+/// when rule hash-binding needed the identical judgment: "can a non-root
+/// user swap the bytes behind this path" is one question, and two copies of
+/// its answer had already drifted apart once elsewhere in this codebase.
+pub fn dir_is_sealed(uid: u32, mode: u32) -> bool {
+    uid == 0 && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+/// Whether the file itself is sealed. No sticky exception: the bit means
+/// nothing on a regular file.
+pub fn file_is_sealed(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
+/// Whether nothing short of root can replace the bytes behind `path`.
+///
+/// True only when the file *and every ancestor directory* pass the sealed
+/// tests above: a root-owned file under a directory someone else can rename
+/// is not a sealed file. Symlinks are resolved first - judging the link and
+/// trusting the target would check the wrong file.
+///
+/// Two callers, two consequences:
+/// * the daemon binds a prompt-created **allow** to the binary's hash when
+///   this says false - a path anyone can rewrite must not carry a standing
+///   path-keyed allow;
+/// * the CLI suggests `--pin-hash` for the same reason.
+///
+/// Errors are the caller's to interpret: a path that cannot even be stat'd
+/// is certainly not sealed, but *why* it cannot matters differently to a
+/// daemon (process may have exited) and a CLI (typo).
+pub fn is_root_sealed(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let real = std::fs::canonicalize(path)?;
+    let meta = std::fs::metadata(&real)?;
+    if !meta.is_file() || !file_is_sealed(meta.uid(), meta.mode()) {
+        return Ok(false);
+    }
+    for dir in real.ancestors().skip(1) {
+        let m = std::fs::metadata(dir)?;
+        if !dir_is_sealed(m.uid(), m.mode()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +508,70 @@ mod tests {
         let mut empty = crate::RuleScope::any();
         assert!(resolve_scope(&mut empty).is_none());
         assert_eq!(empty.exe_path, None);
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    #[test]
+    fn the_sealed_bit_tests_match_the_loader_policy() {
+        // File: root-owned, not group/world-writable. These are the exact
+        // cases the BPF-object vetting was proven against; the predicate
+        // moved here, the truth table must not move with it.
+        assert!(file_is_sealed(0, 0o100644));
+        assert!(file_is_sealed(0, 0o100600));
+        assert!(!file_is_sealed(1000, 0o100644), "non-root owner");
+        assert!(!file_is_sealed(0, 0o100664), "group-writable");
+        assert!(!file_is_sealed(0, 0o100666), "world-writable");
+
+        // Directory: same, plus the sticky exception for the /tmp shape.
+        assert!(dir_is_sealed(0, 0o040755));
+        assert!(dir_is_sealed(0, 0o041777), "sticky world-writable is /tmp");
+        assert!(!dir_is_sealed(0, 0o040777), "world-writable, no sticky");
+        assert!(!dir_is_sealed(1000, 0o040755), "non-root owner");
+    }
+
+    #[test]
+    fn a_users_own_file_is_not_sealed() {
+        // A temp dir is owned by the running (non-root) user, so both the
+        // file and its parent fail the seal - the exact shape of
+        // ~/.local/bin that hash-binding exists for. (Under root the parent
+        // would pass; the file check still runs, so the assertion holds
+        // unless the whole ancestry is root-sealed, which a fresh tempdir
+        // under /tmp never is: /tmp itself is sticky, but the tempdir is
+        // mode 700 and owned by whoever runs the tests.)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("write");
+        let sealed = is_root_sealed(&file).expect("stat succeeds");
+        if euid() == Some(0) {
+            // Under root the ownership half passes and the verdict depends
+            // on the tempdir's mode alone; the test would assert nothing
+            // reliable, so it asserts nothing at all.
+            return;
+        }
+        assert!(
+            !sealed,
+            "a user-owned file under a user-owned dir is not sealed"
+        );
+    }
+
+    #[test]
+    fn a_missing_path_is_an_error_not_a_verdict() {
+        assert!(is_root_sealed(std::path::Path::new("/nonexistent/cfc-x")).is_err());
+    }
+
+    /// From /proc/self/status - no libc dependency for one call.
+    fn euid() -> Option<u32> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
     }
 }

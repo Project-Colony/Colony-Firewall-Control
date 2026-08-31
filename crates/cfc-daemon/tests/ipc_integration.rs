@@ -1372,3 +1372,127 @@ async fn stream_connections_maps_the_live_feed() {
     assert_eq!(event.verdict, pb::Action::Allow as i32);
     assert!(event.rule_id.is_empty());
 }
+
+#[tokio::test]
+async fn a_user_writable_binary_gets_its_allow_hash_bound() {
+    // End to end, with a real process: a copy of /usr/bin/sleep in a
+    // tempdir is exactly the ~/.local/bin shape - user-owned, small, alive
+    // long enough to be hashed. The prompt must announce the binding, the
+    // persisted allow must carry the image's digest, and the note must say
+    // so; a deny through the same prompt shape stays path-keyed (a
+    // hash-bound deny is one file swap away from covering nothing).
+    let sealed_src = std::path::Path::new("/usr/bin/sleep");
+    if !sealed_src.exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = dir.path().join("tool");
+    std::fs::copy(sealed_src, &tool).expect("copying sleep");
+    if cfc_core::exe_path::is_root_sealed(&tool).unwrap_or(false) {
+        // Running as root: the judgment legitimately flips.
+        return;
+    }
+    let mut child = std::process::Command::new(&tool)
+        .arg("30")
+        .spawn()
+        .expect("spawning the tool");
+
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let mut prompts = client
+        .stream_prompts("test".into())
+        .await
+        .expect("subscribing to prompts");
+
+    let process = Process {
+        pid: child.id(),
+        exe: std::fs::canonicalize(&tool).expect("canonical tool path"),
+        ..Process::unknown(child.id())
+    };
+    d.push_prompt_for(61, process.clone()).await;
+    let ev = next_message(&mut prompts).await;
+    assert_eq!(ev.prompt_id, "61");
+    assert!(
+        ev.binds_to_hash,
+        "the prompt must say the allow will pin before the user answers"
+    );
+
+    let scope = pb::RuleScope {
+        exe_path: process.exe.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let outcome = client
+        .submit_verdict("61", pb::Action::Allow, pb::Duration::Always, Some(scope))
+        .await
+        .expect("submitting the verdict");
+    assert!(outcome.accepted);
+    assert_eq!(outcome.rule_persisted, Some(true));
+    let note = outcome.persist_note.expect("the binding must be spoken");
+    assert!(note.contains("sha256"), "{note}");
+
+    let rules = client.list_rules().await.expect("listing rules");
+    assert_eq!(rules.len(), 1);
+    let stored = rules[0].scope.as_ref().expect("scope");
+    assert_eq!(stored.exe_sha256.len(), 64, "the allow is hash-bound");
+    assert!(stored.exe_sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test]
+async fn a_deny_on_a_user_writable_binary_stays_path_keyed() {
+    // Same shape, opposite action: binding a deny to a hash would let a
+    // file swap escape it, so the daemon must leave the deny on the path.
+    let sealed_src = std::path::Path::new("/usr/bin/sleep");
+    if !sealed_src.exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = dir.path().join("tool");
+    std::fs::copy(sealed_src, &tool).expect("copying sleep");
+    if cfc_core::exe_path::is_root_sealed(&tool).unwrap_or(false) {
+        return;
+    }
+    let mut child = std::process::Command::new(&tool)
+        .arg("30")
+        .spawn()
+        .expect("spawning the tool");
+
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let mut prompts = client
+        .stream_prompts("test".into())
+        .await
+        .expect("subscribing to prompts");
+
+    let process = Process {
+        pid: child.id(),
+        exe: std::fs::canonicalize(&tool).expect("canonical tool path"),
+        ..Process::unknown(child.id())
+    };
+    d.push_prompt_for(62, process.clone()).await;
+    assert_eq!(next_message(&mut prompts).await.prompt_id, "62");
+
+    let scope = pb::RuleScope {
+        exe_path: process.exe.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let outcome = client
+        .submit_verdict("62", pb::Action::Deny, pb::Duration::Always, Some(scope))
+        .await
+        .expect("submitting the verdict");
+    assert!(outcome.accepted);
+    assert_eq!(outcome.rule_persisted, Some(true));
+
+    let rules = client.list_rules().await.expect("listing rules");
+    assert_eq!(rules.len(), 1);
+    let stored = rules[0].scope.as_ref().expect("scope");
+    assert!(
+        stored.exe_sha256.is_empty(),
+        "a deny must follow the path, not the bytes"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
