@@ -93,11 +93,18 @@ jobs:
       # and the assert below enforces exactly that — so a second hardcoded
       # number could only ever drift away from the first.
       - name: Install bpf-linker
+        id: linker
         run: |
-          LLVM_MAJOR="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+          # `rustup run <pin>`, never bare `rustc`: this step executes at the
+          # repository root, where rust-toolchain.toml pins *stable*, and a
+          # toolchain file outranks the default the toolchain action set. Bare
+          # rustc here read stable's LLVM while claiming to read the nightly's
+          # - harmless only for as long as the two majors happen to agree.
+          LLVM_MAJOR="$(rustup run "${{ steps.pins.outputs.nightly }}" rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
           if [ -z "${LLVM_MAJOR}" ]; then
-            echo "::error::could not read rustc's LLVM version"; exit 1
+            echo "::error::could not read the pinned nightly's LLVM version"; exit 1
           fi
+          echo "llvm_major=${LLVM_MAJOR}" >> "${GITHUB_OUTPUT}"
           echo "pinned nightly uses LLVM ${LLVM_MAJOR}; building bpf-linker against it"
 
           sudo apt-get update
@@ -121,14 +128,31 @@ jobs:
       # the system provides - so assert it rather than assume it.
       - name: Assert the LLVM versions pair
         run: |
-          RUSTC_LLVM="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
-          LINKER_LLVM="$(bpf-linker --version 2>/dev/null | sed -n 's/.*LLVM \([0-9]*\).*/\1/p')"
-          echo "rustc LLVM=${RUSTC_LLVM}  bpf-linker LLVM=${LINKER_LLVM}"
-          if [ -z "${RUSTC_LLVM}" ]; then
-            echo "::error::could not determine rustc's LLVM version"; exit 1
+          # Two real checks, replacing one that could never fire: the old
+          # version came from `bpf-linker --version`, which prints no LLVM
+          # version at all in 0.11, so the comparison was permanently vacuous
+          # - and its rustc side read stable (see the install step).
+          #
+          # (1) The system LLVM the install step provided must actually be the
+          #     major it asked llvm.sh for - the script can fall back when a
+          #     major is not packaged for the runner's distro yet. Comparing
+          #     the nightly's LLVM against itself would assert nothing; this
+          #     compares it against what landed on disk.
+          WANT="${{ steps.linker.outputs.llvm_major }}"
+          GOT="$("/usr/lib/llvm-${WANT}/bin/llvm-config" --version 2>/dev/null | cut -d. -f1 || true)"
+          echo "requested LLVM=${WANT}  system llvm-config says=${GOT}"
+          if [ "${GOT}" != "${WANT}" ]; then
+            echo "::error::asked apt.llvm.org for LLVM ${WANT} but /usr/lib/llvm-${WANT} answers '${GOT}' - the pinned nightly's LLVM is not installable here, so the bitcode handoff to bpf-linker will fail with 'Invalid record'. Bump crates/cfc-ebpf/bpf-linker-version or move the nightly pin back."
+            exit 1
           fi
-          if [ -n "${LINKER_LLVM}" ] && [ "${RUSTC_LLVM}" -gt "${LINKER_LLVM}" ]; then
-            echo "::error::rustc LLVM ${RUSTC_LLVM} is newer than bpf-linker's ${LINKER_LLVM}; the link will fail with 'Invalid record'. Bump crates/cfc-ebpf/bpf-linker-version or move the nightly pin back."
+          # (2) What the installed binary actually links, read from the binary
+          #     rather than believed from the build flags. A cached bpf-linker
+          #     that survived a toolchain change is exactly what this catches.
+          LINKED="$(ldd "$(command -v bpf-linker)" 2>/dev/null | grep -oE 'libLLVM[-.so]*[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)"
+          if [ -z "${LINKED}" ]; then
+            echo "::warning::could not read a libLLVM major from the bpf-linker binary (static link or layout change); relying on check (1) only"
+          elif [ "${LINKED}" != "${WANT}" ]; then
+            echo "::error::bpf-linker links libLLVM ${LINKED} but was requested against LLVM ${WANT} - a stale cache or a wandering apt default"
             exit 1
           fi
 
@@ -395,7 +419,13 @@ jobs:
           echo "guest glibc: $(ldd --version 2>&1 | head -1)"
           echo "guest kernel: $(uname -r)"
 
-          CFC_EBPF_OBJECT=/cfc-ebpf.o /cfc-test --ignored --nocapture \
+          # CFC_SKIP_LIVE_RESOLUTION: the live-resolver block asserts nothing
+          # here (no uplink) and stays fast only by the accident of an empty
+          # resolv.conf failing on ECONNREFUSED. A rootfs that ever named an
+          # unreachable resolver would stall 40s per kernel in TCG. Skip it
+          # the way runner-kernel does; the hermetic DNS test still runs.
+          CFC_EBPF_OBJECT=/cfc-ebpf.o CFC_SKIP_LIVE_RESOLUTION=1 \
+            /cfc-test --ignored --nocapture \
             --test-threads=1 loads_and_attaches
           echo "CFC_EXIT=$?"
           # No poweroff: bookworm-slim ships no init system, so the binary does
@@ -439,6 +469,15 @@ jobs:
             exit 1
           fi
           CODE="$(sed -n 's/.*CFC_EXIT=\([0-9]*\).*/\1/p' guest.log | tail -1)"
+
+          # CFC_EXIT=0 is necessary but not sufficient: a test filter that
+          # matches nothing (a renamed test, a typo in the init script) exits 0
+          # having run zero tests, and the guest would print a green marker
+          # around an empty suite. Require at least one test to have passed.
+          if [ "${CODE}" = "0" ] && ! grep -qE 'test result: ok\. [1-9][0-9]* passed' guest.log; then
+            echo "::error::the guest exited 0 but no test actually ran - the name filter matched nothing"
+            exit 1
+          fi
 
           {
             echo "### kernel ${{ matrix.kernel }} (${{ matrix.role }})"

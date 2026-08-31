@@ -68,21 +68,30 @@ pub enum Scope {
 
 /// Builds the rule scope for a prompt, or `None` when the event lacks the
 /// fields that scope needs (an unattributed process has no exe to pin).
+///
+/// The exe test is [`convert::exe_is_rule_scopable`] - the same predicate the
+/// GUI and the tray use - not a bare emptiness check. An unattributed process
+/// arrives with the non-empty `<unknown>` placeholder as its exe, and this
+/// function used to pin that string into the rule: the doc above promised
+/// `None`, the daemon persisted the rule, the CLI reported success, and the
+/// rule could never fire because the matcher refuses the placeholder. The
+/// user was told a standing allow existed while the prompts kept coming.
 pub fn build_scope(
     scope: Scope,
     process: Option<&proto::ProcessInfo>,
     conn: Option<&proto::ConnectionInfo>,
 ) -> Option<proto::RuleScope> {
+    let scopable_exe =
+        |p: &proto::ProcessInfo| convert::exe_is_rule_scopable(&p.exe).then(|| p.exe.clone());
     let mut out = proto::RuleScope::default();
     match scope {
         Scope::Exe => {
-            let exe = process.map(|p| p.exe.as_str()).filter(|s| !s.is_empty())?;
-            out.exe_path = exe.to_string();
+            out.exe_path = process.and_then(scopable_exe)?;
         }
         Scope::ExeAndPort => {
-            let exe = process.map(|p| p.exe.as_str()).filter(|s| !s.is_empty())?;
+            let exe = process.and_then(scopable_exe)?;
             let c = conn?;
-            out.exe_path = exe.to_string();
+            out.exe_path = exe;
             out.dst_port = c.dst_port;
             out.has_dst_port = true;
             out.protocol = c.protocol;
@@ -759,6 +768,32 @@ mod tests {
         c.dst_host = String::new();
         c.dst_ip = String::new();
         assert!(build_scope(Scope::Destination, None, Some(&c)).is_none());
+    }
+
+    #[test]
+    fn an_unscopable_exe_pins_no_rule() {
+        // `<unknown>` is what the daemon shows for a process it could not
+        // identify - a non-empty string, so the old `!is_empty()` filter let
+        // it through and "always allow / this app" persisted a rule that
+        // reads as one program and can never fire (the matcher refuses the
+        // placeholder). The GUI and the tray already gate on
+        // `exe_is_rule_scopable`; the CLI must use the same predicate.
+        let mut p = process();
+        p.exe = convert::UNKNOWN_EXE.to_string();
+        assert!(build_scope(Scope::Exe, Some(&p), Some(&conn())).is_none());
+        assert!(build_scope(Scope::ExeAndPort, Some(&p), Some(&conn())).is_none());
+
+        // A relative execve-fallback path can never match /proc's absolute
+        // one either; same predicate, same refusal.
+        p.exe = "curl".to_string();
+        assert!(build_scope(Scope::Exe, Some(&p), Some(&conn())).is_none());
+
+        // The destination scope needs no exe, so it still works for an
+        // unattributed flow - that is the rule shape such prompts should use.
+        p.exe = convert::UNKNOWN_EXE.to_string();
+        let s = build_scope(Scope::Destination, Some(&p), Some(&conn())).unwrap();
+        assert_eq!(s.dst_host, "example.com");
+        assert!(s.exe_path.is_empty());
     }
 
     #[test]

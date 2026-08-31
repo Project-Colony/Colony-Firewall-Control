@@ -127,6 +127,13 @@ pub fn process_display(p: &pb::ProcessInfo) -> String {
     }
 }
 
+/// One line per rule, for `rules list` and the GUI's rule rows.
+///
+/// Direction and the source predicates are part of the line, not only of
+/// `--json`: without them the inbound bundle's LAN-scoped SSH rule rendered as
+/// `allow * -> *:22` - byte-identical to an unrestricted outbound allow - so
+/// the one listing an operator audits hid both the inbound direction and the
+/// 192.168.0.0/16 that makes the rule safe.
 pub fn rule_summary(r: &pb::RuleInfo) -> String {
     let scope = r.scope.as_ref();
     let target = scope
@@ -153,13 +160,54 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
             }
         })
         .unwrap_or_else(|| "*".into());
-    format!(
-        "{:<7} {} -> {}{}",
-        action_label(r.action),
-        exe,
-        target,
-        port
-    )
+    // src_net and src_port collapse into one "peer" column, mirroring how
+    // target and dst_port do.
+    let src = scope.and_then(|s| {
+        let net = (!s.src_net.is_empty()).then(|| s.src_net.clone());
+        let sport = s.has_src_port.then(|| format!(":{}", s.src_port));
+        match (net, sport) {
+            (None, None) => None,
+            (net, sport) => Some(format!(
+                "{}{}",
+                net.unwrap_or_else(|| "*".into()),
+                sport.unwrap_or_default()
+            )),
+        }
+    });
+    let inbound =
+        scope.is_some_and(|s| s.has_direction && s.direction == pb::Direction::Inbound as i32);
+    if inbound {
+        // Inbound reads peer -> our port. The exe slot is dropped: inbound
+        // flows are never attributed to a program, and the boundary refuses
+        // program-scoped inbound rules outright.
+        format!(
+            "{:<7} in {} -> {}{}",
+            action_label(r.action),
+            src.unwrap_or_else(|| "*".into()),
+            target,
+            port
+        )
+    } else if let Some(src) = src {
+        // An outbound rule constraining its source is unusual but
+        // expressible; hiding the predicate would make the rule read wider
+        // than it matches.
+        format!(
+            "{:<7} {} from {} -> {}{}",
+            action_label(r.action),
+            exe,
+            src,
+            target,
+            port
+        )
+    } else {
+        format!(
+            "{:<7} {} -> {}{}",
+            action_label(r.action),
+            exe,
+            target,
+            port
+        )
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +277,58 @@ mod tests {
             "curl 8.21.0-1",
             pb::Provenance::Verified
         )));
+    }
+
+    fn rule(scope: pb::RuleScope) -> pb::RuleInfo {
+        pb::RuleInfo {
+            action: pb::Action::Allow as i32,
+            scope: Some(scope),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_outbound_summary_keeps_its_shape() {
+        // The overwhelming case; the direction/source additions must not
+        // reformat every ordinary row.
+        let s = rule_summary(&rule(pb::RuleScope {
+            exe_path: "/usr/bin/curl".into(),
+            dst_host: "example.com".into(),
+            dst_port: 443,
+            has_dst_port: true,
+            ..Default::default()
+        }));
+        assert_eq!(s, "allow   /usr/bin/curl -> example.com:443");
+    }
+
+    #[test]
+    fn an_inbound_summary_shows_direction_and_peer() {
+        // The inbound bundle's LAN-scoped SSH rule used to render as
+        // `allow * -> *:22` - indistinguishable from an unrestricted
+        // outbound allow. The direction and the source restriction are the
+        // two facts that make the rule safe, so the summary must carry both.
+        let s = rule_summary(&rule(pb::RuleScope {
+            direction: pb::Direction::Inbound as i32,
+            has_direction: true,
+            src_net: "192.168.0.0/16".into(),
+            dst_port: 22,
+            has_dst_port: true,
+            ..Default::default()
+        }));
+        assert!(s.contains("in "), "{s}");
+        assert!(s.contains("192.168.0.0/16"), "{s}");
+        assert!(s.contains(":22"), "{s}");
+    }
+
+    #[test]
+    fn an_outbound_source_restriction_is_not_hidden() {
+        let s = rule_summary(&rule(pb::RuleScope {
+            exe_path: "/usr/bin/curl".into(),
+            src_port: 5000,
+            has_src_port: true,
+            ..Default::default()
+        }));
+        assert!(s.contains("from *:5000"), "{s}");
     }
 
     #[test]

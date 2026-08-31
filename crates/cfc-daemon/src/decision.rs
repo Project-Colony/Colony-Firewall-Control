@@ -90,7 +90,23 @@ impl Engine {
     /// expired. Reuses the ordinary change path, so the recompute is the same
     /// one a rule edit triggers - and its "nothing moved" check means a tick
     /// with no real change still costs no syscalls.
+    ///
+    /// The expired rules are also *removed* from the in-memory set here, not
+    /// only from sqlite (`purge_expired` handles the rows). Before this
+    /// dropped them, the flush task's own is-anything-expired check kept
+    /// finding the same dead rule in the snapshot forever - so one lapsed
+    /// `deny --for 60s` bought a resync (a bpf(2) call per tracked process
+    /// plus a /proc walk of every orphan pid) and a full-table sqlite scan
+    /// every thirty seconds until the daemon restarted. The "still costs no
+    /// syscalls" sentence above was false for the whole time the corpse
+    /// stayed loaded.
     pub fn notify_rules_expired(&self) {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        self.inner
+            .rules
+            .write()
+            .rules
+            .retain(|r| !r.is_expired(now_unix_ms));
         self.notify_changed();
     }
 
@@ -181,38 +197,70 @@ impl Engine {
         None
     }
 
+    /// Whether some resolution of the rules this caller cannot decide would
+    /// still deny this process outright - the question that separates the two
+    /// meanings of `process_wide_action`'s `None`.
+    ///
+    /// The in-kernel sweeps turn on this distinction. `None` covers two
+    /// opposite situations: an abstention (a hash-scoped rule the caller
+    /// cannot decide) and a rule that was simply *deleted* (nobody replaces a
+    /// deny with an explicit allow, they delete it - and keeping the entry
+    /// then means the kernel goes on refusing a program no rule denies).
+    ///
+    /// An earlier version of this answered "is any rule undecidable?", which
+    /// conflates a third case: when the only undecidable rule is an *allow*,
+    /// both resolutions of the ambiguity end without a deny (the hash
+    /// matches and the process is allowed, or it does not and no rule
+    /// speaks), yet the old answer kept a standing kernel DENY on the
+    /// strength of a rule that could never justify one. So this walks the
+    /// rules in precedence order, the same filters as `process_wide_action`
+    /// (the inbound skip included, so the two cannot disagree about which
+    /// rules are in play), and answers whether a deny is still *reachable*:
+    ///
+    /// * an undecidable deny that constrains no destination: reachable - the
+    ///   matching resolution denies process-wide. Answer yes.
+    /// * an undecidable allow, or an undecidable rule the packet path would
+    ///   own anyway (destination-scoped): the deny-reachable resolution is
+    ///   the one where it does not match. Walk on.
+    /// * a decidable match ends the walk exactly as `process_wide_action`
+    ///   does: its action (or the packet path, for a destination-scoped
+    ///   rule) is the whole answer, and nothing below it can matter.
+    pub fn deny_still_possible_for(&self, proc: &Process) -> bool {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let rules = self.inner.rules.read();
+        for rule in rules
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
+            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
+        {
+            if rule.scope.undecidable_for(proc) {
+                if matches!(
+                    rule.action,
+                    cfc_core::Action::Deny | cfc_core::Action::Reject
+                ) && !rule.scope.constrains_destination()
+                {
+                    return true;
+                }
+                continue;
+            }
+            if !rule.scope.matches_process(proc) {
+                continue;
+            }
+            return matches!(
+                rule.action,
+                cfc_core::Action::Deny | cfc_core::Action::Reject
+            ) && !rule.scope.constrains_destination();
+        }
+        false
+    }
+
     /// How many rules are loaded, without copying any of them.
     ///
     /// `snapshot()` clones the whole set - every name, every `PathBuf`, every
     /// `Option<String>` in every scope - which is right for `ListRules` and
     /// absurd for `GetStatus`, which wanted `.len()` and was called about
     /// once a second per connected client, forever.
-    /// Whether any enabled rule abstains for this process - the reason
-    /// `process_wide_action` can return `None` for a reason other than
-    /// "nothing matched".
-    ///
-    /// The orphan sweep turns on this distinction. `None` covers two opposite
-    /// situations: a hash-scoped rule the caller cannot decide (keep the
-    /// kernel entry - clearing would lift a refusal nobody replaced), and a
-    /// rule that was simply *deleted* (clear it - keeping it means the kernel
-    /// goes on refusing a program no rule denies, which is the one thing the
-    /// sweep exists to prevent, and the case it silently failed at until this
-    /// existed: nobody replaces a deny with an explicit allow, they delete it).
-    ///
-    /// Mirrors `process_wide_action`'s filters, the inbound skip included, so
-    /// the two cannot disagree about which rules are in play.
-    pub fn has_undecidable_rule_for(&self, proc: &Process) -> bool {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        self.inner
-            .rules
-            .read()
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
-            .any(|r| r.scope.undecidable_for(proc))
-    }
-
     pub fn rule_count(&self) -> usize {
         self.inner.rules.read().rules.len()
     }
@@ -488,12 +536,6 @@ mod tests {
     // question: when is it safe to precommit an answer the packet path will
     // never get to revise?
 
-    /// An expired rule must drop out of what gets compiled into the kernel.
-    ///
-    /// The kernel table is rebuilt on rule edits, and expiry is not one. The
-    /// packet path already skips expired rules, so a stale entry would only
-    /// overstate a denial - but it would keep overstating it after the daemon
-    /// is gone, which is the state this whole layer exists to make trustworthy.
     #[test]
     fn a_deleted_rule_is_distinguishable_from_an_abstention() {
         // The two meanings of `None`, which the orphan sweep must not conflate.
@@ -506,9 +548,10 @@ mod tests {
             exe: PathBuf::from("/usr/bin/curl"),
             ..Process::unknown(1)
         };
-        // Abstention: a rule is in play but cannot be decided. Keep.
+        // Abstention on a deny: the matching resolution refuses, so a
+        // standing kernel entry must survive. Keep.
         assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(engine.has_undecidable_rule_for(&no_hash));
+        assert!(engine.deny_still_possible_for(&no_hash));
 
         // The same rule pinned to a DIFFERENT binary is decidable for this
         // process, so it must not block the sweep from clearing.
@@ -517,13 +560,51 @@ mod tests {
             ..Process::unknown(1)
         };
         assert_eq!(engine.process_wide_action(&other), None);
-        assert!(!engine.has_undecidable_rule_for(&other));
+        assert!(!engine.deny_still_possible_for(&other));
 
         // And a rule set with nothing in it - the deleted-rule case - is the
-        // one the sweep exists for: None, nothing undecidable, clear.
+        // one the sweep exists for: None, no deny reachable, clear.
         let empty = engine_with(vec![]);
         assert_eq!(empty.process_wide_action(&no_hash), None);
-        assert!(!empty.has_undecidable_rule_for(&no_hash));
+        assert!(!empty.deny_still_possible_for(&no_hash));
+    }
+
+    #[test]
+    fn an_undecidable_allow_cannot_prop_up_a_kernel_deny() {
+        // The case the old any-undecidable answer got backwards: the only
+        // rule naming this exe is a hash-scoped ALLOW. Whichever way the
+        // unknown hash resolves - it matches and the process is allowed, or
+        // it does not and no rule speaks - no deny is reachable, so a
+        // standing kernel DENY (from a deny rule since deleted) must clear.
+        let mut hashed_allow = RuleScope::any();
+        hashed_allow.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        hashed_allow.exe_sha256 = Some("aa".repeat(32));
+        let engine = engine_with(vec![Rule::new(
+            "pin".to_string(),
+            Action::Allow,
+            hashed_allow.clone(),
+        )]);
+
+        let no_hash = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            ..Process::unknown(1)
+        };
+        assert_eq!(engine.process_wide_action(&no_hash), None);
+        assert!(
+            !engine.deny_still_possible_for(&no_hash),
+            "an allow-only abstention pinned a stale deny"
+        );
+
+        // But the same allow layered over a plain deny is the textbook
+        // reason to keep: if the hash does not match, the deny below fires.
+        let mut plain_deny = RuleScope::any();
+        plain_deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let engine = engine_with(vec![
+            Rule::new("pin".to_string(), Action::Allow, hashed_allow),
+            Rule::new("deny".to_string(), Action::Deny, plain_deny),
+        ]);
+        assert_eq!(engine.process_wide_action(&no_hash), None);
+        assert!(engine.deny_still_possible_for(&no_hash));
     }
 
     #[test]
@@ -575,6 +656,12 @@ mod tests {
         assert_eq!(engine.process_wide_action(&without), Some(Action::Deny));
     }
 
+    /// An expired rule must drop out of what gets compiled into the kernel.
+    ///
+    /// The kernel table is rebuilt on rule edits, and expiry is not one. The
+    /// packet path already skips expired rules, so a stale entry would only
+    /// overstate a denial - but it would keep overstating it after the daemon
+    /// is gone, which is the state this whole layer exists to make trustworthy.
     #[test]
     fn an_expired_rule_is_not_compilable() {
         let mut scope = RuleScope::any();

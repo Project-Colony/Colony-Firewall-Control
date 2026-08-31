@@ -217,6 +217,23 @@ pub const COMM_LEN: usize = 16;
 /// number of bytes actually stored.
 pub const FILENAME_LEN: usize = 256;
 
+/// Largest plausible byte offset for a field inside a tracepoint record.
+///
+/// Both kernel programs that read a record at a loader-patched offset bound
+/// the read with this before doing pointer arithmetic on the context
+/// (`read_exec_filename`, `process_is_gone` in `cfc-ebpf`): the `common_*`
+/// header is a handful of small fields, so an offset out here is a parse gone
+/// wrong, not a kernel that reorganised its tracepoints.
+///
+/// It lives here because **both sides must refuse the same values**, for the
+/// same reason [`hash_exe_path`] does. The kernel side can only refuse
+/// *silently* - a BPF program has nowhere to say so - which means a loader
+/// applying a looser bound does not fail, it lies: it patches the offset in,
+/// logs that the field was found, and reports the mechanism as working while
+/// every event arrives without it. The loader applied no bound at all for a
+/// while, so this is not hypothetical drift being guarded against.
+pub const TRACEPOINT_FIELD_OFFSET_MAX: u32 = 64;
+
 /// Size of the DNS payload prefix the kernel program copies out of a packet.
 ///
 /// 512 is the RFC 1035 §4.2.1 limit on an unextended UDP DNS message, so this

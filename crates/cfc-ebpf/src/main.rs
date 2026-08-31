@@ -43,10 +43,21 @@ use cfc_ebpf_common::{ConnectDeny, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent,
 // Maps
 // ---------------------------------------------------------------------------
 
-/// Live processes, keyed by tgid. The daemon reads this to answer "who owns
-/// this connection" without racing `/proc`.
+/// Live processes, keyed by tgid: inserted on `exec` below, evicted on exit.
 ///
-/// 10240 entries at 292 bytes each is ~3 MiB of (preallocated) kernel memory.
+/// **Nothing reads this map.** The daemon answers "who owns this connection"
+/// from its own userspace mirror (`proc_table` in cfc-daemon), fed by the
+/// `EXEC_EVENTS`/`EXIT_EVENTS` rings - an earlier version of this comment said
+/// the daemon reads the map directly, which was never wired up, and sent
+/// anyone debugging attribution with bpftool toward a data path that does not
+/// exist. The map stays anyway, on purpose: inserting here *before* publishing
+/// to the ring is what guarantees a future in-kernel consumer (a whitelist
+/// fast path on the connect hooks) an entry for every pid userspace has heard
+/// of, and that ordering only holds for a map that is actually maintained.
+/// See `README.md`, "Consuming the types".
+///
+/// 10240 entries at 292 bytes each is ~3 MiB of (preallocated) kernel memory -
+/// the price of keeping that option open, paid knowingly.
 #[map]
 static PROCS: HashMap<u32, ExecEvent> = HashMap::with_max_entries(10_240, 0);
 
@@ -243,8 +254,12 @@ static EXEC_FILENAME_DATA_LOC: Global<u32> = Global::new(8);
 /// Largest plausible `__data_loc` offset, used to bound the read below.
 ///
 /// The record header is a handful of fields; anything past this is a parse
-/// gone wrong, not a kernel that reorganised its tracepoints.
-const EXEC_FILENAME_DATA_LOC_MAX: u32 = 64;
+/// gone wrong, not a kernel that reorganised its tracepoints. The shared
+/// constant rather than a local 64, because the loader must refuse the same
+/// values before patching: this side can only refuse *silently*, and a loader
+/// with a looser bound used to patch such an offset in and report the
+/// filename read as working while this early return read nothing.
+const EXEC_FILENAME_DATA_LOC_MAX: u32 = cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX;
 
 /// Byte offset of `group_dead` in `sched_process_exit`'s record, or
 /// [`EXIT_GROUP_DEAD_ABSENT`] when this kernel does not carry it.
@@ -271,8 +286,8 @@ static EXIT_GROUP_DEAD_OFF: Global<u32> = Global::new(EXIT_GROUP_DEAD_ABSENT);
 const EXIT_GROUP_DEAD_ABSENT: u32 = u32::MAX;
 
 /// Largest plausible offset for it, bounding the read the same way the exec
-/// filename offset is bounded.
-const EXIT_GROUP_DEAD_MAX: u32 = 64;
+/// filename offset is bounded - same shared constant, same reason.
+const EXIT_GROUP_DEAD_MAX: u32 = cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX;
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 pub fn cfc_sched_process_exec(ctx: TracePointContext) -> u32 {
@@ -298,6 +313,11 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
     // unreachable from userspace (bounded by `filename_len` *and* by the NUL
     // that `bpf_probe_read_kernel_str` writes). The per-CPU slot starts out
     // zeroed by the kernel, so this is never uninitialised memory.
+    //
+    // `filename_len` is the field that once broke that invariant: it was
+    // assigned only on `read_exec_filename`'s success path, so its early
+    // returns published the previous exec's path *and* matching length under
+    // the wrong pid. That function now zeroes it before anything can return.
     let pid_tgid = bpf_get_current_pid_tgid();
     let uid_gid = bpf_get_current_uid_gid();
     let tgid = (pid_tgid >> 32) as u32;
@@ -336,6 +356,27 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
 /// sits in the variable-length tail of the record.
 #[inline(always)]
 fn read_exec_filename(ctx: &TracePointContext, event: &mut ExecEvent) {
+    // First, before any return is possible. The scratch slot is per-CPU and
+    // never zeroed (see the NOTE in `try_exec`), so `filename` and
+    // `filename_len` still hold the *previous* exec on this CPU, and the
+    // caller publishes the event and hashes `filename[..filename_len]`
+    // against `EXE_RULES` no matter what happens here. The early returns
+    // below used to leave the stale pair in place, which published process
+    // A's path under process B's identity - and could hand B the in-kernel
+    // deny precommitted for A's binary. A failed read must mean "no
+    // filename", never "the last one".
+    //
+    // With a correct `EXEC_FILENAME_DATA_LOC` the per-event returns are dead:
+    // a 4-byte in-record probe read does not fault, and a real `__data_loc`
+    // word has a non-zero offset and length. They are live exactly when the
+    // patched offset is wrong but under the bound - a loader that kept the
+    // built-in 8 on a kernel that moved the field, or a third-party loader
+    // of this object that patches nothing - and then the word read below is
+    // some other field's bytes, varying per event. That is the one world
+    // where these paths run, and it is the one where publishing the previous
+    // exec's path is most misleading.
+    event.filename_len = 0;
+
     let field_off = EXEC_FILENAME_DATA_LOC.load();
     // Two jobs, and both are load-bearing.
     //

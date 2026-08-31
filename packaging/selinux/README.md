@@ -43,12 +43,16 @@ log line, which is the same contract the daemon keeps everywhere else.
 
 ## What is deliberately not here
 
-**`CAP_SYS_ADMIN`.** The five capabilities in `colony_firewall.te` are exactly
-the five the systemd unit grants, and that they are sufficient is a test rather
-than a claim: `attaches_with_only_the_units_capabilities` drops to uid 1000
-holding this set, asserts `CAP_SYS_ADMIN` is absent from its own effective set,
-and requires all five BPF programs to load, attach and pin. If an AVC ever asks
-for `sys_admin`, that is a regression to find, not a rule to add.
+**`CAP_SYS_ADMIN`.** The seven capabilities in `colony_firewall.te` are exactly
+the seven the systemd unit grants — the five BPF/network ones plus `chown`
+(the control socket is chgrped to `colony-firewall` after bind) and
+`dac_read_search` (the `/proc/*/fd` walk behind attribution; its absence once
+took a real machine's network down, see the capability comment in the `.te`).
+That the BPF set is sufficient is a test rather than a claim:
+`attaches_with_only_the_units_capabilities` drops to uid 1000, asserts
+`CAP_SYS_ADMIN` is absent from its own effective set, and requires all five BPF
+programs to load, attach and pin. If an AVC ever asks for `sys_admin`, that is
+a regression to find, not a rule to add.
 
 **A domain for the client binaries.** `cfc`, `colony-firewall` and
 `colony-firewall-tray` run as the invoking user and do nothing privileged.

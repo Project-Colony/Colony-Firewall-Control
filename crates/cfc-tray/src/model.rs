@@ -385,6 +385,25 @@ pub fn allow_confirmation(exe: &str) -> String {
     format!("Rule created: allow {} always", exe_display_name(exe))
 }
 
+/// Said when a persisted choice fell back to a one-shot verdict because the
+/// prompt's executable cannot scope a rule (see [`verdict_for`]).
+///
+/// Distinct from [`rule_not_saved`], which is a rule that was asked for and
+/// failed: here no rule was ever requested, and announcing "Rule created"
+/// anyway - which is what keying the confirmation off the button pressed did -
+/// told the user a standing rule existed for a program the daemon could not
+/// even identify. The next prompt from it then looks like the firewall forgot.
+pub fn one_shot_fallback(choice: PromptChoice, exe: &str) -> String {
+    let applied = match choice {
+        PromptChoice::AllowAlways => "Allowed this time",
+        PromptChoice::BlockAlways | PromptChoice::DenyOnce => "Denied this time",
+    };
+    format!(
+        "{applied} — no rule can be pinned to {}, so you may be asked again",
+        exe_display_name(exe)
+    )
+}
+
 /// The basename, for a message meant to be read at a glance.
 fn exe_display_name(exe: &str) -> String {
     std::path::Path::new(exe)
@@ -952,6 +971,27 @@ mod tests {
             assert_eq!(action, proto::Action::Allow);
             assert_eq!(duration, proto::Duration::Always);
             assert_eq!(scope.unwrap().exe_path, "/usr/bin/curl");
+        }
+
+        /// The degraded verdict's message must never read as the confirmation
+        /// it replaces. The tray announced "Rule created: allow <unknown>
+        /// always" for a click that submitted no scope at all - and the user,
+        /// prompted again by the very next connection, concluded the firewall
+        /// forgot.
+        #[test]
+        fn the_fallback_message_does_not_claim_a_rule() {
+            for choice in [PromptChoice::AllowAlways, PromptChoice::BlockAlways] {
+                let m = one_shot_fallback(choice, cfc_client::convert::UNKNOWN_EXE);
+                assert!(
+                    !m.to_lowercase().contains("rule created"),
+                    "must not be mistakable for a confirmation: {m}"
+                );
+                assert!(m.contains("asked again"), "{m}");
+                assert!(m.contains(cfc_client::convert::UNKNOWN_EXE), "{m}");
+            }
+            // The verb matches the verdict that actually applied.
+            assert!(one_shot_fallback(PromptChoice::AllowAlways, "curl").contains("Allowed"));
+            assert!(one_shot_fallback(PromptChoice::BlockAlways, "curl").contains("Denied"));
         }
     }
 }

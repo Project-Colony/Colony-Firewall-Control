@@ -678,6 +678,12 @@ async fn submit_prompt_verdict(
     }
     let c = client.as_mut().expect("connected above");
     let (action, duration, scope) = model::verdict_for(choice, exe);
+    // Whether a standing rule was even asked for. `verdict_for` degrades a
+    // persisted choice to a one-shot verdict when the exe cannot scope a rule
+    // ("<unknown>", a relative execve-fallback path) - and the Allow button is
+    // offered on every prompt, so that path is reachable from a stock
+    // notification server, not only a misbehaving one.
+    let wanted_rule = scope.is_some();
     match c.submit_verdict(prompt_id, action, duration, scope).await {
         Ok(o) if o.accepted => {
             debug!(prompt_id, ?choice, "verdict accepted");
@@ -691,11 +697,31 @@ async fn submit_prompt_verdict(
             // the first true and the second false. Announcing a standing rule
             // that does not exist is worse than announcing nothing - the user
             // stops watching for the prompt that will come back.
+            //
+            // Keying the confirmation off the button alone was the same lie
+            // one branch over: the silent degrade above submits no scope, the
+            // client then reports `rule_persisted: None` (nothing was asked),
+            // and the None arm read "Rule created: allow <unknown> always"
+            // for a verdict that created nothing.
             match (choice, o.rule_persisted) {
                 (PromptChoice::DenyOnce, _) => {}
-                // `None` is a daemon that did not say - an older build, most
-                // likely one not yet restarted after an upgrade. Reporting a
-                // loss on silence would cry wolf on every single answer.
+                // A persisted choice that fell back to answering once: no
+                // rule was requested, so no rule may be announced - and
+                // silence would read as success to the user who clicked
+                // Allow expecting to never be asked again.
+                _ if !wanted_rule => {
+                    info!(
+                        prompt_id,
+                        ?choice,
+                        exe,
+                        "persisted choice degraded to a one-shot verdict"
+                    );
+                    notify_brief(model::one_shot_fallback(choice, exe));
+                }
+                // `None` here is a daemon that did not say - an older build,
+                // most likely one not yet restarted after an upgrade.
+                // Reporting a loss on silence would cry wolf on every single
+                // answer.
                 (PromptChoice::BlockAlways, Some(true) | None) => {
                     notify_brief(model::block_confirmation(exe))
                 }
