@@ -440,6 +440,21 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
             )
             .into());
         }
+        // Same class of trap, different predicate: inbound flows are never
+        // attributed to a program (the daemon's resolver refuses to try), so
+        // a program-scoped inbound rule lists, ranks, and never fires - and
+        // an allow that silently admits nothing invites its author to widen
+        // it. The daemon refuses this too; caught here so the message can
+        // name the flags.
+        if args.exe.is_some() || args.pin_hash || args.sha256.is_some() {
+            return Err(anyhow::anyhow!(
+                "--exe, --pin-hash and --sha256 cannot be combined with \
+                 --direction in: inbound flows cannot be attributed to a \
+                 program, so the rule would never fire. Scope inbound rules \
+                 with --src-net and --dst-port instead."
+            )
+            .into());
+        }
     }
 
     let duration = match args.duration {
@@ -471,16 +486,8 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
     // read the file must fail loudly rather than quietly write a path-only rule
     // the user believes is content-bound.
     let exe_sha256 = match (&args.sha256, args.pin_hash) {
-        (Some(hex), _) => {
-            let hex = hex.trim().to_ascii_lowercase();
-            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(CliError::Runtime(anyhow::anyhow!(
-                    "--sha256 takes 64 hexadecimal characters; got {} of them",
-                    hex.len()
-                )));
-            }
-            hex
-        }
+        (Some(hex), _) => cfc_core::rule::canonical_exe_sha256(hex)
+            .map_err(|e| CliError::Runtime(anyhow::anyhow!("--sha256: {e}")))?,
         (None, true) => {
             let path = std::path::Path::new(&exe);
             match sha256_of(path) {
@@ -853,6 +860,53 @@ impl ExportedRule {
                  src_net for the peer."
             ));
         }
+        // Same trap, program-shaped: inbound flows are never attributed to a
+        // process, so a program-scoped inbound rule can never fire. The
+        // daemon refuses it; refused here first so the message names the rule.
+        if direction_idx == Some(proto::Direction::Inbound as i32)
+            && (self.scope.exe_path.is_some() || self.scope.exe_sha256.is_some())
+        {
+            return Err(format!(
+                "rule `{name}`: an inbound rule cannot be scoped on a program \
+                 - inbound flows cannot be attributed, so the rule would \
+                 never fire. Scope it on src_net and dst_port instead."
+            ));
+        }
+        // The three refusals below mirror the daemon's own gates
+        // (reject_unmatchable_parent, reject_unmatchable_exe, and the
+        // canonical digest form). Without them a file passes the local
+        // validate-first pass, then dies at the daemon mid-apply - recreating
+        // the partial import this whole function exists to prevent.
+        if let Some(parent) = self.scope.parent_exe.as_deref() {
+            return Err(format!(
+                "rule `{name}`: parent_exe (`{parent}`) is not an evaluated \
+                 predicate - the daemon refuses it because such a rule would \
+                 match every process while outranking narrower rules. Scope \
+                 on the executable itself."
+            ));
+        }
+        if let Some(exe) = self.scope.exe_path.as_deref() {
+            if exe == cfc_core::UNKNOWN_EXE {
+                return Err(format!(
+                    "rule `{name}`: exe_path `{exe}` is the placeholder for an \
+                     unidentified process, not a path; such a rule would match \
+                     every unattributable flow"
+                ));
+            }
+            if !std::path::Path::new(exe).is_absolute() {
+                return Err(format!(
+                    "rule `{name}`: exe_path `{exe}` is not absolute; rules \
+                     match on absolute executable paths, so it could never fire"
+                ));
+            }
+        }
+        let exe_sha256 = match self.scope.exe_sha256.as_deref() {
+            Some(h) => Some(
+                cfc_core::rule::canonical_exe_sha256(h)
+                    .map_err(|e| format!("rule `{name}`: {e}"))?,
+            ),
+            None => None,
+        };
         let src_net = self.scope.src_net.clone();
         let src_port = self.scope.src_port;
         let protocol_idx = match self.scope.protocol.as_deref() {
@@ -909,7 +963,7 @@ impl ExportedRule {
         };
         let scope = proto::RuleScope {
             exe_path: self.scope.exe_path.unwrap_or_default(),
-            exe_sha256: self.scope.exe_sha256.unwrap_or_default(),
+            exe_sha256: exe_sha256.unwrap_or_default(),
             parent_exe: self.scope.parent_exe.unwrap_or_default(),
             uid: self.scope.uid.unwrap_or(0),
             has_uid: self.scope.uid.is_some(),
@@ -1193,9 +1247,26 @@ fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<pr
     })
 }
 
+// The contract for everything below: a converted rule must never be WIDER
+// than the opensnitch rule it came from. Every predicate is either translated
+// faithfully or fails the whole rule (the caller skips it and says why).
+// Silently dropping the untranslatable part used to be the behaviour, and for
+// an allow that is exactly backwards: "allow curl to reach uid 1000's flows on
+// port 443" minus the parts that did not parse becomes "allow curl to reach
+// anything" - a rule the source file never contained.
 fn apply_operator(op: &OsnOperator, scope: &mut proto::RuleScope) -> anyhow::Result<()> {
     match op {
-        OsnOperator::Simple(s) | OsnOperator::Regexp(s) => apply_simple(s, scope),
+        OsnOperator::Simple(s) => apply_simple(s, scope),
+        // A regexp pattern stored as a literal matches nothing (a never-firing
+        // deny) or, worse, would need only one widening edit to "fix". This
+        // firewall matches exact values; there is no faithful translation.
+        OsnOperator::Regexp(s) => anyhow::bail!(
+            "operand `{}` is a regexp (`{}`) and this firewall matches exact \
+             values; importing the pattern as a literal would produce a rule \
+             that never fires. Rewrite it as one rule per concrete value.",
+            s.operand,
+            s.data
+        ),
         OsnOperator::List(l) => {
             for sub in &l.list {
                 apply_operator(sub, scope)?;
@@ -1206,46 +1277,76 @@ fn apply_operator(op: &OsnOperator, scope: &mut proto::RuleScope) -> anyhow::Res
 }
 
 fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<()> {
-    match s.operand.as_str() {
-        "process.path" => scope.exe_path = s.data.clone(),
-        "process.hash.sha256" => scope.exe_sha256 = s.data.clone(),
-        "user.id" => {
-            if let Ok(uid) = s.data.parse::<u32>() {
-                scope.uid = uid;
-                scope.has_uid = true;
-            }
+    // A list with two `dest.ip` entries means "either of these" in
+    // opensnitch; overwriting would keep only the last and silently drop the
+    // rest of the disjunction. One value per predicate, or the rule fails.
+    fn set_once(field: &str, slot: &mut String, value: String) -> anyhow::Result<()> {
+        if !slot.is_empty() && *slot != value {
+            anyhow::bail!(
+                "operand `{field}` appears more than once (`{slot}` then \
+                 `{value}`); this firewall holds one value per predicate, so \
+                 import one rule per value instead"
+            );
         }
-        "dest.host" | "dest.domain" => scope.dst_host = s.data.clone(),
+        *slot = value;
+        Ok(())
+    }
+    match s.operand.as_str() {
+        "process.path" => set_once("process.path", &mut scope.exe_path, s.data.clone())?,
+        "process.hash.sha256" => {
+            let hex = cfc_core::rule::canonical_exe_sha256(&s.data)
+                .map_err(|e| anyhow::anyhow!("operand `process.hash.sha256`: {e}"))?;
+            set_once("process.hash.sha256", &mut scope.exe_sha256, hex)?;
+        }
+        "user.id" => {
+            if scope.has_uid {
+                anyhow::bail!("operand `user.id` appears more than once");
+            }
+            scope.uid = s
+                .data
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("operand `user.id`: `{}` is not a uid", s.data))?;
+            scope.has_uid = true;
+        }
+        "dest.host" | "dest.domain" => set_once("dest.host", &mut scope.dst_host, s.data.clone())?,
         "dest.ip" => {
             // single IP -> /32 or /128
-            if s.data.contains(':') {
-                scope.dst_net = format!("{}/128", s.data);
+            let net = if s.data.contains(':') {
+                format!("{}/128", s.data)
             } else {
-                scope.dst_net = format!("{}/32", s.data);
-            }
+                format!("{}/32", s.data)
+            };
+            set_once("dest.ip", &mut scope.dst_net, net)?;
         }
-        "dest.network" => scope.dst_net = s.data.clone(),
+        "dest.network" => set_once("dest.network", &mut scope.dst_net, s.data.clone())?,
         "dest.port" => {
-            if let Ok(port) = s.data.parse::<u32>() {
-                scope.dst_port = port;
-                scope.has_dst_port = true;
+            if scope.has_dst_port {
+                anyhow::bail!("operand `dest.port` appears more than once");
             }
+            scope.dst_port = s.data.parse::<u32>().map_err(|_| {
+                anyhow::anyhow!("operand `dest.port`: `{}` is not a port number", s.data)
+            })?;
+            scope.has_dst_port = true;
         }
         "protocol" => {
-            let proto = match s.data.to_ascii_uppercase().as_str() {
-                "TCP" => Some(proto::Protocol::Tcp as i32),
-                "UDP" => Some(proto::Protocol::Udp as i32),
-                "ICMP" => Some(proto::Protocol::Icmp as i32),
-                _ => None,
-            };
-            if let Some(p) = proto {
-                scope.protocol = p;
-                scope.has_protocol = true;
+            if scope.has_protocol {
+                anyhow::bail!("operand `protocol` appears more than once");
             }
+            scope.protocol = match s.data.to_ascii_uppercase().as_str() {
+                "TCP" => proto::Protocol::Tcp as i32,
+                "UDP" => proto::Protocol::Udp as i32,
+                "ICMP" => proto::Protocol::Icmp as i32,
+                other => anyhow::bail!(
+                    "operand `protocol`: `{other}` has no equivalent here \
+                     (expected tcp, udp or icmp)"
+                ),
+            };
+            scope.has_protocol = true;
         }
-        // Operands we don't yet support: process.command, process.id,
-        // iface.in/out. Silently skip them.
-        _ => {}
+        other => anyhow::bail!(
+            "operand `{other}` has no equivalent in this firewall; dropping \
+             it would import a wider rule than the file contains"
+        ),
     }
     Ok(())
 }
@@ -2804,10 +2905,15 @@ mod opensnitch_tests {
     }
 
     #[test]
-    fn unknown_operands_silently_skipped() {
-        // process.command isn't supported but the rule has a valid
-        // process.path too - the latter alone is enough.
-        let r = parse(
+    fn unknown_operands_fail_the_rule_instead_of_widening_it() {
+        // This test used to assert the opposite: the unsupported
+        // process.command was dropped and the rule imported on process.path
+        // alone. But the source rule said "curl, when invoked as `curl -s X`"
+        // and the import said "curl, always" - an allow wider than the file
+        // contained, on the migration path the README advertises. A predicate
+        // that cannot be translated now fails the rule, which the caller
+        // skips and reports.
+        let err = parse(
             r#"{
               "name": "mixed",
               "action": "allow",
@@ -2821,21 +2927,71 @@ mod opensnitch_tests {
               }
             }"#,
         )
-        .unwrap();
-        assert_eq!(r.scope.unwrap().exe_path, "/usr/bin/curl");
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("process.command"),
+            "the message must name the operand that could not travel: {err}"
+        );
     }
 
     #[test]
-    fn regexp_type_treated_like_simple() {
-        let r = parse(
+    fn regexp_rules_are_refused_not_imported_as_literals() {
+        // Also inverted: the pattern used to land in exe_path verbatim, where
+        // it matched no real path ever - a rule that lists, ranks, and never
+        // fires.
+        let err = parse(
             r#"{
               "name": "rxp",
               "action": "allow",
               "operator": {"type": "regexp", "operand": "process.path", "data": "/usr/bin/.*"}
             }"#,
         )
-        .unwrap();
-        // We don't actually evaluate regex but the data lands in exe_path.
-        assert_eq!(r.scope.unwrap().exe_path, "/usr/bin/.*");
+        .unwrap_err();
+        assert!(err.to_string().contains("regexp"), "{err}");
+        assert!(err.to_string().contains("/usr/bin/.*"), "{err}");
+    }
+
+    #[test]
+    fn repeated_operands_fail_instead_of_last_one_winning() {
+        // Two dest.ip entries are a disjunction in opensnitch; keeping only
+        // the last would silently drop half of it.
+        let err = parse(
+            r#"{
+              "name": "two-ips",
+              "action": "deny",
+              "operator": {
+                "type": "list",
+                "operand": "list",
+                "list": [
+                  {"type": "simple", "operand": "dest.ip", "data": "192.0.2.1"},
+                  {"type": "simple", "operand": "dest.ip", "data": "192.0.2.2"}
+                ]
+              }
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn unparseable_predicate_values_fail_the_rule() {
+        // `user.id: root` used to be dropped, turning "allow for root only"
+        // into "allow for every uid".
+        let err = parse(
+            r#"{
+              "name": "root-only",
+              "action": "allow",
+              "operator": {
+                "type": "list",
+                "operand": "list",
+                "list": [
+                  {"type": "simple", "operand": "process.path", "data": "/usr/bin/curl"},
+                  {"type": "simple", "operand": "user.id", "data": "root"}
+                ]
+              }
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("user.id"), "{err}");
     }
 }

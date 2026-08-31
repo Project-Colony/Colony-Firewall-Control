@@ -283,7 +283,13 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
         src_net,
         src_port,
         exe_path: empty_to_none(&s.exe_path).map(Into::into),
-        exe_sha256: empty_to_none(&s.exe_sha256),
+        // Canonicalised at the wire, not merely stored: digests are matched by
+        // exact string equality against the daemon's lowercase hex, so an
+        // uppercase or truncated one arriving here would produce a rule that
+        // lists, ranks, and never fires.
+        exe_sha256: empty_to_none(&s.exe_sha256)
+            .map(|h| cfc_core::rule::canonical_exe_sha256(&h))
+            .transpose()?,
         parent_exe: empty_to_none(&s.parent_exe).map(Into::into),
         uid: s.has_uid.then_some(s.uid),
         dst_host: empty_to_none(&s.dst_host),
@@ -342,6 +348,7 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
     scope.reject_unmatchable_exe()?;
     scope.reject_unmatchable_parent()?;
     scope.reject_inbound_destination_scope()?;
+    scope.reject_unattributable_inbound_scope()?;
     let created_at = if r.created_at_unix_ms == 0 {
         chrono::Utc::now()
     } else {
@@ -663,7 +670,10 @@ mod tests {
             src_net: None,
             src_port: None,
             exe_path: Some(PathBuf::from("/usr/bin/curl")),
-            exe_sha256: Some("abc123".into()),
+            // A real-shaped digest: the wire now refuses anything but 64
+            // lowercase hex, and this test's job is the roundtrip, not the
+            // validator.
+            exe_sha256: Some("a".repeat(64)),
             parent_exe: Some(PathBuf::from("/bin/bash")),
             uid: Some(1000),
             dst_host: Some("example.com".into()),

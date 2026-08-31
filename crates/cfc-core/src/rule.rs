@@ -70,6 +70,33 @@ pub struct RuleScope {
     pub protocol: Option<crate::Protocol>,
 }
 
+/// Canonical form of an `exe_sha256` predicate: 64 lowercase hex characters.
+///
+/// The daemon computes digests in lowercase hex and matches by exact string
+/// equality, so a rule carrying `ABCD…`, whitespace, or a truncated digest
+/// would list, rank, and never fire - indistinguishable from working. Every
+/// door a digest can enter through (the wire, `rules import`, `--sha256`)
+/// funnels through this instead of trusting its caller's casing.
+///
+/// Two error shapes on purpose: "wrong length" and "right length, wrong
+/// character" are different mistakes, and a message that says "must be 64
+/// hexadecimal characters; got 64 of them" helps nobody.
+pub fn canonical_exe_sha256(hex: &str) -> Result<String, String> {
+    let hex = hex.trim().to_ascii_lowercase();
+    if hex.len() != 64 {
+        return Err(format!(
+            "exe_sha256 must be 64 hexadecimal characters; got {}",
+            hex.len()
+        ));
+    }
+    if let Some(bad) = hex.chars().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "exe_sha256 must be hexadecimal; `{bad}` is not"
+        ));
+    }
+    Ok(hex)
+}
+
 impl RuleScope {
     pub fn any() -> Self {
         Self {
@@ -89,9 +116,19 @@ impl RuleScope {
 
     /// Number of populated (`Some`) predicates. Higher means more specific;
     /// [`RuleSet::sort_deterministic`] orders more-specific rules first.
+    ///
+    /// `direction` is deliberately not counted. An unset direction already
+    /// means outbound in `matches` (`None` and `Some(Outbound)` accept the
+    /// same flows), so counting it made two spellings of the same rule rank
+    /// differently - the explicit one outranked the implicit one at the
+    /// closed-wins tie-break while narrowing nothing. And a flow only ever
+    /// competes against rules of its own direction, so the predicate can
+    /// never distinguish two candidates. A side effect that is also correct:
+    /// a scope constraining *only* the direction now counts as constraining
+    /// nothing, and `reject_unscoped` refuses it - "allow every inbound flow
+    /// from anyone" was never a rule this store should hold.
     pub fn specificity(&self) -> u8 {
         [
-            self.direction.is_some(),
             self.src_net.is_some(),
             self.src_port.is_some(),
             self.exe_path.is_some(),
@@ -132,30 +169,6 @@ impl RuleScope {
             || self.direction == Some(crate::Direction::Inbound)
     }
 
-    /// Rejects an inbound scope that constrains the packet's *destination*.
-    ///
-    /// Inbound, the destination is this machine: `dst_net` matches one of our
-    /// own addresses and `dst_host` a name for ourselves. Someone writing
-    /// `--direction in --dst-net 203.0.113.0/24` means "from that network" and
-    /// gets a rule that matches nothing - the exact shape of failure this
-    /// project spent a day removing elsewhere, where a rule reads like policy
-    /// and enforces something else.
-    ///
-    /// `dst_port` is deliberately *not* rejected: inbound it is our listening
-    /// port, which is the most useful inbound predicate there is
-    /// (`--direction in --dst-port 22`).
-    /// Refuse a scope whose `exe_path` is not an absolute path.
-    ///
-    /// Rules match on absolute executable paths, so a relative one can never
-    /// fire - and one specific non-absolute value is worse than useless. The
-    /// prompt path renders an unidentified program as [`crate::UNKNOWN_EXE`],
-    /// and answering "always allow" for such a flow used to write that string
-    /// into `exe_path`. The result read as "allow this one program" and
-    /// behaved as "allow everything I cannot identify".
-    ///
-    /// The matcher no longer honours it either, so this is the second of two
-    /// locks: one stops the rule being written, one stops it mattering if an
-    /// older database already holds it.
     /// Refuse a scope carrying `parent_exe`.
     ///
     /// The field exists, `specificity` counts it, and `matches_process` never
@@ -185,6 +198,18 @@ impl RuleScope {
         ))
     }
 
+    /// Refuse a scope whose `exe_path` is not an absolute path.
+    ///
+    /// Rules match on absolute executable paths, so a relative one can never
+    /// fire - and one specific non-absolute value is worse than useless. The
+    /// prompt path renders an unidentified program as [`crate::UNKNOWN_EXE`],
+    /// and answering "always allow" for such a flow used to write that string
+    /// into `exe_path`. The result read as "allow this one program" and
+    /// behaved as "allow everything I cannot identify".
+    ///
+    /// The matcher no longer honours it either, so this is the second of two
+    /// locks: one stops the rule being written, one stops it mattering if an
+    /// older database already holds it.
     pub fn reject_unmatchable_exe(&self) -> Result<(), String> {
         let Some(exe) = &self.exe_path else {
             return Ok(());
@@ -209,6 +234,18 @@ impl RuleScope {
         Ok(())
     }
 
+    /// Rejects an inbound scope that constrains the packet's *destination*.
+    ///
+    /// Inbound, the destination is this machine: `dst_net` matches one of our
+    /// own addresses and `dst_host` a name for ourselves. Someone writing
+    /// `--direction in --dst-net 203.0.113.0/24` means "from that network" and
+    /// gets a rule that matches nothing - the exact shape of failure this
+    /// project spent a day removing elsewhere, where a rule reads like policy
+    /// and enforces something else.
+    ///
+    /// `dst_port` is deliberately *not* rejected: inbound it is our listening
+    /// port, which is the most useful inbound predicate there is
+    /// (`--direction in --dst-port 22`).
     pub fn reject_inbound_destination_scope(&self) -> Result<(), String> {
         if self.direction != Some(crate::Direction::Inbound) {
             return Ok(());
@@ -225,6 +262,36 @@ impl RuleScope {
              destination is this machine. To restrict which peers may reach \
              you, use src_net. To restrict which of your ports they may \
              reach, use dst_port."
+        ))
+    }
+
+    /// Rejects an inbound scope that names a program.
+    ///
+    /// Inbound flows are never attributed to a process: the daemon's resolver
+    /// refuses to even try (see nfqueue - "an inbound flow must not pay for
+    /// socket attribution", enforced by a test). A rule with `direction: in`
+    /// and an `exe_path` or
+    /// `exe_sha256` therefore lists, ranks, and never fires - the worst
+    /// failure a rule can have, because it is indistinguishable from working.
+    /// An allow written that way admits nothing, and its author, watching the
+    /// port stay closed, widens it - which is how a scoped rule becomes an
+    /// unscoped one. Refused at every door instead: here for the daemon, and
+    /// in the CLI with messages that name the flags.
+    pub fn reject_unattributable_inbound_scope(&self) -> Result<(), String> {
+        if self.direction != Some(crate::Direction::Inbound) {
+            return Ok(());
+        }
+        let offender = if self.exe_path.is_some() {
+            "an executable path"
+        } else if self.exe_sha256.is_some() {
+            "an executable hash"
+        } else {
+            return Ok(());
+        };
+        Err(format!(
+            "an inbound rule cannot be scoped on {offender}: inbound flows \
+             cannot be attributed to a program, so the rule would never fire. \
+             Scope inbound rules on src_net and dst_port instead."
         ))
     }
 
@@ -814,7 +881,32 @@ mod tests {
             dst_port: Some(443),
             protocol: Some(Protocol::Tcp),
         };
-        assert_eq!(full.specificity(), 11);
+        // 10, not 11: direction is populated above and deliberately does not
+        // count. `None` and `Some(Outbound)` match the same flows, so counting
+        // it let two spellings of one rule rank differently at the
+        // closed-wins tie-break.
+        assert_eq!(full.specificity(), 10);
+
+        let mut direction_only = RuleScope::any();
+        direction_only.direction = Some(crate::Direction::Inbound);
+        assert_eq!(
+            direction_only.specificity(),
+            0,
+            "a scope constraining only the direction constrains nothing"
+        );
+    }
+
+    #[test]
+    fn explicit_outbound_does_not_outrank_implicit_outbound() {
+        // The regression that removed direction from the count: two rules
+        // identical except for spelling out the default direction must tie,
+        // so the deny-beats-allow tie-break decides - not the spelling.
+        let mut spelled = RuleScope::any();
+        spelled.dst_port = Some(443);
+        spelled.direction = Some(crate::Direction::Outbound);
+        let mut implied = RuleScope::any();
+        implied.dst_port = Some(443);
+        assert_eq!(spelled.specificity(), implied.specificity());
     }
 
     // --- frozen v0.1.0 wire-format fixtures ------------------------------
