@@ -541,6 +541,91 @@ async fn prompt_answered_without_a_scope_persists_nothing() {
     assert!(client.list_rules().await.expect("listing rules").is_empty());
 }
 
+#[tokio::test]
+async fn a_persist_scope_the_boundary_refuses_degrades_to_a_one_shot_verdict() {
+    // The persist path used to replicate exactly one of `rule_from_pb`'s
+    // gates by hand, so a verdict carrying persist_scope { parent_exe } - a
+    // predicate `matches_process` never evaluates - passed `reject_unscoped`
+    // (specificity counts the field) and persisted a rule that matches every
+    // outbound flow from every process, surviving restarts. The path now runs
+    // the same conversion UpsertRule does, and a refused scope must degrade
+    // rather than fail the RPC: the verdict already reached the waiting
+    // connection, and un-reporting it would invite a retry of a prompt that
+    // no longer exists.
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let mut prompts = client
+        .stream_prompts("test".into())
+        .await
+        .expect("subscribing to prompts");
+
+    d.push_prompt(43).await;
+    assert_eq!(next_message(&mut prompts).await.prompt_id, "43");
+
+    let scope = pb::RuleScope {
+        parent_exe: "/usr/bin/bash".into(),
+        ..Default::default()
+    };
+    let outcome = client
+        .submit_verdict("43", pb::Action::Allow, pb::Duration::Always, Some(scope))
+        .await
+        .expect("the verdict must not fail whole: it already reached the connection");
+    assert!(outcome.accepted, "the one-shot answer still lands");
+    assert_eq!(
+        outcome.rule_persisted,
+        Some(false),
+        "the client must be able to say no standing rule exists"
+    );
+    let why = outcome.persist_error.expect("the reason must travel back");
+    assert!(
+        why.contains("parent_exe"),
+        "the reason names the gate: {why}"
+    );
+
+    // The verdict reached the worker exactly once...
+    assert_eq!(d.next_verdict().await.verdict.action, Action::Allow);
+    d.assert_no_verdict();
+    // ...and nothing was persisted, in memory or on disk.
+    assert!(client.list_rules().await.expect("listing rules").is_empty());
+    let reopened = RuleStore::open(&d.db).expect("reopening the store");
+    assert!(reopened.snapshot().expect("snapshot").rules.is_empty());
+}
+
+#[tokio::test]
+async fn a_placeholder_exe_persist_scope_is_refused_with_the_reason() {
+    // What the CLI's prompt flow used to send for "always allow / this app"
+    // on an unattributed prompt: exe_path = "<unknown>", a non-empty string,
+    // so it slid past the single replicated gate and persisted a rule that
+    // lists, ranks, and can never fire - while the user was told a standing
+    // allow existed.
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let mut prompts = client
+        .stream_prompts("test".into())
+        .await
+        .expect("subscribing to prompts");
+
+    d.push_prompt(44).await;
+    assert_eq!(next_message(&mut prompts).await.prompt_id, "44");
+
+    let scope = pb::RuleScope {
+        exe_path: cfc_core::UNKNOWN_EXE.into(),
+        ..Default::default()
+    };
+    let outcome = client
+        .submit_verdict("44", pb::Action::Allow, pb::Duration::Always, Some(scope))
+        .await
+        .expect("the verdict must not fail whole");
+    assert!(outcome.accepted);
+    assert_eq!(outcome.rule_persisted, Some(false));
+    assert!(outcome
+        .persist_error
+        .expect("reason")
+        .contains(cfc_core::UNKNOWN_EXE));
+    assert_eq!(d.next_verdict().await.verdict.action, Action::Allow);
+    assert!(client.list_rules().await.expect("listing rules").is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // 2. Prompt timeout
 // ---------------------------------------------------------------------------

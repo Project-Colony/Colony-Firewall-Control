@@ -116,9 +116,9 @@ async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) {
 use cfc_proto::v1::{
     firewall_server::{Firewall, FirewallServer},
     ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse, ListEventsRequest, ListEventsResponse,
-    ListRulesRequest, ListRulesResponse, PromptEvent, SetPausedRequest, SetPausedResponse,
-    StatusRequest, StatusResponse, SubscribeRequest, UpsertRuleRequest, UpsertRuleResponse,
-    VerdictRequest, VerdictResponse,
+    ListRulesRequest, ListRulesResponse, PromptEvent, RuleInfo, SetPausedRequest,
+    SetPausedResponse, StatusRequest, StatusResponse, SubscribeRequest, UpsertRuleRequest,
+    UpsertRuleResponse, VerdictRequest, VerdictResponse,
 };
 
 /// Hard ceiling on a pause, regardless of what a client asks for. A pause
@@ -413,45 +413,67 @@ impl Firewall for FirewallService {
         let mut persisted_rule = None;
         let mut persist_error = String::new();
         if let (true, Some(scope_pb)) = (accepted, req.persist_scope.clone()) {
-            let mut scope = convert::scope_from_pb(&scope_pb).map_err(Status::invalid_argument)?;
-            // The same resolution UpsertRule does. This is the *higher volume*
-            // of the two paths - every "Allow always" click in the tray and
-            // every prompt answered in the GUI arrives here - and it was missed
-            // on the first pass. It matters most exactly when attribution fell
-            // back to the exec event's path, which is whatever string was
-            // passed to execve() and may well be `/bin/curl`.
-            resolve_exe_off_thread(&mut scope).await;
-            // The same gate `rule_from_pb` applies on the UpsertRule path. It
-            // was missed here, which left the busier of the two paths able to
-            // persist a rule that matches every process and every destination.
-            convert::reject_unscoped(&scope).map_err(Status::invalid_argument)?;
-            let duration =
-                convert::duration_from_pb(req.duration).map_err(Status::invalid_argument)?;
-            convert::reject_unpersistable_duration(duration).map_err(Status::invalid_argument)?;
-            let rule = cfc_core::Rule {
-                id: uuid::Uuid::new_v4(),
+            // One authority on what a storable rule is: `rule_from_pb`, the
+            // same conversion the UpsertRule path runs, gates and all. This
+            // path used to replicate a single gate of the list by hand
+            // (`reject_unscoped`), so the *higher volume* of the two paths -
+            // every "Allow always" click in the tray, every prompt answered in
+            // the GUI - happily persisted scopes UpsertRule refuses: a
+            // parent_exe-only scope that matches every process, or the
+            // `<unknown>` placeholder as an exe. A copied gate list would just
+            // drift again the next time one is added.
+            let rule_pb = RuleInfo {
+                id: String::new(),
                 name: format!("user prompt {}", req.prompt_id),
                 enabled: true,
-                action,
-                duration,
-                scope,
-                created_at: chrono::Utc::now(),
+                action: req.action,
+                duration: req.duration,
+                scope: Some(scope_pb),
+                created_at_unix_ms: 0,
                 hit_count: 0,
             };
-            match self.store.upsert(&rule) {
-                Ok(()) => {
-                    persisted_rule = Some(rule.id);
-                    self.engine.upsert_rule(rule);
+            match convert::rule_from_pb(&rule_pb).and_then(|rule| {
+                convert::reject_unpersistable_duration(rule.duration)?;
+                Ok(rule)
+            }) {
+                Ok(mut rule) => {
+                    // The same resolution UpsertRule does, in the same order
+                    // (convert, then resolve). It matters most exactly when
+                    // attribution fell back to the exec event's path, which is
+                    // whatever string was passed to execve() and may well be
+                    // `/bin/curl`.
+                    resolve_exe_off_thread(&mut rule.scope).await;
+                    match self.store.upsert(&rule) {
+                        Ok(()) => {
+                            persisted_rule = Some(rule.id);
+                            self.engine.upsert_rule(rule);
+                        }
+                        Err(e) => {
+                            // Reported to the caller, not only to the journal.
+                            // The verdict itself is still valid and still
+                            // applies to the waiting connection - only the
+                            // standing rule failed - so this must not turn
+                            // into `accepted = false`. But a client that says
+                            // "Rule created" on the strength of `accepted`
+                            // alone is telling the user something untrue,
+                            // which for a firewall is the worst kind of wrong.
+                            warn!("failed to persist rule from prompt verdict: {e}");
+                            persist_error = format!(
+                                "the verdict was applied, but the \
+                                 standing rule could not be saved: {e}"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
-                    // Reported to the caller, not only to the journal. The
-                    // verdict itself is still valid and still applies to the
-                    // waiting connection - only the standing rule failed - so
-                    // this must not turn into `accepted = false`. But a client
-                    // that says "Rule created" on the strength of `accepted`
-                    // alone is telling the user something untrue, which for a
-                    // firewall is the worst kind of wrong.
-                    warn!("failed to persist rule from prompt verdict: {e}");
+                    // NOT a Status error: the verdict was already submitted
+                    // above and reached the waiting connection, so failing the
+                    // RPC now would tell the client nothing happened when half
+                    // of it did - and the client would invite a retry of a
+                    // prompt that no longer exists. The rule degrades to a
+                    // one-shot answer instead, and the reason travels back so
+                    // the client can say why no standing rule exists.
+                    warn!("refusing to persist rule from prompt verdict: {e}");
                     persist_error = format!(
                         "the verdict was applied, but the \
                          standing rule could not be saved: {e}"

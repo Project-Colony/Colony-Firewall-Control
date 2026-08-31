@@ -420,7 +420,10 @@ impl VerdictSink {
         // decision for a dead pid is cleaned by the exit program or the next
         // sweep.
         let corrected = match resolved {
-            Some(exe) if exe != proc.exe => Some(Process { exe, ..proc.clone() }),
+            Some(exe) if exe != proc.exe => Some(Process {
+                exe,
+                ..proc.clone()
+            }),
             _ => None,
         };
         let as_process = corrected.as_ref().unwrap_or(proc);

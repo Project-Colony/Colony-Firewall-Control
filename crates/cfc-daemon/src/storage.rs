@@ -82,41 +82,34 @@ fn heal_legacy_protocol(rule: &mut Rule) -> bool {
     false
 }
 
-/// True when a stored rule constrains nothing and therefore matches everything.
+/// Why a stored rule must not be applied, or `None` when it may be.
 ///
-/// Older builds accepted these; the boundary now refuses them. Left loaded they
-/// are worse than useless: the rule matches every process and every destination
-/// *and* cannot be edited or disabled, because every client edit is a
-/// read-modify-write that sends the empty scope straight back to a daemon that
-/// now rejects it. The one thing an operator would reach for on a
-/// match-everything rule is the one thing that stops working.
+/// The exact gate list `rule_from_pb` runs at the API boundary, because the
+/// database is one more door into the engine: rows written by an older build
+/// (before a given gate existed), by a hand edit, or through a path that
+/// missed a gate deserialize here with none of the wire checks re-run. This
+/// used to name two shapes explicitly - unscoped and placeholder-exe - so
+/// every gate added later (parent_exe, inbound scoping) silently did not
+/// apply at load: a stored `parent_exe` rule, which the matcher never
+/// evaluates, loaded live and matched every process while outranking rules
+/// that are genuinely narrower. Reusing the boundary's own list is what stops
+/// the two from drifting a second time.
 ///
-/// So it is disabled in memory and named in the log. Not deleted: the row is
-/// the operator's, and `cfc rules list` is not where a firewall should silently
-/// lose things.
-fn is_unscoped(rule: &Rule) -> bool {
-    rule.scope.specificity() == 0
-}
-
-/// A rule scoped to the "we could not identify this program" placeholder.
-///
-/// Treated exactly like an unscoped one, and for the same reason: it looks
-/// narrow and behaves as a wildcard. `Process::unknown` puts
-/// [`cfc_core::UNKNOWN_EXE`] in a `PathBuf`, so answering "always allow" on a
-/// flow that could not be attributed used to write that string as the rule's
-/// executable - and every later unattributable flow compared equal to it.
-/// Inbound flows are always unattributable, so one such rule admitted all
-/// inbound traffic regardless of the rules meant to govern it.
-///
-/// New rules of this shape are refused at the API boundary and the matcher
-/// ignores the placeholder outright; this catches the ones already written to
-/// databases before either lock existed. Disabled in memory, never deleted -
-/// the row is the operator's.
-fn has_placeholder_exe(rule: &Rule) -> bool {
-    rule.scope
-        .exe_path
-        .as_ref()
-        .is_some_and(|p| p.as_os_str() == cfc_core::UNKNOWN_EXE)
+/// A rule caught here is quarantined, not deleted: the row is the operator's,
+/// and `cfc rules list` is not where a firewall should silently lose things.
+/// It is also not loaded disabled-but-present - the engine snapshot holds
+/// only enabled rules - so "not applied, named in the log, preserved on
+/// disk" is the whole contract. Applying it is the bug, and most of these
+/// shapes cannot even be edited away: every client edit is a
+/// read-modify-write that sends the refused scope straight back to a daemon
+/// that now rejects it.
+fn quarantine_reason(rule: &Rule) -> Option<String> {
+    crate::convert::reject_unscoped(&rule.scope)
+        .and_then(|()| rule.scope.reject_unmatchable_exe())
+        .and_then(|()| rule.scope.reject_unmatchable_parent())
+        .and_then(|()| rule.scope.reject_inbound_destination_scope())
+        .and_then(|()| rule.scope.reject_unattributable_inbound_scope())
+        .err()
 }
 
 /// Journalling mode, chosen by measurement rather than by reputation.
@@ -208,21 +201,32 @@ impl RuleStore {
         let mut rules = Vec::new();
         let mut skipped_ids = Vec::new();
         let mut healed_ids = Vec::new();
-        let mut unscoped_ids = Vec::new();
-        let mut placeholder_ids = Vec::new();
+        let mut quarantined = 0usize;
         for r in rows {
             let (id, json) = r?;
             match serde_json::from_str::<Rule>(&json) {
                 Ok(mut rule) => {
+                    // Heal before gating: the healed shape is what the
+                    // operator meant, and dropping the inert predicate can
+                    // itself leave the scope empty - which the gate below
+                    // must then see.
                     if heal_legacy_protocol(&mut rule) {
                         healed_ids.push(id.clone());
                     }
-                    if is_unscoped(&rule) {
-                        unscoped_ids.push(id.clone());
-                        continue;
-                    }
-                    if has_placeholder_exe(&rule) {
-                        placeholder_ids.push(id.clone());
+                    if let Some(reason) = quarantine_reason(&rule) {
+                        // One warning per rule, naming it and saying why, in
+                        // the gate's own words. A quarantine with no log line
+                        // is indistinguishable from the rule silently
+                        // vanishing.
+                        tracing::warn!(
+                            rule_id = %id,
+                            rule_name = %rule.name,
+                            %reason,
+                            "stored rule fails the API boundary's gates and is \
+                             not applied; the row is preserved - delete it with \
+                             `cfc rules remove {id}`, or rewrite it"
+                        );
+                        quarantined += 1;
                         continue;
                     }
                     rules.push(rule);
@@ -233,17 +237,11 @@ impl RuleStore {
                 }
             }
         }
-        if !placeholder_ids.is_empty() {
+        if quarantined > 0 {
             tracing::warn!(
-                count = placeholder_ids.len(),
-                ids = ?placeholder_ids,
-                "{} rule(s) are scoped to {} - the placeholder for a program \
-                 that could not be identified, not a path. Such a rule matches \
-                 every unattributable flow, which is every inbound one, so it \
-                 is not applied. The rows are preserved; delete them, or \
-                 rewrite them against a real executable or a port and source.",
-                placeholder_ids.len(),
-                cfc_core::UNKNOWN_EXE
+                count = quarantined,
+                "{quarantined} stored rule(s) were quarantined at load; see the \
+                 warnings above for each rule and reason"
             );
         }
         if !skipped_ids.is_empty() {
@@ -262,16 +260,6 @@ impl RuleStore {
                  an older build; it has been dropped in memory. Re-save them to \
                  clear it on disk.",
                 healed_ids.len()
-            );
-        }
-        if !unscoped_ids.is_empty() {
-            tracing::warn!(
-                count = unscoped_ids.len(),
-                ids = ?unscoped_ids,
-                "{} stored rule(s) constrain nothing and would match every process \
-                 and every destination; they are not being applied. Delete them \
-                 with `cfc rules remove <id>` - the rows are preserved on disk.",
-                unscoped_ids.len()
             );
         }
         self.skipped.store(skipped_ids.len(), Ordering::Relaxed);
@@ -635,7 +623,9 @@ mod tests {
             cfc_core::Action::Allow,
             cfc_core::RuleScope::any(),
         );
-        assert!(super::is_unscoped(&unscoped));
+        assert!(super::quarantine_reason(&unscoped)
+            .expect("an unscoped rule must be quarantined")
+            .contains("constrains nothing"));
 
         let scoped = Rule::new(
             "curl",
@@ -645,7 +635,84 @@ mod tests {
                 ..cfc_core::RuleScope::any()
             },
         );
-        assert!(!super::is_unscoped(&scoped));
+        assert_eq!(super::quarantine_reason(&scoped), None);
+    }
+
+    #[test]
+    fn a_stored_parent_exe_rule_is_quarantined_not_applied() {
+        // The trap the load path missed while the boundary already refused it:
+        // `matches_process` never evaluates parent_exe, so a stored rule
+        // scoped only on it matches EVERY process - and its counted predicate
+        // sorts it ahead of genuinely narrower rules. A Deny of this shape is
+        // "take the network down"; an Allow is "switch the firewall off". Such
+        // rows exist in the wild: the proto API and `cfc rules import` both
+        // accepted the field before the gate, and the SubmitVerdict persist
+        // path accepted it for longer still.
+        let dir = tempfile::tempdir().unwrap();
+        let store = RuleStore::open(&dir.path().join("rules.db")).unwrap();
+
+        let mut scope = cfc_core::RuleScope::any();
+        scope.parent_exe = Some(std::path::PathBuf::from("/usr/bin/bash"));
+        store
+            .upsert(&Rule::new("deny-bash-children", Action::Deny, scope))
+            .unwrap();
+        store
+            .upsert(&Rule::new(
+                "curl",
+                Action::Allow,
+                cfc_core::RuleScope {
+                    exe_path: Some("/usr/bin/curl".into()),
+                    ..cfc_core::RuleScope::any()
+                },
+            ))
+            .unwrap();
+
+        // Reopen: the load path a daemon restart takes.
+        let reopened = RuleStore::open(&dir.path().join("rules.db")).unwrap();
+        let names: Vec<String> = reopened
+            .snapshot()
+            .unwrap()
+            .rules
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert!(
+            !names.contains(&"deny-bash-children".to_string()),
+            "a parent_exe rule matches every process and must not load: {names:?}"
+        );
+        assert!(names.contains(&"curl".to_string()), "{names:?}");
+
+        // Quarantined, never deleted: the row is the operator's.
+        let rows: i64 = reopened
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "quarantine must preserve the row on disk");
+    }
+
+    #[test]
+    fn an_inbound_program_scoped_rule_is_quarantined_at_load() {
+        // Inbound flows are never attributed to a process, so this rule
+        // lists, ranks, and never fires - the boundary refuses it now, and
+        // the load path must not resurrect the ones written before it did.
+        let mut scope = cfc_core::RuleScope::any();
+        scope.direction = Some(cfc_core::Direction::Inbound);
+        scope.exe_path = Some("/usr/sbin/sshd".into());
+        let rule = Rule::new("inbound-sshd", Action::Allow, scope);
+        assert!(super::quarantine_reason(&rule)
+            .expect("an inbound program scope must be quarantined")
+            .contains("cannot be attributed"));
+
+        // The legitimate inbound shape still loads.
+        let mut ok = cfc_core::RuleScope::any();
+        ok.direction = Some(cfc_core::Direction::Inbound);
+        ok.src_net = Some("192.168.0.0/16".parse().unwrap());
+        ok.dst_port = Some(22);
+        assert_eq!(
+            super::quarantine_reason(&Rule::new("inbound-ssh-lan", Action::Allow, ok)),
+            None
+        );
     }
 
     #[test]

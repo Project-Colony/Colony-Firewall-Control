@@ -90,9 +90,7 @@ pub fn canonical_exe_sha256(hex: &str) -> Result<String, String> {
         ));
     }
     if let Some(bad) = hex.chars().find(|c| !c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "exe_sha256 must be hexadecimal; `{bad}` is not"
-        ));
+        return Err(format!("exe_sha256 must be hexadecimal; `{bad}` is not"));
     }
     Ok(hex)
 }

@@ -174,6 +174,19 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
     println!("hits         {}", rule.hit_count);
     println!("summary      {}", convert::rule_summary(&rule));
     println!("scope:");
+    // Not dashed when unset: an absent direction is not "unconstrained", it
+    // means outbound (the matcher's contract - unset kept the meaning every
+    // pre-inbound rule was written with). Printing "-" here made an inbound
+    // rule indistinguishable from an outbound one in the only human-readable
+    // detail view there is.
+    println!(
+        "  direction  {}",
+        if scope.has_direction {
+            convert::direction_label(scope.direction).to_string()
+        } else {
+            "out (unset)".into()
+        }
+    );
     println!("  exe        {}", dash(&scope.exe_path));
     println!("  sha256     {}", dash(&scope.exe_sha256));
     println!("  parent-exe {}", dash(&scope.parent_exe));
@@ -181,6 +194,15 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
         "  uid        {}",
         if scope.has_uid {
             scope.uid.to_string()
+        } else {
+            "-".into()
+        }
+    );
+    println!("  src-net    {}", dash(&scope.src_net));
+    println!(
+        "  src-port   {}",
+        if scope.has_src_port {
+            scope.src_port.to_string()
         } else {
             "-".into()
         }
@@ -369,9 +391,14 @@ impl ActionArg {
     }
 }
 
+/// Durations `rules add` can actually store. `once` is deliberately absent:
+/// it answers a single prompt and the daemon refuses to persist it on every
+/// upsert, so offering it here advertised a flag value whose only possible
+/// outcome was a wire error naming no flag. The prompt flow still uses
+/// `Duration::Once` legitimately - it submits a verdict, not a rule - and
+/// does so through `proto::Duration` directly, not this enum.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum DurationArg {
-    Once,
     UntilRestart,
     Always,
 }
@@ -458,7 +485,6 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
     }
 
     let duration = match args.duration {
-        DurationArg::Once => proto::Duration::Once,
         DurationArg::UntilRestart => proto::Duration::UntilRestart,
         DurationArg::Always => proto::Duration::Always,
     };
@@ -1705,6 +1731,15 @@ fn bundles() -> Vec<Bundle> {
                 // that was the guarantee this bundle exists to uphold being
                 // handed away by the bundle itself.
                 //
+                // The ranges are dual-stack because the inbound chain is: the
+                // nftables table is family `inet`, so IPv6 mDNS/LLMNR - sent
+                // from neighbours' fe80:: link-local addresses - is filtered
+                // too, and a v4-only list silently broke discovery for
+                // IPv6-only speakers in exactly the "device that sometimes
+                // disappears" way this comment promises to prevent. DHCPv6
+                // needs no entry here: the shipped inbound snippet accepts
+                // fe80::/10 to ports 546/547 in-kernel, before the queue.
+                //
                 // A LAN outside RFC1918 needs a hand-written rule. That is the
                 // right trade: a missing rule is a visible symptom, an
                 // internet-wide hole is not.
@@ -1741,6 +1776,14 @@ fn bundles() -> Vec<Bundle> {
                     src_net: Some("169.254.0.0/16"),
                 },
                 BundleRule {
+                    name: "inbound-mdns-v6-linklocal",
+                    exe_candidates: &[],
+                    dst_port: Some(5353),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("fe80::/10"),
+                },
+                BundleRule {
                     name: "inbound-llmnr-lan",
                     exe_candidates: &[],
                     dst_port: Some(5355),
@@ -1771,6 +1814,14 @@ fn bundles() -> Vec<Bundle> {
                     protocol: Some(Udp),
                     direction: Some(proto::Direction::Inbound),
                     src_net: Some("169.254.0.0/16"),
+                },
+                BundleRule {
+                    name: "inbound-llmnr-v6-linklocal",
+                    exe_candidates: &[],
+                    dst_port: Some(5355),
+                    protocol: Some(Udp),
+                    direction: Some(proto::Direction::Inbound),
+                    src_net: Some("fe80::/10"),
                 },
                 BundleRule {
                     name: "inbound-dhcp-client-lan",
@@ -2195,6 +2246,28 @@ pub async fn bootstrap_defaults(
 }
 
 #[cfg(test)]
+mod add_args_tests {
+    use super::*;
+
+    /// The daemon unconditionally refuses to persist a `Once` rule, so `add`
+    /// must not offer it: every `--duration once` invocation died with a wire
+    /// error naming no flag. Locked at the clap layer - reintroducing the
+    /// variant is what would break this.
+    #[test]
+    fn rules_add_does_not_offer_a_duration_it_cannot_store() {
+        use clap::ValueEnum as _;
+        let offered: Vec<String> = DurationArg::value_variants()
+            .iter()
+            .filter_map(|v| v.to_possible_value())
+            .map(|p| p.get_name().to_string())
+            .collect();
+        assert!(!offered.iter().any(|s| s == "once"), "{offered:?}");
+        assert!(offered.iter().any(|s| s == "until-restart"), "{offered:?}");
+        assert!(offered.iter().any(|s| s == "always"), "{offered:?}");
+    }
+}
+
+#[cfg(test)]
 mod resolve_tests {
     use super::*;
 
@@ -2576,12 +2649,17 @@ mod bundle_tests {
                 let net: ipnet::IpNet = net
                     .parse()
                     .unwrap_or_else(|e| panic!("{}/{}: bad src_net {net:?}: {e}", b.name, r.name));
-                // And it must be a range a LAN actually lives in.
+                // And it must be a range a LAN actually lives in - RFC1918,
+                // IPv4 link-local, or IPv6 link-local (fe80::/10, where v6
+                // mDNS/LLMNR speakers source from). Notably NOT a v6 global
+                // or ULA range: the inbound chain filters dual-stack, and a
+                // bundle must never widen past the link.
                 let private = [
                     "192.168.0.0/16",
                     "10.0.0.0/8",
                     "172.16.0.0/12",
                     "169.254.0.0/16",
+                    "fe80::/10",
                 ]
                 .iter()
                 .map(|s| s.parse::<ipnet::IpNet>().unwrap())
@@ -2649,6 +2727,65 @@ mod bundle_tests {
                 );
             }
         }
+    }
+
+    /// The inbound bundle's mDNS/LLMNR promise is dual-stack, because the
+    /// inbound chain is (`table inet`). With only IPv4 CIDRs, IPv6 queries
+    /// from neighbours' fe80:: addresses matched no rule and hit the inbound
+    /// default - which config forbids being Allow - so v6-only speakers
+    /// vanished from discovery in exactly the hard-to-attribute way the
+    /// bundle's own comment warns about.
+    #[test]
+    fn the_inbound_bundle_covers_v6_linklocal_mdns_and_llmnr() {
+        let inbound = bundles()
+            .into_iter()
+            .find(|b| b.name == "inbound")
+            .expect("the inbound bundle exists");
+        for port in [5353u16, 5355] {
+            assert!(
+                inbound
+                    .rules
+                    .iter()
+                    .any(|r| { r.dst_port == Some(port) && r.src_net == Some("fe80::/10") }),
+                "no fe80::/10 entry for port {port}: the bundle would break \
+                 IPv6 mDNS/LLMNR while promising LAN discovery"
+            );
+        }
+
+        // And the rule model genuinely matches a v6 link-local source against
+        // that CIDR - otherwise the entries would list, rank, and never fire.
+        let scope = cfc_core::RuleScope {
+            direction: Some(cfc_core::Direction::Inbound),
+            src_net: Some("fe80::/10".parse().unwrap()),
+            dst_port: Some(5353),
+            protocol: Some(cfc_core::Protocol::Udp),
+            ..cfc_core::RuleScope::any()
+        };
+        let unattributed = cfc_core::Process::unknown(0);
+        let v6_neighbour = cfc_core::Connection::new(
+            cfc_core::Protocol::Udp,
+            cfc_core::Direction::Inbound,
+            "fe80::1234:5678:9abc:def0".parse().unwrap(),
+            5353,
+            "ff02::fb".parse().unwrap(),
+            5353,
+        );
+        assert!(
+            scope.matches(&v6_neighbour, &unattributed),
+            "an fe80:: mDNS packet must match the v6 link-local entry"
+        );
+
+        // Family mismatch is a non-match, not a wildcard: the v6 entry must
+        // not quietly admit IPv4 peers.
+        let v4_neighbour = cfc_core::Connection::new(
+            cfc_core::Protocol::Udp,
+            cfc_core::Direction::Inbound,
+            "192.168.1.20".parse().unwrap(),
+            5353,
+            "224.0.0.251".parse().unwrap(),
+            5353,
+        );
+        assert!(!scope.matches(&v4_neighbour, &unattributed));
     }
 
     /// `bundle remove` deletes by exact rule name. If two bundles ever shared

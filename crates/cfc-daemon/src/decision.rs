@@ -235,8 +235,10 @@ impl Engine {
             .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
         {
             if rule.scope.undecidable_for(proc) {
-                if matches!(rule.action, cfc_core::Action::Deny | cfc_core::Action::Reject)
-                    && !rule.scope.constrains_destination()
+                if matches!(
+                    rule.action,
+                    cfc_core::Action::Deny | cfc_core::Action::Reject
+                ) && !rule.scope.constrains_destination()
                 {
                     return true;
                 }
@@ -245,8 +247,10 @@ impl Engine {
             if !rule.scope.matches_process(proc) {
                 continue;
             }
-            return matches!(rule.action, cfc_core::Action::Deny | cfc_core::Action::Reject)
-                && !rule.scope.constrains_destination();
+            return matches!(
+                rule.action,
+                cfc_core::Action::Deny | cfc_core::Action::Reject
+            ) && !rule.scope.constrains_destination();
         }
         false
     }
