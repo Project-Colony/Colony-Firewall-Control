@@ -194,6 +194,11 @@ jobs:
         # records what a hardcoded version cost once already.
         run: |
           set -eux
+          # The checkout is owned by the runner uid, the container runs as
+          # root, and git refuses to read a repo owned by someone else
+          # ("dubious ownership") - which surfaced here, on the first git
+          # command of the job, as exit 128 with the advice cut off by set -e.
+          git config --global --add safe.directory "$(pwd)"
           VERSION="$(rpmspec -q --srpm --qf '%{version}\n' packaging/rpm/colony-firewall-control.spec)"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           git archive --format=tar.gz \
