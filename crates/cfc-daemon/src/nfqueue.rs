@@ -12,7 +12,9 @@
 //! the worker's `waiters` table while the rest of the datapath keeps
 //! verdicting, so a single unanswered prompt no longer stalls every flow
 //! behind it. Repeat SYNs and parallel connections of the same flow attach
-//! to the already-outstanding prompt instead of re-prompting.
+//! to the already-outstanding prompt instead of re-prompting -- up to
+//! [`MAX_PACKETS_PER_PROMPT`] of them; past that, extra packets take the
+//! prompt's fallback verdict rather than a kernel queue slot.
 //!
 //! Channel topology:
 //!
@@ -84,12 +86,38 @@ const RECV_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// How many prompts may be waiting for an answer at once.
 ///
-/// Not a UI limit - it is a memory bound. See `park_for_prompt`: every parked
-/// packet pins the 68 KiB buffer it arrived in, so this cap is worth about
-/// 34 MB of worst-case residency inside the packet worker. Far above any
-/// number of bubbles a person could face, and far below what an unattended
-/// flood would otherwise take.
+/// Not a UI limit - it is one axis of a residency bound, and it is worth
+/// being explicit that it is only one: this caps how many prompts hold
+/// packets, [`MAX_PACKETS_PER_PROMPT`] caps how many packets each of them
+/// holds. Every parked packet pins the 68 KiB buffer it arrived in *and* a
+/// slot in the kernel queue, so the two caps together are worth
+/// 512 x 4 = 2048 packets: ~136 MB of worst-case residency inside the
+/// packet worker, and half the default 4096-slot queue. Neither cap bounds
+/// anything alone - this one sat at 1 while a single chatty flow parked
+/// packets without limit, because [`FlowKey`] folds a whole flow onto one
+/// prompt.
 const MAX_PARKED_PROMPTS: usize = 512;
+
+/// How many packets one prompt may hold parked at once, first one included.
+///
+/// The scarce resource is not daemon memory but the kernel queue: an
+/// enqueued packet keeps one of the `queue_max_len` slots (4096 by default,
+/// set at bind time in [`spawn`]) until its verdict, and [`FlowKey`]
+/// deliberately folds every packet of a flow onto one prompt. Without this
+/// bound, one unanswered prompt over a chatty flow - unreplied UDP is
+/// conntrack-NEW on every datagram, so each one is queued - filled the
+/// whole queue inside a single prompt timeout, and the kernel then dropped
+/// every ct-state-new packet machine-wide, inbound included.
+/// [`MAX_PARKED_PROMPTS`] never fired against it: `waiters.len()` sat at 1.
+///
+/// Four covers what riding exists for - the first packet plus a retransmit
+/// or a couple of parallel connections - and it is chosen against the
+/// queue: one prompt pins at most 4 of 4096 slots, and even all 512
+/// prompts at this cap pin 2048, half the default queue, so parked packets
+/// can never starve live ones. Overflow takes the prompt's fallback
+/// instead of a slot; a dropped SYN is retransmitted, and the retry lands
+/// on whatever the answer produced.
+const MAX_PACKETS_PER_PROMPT: usize = 4;
 
 /// `NF_INET_LOCAL_IN` - a packet addressed to this machine.
 const NF_INET_LOCAL_IN: u8 = 1;
@@ -678,6 +706,24 @@ impl<Q: PacketQueue> Worker<Q> {
         let flow = FlowKey::for_flow(&connection, &process);
         if let Some(&prompt_id) = self.pending_flows.get(&flow) {
             if let Some(pending) = self.waiters.get_mut(&prompt_id) {
+                // Riding is bounded per prompt, not just per table: the cap
+                // on `waiters` below counts prompts, and counting prompts
+                // bounds nothing when every packet of a flood shares one -
+                // which is exactly what `FlowKey` makes them do. Each packet
+                // parked here keeps a kernel queue slot until the verdict,
+                // so an unbounded ride let one unanswered prompt fill the
+                // queue and blackhole every new flow on the machine. Past
+                // the cap, overflow takes the same path as every other
+                // packet that cannot park.
+                if pending.packets.len() >= MAX_PACKETS_PER_PROMPT {
+                    trace!(
+                        prompt_id,
+                        parked = pending.packets.len(),
+                        "prompt already holds its packet cap; applying the fallback"
+                    );
+                    self.deliver_fallback(msg, connection, process, fallback);
+                    return;
+                }
                 trace!(
                     prompt_id,
                     "flow already prompting; parking packet on existing prompt"
@@ -699,10 +745,11 @@ impl<Q: PacketQueue> Worker<Q> {
 
         // A parked packet is not free. Each one holds the nfq `Message` it
         // arrived in, and that owns the 68 KiB netlink receive buffer the
-        // kernel copied it into - so 512 unanswered prompts is ~34 MB pinned
-        // inside the packet worker, and nothing bounded it. A process opening
-        // new flows faster than a human answers bubbles - a torrent client
-        // reaching for peers, a scan - reaches that in seconds.
+        // kernel copied it into - so 512 unanswered prompts is at least
+        // ~34 MB pinned inside the packet worker, and nothing bounded the
+        // prompt count. A process opening new flows faster than a human
+        // answers bubbles - a torrent client reaching for peers, a scan -
+        // reaches that in seconds.
         //
         // Over the cap, take the same branch as a saturated router below:
         // apply `fallback`, which is the configured `no_ui_action`. That is
@@ -713,7 +760,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 parked = self.waiters.len(),
                 "prompt backlog at its cap; applying the fallback rather than parking"
             );
-            self.apply_action(msg, fallback.action);
+            self.deliver_fallback(msg, connection, process, fallback);
             return;
         }
 
@@ -742,15 +789,33 @@ impl<Q: PacketQueue> Worker<Q> {
                 // Router saturated or gone: apply the default policy now
                 // rather than stranding the packet.
                 trace!("prompt channel unavailable ({e}); applying fallback");
-                self.apply_action(msg, fallback.action);
-                record(&self.stats, fallback.action);
-                let _ = self.observed_tx.send(ObservedConnection {
-                    connection,
-                    process,
-                    verdict: fallback,
-                });
+                self.deliver_fallback(msg, connection, process, fallback);
             }
         }
+    }
+
+    /// Answers a packet with the prompt fallback right now, with everything
+    /// a resolved prompt would have produced: the verdict, the stats count
+    /// and the feed entry. Every path that cannot park - a prompt at its
+    /// packet cap, the prompt backlog at its cap, a saturated or vanished
+    /// router - comes through here, because the backlog-cap branch once
+    /// applied only the verdict: the flood it existed for was denied with
+    /// nothing in the stats, nothing in the feed, and only a trace line to
+    /// say so.
+    fn deliver_fallback(
+        &mut self,
+        msg: Q::Msg,
+        connection: Connection,
+        process: Process,
+        fallback: Verdict,
+    ) {
+        self.apply_action(msg, fallback.action);
+        record(&self.stats, fallback.action);
+        let _ = self.observed_tx.send(ObservedConnection {
+            connection,
+            process,
+            verdict: fallback,
+        });
     }
 
     /// Applies a policy action to a queued packet.
@@ -1235,7 +1300,10 @@ mod tests {
     /// the count, so a process opening flows faster than a human answers
     /// bubbles - a torrent client reaching for peers, a scan - grew it until
     /// the worker ran out of memory. Overflow now takes the same branch a
-    /// saturated prompt router already took, which is fail-closed.
+    /// saturated prompt router already took, which is fail-closed - and it
+    /// is the whole branch: the denial is counted and published, not just
+    /// verdicted. It used to be verdict-only, so the flood this cap exists
+    /// for was denied with nothing in the stats and nothing in the feed.
     #[test]
     fn a_prompt_backlog_at_its_cap_falls_back_instead_of_parking() {
         let mut h = LoopHarness::new(vec![], vec![], dp_deny());
@@ -1280,6 +1348,89 @@ mod tests {
             vec![(overflow_id, NfqVerdict::Drop)],
             "overflow must take the fallback verdict, and dp_deny() means Drop"
         );
+        // The saturated-router branch counts and publishes what it denies;
+        // this branch claims to be the same branch, so it must too.
+        assert_eq!(
+            h.stats.connections_denied(),
+            1,
+            "the fallback denial is counted"
+        );
+        let observed = h
+            .observed_rx
+            .try_recv()
+            .expect("the fallback denial reaches the feed");
+        assert_eq!(observed.verdict.action, Action::Deny);
+    }
+
+    /// A flow that keeps sending while its prompt sits unanswered must not
+    /// park without bound.
+    ///
+    /// [`FlowKey`] folds every packet of a flow onto one prompt on purpose,
+    /// so [`MAX_PARKED_PROMPTS`] never bites - `waiters.len()` sits at 1 -
+    /// and each parked packet keeps a kernel queue slot until the verdict.
+    /// Unbounded riding let one chatty flow (unreplied UDP, a SYN spray
+    /// across source ports) fill the whole queue within a prompt timeout
+    /// and blackhole every new flow on the machine. Past the per-prompt
+    /// cap, overflow is answered with the fallback, counted and published
+    /// like any other denial, while the prompt itself stays intact.
+    #[test]
+    fn a_full_prompt_answers_overflow_with_the_fallback_instead_of_parking() {
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+
+        // One flow throughout: the destination stays fixed and the source
+        // port varies, as a parallel-connection burst would.
+        for i in 0..MAX_PACKETS_PER_PROMPT {
+            h.worker().park_for_prompt(
+                FakeMsg::new(i as u32, tcp_packet(443)),
+                conn_to(443, 1111 + i as u16),
+                test_process(4242, "/usr/bin/curl"),
+                Verdict::default_deny(),
+            );
+        }
+        assert_eq!(h.worker().waiters.len(), 1, "one flow is one prompt");
+        assert!(h.verdicts().is_empty(), "up to the cap, packets park");
+        assert_eq!(h.stats.connections_total(), 0);
+
+        // One more packet of the same flow. It must be answered, not parked.
+        let overflow_id = MAX_PACKETS_PER_PROMPT as u32;
+        h.worker().park_for_prompt(
+            FakeMsg::new(overflow_id, tcp_packet(443)),
+            conn_to(443, 9999),
+            test_process(4242, "/usr/bin/curl"),
+            Verdict::default_deny(),
+        );
+
+        assert_eq!(
+            h.verdicts(),
+            vec![(overflow_id, NfqVerdict::Drop)],
+            "overflow must take the fallback verdict, and dp_deny() means Drop"
+        );
+        assert_eq!(
+            h.stats.connections_denied(),
+            1,
+            "the overflow denial is counted"
+        );
+        let observed = h
+            .observed_rx
+            .try_recv()
+            .expect("the overflow denial reaches the feed");
+        assert_eq!(observed.verdict.action, Action::Deny);
+        assert_eq!(observed.connection.src_port, 9999);
+
+        // The prompt survives its own overflow: resolving it frees exactly
+        // the packets that parked, none of them double-verdicted.
+        let req = h.prompt_rx.try_recv().expect("prompt dispatched");
+        h.send_verdict(req.prompt_id, Verdict::default_allow());
+        h.worker().drain_verdicts();
+
+        let expected: Vec<_> = std::iter::once((overflow_id, NfqVerdict::Drop))
+            .chain((0..MAX_PACKETS_PER_PROMPT).map(|i| (i as u32, NfqVerdict::Accept)))
+            .collect();
+        assert_eq!(h.verdicts(), expected);
+        // One prompt is one logical connection, counted once.
+        assert_eq!(h.stats.connections_allowed(), 1);
+        assert!(h.worker().waiters.is_empty());
+        assert!(h.worker().pending_flows.is_empty());
     }
 
     /// The worker must declare its thread to be the datapath.
