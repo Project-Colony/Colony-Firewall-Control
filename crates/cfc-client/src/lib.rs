@@ -150,6 +150,11 @@ pub struct VerdictOutcome {
     pub rule_persisted: Option<bool>,
     /// Why the rule could not be stored, when one was asked for and failed.
     pub persist_error: Option<String>,
+    /// Something true about the rule that WAS stored, worth showing: today,
+    /// that it was hash-bound (a replaced binary will prompt again), or that
+    /// a promised binding fell through and the rule follows the path. Never
+    /// a failure - `persist_error` owns those.
+    pub persist_note: Option<String>,
 }
 
 impl Client {
@@ -275,6 +280,7 @@ impl Client {
                 (true, true) => Some(!resp.persisted_rule_id.is_empty()),
             },
             persist_error: (!resp.persist_error.is_empty()).then_some(resp.persist_error),
+            persist_note: (!resp.persist_note.is_empty()).then_some(resp.persist_note),
         })
     }
 

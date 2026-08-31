@@ -46,6 +46,13 @@ message PromptEvent {
   ConnectionInfo connection = 2;
   ProcessInfo process = 3;
   int64 deadline_unix_ms = 4;
+  // True when a persisted *allow* answered from this prompt will be bound to
+  // the binary's current sha256, not only its path - the daemon decides this
+  // when the executable lives somewhere a non-root user could rewrite, and
+  // the UI must say so before the user answers. Denies are never bound: a
+  // hash-bound deny is one file swap away from not applying, while the
+  // path-bound one covers whatever bytes sit there next.
+  bool binds_to_hash = 5;
 }
 
 message VerdictRequest {
@@ -68,6 +75,11 @@ message VerdictResponse {
   string persisted_rule_id = 3;
   // Why the rule could not be stored. Empty when nothing went wrong.
   string persist_error = 4;
+  // Something true about the rule that WAS stored, worth a line of screen:
+  // today, that it was bound to the binary's hash (and a replaced file will
+  // prompt again), or that a promised binding could not be made and the rule
+  // follows the path. Never a failure - `persist_error` owns those.
+  string persist_note = 5;
 }
 
 message ConnectionEvent {

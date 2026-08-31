@@ -669,7 +669,7 @@ fn exe_sha256(pid: u32) -> Option<String> {
 
 /// Streaming sha256 of a file; None on I/O error or if the file exceeds
 /// `max_len` (checked up front so we never read an oversized file).
-fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
+pub(crate) fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
     let mut f = fs::File::open(path).ok()?;
     if f.metadata().ok()?.len() > max_len {
         return None;

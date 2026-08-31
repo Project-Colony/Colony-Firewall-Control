@@ -134,6 +134,7 @@ struct PromptJson<'a> {
     dst_ip: Option<&'a str>,
     dst_port: u32,
     dst_host: Option<&'a str>,
+    binds_to_hash: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     verdict: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,6 +175,7 @@ fn to_json<'a>(
         dst_ip: conn.and_then(|c| opt(&c.dst_ip)),
         dst_port: conn.map(|c| c.dst_port).unwrap_or(0),
         dst_host: conn.and_then(|c| opt(&c.dst_host)),
+        binds_to_hash: ev.binds_to_hash,
         verdict,
         accepted,
     }
@@ -622,6 +624,11 @@ async fn submit(
                 .unwrap_or("the answer applied, but no lasting rule was saved")
         );
     }
+    // A fact about the stored rule (hash-bound, or a binding that fell
+    // through), never a failure - those took the branch above.
+    if let Some(note) = outcome.persist_note.as_deref() {
+        println!("  note: {note}");
+    }
     Ok(outcome.accepted)
 }
 
@@ -676,6 +683,13 @@ fn print_prompt(ev: &proto::PromptEvent) {
         "  target   {}",
         describe_destination(ev.connection.as_ref())
     );
+    // Before the user answers, because it changes what answering means: the
+    // daemon judged this executable's path rewritable by a non-root user, so
+    // an allow-always will bind to the binary's current hash rather than
+    // follow whatever bytes sit at the path next.
+    if ev.binds_to_hash {
+        println!("  binding  allow-always will pin to this binary's sha256");
+    }
 }
 
 #[cfg(test)]
@@ -866,6 +880,7 @@ mod tests {
             connection: Some(conn()),
             process: Some(process()),
             deadline_unix_ms: 1_700_000_030_000,
+            binds_to_hash: false,
         };
         let v = serde_json::to_value(to_json(&ev, None, None)).unwrap();
         assert_eq!(v["prompt_id"], "17");
