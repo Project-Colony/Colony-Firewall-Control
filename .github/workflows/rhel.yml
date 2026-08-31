@@ -174,13 +174,20 @@ jobs:
         # for the module build; shadow-utils and util-linux are for the
         # unprivileged-builder steps below (the base image has useradd and su
         # only by accident, if at all).
+        #
+        # pkgconfig(systemd): demanded by rpmbuild on fc44 as a failed build
+        # dependency even though the spec never declares it - something in
+        # the macro stack injects it. Installed as the capability string, so
+        # whichever package provides it on a given Fedora satisfies it. This
+        # is the first run's one correction, exactly as this repository has
+        # learned to expect.
         run: |
           set -eux
           dnf -y install \
             git-core rpm-build rpmdevtools \
             rust cargo protobuf-compiler pkgconf gcc \
             systemd-rpm-macros selinux-policy-devel make bzip2 \
-            shadow-utils util-linux
+            shadow-utils util-linux 'pkgconfig(systemd)'
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
