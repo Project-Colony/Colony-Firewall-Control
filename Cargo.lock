@@ -816,6 +816,7 @@ dependencies = [
  "cfc-proto",
  "ksni",
  "notify-rust",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",

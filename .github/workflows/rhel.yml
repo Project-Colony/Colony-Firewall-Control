@@ -2,7 +2,7 @@
 #
 # Everything in `packaging/rpm` and `packaging/selinux` is written against a
 # platform this project is not developed on, which is exactly the kind of file
-# that rots without anyone noticing. Two things are checked here, and neither
+# that rots without anyone noticing. Three things are checked here, and none
 # is cosmetic:
 #
 #   1. the SELinux module *compiles* against the real `selinux-policy-devel` of
@@ -11,11 +11,16 @@
 #      which is the failure mode a policy written away from the platform
 #      actually has.
 #   2. the spec parses and produces a source RPM, with `rpmlint` on top.
+#   3. the package builds, installs and verifies end to end - in a Fedora
+#      container, not on Rocky 9, because the workspace's MSRV is 1.88 and
+#      Rocky 9's default repos do not reach it. The Rocky-native path
+#      (`rust-toolset`) remains untried; TODO.md 2b says so rather than
+#      letting a green Fedora build imply the deployment target can build it.
 #
 # What is deliberately NOT checked: that the rules are *sufficient*. That needs
 # a running enforcing system with the daemon under load, and no amount of
-# compiling proves it. `packaging/selinux/README.md` says so plainly rather
-# than letting a green tick here imply otherwise.
+# compiling proves it. `packaging/selinux/README.md` says so plainly, and
+# `packaging/selinux/TESTING.md` is the protocol for whoever has such a host.
 
 name: rhel
 
@@ -147,6 +152,161 @@ jobs:
         # arguing with a linter instead of packaging.
         continue-on-error: true
         run: rpmlint packaging/rpm/colony-firewall-control.spec
+
+  rpm-end-to-end:
+    name: rpm end to end (fedora)
+    runs-on: ubuntu-24.04
+    container:
+      image: "fedora:latest"
+    steps:
+      - name: Install the build toolchain
+        # Before checkout, unlike every sibling job, and the order matters:
+        # this container ships no git, and actions/checkout without git falls
+        # back to a REST API tarball that leaves no repository behind - which
+        # the `git archive` two steps down would report as a confusing error
+        # long after the real cause.
+        #
+        # The compiler half of this list mirrors the spec's BuildRequires
+        # rather than replacing them: `rpmbuild -ba` re-checks BuildRequires
+        # itself and refuses with the missing names, so if the spec grows a
+        # dependency this list lacks, the failure names exactly what to add
+        # here. make and bzip2 are the same additions the selinux job needs
+        # for the module build; shadow-utils and util-linux are for the
+        # unprivileged-builder steps below (the base image has useradd and su
+        # only by accident, if at all).
+        run: |
+          set -eux
+          dnf -y install \
+            git-core rpm-build rpmdevtools \
+            rust cargo protobuf-compiler pkgconf gcc \
+            systemd-rpm-macros selinux-policy-devel make bzip2 \
+            shadow-utils util-linux
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the tarball %prep expects
+        # Source0 is GitHub's /archive/v<version>/ tarball, which is exactly
+        # a `git archive` with a `Colony-Firewall-Control-<version>/` prefix -
+        # the directory the spec's `%autosetup -n` names. Reproduce that
+        # instead of inventing a layout, so what is built here is what a
+        # build from the released tarball would consume. The version comes
+        # from the spec, not a hardcode - the source-RPM job's comment
+        # records what a hardcoded version cost once already.
+        run: |
+          set -eux
+          VERSION="$(rpmspec -q --srpm --qf '%{version}\n' packaging/rpm/colony-firewall-control.spec)"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          git archive --format=tar.gz \
+            --prefix="Colony-Firewall-Control-${VERSION}/" \
+            --output="colony-firewall-control-${VERSION}.tar.gz" HEAD
+          tar tzf "colony-firewall-control-${VERSION}.tar.gz" | head -3
+
+      - name: Set up an unprivileged build tree
+        # Container steps run as root, and rpmbuild as root turns one class
+        # of spec bug - an %install line writing outside %{buildroot} - into
+        # silent edits of the container's real filesystem. A throwaway user
+        # turns the same bug into an EACCES with a path in it.
+        run: |
+          set -eux
+          useradd --create-home builder
+          su builder -c 'rpmdev-setuptree'
+          install -m 0644 -o builder -g builder \
+            "colony-firewall-control-${VERSION}.tar.gz" /home/builder/rpmbuild/SOURCES/
+          install -m 0644 -o builder -g builder \
+            packaging/rpm/colony-firewall-control.spec /home/builder/rpmbuild/SPECS/
+
+      - name: rpmbuild -ba
+        # The pipeline the source-RPM job cannot claim: %prep unpacks the
+        # tarball, %build compiles the workspace and the SELinux module,
+        # %install lays out the buildroot (completions and man pages come out
+        # of the just-built cfc), %check runs the test suite, and rpm packs
+        # the lot. cargo fetches crates.io here - a distro build root would
+        # vendor, but this job is about the spec, not about hermeticity.
+        run: |
+          set -eux
+          su builder -c 'rpmbuild -ba ~/rpmbuild/SPECS/colony-firewall-control.spec'
+          ls -l /home/builder/rpmbuild/RPMS/x86_64/ \
+                /home/builder/rpmbuild/RPMS/noarch/ \
+                /home/builder/rpmbuild/SRPMS/
+
+      - name: Install what was built
+        # Both packages in one transaction, so dnf resolves the spec's real
+        # Requires: nftables, and Requires(post): systemd - which is what
+        # lets %sysusers_create_compat do real work in %post instead of
+        # failing into its `|| :`. The selinux subpackage drags
+        # selinux-policy-targeted in, and its %post runs `semodule -n`: a
+        # write into the on-disk module store, never a policy load. Loading
+        # needs a kernel with SELinux, which a container does not get -
+        # that half is exactly what packaging/selinux/TESTING.md exists for.
+        run: |
+          set -eux
+          dnf -y install \
+            /home/builder/rpmbuild/RPMS/x86_64/colony-firewall-control-[0-9]*.rpm \
+            /home/builder/rpmbuild/RPMS/noarch/colony-firewall-control-selinux-*.rpm
+
+      - name: Binaries exist and say the packaged version
+        # --version only where clap provides it (the daemon and the CLI).
+        # The GUI and tray are checked for presence and mode alone: neither
+        # takes --version, and starting either headless tests a display
+        # server, not a package.
+        run: |
+          set -eux
+          test -x /usr/bin/colony-firewalld
+          test -x /usr/bin/colony-firewall
+          test -x /usr/bin/colony-firewall-tray
+          test -x /usr/bin/cfc
+          /usr/bin/colony-firewalld --version | grep -F "${VERSION}"
+          /usr/bin/cfc --version | grep -F "${VERSION}"
+
+      - name: Files landed where the units and macros put them
+        # Nothing is enabled or started, deliberately: there is no systemd
+        # running in here, and a fail-closed ruleset inside the job's own
+        # network namespace is a self-inflicted outage. Presence is the
+        # claim this step makes, and only presence.
+        run: |
+          set -eux
+          test -f /usr/lib/systemd/system/colony-firewalld.service
+          test -f /usr/lib/systemd/system/colony-firewall-nft.service
+          test -f /usr/lib/systemd/system/colony-firewall-nft-inbound.service
+          test -f /usr/lib/sysusers.d/colony-firewall.conf
+          test -f /etc/colony-firewall/daemon.toml
+          test -d /usr/lib/colony-firewall
+          test -f /usr/share/selinux/packages/targeted/colony_firewall.pp.bz2
+          # Printed, not asserted: whether `semodule -n` succeeds in a
+          # container is a property of selinux-policy's store layout, not of
+          # this package. The .pp.bz2 existence check above is the contract.
+          semodule -l | grep colony_firewall || echo "module not in the store (container)"
+
+      - name: Scriptlets did their work
+        # %sysusers_create_compat ends in `|| :`, so a failure there is
+        # silent by design. Either the group exists now or the scriptlet
+        # swallowed something, and this is the step that refuses to let it.
+        run: |
+          set -eux
+          getent group colony-firewall
+
+      - name: rpm -V is clean
+        # Mode, digest, size and mtime of everything packaged. A scriptlet
+        # that edited a packaged file, or an %install/%files disagreement,
+        # surfaces here as a one-letter code instead of on a user's machine.
+        run: |
+          set -eux
+          rpm -V colony-firewall-control
+          rpm -V colony-firewall-control-selinux
+
+      - name: Keep the RPMs
+        # The artifact is what lets the enforcing-host validation
+        # (packaging/selinux/TESTING.md) start from an installable package
+        # instead of a toolchain bootstrap. Fedora RPMs, so they fit a
+        # Fedora VM; a Rocky 9 host still has to build by hand until
+        # rust-toolset is tried.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rpms-fedora
+          path: |
+            /home/builder/rpmbuild/RPMS/**/*.rpm
+            /home/builder/rpmbuild/SRPMS/*.rpm
+          if-no-files-found: error
 
   version-agrees:
     name: version agrees with Cargo.toml
