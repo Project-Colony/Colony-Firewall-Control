@@ -2044,10 +2044,11 @@ pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult
     Ok(())
 }
 
-/// Largest binary the daemon will hash, mirrored here so `--pin-hash` cannot
-/// write a rule the daemon can never satisfy. Keep in step with
-/// `process_resolve::SHA256_MAX_LEN`.
-const SHA256_MAX_LEN: u64 = 64 * 1024 * 1024;
+/// Largest binary the daemon will hash, so `--pin-hash` cannot write a rule
+/// the daemon can never satisfy. The shared constant replaced a mirrored
+/// value whose "keep in step" comment was the only thing holding the two
+/// sides together.
+const SHA256_MAX_LEN: u64 = cfc_core::rule::SHA256_MAX_LEN;
 
 /// Streaming sha256 of a file, as lowercase hex.
 ///

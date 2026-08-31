@@ -117,16 +117,24 @@ should notice it has no resolvable theme icon and say so.
 
 ## 6. Verify the CI that was written for this
 
-Neither `.github/workflows/ebpf.yml` nor `.github/workflows/rhel.yml` has ever
-executed - a workflow cannot be run from a working tree. The YAML parses, the
-shell helpers run clean locally, and every ci-kernels digest (including the new
-5.10 entry) was resolved against the registry by hand. **Expect one round of
-correction on the first push**, most likely in the Rocky container's `dnf`
-invocation or in an interface name the SELinux module gets wrong.
+Done, the hard way. "Expect one round of correction on the first push" was
+optimistic by a factor of nine: the vm matrix and selinux jobs took nine
+rounds (#23), and nearly every round's error was another bug's mask - a
+docker invocation, an ext4 guest that became a cpio initramfs, a mute
+console, a glibc floor, a loopback nobody raised, one possessive apostrophe
+inside an m4-quoted interface body, and a guest verdict that trusted qemu's
+exit code. The predicted failure points (the Rocky dnf invocation, a wrong
+interface name) were not among them. Every job has since run green
+repeatedly, including the five-kernel matrix with enforcement-attach
+assertions and both selinux containers; `release.yml`'s eBPF steps and the
+Arch packaging path (`makepkg`, `namcap`, `50-strip.sh` on the BPF object)
+were exercised for real by the v0.2.3 release, which took five tag attempts
+of its own.
 
-Also unverified: the eBPF build steps added to `release.yml`, and Arch
-packaging end to end (`makepkg`, `namcap`, and what `50-strip.sh` does to a BPF
-object).
+What this bought beyond green squares: the CI now asserts things it only
+appeared to before - the LLVM pairing check could never fire, CFC_EXIT=0
+covered a test filter matching zero tests, and the kernel matrix never
+checked that enforcement attached. All three assert for real now.
 
 ---
 

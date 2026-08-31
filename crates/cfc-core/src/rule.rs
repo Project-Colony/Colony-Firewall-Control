@@ -70,6 +70,18 @@ pub struct RuleScope {
     pub protocol: Option<crate::Protocol>,
 }
 
+/// Largest executable either side will hash for an `exe_sha256` predicate.
+///
+/// One constant, two enforcers, and they must agree: the daemon refuses to
+/// hash a running image past this (a hash-scoped rule then abstains and the
+/// packet path decides), and the CLI's `--pin-hash` refuses to *create* a
+/// rule past it - otherwise the CLI could happily pin a digest the daemon
+/// will never compute, producing a rule that lists, ranks, and never fires.
+/// The two copies lived in their own crates for a while with a keep-in-step
+/// comment doing the work of a type system; this is the constant that
+/// comment described.
+pub const SHA256_MAX_LEN: u64 = 64 * 1024 * 1024;
+
 /// Canonical form of an `exe_sha256` predicate: 64 lowercase hex characters.
 ///
 /// The daemon computes digests in lowercase hex and matches by exact string

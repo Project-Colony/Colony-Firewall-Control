@@ -815,6 +815,13 @@ fn attach_one(
         .try_into()
         .map_err(anyhow::Error::new)
         .with_context(|| format!("{name} link is not fd-based (needs kernel >= 5.7)"))?;
+    // On failure this does NOT leave the program attached-but-unpinned:
+    // `pin` consumes the link, the error path drops it, and dropping the last
+    // fd of a taken link detaches the program - so the Single-mode cgroup
+    // slot frees and the caller's `_basic` fallback attaches cleanly. Worth
+    // stating because the opposite reading (attached ghost holding the slot,
+    // fallback dying on EEXIST) is the natural first guess, and disproving it
+    // took a walk through aya's ownership rather than through this file.
     fd_link
         .pin(pin)
         .map_err(anyhow::Error::new)

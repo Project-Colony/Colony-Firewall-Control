@@ -299,6 +299,12 @@ jobs:
           set -o pipefail
           runuser -u builder -- makepkg --printsrcinfo | tee .SRCINFO
           grep -q '^pkgbase = colony-firewall-control$' .SRCINFO
+          # An undotted copy is what gets attached: GitHub renames dot-leading
+          # asset filenames (`.SRCINFO` became `default.SRCINFO`), so the
+          # published name never matched what the README told people to
+          # download. Ship a name GitHub keeps; the AUR checkout renames it
+          # back to `.SRCINFO` locally.
+          cp .SRCINFO SRCINFO
 
       - name: namcap the PKGBUILD
         working-directory: pkg
@@ -354,4 +360,4 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: |
             pkg/PKGBUILD
-            pkg/.SRCINFO
+            pkg/SRCINFO

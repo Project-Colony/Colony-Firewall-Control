@@ -93,8 +93,10 @@ const PROCESS_CACHE_TTL: Duration = Duration::from_secs(5);
 /// rule predicate, and a hash-scoped rule abstains when the hash is unknown.
 const SHA_CACHE_TTL: Duration = Duration::from_secs(u64::MAX / 2);
 
-/// Don't hash executables larger than this.
-const SHA256_MAX_LEN: u64 = 64 * 1024 * 1024;
+/// Don't hash executables larger than this. Shared with the CLI's
+/// `--pin-hash` (`cfc_core::rule`), which must refuse to create what this
+/// side would refuse to compute.
+const SHA256_MAX_LEN: u64 = cfc_core::rule::SHA256_MAX_LEN;
 
 const CACHE_CAP: usize = 1024;
 
