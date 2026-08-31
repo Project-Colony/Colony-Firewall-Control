@@ -266,6 +266,14 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
         body.push('\n');
         body.push_str(exe);
     }
+    // Said before the buttons, because it changes what Allow means: the
+    // daemon judged this path rewritable by a non-root user, so an Allow
+    // will bind to the binary's current hash - a replaced file prompts
+    // again instead of inheriting the access.
+    if ev.binds_to_hash {
+        body.push('\n');
+        body.push_str("Allow will pin to this binary (user-writable path)");
+    }
     let remaining = ev.deadline_unix_ms.saturating_sub(now_unix_ms);
     let timeout_ms = remaining.clamp(i64::from(MIN_PROMPT_TIMEOUT_MS), i64::from(u32::MAX)) as u32;
     PromptNotification {
@@ -716,6 +724,7 @@ mod tests {
                 ..Default::default()
             }),
             deadline_unix_ms,
+            ..Default::default()
         }
     }
 
