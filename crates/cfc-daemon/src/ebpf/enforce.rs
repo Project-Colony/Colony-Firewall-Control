@@ -227,13 +227,16 @@ impl VerdictSink {
         // and it is what survives this daemon.
         self.compile_rules();
 
+        // No early return on an empty live list. There used to be one, and it
+        // was wrong in exactly the state this function's own orphan comment
+        // describes: after a restart the proc table is empty while the pinned
+        // map holds every inherited entry, so the first rule deletion arrived
+        // here, saw nothing live, and left - and the kernel went on refusing a
+        // program no rule denied. When exec tracking is down entirely the
+        // table is empty *forever*, which made that permanent. The live loop
+        // below no-ops on an empty list by itself; the orphan sweep is the
+        // part that must run precisely then.
         let live = self.table.live_processes(Instant::now());
-        if live.is_empty() {
-            // Either nothing is tracked or the exec tracepoint is not feeding
-            // the table. Writing nothing is right in both cases: the packet
-            // path still decides, which is where it decided before.
-            return;
-        }
         let mut denied = 0usize;
         let mut map = self.map.lock();
         for proc in &live {
@@ -248,18 +251,24 @@ impl VerdictSink {
                 exe: exe.to_path_buf(),
                 ..Process::unknown(proc.pid)
             };
-            let deny = matches!(
-                self.engine.process_wide_action(&as_process),
-                Some(Action::Deny | Action::Reject)
-            );
-            let r = if deny {
-                denied += 1;
-                map.insert(proc.pid, cfc_ebpf_common::verdict::DENY, 0)
-            } else {
-                clear(&mut map, proc.pid)
+            // The same three-way answer as the orphan branch below, because
+            // these are the same question at different ages. This loop used
+            // to collapse it to deny-or-clear, so a hash-scoped rule that
+            // made the engine abstain *cleared* a standing kernel deny for a
+            // recently-exec'd process while the orphan branch kept it for an
+            // old one - identical binary, identical rules, opposite
+            // enforcement, selected by exec age.
+            let r = match self.engine.process_wide_action(&as_process) {
+                Some(Action::Deny | Action::Reject) => {
+                    denied += 1;
+                    map.insert(proc.pid, cfc_ebpf_common::verdict::DENY, 0)
+                }
+                Some(_) => clear(&mut map, proc.pid),
+                None if self.engine.deny_still_possible_for(&as_process) => Ok(()),
+                None => clear(&mut map, proc.pid),
             };
             if let Err(e) = r {
-                warn!(pid = proc.pid, deny, "verdict resync failed: {e}");
+                warn!(pid = proc.pid, "verdict resync failed: {e}");
             }
         }
         // And the entries the live list does not cover.
@@ -285,7 +294,14 @@ impl VerdictSink {
             .collect();
         drop(map);
 
-        let mut doomed = Vec::new();
+        // Each doomed pid carries the start time it was judged at, so the
+        // final pass can tell "still the process I judged" from "the kernel
+        // recycled this pid while I was reading /proc". The window is real:
+        // this loop does per-pid /proc work over a potentially large orphan
+        // set, and on_exec plus the pinned exec program keep writing fresh
+        // verdicts the whole time. Clearing unconditionally at the end erased
+        // a DENY installed for the pid's *new* owner.
+        let mut doomed: Vec<(u32, Option<u64>)> = Vec::new();
         for pid in orphans {
             // Evaluate the process as it actually is, not as a stripped-down
             // guess. Reading the uid matters: `process_wide_action` answers
@@ -294,8 +310,22 @@ impl VerdictSink {
             // was never meant to lift, which is the fail-open direction.
             let Some(exe) = std::fs::read_link(format!("/proc/{pid}/exe")).ok() else {
                 // Gone. Clear, or a recycled pid inherits its answer.
-                doomed.push(pid);
+                doomed.push((pid, None));
                 continue;
+            };
+            // The kernel appends " (deleted)" once the binary is replaced on
+            // disk - a package upgrade under a running program, which
+            // process_resolve calls Tuesday on a rolling distribution. Rules
+            // match on exact path equality, so the raw suffixed path matched
+            // no rule and abstained for none: the sweep then read a standing
+            // deny for the *upgraded* binary as a deleted rule and cleared
+            // it. Same normalization as process_resolve, same reason.
+            let exe = {
+                let s = exe.to_string_lossy();
+                match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
+                    Some(stripped) => std::path::PathBuf::from(stripped),
+                    None => exe,
+                }
             };
             let proc = Process {
                 exe,
@@ -303,18 +333,21 @@ impl VerdictSink {
                 ..Process::unknown(pid)
             };
             // `None` is two opposite answers and they must not be conflated.
-            // An abstention - a hash-scoped rule the sweep cannot decide -
-            // keeps the entry: clearing would lift a refusal nobody replaced.
-            // But "no rule matched at all" is the *deleted rule*, and that is
-            // the case this sweep exists for - nobody replaces a deny with an
-            // explicit allow, they delete it. Reading `None` as "keep" made
-            // the sweep fail at its one job whenever a rule was removed.
+            // An abstention that could still resolve to a refusal - a
+            // hash-scoped deny the sweep cannot decide - keeps the entry:
+            // clearing would lift a refusal nobody replaced. But "no rule
+            // matched at all" is the *deleted rule*, and that is the case
+            // this sweep exists for - nobody replaces a deny with an explicit
+            // allow, they delete it. Reading `None` as "keep" made the sweep
+            // fail at its one job whenever a rule was removed; reading every
+            // abstention as "keep" then pinned stale denies on the strength
+            // of allow rules that could never justify one.
             match self.engine.process_wide_action(&proc) {
                 Some(Action::Deny | Action::Reject) => {}
-                Some(_) => doomed.push(pid),
+                Some(_) => doomed.push((pid, proc_starttime(pid))),
                 None => {
-                    if !self.engine.has_undecidable_rule_for(&proc) {
-                        doomed.push(pid);
+                    if !self.engine.deny_still_possible_for(&proc) {
+                        doomed.push((pid, proc_starttime(pid)));
                     }
                 }
             }
@@ -322,7 +355,17 @@ impl VerdictSink {
 
         if !doomed.is_empty() {
             let mut map = self.map.lock();
-            for pid in doomed {
+            for (pid, judged_at) in doomed {
+                // Clear only what was judged. A process existing NOW with a
+                // different start time - or existing at all where "gone" was
+                // judged - is a new owner of a recycled pid, and its verdict
+                // was written by its own exec flow. A pid that has no process
+                // now still clears: the judged one exiting in the window only
+                // strengthens the judgment.
+                let now = proc_starttime(pid);
+                if now.is_some() && now != judged_at {
+                    continue;
+                }
                 let _ = clear(&mut map, pid);
             }
         }
@@ -352,11 +395,47 @@ impl VerdictSink {
     /// anything closer to what a Reject rule promises - an immediate error
     /// rather than a silent timeout - than the injected RST it replaces.
     pub(super) fn on_exec(&self, pid: u32, proc: &Process) {
+        // Decide on the path /proc reports, not the string execve() was
+        // handed. The event's path may be a symlink (/usr/bin/python3 ->
+        // python3.12) while rules written from prompts carry the resolved
+        // target - so deciding on the event string meant a prompt-created
+        // "block always" never engaged in-kernel for symlink-invoked
+        // programs, and a CLI rule naming the symlink denied a process the
+        // packet path would have prompted for. This read also corrects the
+        // kernel's own precommit, which can only hash the execve string: by
+        // the time this runs, whatever the exec program wrote for a
+        // mismatched spelling is overwritten or cleared. The residual window
+        // is the exec-to-consumer latency, and the packet path covers it.
+        let resolved = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|exe| {
+                let s = exe.to_string_lossy();
+                match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
+                    Some(stripped) => std::path::PathBuf::from(stripped),
+                    None => exe,
+                }
+            });
+        // When /proc is unreadable, the process already exec'd again or
+        // exited; the event's own path is the only witness left, and a wrong
+        // decision for a dead pid is cleaned by the exit program or the next
+        // sweep.
+        let corrected = match resolved {
+            Some(exe) if exe != proc.exe => Some(Process { exe, ..proc.clone() }),
+            _ => None,
+        };
+        let as_process = corrected.as_ref().unwrap_or(proc);
         let deny = matches!(
-            self.engine.process_wide_action(proc),
+            self.engine.process_wide_action(as_process),
             Some(Action::Deny | Action::Reject)
         );
         let mut map = self.map.lock();
+        // Two-way, not three-way like resync: an abstention here still
+        // clears. The difference is principled, not an oversight - any
+        // existing entry for this pid was written for the binary it just
+        // exec'd AWAY from, so there is no standing refusal for the current
+        // binary to preserve; keeping it would enforce the predecessor's
+        // verdict on its successor. The packet path decides the ambiguous
+        // case with the real hash in hand.
         let r = if deny {
             map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
         } else {
@@ -365,7 +444,7 @@ impl VerdictSink {
         if let Err(e) = r {
             warn!(pid, deny, "could not update the in-kernel verdict: {e}");
         } else if deny {
-            debug!(pid, exe = %proc.exe.display(), "in-kernel deny installed");
+            debug!(pid, exe = %as_process.exe.display(), "in-kernel deny installed");
         }
     }
 
@@ -498,6 +577,23 @@ fn proc_uid(pid: u32) -> Option<u32> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Start time of a live process (clock ticks since boot, field 22 of
+/// `/proc/<pid>/stat`), or `None` when the process is gone.
+///
+/// This is the one property of a pid the kernel never recycles within a boot:
+/// two processes may share a pid across time, never a (pid, starttime) pair.
+/// The orphan sweep compares it across its judge-then-clear window so a clear
+/// aimed at one process cannot land on the pid's next owner.
+fn proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field is parenthesised and may itself contain spaces and
+    // parentheses, so counting fields from the LEFT miscounts for a process
+    // named, say, ":-) 1 2 3". Everything after the last ')' is fixed-format;
+    // starttime is the 20th field from there (22nd overall).
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Removes `pid`'s entry, treating "there was no entry" as success.
@@ -635,8 +731,44 @@ fn unpin_other_versions(namespace: &Path) {
 
 /// True when both link pins are present, i.e. a previous daemon left
 /// enforcement running and this one should steer it rather than replace it.
+///
+/// Exactly one pin present is a half-attached leftover - a daemon that died
+/// between pinning connect4 and pinning connect6 - and it does not count as
+/// attached. [`attach`] removes it before attaching fresh; without that, the
+/// lone pin held the cgroup's Single-mode slot, every later start failed with
+/// EEXIST, and the stale program went on refusing IPv4 connect() from the
+/// shared pinned map with no daemon steering it and nobody consuming its deny
+/// events. That state never healed short of `rm` under bpffs or a reboot.
 pub(super) fn already_attached(dir: &Path) -> bool {
     dir.join("connect4").exists() && dir.join("connect6").exists()
+}
+
+/// Unpins any lone connect-link leftovers so a fresh attach starts clean.
+///
+/// Removing a pinned link drops the kernel's last reference and detaches the
+/// program, so the half that was still enforcing IPv4 stops for the moment
+/// between this and the attach a few lines later. That brief gap - covered by
+/// the packet path like any other unenforced moment - is the price of not
+/// being wedged forever.
+fn drop_half_attached(dir: &Path) {
+    for name in ["connect4", "connect6"] {
+        let pin = dir.join(name);
+        if !pin.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&pin) {
+            Ok(()) => warn!(
+                "removed a half-attached {name} pin at {}; a previous daemon \
+                 died mid-attach and its leftover held the cgroup slot",
+                pin.display()
+            ),
+            Err(e) => warn!(
+                "could not remove the stale {name} pin at {}: {e}; \
+                 the attach below will likely fail with EEXIST",
+                pin.display()
+            ),
+        }
+    }
 }
 
 /// Loads, attaches and pins one `cgroup/connect*` program.
@@ -704,7 +836,15 @@ pub(super) fn attach(
     let cgroup = std::fs::File::open(&root)
         .with_context(|| format!("opening cgroup v2 root {}", root.display()))?;
 
+    // This function only runs when already_attached() said no - which
+    // includes the half-attached case, where one leftover pin would make
+    // every attach below fail with EEXIST forever.
+    if let Some(dir) = dir {
+        drop_half_attached(dir);
+    }
+
     let mut out = Vec::with_capacity(2);
+    let mut pinned: Vec<std::path::PathBuf> = Vec::with_capacity(2);
     for (name, basic, pin_name) in [
         (PROG_CONNECT4, PROG_CONNECT4_BASIC, "connect4"),
         (PROG_CONNECT6, PROG_CONNECT6_BASIC, "connect6"),
@@ -714,20 +854,41 @@ pub(super) fn attach(
         // answer on a kernel without `bpf_get_socket_cookie` for sock_addr
         // programs, not a bug - so it downgrades to the `_basic` twin rather
         // than failing the layer. Any error on the *fallback* is real and
-        // propagates.
+        // propagates - after unwinding whatever this loop already pinned, or
+        // the failure itself would manufacture the half-attached state the
+        // cleanup above exists to remove.
         let insns = match attach_one(bpf, name, &cgroup, pin.as_deref()) {
             Ok(i) => {
+                if let Some(p) = &pin {
+                    pinned.push(p.clone());
+                }
                 out.push((name.to_string(), i));
                 continue;
             }
             Err(first) => {
+                // Not "did not verify": attach_one can fail past the verifier
+                // (the attach itself, taking the link, pinning), and claiming
+                // a verifier rejection for an EEXIST sent a reader hunting a
+                // program bug where there was a state bug.
                 warn!(
-                    "{name} did not verify ({first:#}); attaching {basic} - \
-                     enforcement is unaffected, O(1) attribution is unavailable"
+                    "{name} could not load or attach ({first:#}); attaching \
+                     {basic} - enforcement is unaffected, O(1) attribution is \
+                     unavailable"
                 );
-                attach_one(bpf, basic, &cgroup, pin.as_deref())?
+                match attach_one(bpf, basic, &cgroup, pin.as_deref()) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        for p in &pinned {
+                            let _ = std::fs::remove_file(p);
+                        }
+                        return Err(e);
+                    }
+                }
             }
         };
+        if let Some(p) = &pin {
+            pinned.push(p.clone());
+        }
         out.push((basic.to_string(), insns));
     }
     Ok(out)
