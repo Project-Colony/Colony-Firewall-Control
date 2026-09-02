@@ -13,7 +13,7 @@ name = "colony-firewall"
 path = "src/main.rs"
 
 [dependencies]
-colony-ui = "0.1.4"
+colony-ui = "0.1.5"
 cfc-core = { path = "../cfc-core" }
 cfc-proto = { path = "../cfc-proto" }
 cfc-client = { path = "../cfc-client" }
