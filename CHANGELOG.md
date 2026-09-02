@@ -6,6 +6,32 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-02
+
+### Added
+
+- **Hash-bound prompt allows.** Answering a prompt for a user-writable binary
+  now binds the rule to the binary's sha256 rather than to its path, so a
+  replacement does not inherit the permission the user granted the original.
+- **Tray icon fallback**, so the indicator still appears where the themed icon
+  cannot be loaded.
+- **RPM packaging**, built end to end in CI alongside the Arch package.
+
+### Fixed
+
+- **Forty-seven findings from an adversarial audit of the 0.2.x line.** The
+  one critical: the SELinux policy granted three capabilities it did not need.
+- The VM matrix and SELinux CI jobs, whose failures had been masking each
+  other across nine rounds.
+
+### Internals
+
+- The parchment palette now comes from `colony-ui` rather than from eleven
+  hand-maintained constants in `cfc-ui`. The eleven names and their values are
+  unchanged, so no call site moved.
+- `colony-ui` 0.1.4, which fixes six palettes whose progress-bar track was the
+  same colour as the card it sat on.
+
 ## [0.2.3] - 2026-08-27
 
 ### Added

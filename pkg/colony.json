@@ -1,7 +1,7 @@
 {
   "id": "colony-firewall-control",
   "name": "Colony Firewall Control",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Application-aware outbound firewall for Linux. Per-app prompts, persistent rules, live connection feed.",
   "license": "GPL-3.0-or-later",
   "homepage": "https://github.com/Project-Colony/Colony-Firewall-Control",
@@ -11,7 +11,7 @@
   "tags": ["firewall", "security", "network", "outbound", "opensnitch"],
   "platforms": {
     "linux-x86_64": {
-      "asset": "colony-firewall-control-0.2.3-linux-x86_64.tar.zst",
+      "asset": "colony-firewall-control-0.3.0-linux-x86_64.tar.zst",
       "binaries": ["colony-firewalld", "colony-firewall", "colony-firewall-tray", "cfc"],
       "installPath": "/usr/bin",
       "postInstall": [
