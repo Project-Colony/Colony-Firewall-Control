@@ -6,62 +6,28 @@
 use iced::widget::{button, container, progress_bar};
 use iced::{theme::Palette, Background, Border, Color, Shadow, Theme, Vector};
 
-pub const PARCHMENT_BG: Color = Color::from_rgb(
-    0xf2 as f32 / 255.0,
-    0xe9 as f32 / 255.0,
-    0xd0 as f32 / 255.0,
-);
-pub const PARCHMENT_DARK: Color = Color::from_rgb(
-    0xe6 as f32 / 255.0,
-    0xd9 as f32 / 255.0,
-    0xb6 as f32 / 255.0,
-);
-pub const PARCHMENT_DARKER: Color = Color::from_rgb(
-    0xd9 as f32 / 255.0,
-    0xc6 as f32 / 255.0,
-    0x9a as f32 / 255.0,
-);
-pub const PARCHMENT_TEXT: Color = Color::from_rgb(
-    0x2b as f32 / 255.0,
-    0x1d as f32 / 255.0,
-    0x0e as f32 / 255.0,
-);
-pub const PARCHMENT_MUTED: Color = Color::from_rgb(
-    0x6e as f32 / 255.0,
-    0x5a as f32 / 255.0,
-    0x3e as f32 / 255.0,
-);
-pub const BURGUNDY: Color = Color::from_rgb(
-    0x80 as f32 / 255.0,
-    0x1f as f32 / 255.0,
-    0x2c as f32 / 255.0,
-);
-pub const BURGUNDY_DARK: Color = Color::from_rgb(
-    0x5a as f32 / 255.0,
-    0x12 as f32 / 255.0,
-    0x1c as f32 / 255.0,
-);
-pub const INK_GREEN: Color = Color::from_rgb(
-    0x3c as f32 / 255.0,
-    0x5a as f32 / 255.0,
-    0x3b as f32 / 255.0,
-);
-pub const AMBER: Color = Color::from_rgb(
-    0xb8 as f32 / 255.0,
-    0x73 as f32 / 255.0,
-    0x33 as f32 / 255.0,
-);
-#[allow(dead_code)]
-pub const FADED: Color = Color::from_rgb(
-    0xb8 as f32 / 255.0,
-    0x99 as f32 / 255.0,
-    0x6a as f32 / 255.0,
-);
-pub const HAIRLINE: Color = Color::from_rgb(
-    0xc2 as f32 / 255.0,
-    0xaa as f32 / 255.0,
-    0x7a as f32 / 255.0,
-);
+/// The Parchment palette, from the shared design tokens.
+///
+/// These eleven names were eleven hand-written `Color::from_rgb` literals. They
+/// are the same eleven colours — the family in Project-Colony-Resources was
+/// derived from them — but they are now one definition instead of two, and the
+/// twenty-seven fields they imply come with them for anything that needs more
+/// than a burgundy and a parchment — FADED went with this change, unused, and
+/// is `PARCHMENT.text_dimmer` if it is ever wanted back.
+///
+/// Still `const`, so nothing that used them had to change.
+const PARCHMENT: colony_ui::ThemePalette = colony_ui::ThemePalette::PARCHMENT_LIGHT;
+
+pub const PARCHMENT_BG: Color = PARCHMENT.bg_primary;
+pub const PARCHMENT_DARK: Color = PARCHMENT.bg_sidebar;
+pub const PARCHMENT_DARKER: Color = PARCHMENT.bg_card_pressed;
+pub const PARCHMENT_TEXT: Color = PARCHMENT.text_primary;
+pub const PARCHMENT_MUTED: Color = PARCHMENT.text_muted;
+pub const BURGUNDY: Color = PARCHMENT.accent_blue;
+pub const BURGUNDY_DARK: Color = PARCHMENT.btn_trash_pressed;
+pub const INK_GREEN: Color = PARCHMENT.success;
+pub const AMBER: Color = PARCHMENT.warning;
+pub const HAIRLINE: Color = PARCHMENT.border_subtle;
 
 pub fn parchment() -> Theme {
     Theme::custom(
