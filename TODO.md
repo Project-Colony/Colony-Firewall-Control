@@ -20,14 +20,36 @@ longer lifts anything; `nft delete table` no longer lifts the denies it holds.
 Two pieces of it are deliberately not done, and both are real work rather than
 oversights:
 
-**1a. An in-kernel *allow* buys nothing yet.** The connect hook cannot skip
-NFQUEUE, so a pre-approved program still takes a userspace round trip per
-connection - which is the actual latency cost of CFC, and it is paid dozens of
-times per page load in a browser. Making it real needs
-`bpf_setsockopt(SO_MARK)` on the connect path plus an nft rule that accepts the
-mark before the queue rule. That is a performance change with a
-traffic-bypasses-the-firewall blast radius, so it wants its own change and its
-own tests, not a line in this one.
+**1a. An in-kernel *allow* now buys the round trip - opt-in.** Done, along
+the line sketched here (`bpf_setsockopt(SO_MARK)` on the connect path, an nft
+rule ahead of the queue), and then reshaped by an adversarial review of the
+design that stood 59 objections before a line was written. The three that
+could not be patched, and what replaced them:
+
+- *The mark lives on the socket, not in the map.* Revoking a grant left every
+  already-marked socket marked, and an fd inherited across `execve` carried
+  the bypass to a binary that earned nothing. So the mark is re-decided - set
+  or stripped - at every flow start, `connect()` and `sendmsg()` alike, and
+  sockets already carrying someone else's mark (a VPN, a proxy) are left
+  alone in both directions.
+- *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
+  default. A published mark value is a bypass token. The value is drawn at
+  random per start and lives in a pinned map and an nftables set, never in a
+  package.
+- *A static accept rule is a token on every install.* The snippet ships the
+  set empty; the daemon fills it only when the path is armed - the one thing
+  the daemon does to nftables.
+
+Grants are cleared in the kernel on exec and exit, so no daemon is needed for
+the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline refreshed every 10 s
+makes a dead daemon fail-closed within 60 s; and the path stays off - with
+the reason in `cfc status` - unless enforcement is pinned, exit is detected
+exactly (`group_dead`), the cookie connect variants verified, and
+`[ebpf] fast_allow` is set. **Off by default** for this release: the
+blast radius named above has not changed, only its edges. What is not done:
+the latency win is not yet *measured* on the veth bench - the number that
+justifies the feature is still the pre-feature 0.28 ms per new flow - and 1b
+below is untouched.
 
 **1b. Rules that depend on a destination still cannot be precomputed.**
 `process_wide_action` deliberately answers `None` for them, which is correct and
@@ -58,12 +80,14 @@ rule enforced is an outage, not a log line), one exercise per policy group,
 missing rule it finds is a bug in `packaging/selinux/colony_firewall.te`,
 not something to add locally.
 
-**2b. Written, awaiting its first green run - the `rpm end to end (fedora)`
-job in `rhel.yml` builds, installs and verifies the RPM end to end.** This
-file has been burned once by declaring CI verified before it ran (see
-section 6: "expect one round" became nine), so: the job exists, every local
-check passes, and "done" is one green run away, not here yet.
-`rpmbuild -ba` in a Fedora container (the
+**2b. Done - the `rpm end to end (fedora)` job in `rhel.yml` builds,
+installs and verifies the RPM end to end, and has run green on every push
+since.** It took three rounds to get there, none at a predicted failure
+point: git's dubious-ownership refusal inside the container, then a
+`pkgconfig(systemd)` build dependency Fedora 44's generator injects that the
+spec never declares. (This file had been burned once by declaring CI verified
+before it ran - see section 6 - so the previous wording here was "one green
+run away"; the run came.) `rpmbuild -ba` in a Fedora container (the
 tarball laid out the way `%autosetup` expects, built as an unprivileged
 user), then a real `dnf install` of both packages: binaries report the
 packaged version, units and the sysusers file land where the spec says, the

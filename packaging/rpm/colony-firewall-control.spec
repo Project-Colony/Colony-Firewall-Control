@@ -51,10 +51,12 @@ the way Windows Firewall Control does, and remembers the answer per executable.
 
 Filtering happens in nftables via NFQUEUE; the daemon attributes each flow to
 the process that opened it and either applies a stored rule or prompts. On a
-kernel with BPF available it additionally attaches five small eBPF programs:
-three that improve attribution and hostname resolution, and two that refuse
+kernel with BPF available it additionally attaches seven small eBPF programs:
+three that improve attribution and hostname resolution, two that refuse
 connect(2) in the kernel for programs already denied - pinned to bpffs, so
-those denials survive the daemon being killed.
+those denials survive the daemon being killed - and, with the opt-in fast
+path, two more that let a program a lasting rule allows outright skip the
+queue entirely.
 
 The ruleset is fail-closed. If the daemon is not running, new outbound
 connections are dropped rather than allowed.
@@ -73,9 +75,10 @@ SELinux policy module for Colony Firewall Control.
 
 Confines the daemon to what it actually needs: netlink_netfilter and raw
 sockets, bpf() and perf_event_open(), the bpffs pin directory, other domains'
-/proc entries for attribution, and a read-only rpm query for package
-provenance. CAP_SYS_ADMIN is deliberately not granted; that it is unnecessary
-is covered by a test rather than assumed.
+/proc entries for attribution, a read-only rpm query for package provenance,
+and running nft(8) to add and remove the one nftables set element the opt-in
+fast path uses. CAP_SYS_ADMIN is deliberately not granted; that it is
+unnecessary is covered by a test rather than assumed.
 
 %prep
 %autosetup -n Colony-Firewall-Control-%{version}

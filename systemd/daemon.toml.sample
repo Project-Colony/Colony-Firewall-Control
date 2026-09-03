@@ -209,9 +209,15 @@ enabled = true
 # #     rule into a boundary.
 # #
 # # WHAT IT DOES NOT DO
-# # It does not filter, and it cannot. Verdicts still come from NFQUEUE. It
-# # also does not remove the socket -> pid step, because NFQUEUE hands the
-# # daemon a packet, not a pid.
+# # It does not replace NFQUEUE. Two decisions do happen in the kernel: a
+# # program a rule denies outright is refused at connect() before a packet
+# # exists (and keeps being refused after the daemon dies - the link is
+# # pinned), and with fast_allow on, a program a lasting rule allows outright
+# # has its sockets marked so the ruleset accepts them ahead of the queue.
+# # Everything conditional - a destination, a port, a protocol, a prompt -
+# # is still decided per packet by the daemon. It also does not remove the
+# # socket -> pid step, because NFQUEUE hands the daemon a packet, not a pid;
+# # it only makes that step cheap.
 # #
 # # REQUIREMENTS - all of which degrade to a warning, never to a failure to
 # # start. If any of this is missing the daemon logs what it could not do and
@@ -240,6 +246,27 @@ enabled = true
 # # /usr/lib/colony-firewall/cfc-ebpf.o. Point it at
 # # `cargo xtask ebpf-path` output when working on the programs themselves.
 # object_path = "/usr/lib/colony-firewall/cfc-ebpf.o"
+# # Let a process-wide allow skip the queue entirely. Off unless you say so.
+# #
+# # With this on, a process that a rule allows outright - every destination,
+# # for as long as the rule lives; a timed allow keeps the queue so it expires
+# # to the second - has its sockets marked by the kernel at connect(), and the
+# # nftables snippet accepts the mark ahead of the queue. Nothing that process
+# # sends waits on the daemon any more, which is the largest latency this
+# # firewall adds.
+# #
+# # What you give up: those decisions no longer pass through the one path
+# # every other guarantee here rests on. The mark is a random value chosen at
+# # each daemon start and matched exactly, so a process with CAP_NET_RAW
+# # (enough to set SO_MARK since kernel 5.17, and granted by docker by default)
+# # cannot mint it without first learning it; and the connections it lets
+# # through are reported back over a ring buffer rather than seen on the
+# # packet path, so the live feed and the counters for those flows are only
+# # as timely as that consumer.
+# #
+# # Silently inert without the layer pinned or inherited, exit tracking and
+# # the cookie programs; `cfc status` prints the reason. Needs a restart.
+# fast_allow = false
 
 # Needs a restart (the socket is secured once, right after bind).
 [ipc]

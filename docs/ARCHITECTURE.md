@@ -50,6 +50,10 @@ headless machine gets a say.
 ```
 kernel (nftables OUTPUT hook)
    |
+   |  meta mark @fast_allow accept   (opt-in fast path: a socket the connect
+   |                                  hook marked for an already-allowed
+   |                                  process skips the queue; the set holds
+   |                                  one element while armed, none otherwise)
    |  ct state new   queue num 0
    v
 NFQUEUE 0
@@ -347,9 +351,20 @@ inert as one built with `--no-default-features`.
 | `tracepoint/sched/sched_process_exec` | `sched:sched_process_exec` | fills a pid -> (exe, comm, uid, gid, ppid) table |
 | `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts from that table |
 | `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads out; the daemon parses them and lifts the `A`/`AAAA` records |
+| `cgroup/connect4`, `cgroup/connect6` | cgroup v2 root, link **pinned** | refuse `connect()` for pids the daemon has denied outright, before a packet exists - and, under `[ebpf] fast_allow`, mark the sockets of pids a lasting rule allows outright |
+| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | the same mark decision for UDP that never calls `connect()`; no refusal |
 
-**This is enrichment, not a fast path.** Verdicts still come from NFQUEUE, and
-nothing here filters anything - the `cgroup_skb` program returns "pass"
+**Two decisions happen in the kernel; everything else is enrichment.** The
+connect hooks refuse a denied program's `connect()` with `EPERM` - pinned, so
+the refusal outlives the daemon - and, with one opt-in fast path, wave an
+allowed one past the queue. Every other verdict comes from NFQUEUE,
+with a single exception: under `[ebpf] fast_allow`, the sockets of a process
+the daemon has already ruled allowed process-wide are marked in the connect
+hook, and the snippet's `meta mark @fast_allow accept` rule takes them ahead
+of the queue. That set is the one thing the daemon ever writes to nftables -
+one element added when the path is armed, flushed at every start and at
+shutdown - and it ships empty, so a default install carries no bypass value.
+Nothing else here filters anything - the `cgroup_skb` program returns "pass"
 unconditionally. What the programs buy is *better answers to questions the
 daemon already asks*, and every one of them degrades independently: a missing
 object, no `CAP_BPF`, a kernel without BTF, a verifier rejection or a host with

@@ -6,6 +6,34 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Fast allow (opt-in, `[ebpf] fast_allow = true`).** A process a lasting
+  rule allows outright no longer pays an NFQUEUE round trip per connection:
+  the `cgroup/connect4|6` hooks (and new `sendmsg4|6` hooks, for UDP that
+  never calls `connect()`) mark its sockets with a value the daemon draws at
+  random on each start, and a `meta mark @fast_allow accept` rule the
+  snippet ships with an *empty* set takes them ahead of the queue. The mark
+  is re-decided at every flow start and stripped when the grant is gone; the
+  kernel clears grants on exec and exit by itself; and a `CLOCK_BOOTTIME`
+  deadline the daemon refreshes every 10 s means a dead daemon leaves the
+  machine fail-closed again within 60 s. Fast-allowed flows are reported on
+  a ring, so the live feed, rule hit counts and the `enforcing` heuristic
+  keep telling the truth. Off by default for this first release; `cfc
+  status` shows `fast-allow live` or `off: <the one reason>`.
+
+### Changed
+
+- **eBPF ABI v4.** New maps and programs the connect hooks read; v3 pins
+  would enforce fine and never mark, so a restarting daemon now replaces
+  them rather than inheriting them. `verdict::ALLOW`, matched by the kernel
+  and written by nobody for two releases, is gone.
+- The daemon now runs `nft` at start and stop to put its fast-allow value
+  into one set and take it out again - the first time it touches nftables;
+  the SELinux policy grants exactly that. The nftables snippet gains the
+  set and the accept rule; an older snippet leaves fast-allow off with the
+  reason spelled out.
+
 ## [0.3.0] - 2026-09-02
 
 ### Added
