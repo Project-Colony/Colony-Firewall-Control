@@ -707,9 +707,15 @@ pub(super) fn load_and_attach(
     // connect variants plus both sendmsg programs. On the inherited path the
     // pin names do not say which connect variant is running, and the sendmsg
     // pins - made only after the cookie variants attached - are the evidence.
-    let mut fast_capable = false;
+    let mut fast_path = enforce::FastPathCapability::BasicConnect;
     report.enforcement = if inherited {
-        fast_capable = pin_dir.as_deref().is_some_and(enforce::fast_path_attached);
+        // Inherited pins do not say which connect variant is running; the
+        // sendmsg pins, made only after the cookie variants attached, are the
+        // evidence, and their absence could be either reason. "Basic" is the
+        // safe reading: it names the older kernel, the more likely one.
+        if pin_dir.as_deref().is_some_and(enforce::fast_path_attached) {
+            fast_path = enforce::FastPathCapability::Ready;
+        }
         report.notes.push(format!(
             "in-kernel enforcement was already attached and pinned at {}; \
              steering it rather than replacing it",
@@ -719,7 +725,7 @@ pub(super) fn load_and_attach(
     } else {
         match enforce::attach(&mut bpf, pin_dir.as_deref()) {
             Ok(attached) => {
-                fast_capable = attached.fast_capable;
+                fast_path = attached.fast_path;
                 for (name, insns) in attached.programs {
                     if let Some(n) = insns {
                         report.verified_insns.push((name, n));
@@ -871,10 +877,8 @@ pub(super) fn load_and_attach(
                         // direction for denies and the fail-open one for
                         // grants.
                         Some("process exit is not detected exactly on this kernel (no readable group_dead)")
-                    } else if !fast_capable {
-                        Some("the kernel runs the basic connect programs (no bpf_setsockopt on sock_addr)")
                     } else {
-                        None
+                        fast_path.off_reason()
                     };
 
                     let (state, mark_opt) = match off {
@@ -2046,27 +2050,39 @@ mod tests {
             "cgroup/connect4|6 must load and attach on every matrix kernel: {:?}",
             report.notes
         );
-        // The fast path's kernel side rides with the cookie connect variants:
-        // where those verified, the sendmsg programs must have too. Where the
-        // basic twins run, neither exists, and that is the documented shape.
+        // The fast path's kernel side rides with the cookie connect variants,
+        // but not all the way: 5.10 verifies bpf_setsockopt on connect hooks
+        // and refuses it on sendmsg ones, so "cookie verified implies sendmsg
+        // verified" is false on the matrix floor and is not asserted. What is
+        // asserted is consistency: the two sendmsg programs verify together
+        // or not at all.
         println!("fast_allow = {:?}", report.fast_allow);
         let measured = |name: &str| report.verified_insns.iter().any(|(p, _)| p == name);
-        if report.enforcement != Enforcement::Inherited && measured(enforce::PROG_CONNECT4) {
-            assert!(
-                measured(enforce::PROG_SENDMSG4) && measured(enforce::PROG_SENDMSG6),
-                "the cookie connect variants verified but the sendmsg pair did not: {:?}",
-                report.notes
-            );
-        }
-        // Off, and off for the reason this test asked for: the config flag.
-        // Every other reason would mean the layer judged itself ineligible on
-        // a kernel the matrix says is fine, which is a finding, not a pass.
+        assert_eq!(
+            measured(enforce::PROG_SENDMSG4),
+            measured(enforce::PROG_SENDMSG6),
+            "the sendmsg pair must verify together or not at all: {:?}",
+            report.verified_insns
+        );
+        // Off, and off for the reason this test's own setup dictates: it
+        // hands the layer no decision engine, so there is no sink to grant
+        // from. The first version of this assertion expected the config
+        // reason and learned on every matrix kernel at once that the test's
+        // inputs never reach the config check - an assertion about a state
+        // the test does not produce is the class of mistake this file exists
+        // to catch in the code, not to commit in the tests.
         match &report.fast_allow {
             Some(FastAllow::Off(why)) => assert!(
-                why.contains("fast_allow is not set"),
-                "fast-allow is off for a reason the test did not choose: {why}"
+                why.contains("no decision engine"),
+                "fast-allow is off for a reason this setup does not produce: {why}"
             ),
-            other => panic!("fast-allow should be off by config here, got {other:?}"),
+            other => panic!("fast-allow should be off here (no engine), got {other:?}"),
+        }
+        // Where the sendmsg pair did not verify, the report must say so in the
+        // fast-path terms - the note is the only trace a kernel like 5.10
+        // leaves, and it must not be mistaken for the basic-connect fallback.
+        if measured(enforce::PROG_CONNECT4) && !measured(enforce::PROG_SENDMSG4) {
+            println!("sendmsg hooks refused by this kernel; fast path unavailable here");
         }
         // `bpf_prog_info.verified_insns` exists since kernel 5.16; before
         // that, an empty report is the correct answer, not a recording

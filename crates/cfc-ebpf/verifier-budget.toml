@@ -37,11 +37,14 @@ measured_on = "7.1.8"
 # every execve on the machine. The `EXE_RULES_ON` gate exists for exactly that:
 # the loop is skipped entirely on a host with no exe-scoped deny rule, which is
 # the common case.
-observed = 2355
+# 2355 before the fast path; the unconditional FAST_ALLOW delete on the exec
+# path is the difference.
+observed = 2388
 max = 3000
 
 [cfc_sched_process_exit]
-observed = 25
+# 25 before the fast path; one more map delete (FAST_ALLOW) per exit.
+observed = 52
 max = 200
 
 [cfc_dns_ingress]
@@ -64,27 +67,31 @@ max = 40000
 #
 # The cookie recording is what buys back the packet path's ~37 ms /proc walk per
 # new connection: 24 instructions (106 against the 82 the no-cookie twin costs)
-# for a measured 44.9 -> 4.3 ms median connect. The fast path buys back the
-# round trip itself for process-wide allows; its own number is filled in by the
-# first matrix run, which is also the first time a verifier judges it.
-#
-# `observed` is the pre-fast-path figure and is deliberately left so the delta
-# is visible in the diff that ships the measurement.
-observed = 106
+# for a measured 44.9 -> 4.3 ms median connect. The fast path - a mark map
+# read, a getsockopt, a set lookup, a deadline compare, a conditional
+# setsockopt and, on a honoured grant, a ring record - took it from 106 to
+# 318 on the first matrix run. Three times the instructions
+# for the whole round trip: still the cheapest millisecond on offer.
+observed = 318
 max = 450
 
 [cfc_connect6]
-# Three more than v4: the address copy is four words instead of one.
-observed = 109
+# A few more than v4: the address copy is four words instead of one.
+observed = 323
 max = 450
 
 # The mark decision alone: no deny lookup, no cookie, no ring record unless a
-# grant is honoured. Unmeasured until the matrix runs them; the ceiling is
-# the connect path's minus the parts they do not do.
+# grant is honoured. Note what the matrix taught on the first run: 5.10
+# refuses these outright - `unknown func bpf_getsockopt` on a sendmsg hook,
+# while the same helper verifies on the connect hooks of that kernel - and
+# 6.12 onward accepts them. That is why the fast path is off with its reason
+# on the matrix floor rather than half-present.
 [cfc_sendmsg4]
+observed = 257
 max = 350
 
 [cfc_sendmsg6]
+observed = 259
 max = 350
 
 # The no-cookie twins, for kernels whose verifier does not offer

@@ -1140,10 +1140,47 @@ fn attach_one(
 pub(super) struct AttachedPrograms {
     /// Every program attached, with its verified instruction count.
     pub programs: Vec<(String, Option<u32>)>,
-    /// True when the cookie connect variants *and* both sendmsg programs
-    /// attached - the kernel side of the fast path is in place. False means
-    /// enforcement is up on the `_basic` twins and the fast path is not.
-    pub fast_capable: bool,
+    /// Whether the kernel side of the fast path is in place, and if not, the
+    /// one sentence that says why - two different kernels give two different
+    /// answers, and reporting the wrong one sent a reader to the wrong
+    /// kernel version.
+    pub fast_path: FastPathCapability,
+}
+
+/// What this kernel's verifier let the fast path have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FastPathCapability {
+    /// Cookie connect variants and both sendmsg programs verified.
+    Ready,
+    /// The connect hooks fell back to the `_basic` twins: no socket cookie
+    /// and, in the same era of kernels, no `bpf_setsockopt` on sock_addr.
+    BasicConnect,
+    /// The connect hooks verified with the mark decision in them, but the
+    /// sendmsg hooks did not: this kernel allows `bpf_getsockopt` /
+    /// `bpf_setsockopt` on connect programs and not yet on UDP sendmsg ones.
+    /// Observed on 5.10 (`unknown func bpf_getsockopt#57`); 6.12 accepts.
+    /// The fast path needs both - a connected UDP socket can still `sendto`
+    /// another peer without re-passing the connect hook, so without the
+    /// sendmsg re-decision a stale mark would follow it there.
+    SendmsgRejected,
+}
+
+impl FastPathCapability {
+    /// The reason for `cfc status`, or `None` when ready.
+    pub(super) fn off_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::BasicConnect => Some(
+                "the kernel runs the basic connect programs (no bpf_get_socket_cookie / \
+                 bpf_setsockopt on sock_addr programs)",
+            ),
+            Self::SendmsgRejected => Some(
+                "this kernel's verifier refused the sendmsg hooks: bpf_getsockopt/setsockopt \
+                 on cgroup/sendmsg needs a newer kernel than on cgroup/connect (5.10 refuses, \
+                 6.12 accepts)",
+            ),
+        }
+    }
 }
 
 /// Attaches both connect programs, pinning them under `dir` when it is
@@ -1223,8 +1260,12 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
     // same hooks, and a kernel on the basic twins has no fast path to serve.
     // A failure here costs the fast path, never enforcement - so it is a
     // note, not an error, and never unwinds the connect pins.
-    let mut fast_capable = cookie_variants == 2;
-    if fast_capable {
+    let mut fast_path = if cookie_variants == 2 {
+        FastPathCapability::Ready
+    } else {
+        FastPathCapability::BasicConnect
+    };
+    if fast_path == FastPathCapability::Ready {
         for (name, pin_name) in [
             (PROG_SENDMSG4, LINK_SENDMSG4),
             (PROG_SENDMSG6, LINK_SENDMSG6),
@@ -1233,13 +1274,16 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
             match attach_one(bpf, name, &cgroup, pin.as_deref()) {
                 Ok(i) => out.push((name.to_string(), i)),
                 Err(e) => {
-                    warn!("{name} could not load or attach ({e:#}); the fast path is off");
-                    fast_capable = false;
+                    warn!(
+                        "{name} could not load or attach ({e:#}); the fast path is off on \
+                         this kernel"
+                    );
+                    fast_path = FastPathCapability::SendmsgRejected;
                     break;
                 }
             }
         }
-        if !fast_capable {
+        if fast_path != FastPathCapability::Ready {
             // Leave no lone sendmsg pin behind for the next start to trip on.
             if let Some(d) = dir {
                 for p in [LINK_SENDMSG4, LINK_SENDMSG6] {
@@ -1250,7 +1294,7 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
     }
     Ok(AttachedPrograms {
         programs: out,
-        fast_capable,
+        fast_path,
     })
 }
 

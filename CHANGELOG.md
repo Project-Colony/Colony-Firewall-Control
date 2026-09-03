@@ -20,7 +20,9 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   machine fail-closed again within 60 s. Fast-allowed flows are reported on
   a ring, so the live feed, rule hit counts and the `enforcing` heuristic
   keep telling the truth. Off by default for this first release; `cfc
-  status` shows `fast-allow live` or `off: <the one reason>`.
+  status` shows `fast-allow live` or `off: <the one reason>`. Needs a
+  kernel that allows `bpf_getsockopt` on `cgroup/sendmsg` hooks: 5.10 does
+  not (and says so in the status line), 6.12 and later do.
 
 ### Changed
 

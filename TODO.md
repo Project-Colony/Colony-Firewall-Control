@@ -44,8 +44,13 @@ Grants are cleared in the kernel on exec and exit, so no daemon is needed for
 the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline refreshed every 10 s
 makes a dead daemon fail-closed within 60 s; and the path stays off - with
 the reason in `cfc status` - unless enforcement is pinned, exit is detected
-exactly (`group_dead`), the cookie connect variants verified, and
-`[ebpf] fast_allow` is set. **Off by default** for this release: the
+exactly (`group_dead`), the cookie connect variants *and* the sendmsg hooks
+verified, and `[ebpf] fast_allow` is set. The matrix drew that last line on
+the first run: 5.10 accepts `bpf_getsockopt` on a connect hook and refuses it
+on a sendmsg hook (`unknown func bpf_getsockopt#57`), 6.12 accepts both - so
+on the RHEL-floor kernel the fast path reports itself off with that sentence,
+rather than shipping half-present without the UDP re-decision that closes the
+reused-socket hole. **Off by default** for this release: the
 blast radius named above has not changed, only its edges. What is not done:
 the latency win is not yet *measured* on the veth bench - the number that
 justifies the feature is still the pre-feature 0.28 ms per new flow - and 1b
