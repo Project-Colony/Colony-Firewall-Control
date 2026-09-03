@@ -84,6 +84,13 @@ const SHT_SYMTAB: u32 = 2;
 /// Everything the daemon's loader looks up by name. If any of these is missing
 /// the object will fail at run time on a user's machine; this turns that into a
 /// build failure here.
+///
+/// The list is maintained by hand - this crate takes no dependencies, so it
+/// cannot import the daemon's constants - which means it drifts, and it has:
+/// the fast path added four maps and two programs to the loader and only the
+/// programs were added here. Every `MAP_*` and `PROG_*`/`LINK_*` constant in
+/// `cfc-daemon/src/ebpf/{loader,enforce}.rs` has to appear below; `grep -h
+/// 'const MAP_' crates/cfc-daemon/src/ebpf/*.rs` is the list to check against.
 const REQUIRED_SYMBOLS: &[&str] = &[
     // programs (aya keys `program_mut` on the symbol, not the section)
     "cfc_sched_process_exec",
@@ -108,6 +115,16 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     "ENFORCE_STATS",
     "DENY_EVENTS",
     "SOCK_PIDS",
+    // the table the exec program reads when no daemon is running, and its
+    // "is it worth hashing?" guard
+    "EXE_RULES",
+    "EXE_RULES_ON",
+    // the fast path: the grant map, the deadline the daemon's heartbeat
+    // refreshes, the mark to set, and the ring the grants are reported on
+    "FAST_ALLOW",
+    "FAST_ALLOW_UNTIL",
+    "FAST_ALLOW_MARK",
+    "ALLOW_EVENTS",
     // patchable .rodata globals
     "TASK_REAL_PARENT_OFFSET",
     "TASK_TGID_OFFSET",

@@ -367,7 +367,7 @@ to shrink what a code-execution bug could reach:
 
 | Directive                          | Why                             |
 |------------------------------------|---------------------------------|
-| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE and for the one nftables set element the fast-allow path adds and flushes, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer |
+| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE and for the one nftables set element the fast-allow path adds and flushes, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer, `CAP_CHOWN` for the control socket's group, and `CAP_DAC_READ_SEARCH` for the `/proc/*/fd` walk attribution falls back to. The count and the list have to agree: this said seven and named five, and the two it left out are exactly the pair the SELinux policy was once missing - with the fail-closed ruleset, a daemon that cannot read `/proc` attributes nothing and the machine loses outbound traffic |
 | `NoNewPrivileges`                  | No regaining privileges via setuid binaries |
 | `SystemCallFilter=@system-service` | seccomp; the biggest blast-radius reduction available |
 | `SystemCallFilter=bpf perf_event_open` | The two syscalls the eBPF layer needs, named individually |

@@ -378,7 +378,10 @@ impl VerdictSink {
             return;
         };
         if matches!(grant, Grant::Yes(_)) && proc_starttime(pid) != judged_at {
-            debug!(pid, "not granting: the pid changed hands while it was judged");
+            debug!(
+                pid,
+                "not granting: the pid changed hands while it was judged"
+            );
             return;
         }
         Self::apply_grant(fast, &mut fast.map.lock(), pid, grant);

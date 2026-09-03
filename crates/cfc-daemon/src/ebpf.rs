@@ -595,6 +595,16 @@ impl Report {
             exit_tracking = self.exit_tracking,
             dns_capture = self.dns_capture,
             ppid_from_btf = self.ppid_offsets,
+            // The fast path has five reasons to be off and they used to reach
+            // `cfc status` only. An operator who set `fast_allow = true`,
+            // restarted, and never ran the CLI had no way to learn from the
+            // journal that the kernel had refused a hook - which is the whole
+            // point of degrading loudly.
+            fast_allow = self
+                .fast_allow
+                .as_ref()
+                .map(FastAllow::describe)
+                .unwrap_or_else(|| "not decided".to_string()),
             "attribution sources: sock_diag + /proc{}; hostnames: PTR + FCrDNS{}",
             if self.exec_tracking {
                 " + eBPF exec events"
@@ -725,25 +735,33 @@ pub fn start(
                 // error policy.
                 report.mode = cfg.enabled;
                 table.set_live(report.exec_tracking);
-                // Published here, where the report is final, so `cfc status`
-                // never reads a state startup has not finished deciding.
-                set_fast_allow_level(report.fast_allow.clone().unwrap_or_else(|| {
-                    FastAllow::Off("the in-kernel layer did not come up".to_string())
-                }));
+                // The fast-allow level is NOT published here. The loader
+                // publishes it before it spawns the heartbeat, because that
+                // task publishes too - and this call site runs after both, so
+                // it could only ever overwrite a fresher answer with a staler
+                // one. It did: on a restart the heartbeat arms immediately and
+                // says `Live`, and this line put "waiting for the nftables
+                // table" back on top of it, permanently.
                 Runtime {
                     report,
                     _attached: Some(attached),
                 }
             }
-            Err(e) => Runtime {
-                report: Report::inert_because(
-                    cfg.enabled,
-                    true,
-                    e.degrade,
-                    format!("load failed, continuing without it: {:#}", e.source),
-                ),
-                _attached: None,
-            },
+            Err(e) => {
+                // The loader never got far enough to publish one.
+                set_fast_allow_level(FastAllow::Off(
+                    "the in-kernel layer did not come up".to_string(),
+                ));
+                Runtime {
+                    report: Report::inert_because(
+                        cfg.enabled,
+                        true,
+                        e.degrade,
+                        format!("load failed, continuing without it: {:#}", e.source),
+                    ),
+                    _attached: None,
+                }
+            }
         }
     };
 

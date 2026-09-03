@@ -1064,6 +1064,21 @@ pub(super) fn load_and_attach(
         ));
     }
 
+    // Published here, and only here, because after this point the heartbeat
+    // task below is running and publishing states of its own.
+    //
+    // `start` used to do it, once `load_and_attach` returned - which is *after*
+    // that task exists. On a daemon restart the table is already loaded, so the
+    // very first thing the heartbeat does is arm and publish `Live`; `start`
+    // then overwrote it with the state decided here, "waiting for the nftables
+    // table". And nothing ever corrected it: the heartbeat only publishes while
+    // it is not armed. `cfc status` said the fast path was waiting for a table
+    // that had been there all along, for the life of the daemon, while the path
+    // was in fact live.
+    if let Some(state) = report.fast_allow.clone() {
+        super::set_fast_allow_level(state);
+    }
+
     // Exec without exit tracking would let entries age out on the TTL alone,
     // which is a materially weaker pid-reuse story. Refuse the combination
     // rather than quietly serving it.
@@ -1760,7 +1775,11 @@ mod tests {
         for _ in 0..2000 {
             let mark = pick_mark(&mut draw);
             assert_ne!(mark, cfc_ebpf_common::fast_allow::UNARMED);
-            assert_eq!(collides_with(mark), None, "drew a colliding mark 0x{mark:08x}");
+            assert_eq!(
+                collides_with(mark),
+                None,
+                "drew a colliding mark 0x{mark:08x}"
+            );
         }
     }
 
@@ -2177,7 +2196,7 @@ mod tests {
             let pin = enforce::pin_dir().join(name);
             assert!(pin.exists(), "{} must be pinned", pin.display());
         }
-        println!("all five programs attached and pinned without CAP_SYS_ADMIN");
+        println!("all seven attached programs pinned without CAP_SYS_ADMIN");
 
         drop(attached);
         // Pins outlive the process by design, so this test has to take its own

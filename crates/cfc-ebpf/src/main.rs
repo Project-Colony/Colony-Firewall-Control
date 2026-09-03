@@ -1,7 +1,9 @@
 //! Colony Firewall Control - kernel-side eBPF programs.
 //!
-//! Five programs (see `README.md` for attach points and capability
-//! requirements):
+//! Nine programs, of which at most seven are attached at once - the two
+//! `_basic` connect variants are the fallback for a kernel that will not
+//! verify the cookie ones, never loaded alongside them (see `README.md` for
+//! attach points and capability requirements):
 //!
 //! | section                            | purpose                                   |
 //! |------------------------------------|-------------------------------------------|
@@ -9,7 +11,7 @@
 //! | `tracepoint/sched/sched_process_exit` | evict dead pids from `PROCS` + `EXIT_EVENTS`     |
 //! | `cgroup_skb/ingress`                 | copy DNS response payloads into `DNS_PACKETS`    |
 //! | `cgroup/connect4`, `cgroup/connect6` | refuse `connect()` for already-denied pids, and mark the sockets of fast-allowed ones |
-//! | `cgroup/sendmsg4`, `cgroup/sendmsg6` | the mark decision again, for UDP that never calls `connect()` |
+//! | `cgroup/sendmsg4`, `cgroup/sendmsg6` | the mark decision again, for UDP sends that carry a destination |
 //!
 //! The first three *observe*. The rest **decide**, and are the only part of
 //! CFC that enforces without a userspace round trip: their link is pinned to
@@ -1196,9 +1198,29 @@ pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
 /// `sendto()` on an unconnected socket starts a new flow without ever passing
 /// the connect hooks, so a socket marked at some earlier `connect()` and then
 /// reused toward another destination would carry a decision nobody re-made.
-/// These hooks close that: the same `mark_decision`, on every datagram send.
-/// No refusal here - the in-kernel deny is a `connect()` thing, and
-/// unconnected UDP has always been the packet path's to refuse.
+/// These hooks close that, with the same `mark_decision`. No refusal here -
+/// the in-kernel deny is a `connect()` thing, and unconnected UDP has always
+/// been the packet path's to refuse.
+///
+/// **Not "on every datagram send"**, which is what this comment used to claim
+/// and what the design was reviewed against. `cgroup/sendmsg{4,6}` runs for a
+/// send that carries a destination; a `send()` or `write()` on a socket that
+/// has already been `connect()`ed does not pass it. So a connected UDP socket
+/// is marked once, at its `connect()`, and never re-decided:
+///
+/// * revoking the grant does not unmark it. The map entry goes, but the mark
+///   lives on the socket, and no hook of ours will run for that socket again.
+/// * the deadline does not reach it either, for the same reason - the deadline
+///   is consulted at hook time, and there is no next hook.
+///
+/// What bounds it is conntrack, not this program. The ruleset queues
+/// `ct state new`, so the second and later datagrams of a connected UDP socket
+/// were never going to the daemon regardless of any mark. The residual window
+/// is a socket idle long enough for its conntrack entry to expire and then
+/// used again: that datagram is `new`, and its stale mark takes it past the
+/// queue where a prompt was due. It is real, it is not closable from inside
+/// this hook, and `docs/ARCHITECTURE.md` states it as a boundary of the
+/// feature rather than leaving it to be discovered.
 ///
 /// No `_basic` twins: these exist only for the fast path, which the basic
 /// variants do not have, so on a kernel that verifies only the basic connect

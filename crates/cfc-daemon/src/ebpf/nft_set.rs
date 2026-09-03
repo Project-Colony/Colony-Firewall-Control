@@ -318,9 +318,7 @@ fn stderr_names_no_such_object(stderr: &str) -> bool {
 /// as it is.
 fn redact(op: Op, text: String) -> String {
     match op {
-        Op::AddElement(mark) | Op::GetElement(mark) => {
-            text.replace(&mark_literal(mark), "<mark>")
-        }
+        Op::AddElement(mark) | Op::GetElement(mark) => text.replace(&mark_literal(mark), "<mark>"),
         _ => text,
     }
 }
@@ -431,7 +429,10 @@ mod tests {
         let mark = 0xdead_0a6c;
         let echoed = format!("Error: No such file or directory\nget element inet colony_firewall fast_allow {{ {} }}", mark_literal(mark));
         let safe = redact(Op::GetElement(mark), echoed);
-        assert!(!safe.contains(&mark_literal(mark)), "leaked the mark: {safe}");
+        assert!(
+            !safe.contains(&mark_literal(mark)),
+            "leaked the mark: {safe}"
+        );
         assert!(safe.contains("<mark>"));
     }
     use super::*;

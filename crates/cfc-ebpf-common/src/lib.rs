@@ -128,7 +128,11 @@ pub mod verdict {
     /// for two releases. Allows live in `FAST_ALLOW` now, a separate map with
     /// separate clearing rules, because an allow that leaks is a bypass and
     /// a deny that leaks is an inconvenience, and the two must not share a
-    /// sweep. `2` is kept so a v3 pin holding it still reads as a deny.
+    /// sweep. `2` is simply the number it already had; renumbering it to 1
+    /// would buy nothing. Not, as this once claimed, so that a v3 pin still
+    /// reads as a deny - the pin directory carries the ABI version, and pins
+    /// from another version are removed rather than read, so no v4 program
+    /// ever sees a value a v3 daemon wrote.
     pub const DENY: u32 = 2;
 }
 
@@ -199,11 +203,17 @@ pub mod enforce_stat {
     /// Granted, but the deadline had passed: the daemon that granted this is
     /// no longer refreshing. Non-zero here reads "the fast path stopped".
     pub const STALE: u32 = 3;
-    /// Fast-allow granted but the socket already carried a mark that was not
-    /// ours - left alone, so that socket takes the queue. Counted separately
-    /// because "the fast path never engages for this program" has a legible
-    /// cause here (a VPN or proxy marking its own sockets) that the ALLOWED
-    /// counter alone would hide.
+    /// The socket already carried a mark that was not ours - left alone, so
+    /// it takes the queue. Counted separately because "the fast path never
+    /// engages for this program" has a legible cause here (a VPN or proxy
+    /// marking its own sockets) that the ALLOWED counter alone would hide.
+    ///
+    /// Note what this does **not** say: not "granted, but". The kernel bumps
+    /// this before it looks the pid up in `FAST_ALLOW`, deliberately - the
+    /// foreign mark settles the question on its own, and a map lookup that
+    /// cannot change the outcome is not worth paying for on this path. So the
+    /// counter covers every process with a foreign mark, granted or not, and
+    /// reading it as "grants we could not honour" overstates it.
     pub const FOREIGN_MARK: u32 = 4;
     /// Number of slots, and the array's `max_entries`.
     pub const SLOTS: u32 = 5;

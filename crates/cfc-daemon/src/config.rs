@@ -676,11 +676,17 @@ enabled = " Auto ""#
     fn the_fast_allow_mark_parses_in_the_spelling_the_sample_documents() {
         let mark = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.fast_allow_mark;
         assert_eq!(mark(""), None, "absent means draw one");
-        assert_eq!(mark("[ebpf]\nfast_allow_mark = 0x00033331\n"), Some(0x0003_3331));
+        assert_eq!(
+            mark("[ebpf]\nfast_allow_mark = 0x00033331\n"),
+            Some(0x0003_3331)
+        );
         assert_eq!(mark("[ebpf]\nfast_allow_mark = 209713\n"), Some(209_713));
         // The whole word must fit: the mark is a u32, and the top bit is as
         // legitimate a mark bit as any other.
-        assert_eq!(mark("[ebpf]\nfast_allow_mark = 0xffffffff\n"), Some(u32::MAX));
+        assert_eq!(
+            mark("[ebpf]\nfast_allow_mark = 0xffffffff\n"),
+            Some(u32::MAX)
+        );
     }
 
     /// The fast path is opt-in: nothing short of `fast_allow = true` turns it

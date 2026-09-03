@@ -50,13 +50,18 @@ Colony Firewall Control asks before a program is allowed to reach the network,
 the way Windows Firewall Control does, and remembers the answer per executable.
 
 Filtering happens in nftables via NFQUEUE; the daemon attributes each flow to
-the process that opened it and either applies a stored rule or prompts. On a
-kernel with BPF available it additionally attaches seven small eBPF programs:
-three that improve attribution and hostname resolution, two that refuse
-connect(2) in the kernel for programs already denied - pinned to bpffs, so
-those denials survive the daemon being killed - and, with the opt-in fast
-path, two more that let a program a lasting rule allows outright skip the
-queue entirely.
+the process that opened it and either applies a stored rule or prompts. That
+is the whole of what this package does on its own: it deliberately ships no
+eBPF object, because building one needs a pinned nightly toolchain that does
+not belong in a distro build root.
+
+Install one - `cargo xtask build-ebpf`, dropped at
+/usr/lib/colony-firewall/cfc-ebpf.o, in the directory this package creates for
+it - and the daemon additionally attaches seven small programs: three that
+improve attribution and hostname resolution, two that refuse connect(2) in the
+kernel for programs already denied (pinned to bpffs, so those denials survive
+the daemon being killed), and two that mark the sockets of programs a lasting
+rule allows, which the opt-in fast path then accepts ahead of the queue.
 
 The ruleset is fail-closed. If the daemon is not running, new outbound
 connections are dropped rather than allowed.
