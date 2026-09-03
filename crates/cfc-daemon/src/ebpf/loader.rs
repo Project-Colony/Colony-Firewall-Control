@@ -1370,6 +1370,16 @@ pub(super) fn load_and_attach(
         let engine_hits = sink.engine().clone();
         let observed_tx = observed.clone();
         let stats_tx = stats.clone();
+        // The same reverse-DNS seam the packet path uses. Without it a
+        // fast-allowed flow is the one kind of connection whose destination
+        // never gets a name: the packet path attaches whatever is cached and
+        // enqueues a lookup for next time, and this consumer - which exists
+        // precisely because these flows never reach that path - did neither.
+        // So `cfc log` and the live feed showed bare addresses for exactly the
+        // programs a user had trusted enough to allow outright, and the cache
+        // was never warmed for their destinations either, so the *next* flow
+        // to the same host had no name to attach.
+        let dns_hosts = dns.clone();
         match spawn_ring(&mut bpf, enforce::MAP_ALLOW_EVENTS, move |bytes| {
             let Some(ev) = decode::<ConnectReport>(bytes) else {
                 return;
@@ -1396,7 +1406,7 @@ pub(super) fn load_and_attach(
                 std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
             };
             let dst = ev.destination();
-            let connection = cfc_core::Connection::new(
+            let mut connection = cfc_core::Connection::new(
                 protocol,
                 cfc_core::Direction::Outbound,
                 unspecified,
@@ -1404,6 +1414,10 @@ pub(super) fn load_and_attach(
                 dst.ip(),
                 dst.port(),
             );
+            if let Some(host) = dns_hosts.lookup_cached(dst.ip()) {
+                connection = connection.with_host(host);
+            }
+            dns_hosts.enqueue_lookup(dst.ip());
             let process = crate::process_resolve::resolve(ev.pid);
             let _ = observed_tx.send(crate::nfqueue::ObservedConnection {
                 connection,

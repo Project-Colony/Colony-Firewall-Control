@@ -10,19 +10,34 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Fast allow (opt-in, `[ebpf] fast_allow = true`).** A process a lasting
   rule allows outright no longer pays an NFQUEUE round trip per connection:
-  the `cgroup/connect4|6` hooks (and new `sendmsg4|6` hooks, for UDP that
-  never calls `connect()`) mark its sockets with a value the daemon draws at
-  random on each start, and a `meta mark @fast_allow accept` rule the
-  snippet ships with an *empty* set takes them ahead of the queue. The mark
-  is re-decided at every flow start and stripped when the grant is gone; the
-  kernel clears grants on exec and exit by itself; and a `CLOCK_BOOTTIME`
-  deadline the daemon refreshes every 10 s means a dead daemon leaves the
-  machine fail-closed again within 60 s. Fast-allowed flows are reported on
-  a ring, so the live feed, rule hit counts and the `enforcing` heuristic
-  keep telling the truth. Off by default for this first release; `cfc
-  status` shows `fast-allow live` or `off: <the one reason>`. Needs a
-  kernel that allows `bpf_getsockopt` on `cgroup/sendmsg` hooks: 5.10 does
-  not (and says so in the status line), 6.12 and later do.
+  the `cgroup/connect4|6` hooks (and new `sendmsg4|6` hooks, for UDP sends
+  that carry a destination) mark its sockets with a value the daemon draws
+  at random on each start, and a `meta mark @fast_allow accept` rule the
+  snippet ships with an *empty* set takes them ahead of the queue. Grants
+  reach processes that were already running, not only ones that exec after
+  the rule: the daemon walks `/proc` at start and at every rule change. The
+  mark is re-decided at every hook that opens a flow and stripped when the
+  grant is gone; the kernel clears grants on exec and exit by itself; and a
+  `CLOCK_BOOTTIME` deadline the daemon refreshes every 10 s means a dead
+  daemon leaves the machine fail-closed again within 60 s. Fast-allowed
+  flows are reported on a ring, with their destination named from the same
+  reverse-DNS cache the packet path uses, so the live feed, rule hit counts
+  and the `enforcing` heuristic keep telling the truth. Off by default for
+  this first release; `cfc status` and the startup log line show
+  `fast-allow live` or `off: <the one reason>`.
+
+  Two boundaries, stated rather than left to be found. Revocation reaches a
+  socket at its next flow-opening hook, so a **connected UDP socket** - which
+  passes none - keeps the mark it was given; conntrack makes that mostly moot
+  (only `ct state new` is queued) and what is left is such a socket idle past
+  its conntrack timeout and then reused. And the mark shares one 32-bit word
+  with everything else on the machine: the daemon refuses values that collide
+  with the fwmark selectors it knows (kube-proxy's two single-bit masks,
+  Tailscale's, wg-quick's), and `[ebpf] fast_allow_mark` pins one by hand for
+  a host with a selector it does not know.
+
+  Needs a kernel that allows `bpf_getsockopt` on `cgroup/sendmsg` hooks: 5.10
+  does not (and says so in the status line), 6.12 and later do.
 
 ### Changed
 
@@ -30,11 +45,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   would enforce fine and never mark, so a restarting daemon now replaces
   them rather than inheriting them. `verdict::ALLOW`, matched by the kernel
   and written by nobody for two releases, is gone.
-- The daemon now runs `nft` at start and stop to put its fast-allow value
-  into one set and take it out again - the first time it touches nftables;
-  the SELinux policy grants exactly that. The nftables snippet gains the
-  set and the accept rule; an older snippet leaves fast-allow off with the
-  reason spelled out.
+- The daemon now runs `nft` to put its fast-allow value into one set and
+  take it out again - the first time it touches nftables; the SELinux policy
+  grants exactly that. The set is flushed unconditionally at every start, so
+  a daemon that crashed while armed and came back with the path off does not
+  leave its predecessor's mark accepted; and once armed the daemon re-checks
+  every minute that the element is still there, so an `nft -f` that reloads
+  the ruleset is noticed and re-armed rather than reported as live. The
+  nftables snippet gains the set and the accept rule; an older snippet leaves
+  fast-allow off with the reason spelled out.
 
 ## [0.3.0] - 2026-09-02
 

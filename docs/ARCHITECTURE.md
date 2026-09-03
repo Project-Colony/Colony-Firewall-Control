@@ -352,7 +352,7 @@ inert as one built with `--no-default-features`.
 | `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts from that table |
 | `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads out; the daemon parses them and lifts the `A`/`AAAA` records |
 | `cgroup/connect4`, `cgroup/connect6` | cgroup v2 root, link **pinned** | refuse `connect()` for pids the daemon has denied outright, before a packet exists - and, under `[ebpf] fast_allow`, mark the sockets of pids a lasting rule allows outright |
-| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | the same mark decision for UDP that never calls `connect()`; no refusal |
+| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | the same mark decision for a UDP send that carries a destination; no refusal |
 
 **Two decisions happen in the kernel; everything else is enrichment.** The
 connect hooks refuse a denied program's `connect()` with `EPERM` - pinned, so
@@ -362,8 +362,27 @@ with a single exception: under `[ebpf] fast_allow`, the sockets of a process
 the daemon has already ruled allowed process-wide are marked in the connect
 hook, and the snippet's `meta mark @fast_allow accept` rule takes them ahead
 of the queue. That set is the one thing the daemon ever writes to nftables -
-one element added when the path is armed, flushed at every start and at
-shutdown - and it ships empty, so a default install carries no bypass value.
+one element added when the path is armed, flushed unconditionally at every
+start and at shutdown - and it ships empty, so a default install carries no
+bypass value.
+
+**Where revocation reaches, and where it does not.** A grant is re-decided at
+every hook that opens a flow: `connect()`, and a `sendmsg` that carries a
+destination. Deleting the rule, replacing it with a Block, the process
+exec'ing, the process exiting, and the daemon going away for more than a
+minute all take effect at the next such hook, which is what makes the mark
+safe to hand out at all.
+
+They do not reach a socket that has already been marked and does not pass a
+hook again - a **connected UDP socket**, whose later `send()` calls take
+neither path. Conntrack makes that mostly moot: the ruleset queues only
+`ct state new`, so those datagrams were never reaching the daemon anyway. The
+residual case is a connected UDP socket left idle long enough for its
+conntrack entry to expire and then used again - that datagram is `new`, and it
+carries a mark decided before the revocation. It is bounded by the conntrack
+timeout, it cannot be closed from inside a hook that does not run, and it is
+one of the reasons the path is opt-in. TCP has no equivalent: an established
+connection is not `ct state new` either way, with or without this feature.
 Nothing else here filters anything - the `cgroup_skb` program returns "pass"
 unconditionally. What the programs buy is *better answers to questions the
 daemon already asks*, and every one of them degrades independently: a missing
