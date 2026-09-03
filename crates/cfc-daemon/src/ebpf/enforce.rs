@@ -494,9 +494,18 @@ impl VerdictSink {
     /// rule added for a running process was honoured by NFQUEUE
     /// (`source="rule"`) and the kernel counters never moved.
     ///
-    /// O(live processes), on whichever thread changed the rules - an IPC
-    /// handler, never the packet path. A few thousand map operations at worst,
-    /// and only when a human or the CLI actually changed something.
+    /// Cost, since it is no longer only map operations: three small /proc
+    /// reads per recently-exec'd process, three more per orphan, and one walk
+    /// of /proc for `sweep_fast_allow` at the end. All of it on whichever
+    /// thread changed the rules - an IPC handler or startup, never the packet
+    /// path - and only when a human or the CLI actually changed something.
+    ///
+    /// None of those reads happen while a map lock is held. That is a
+    /// constraint, not an accident: `on_exec` and `on_exit` block on the
+    /// verdict mutex from inside the ring consumers, and a stalled exec ring
+    /// is a dropped record, which is a process with no in-kernel verdict at
+    /// all. The orphan sweep has said so since it was written; the live loop
+    /// inherited the constraint the moment it started reading /proc too.
     pub(super) fn resync(&self) {
         // The kernel's table first: it governs processes that do not exist yet,
         // and it is what survives this daemon.
@@ -513,39 +522,63 @@ impl VerdictSink {
         // part that must run precisely then.
         let live = self.table.live_processes(Instant::now());
         let mut denied = 0usize;
+
+        // Every /proc read first, and only then the lock.
+        //
+        // Reading under it would be the mistake the orphan sweep below spells
+        // out at length and avoids: `on_exec` and `on_exit` block on this same
+        // mutex from inside the ring consumers, and a stalled exec ring is a
+        // dropped record, which is a process with no in-kernel verdict at all.
+        // This loop used to decide from an in-memory record and could hold the
+        // lock across the whole thing for free; the moment it moved to /proc,
+        // it inherited that constraint.
+        let views: Vec<(u32, Process, Option<u64>)> = live
+            .iter()
+            .filter_map(|proc| {
+                // From /proc, like every other decider - not from the exec
+                // record.
+                //
+                // Both loops in this function ask one question about one
+                // process, and for a long time they asked it of different
+                // inputs: this one of the `ExecEvent` (the execve *string*,
+                // and the uid the process had when it exec'd), the orphan
+                // sweep below of /proc. Two deciders that disagree about the
+                // same process is the defect, and all three ways it showed up
+                // were fail-open:
+                //
+                // * `execve("./foo")` records no absolute path, so
+                //   `absolute_exe` answered None and this loop skipped the pid
+                //   whole. Deleting the rule that granted such a process, or
+                //   replacing it with a Block, left the grant standing in the
+                //   kernel: a marked socket past the queue for a program no
+                //   rule allowed any more.
+                // * the execve string is what the caller typed, not what ran.
+                //   A rule naming a symlink - or `/bin/curl` on a merged-usr
+                //   system - granted here what `on_exec` and the packet path,
+                //   both of which resolve, refuse.
+                // * the recorded uid is the uid at exec. A process that
+                //   dropped privileges kept a uid-scoped grant it had stopped
+                //   qualifying for until its next execve, and absent one,
+                //   forever.
+                match proc_view(proc.pid) {
+                    Some((view, judged_at)) => Some((proc.pid, view, judged_at)),
+                    None => {
+                        // Gone, or /proc unreadable. Do not fall back to the
+                        // exec record - that is the guess this comment exists
+                        // to refuse. Withdraw the grant (a grant kept in doubt
+                        // is a marked socket) and leave the deny to the exit
+                        // tracepoint, which owns eviction and can tell
+                        // "exited" from "unreadable".
+                        self.drop_grant(proc.pid);
+                        None
+                    }
+                }
+            })
+            .collect();
+
         let mut map = self.map.lock();
-        for proc in &live {
-            // From /proc, like every other decider - not from the exec record.
-            //
-            // Both loops in this function ask one question about one process,
-            // and for a long time they asked it of different inputs: this one
-            // of the `ExecEvent` (the execve *string*, and the uid the process
-            // had when it exec'd), the orphan sweep below of /proc. Two
-            // deciders that disagree about the same process is the defect, and
-            // all three ways it showed up were fail-open:
-            //
-            // * `execve("./foo")` records no absolute path, so `absolute_exe`
-            //   answered None and this loop `continue`d - skipping the pid
-            //   whole. Deleting the rule that granted such a process, or
-            //   replacing it with a Block, left the grant standing in the
-            //   kernel: a marked socket past the queue for a program no rule
-            //   allowed any more.
-            // * the execve string is what the caller typed, not what ran. A
-            //   rule naming a symlink - or `/bin/curl` on a merged-usr system -
-            //   granted here what `on_exec` and the packet path, both of which
-            //   resolve, refuse.
-            // * the recorded uid is the uid at exec. A process that dropped
-            //   privileges kept a uid-scoped grant it had stopped qualifying
-            //   for until its next execve, and absent one, forever.
-            let Some((as_process, judged_at)) = proc_view(proc.pid) else {
-                // Gone, or /proc unreadable. Do not fall back to the exec
-                // record - that is the guess this comment exists to refuse.
-                // Withdraw the grant (a grant kept in doubt is a marked socket)
-                // and leave the deny to the exit tracepoint, which owns
-                // eviction and can tell "exited" from "unreadable".
-                self.drop_grant(proc.pid);
-                continue;
-            };
+        for (pid, as_process, _) in &views {
+            let pid = *pid;
             // The same three-way answer as the orphan branch below, because
             // these are the same question at different ages. This loop used
             // to collapse it to deny-or-clear, so a hash-scoped rule that
@@ -553,25 +586,33 @@ impl VerdictSink {
             // recently-exec'd process while the orphan branch kept it for an
             // old one - identical binary, identical rules, opposite
             // enforcement, selected by exec age.
-            let r = match self.engine.process_wide_action(&as_process) {
+            let r = match self.engine.process_wide_action(as_process) {
                 Some(Action::Deny | Action::Reject) => {
                     denied += 1;
-                    map.insert(proc.pid, cfc_ebpf_common::verdict::DENY, 0)
+                    map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
                 }
-                Some(_) => clear(&mut map, proc.pid),
-                None if self.engine.deny_still_possible_for(&as_process) => Ok(()),
-                None => clear(&mut map, proc.pid),
+                Some(_) => clear(&mut map, pid),
+                None if self.engine.deny_still_possible_for(as_process) => Ok(()),
+                None => clear(&mut map, pid),
             };
             if let Err(e) = r {
-                warn!(pid = proc.pid, "verdict resync failed: {e}");
+                warn!(pid, "verdict resync failed: {e}");
             }
-            // The grant side has no tri-state: the same engine answer either
-            // says "allow, lasting" or the entry goes. In particular an
-            // abstention - which keeps a deny above - removes a grant here,
-            // because a grant kept in doubt is a marked socket past the
-            // queue.
-            self.grant_if_still(proc.pid, judged_at, self.grant_for(&as_process));
         }
+        drop(map);
+
+        // The grant side, with the verdict lock released: `grant_if_still`
+        // takes the grant map's own mutex, and holding both at once would put
+        // an ordering constraint on two locks that otherwise never nest.
+        //
+        // No tri-state here: the same engine answer either says "allow,
+        // lasting" or the entry goes. In particular an abstention - which
+        // keeps a deny above - removes a grant, because a grant kept in doubt
+        // is a marked socket past the queue.
+        for (pid, as_process, judged_at) in &views {
+            self.grant_if_still(*pid, *judged_at, self.grant_for(as_process));
+        }
+
         // And the entries the live list does not cover.
         //
         // `live_processes` only returns pids the proc table has seen exec
@@ -588,6 +629,7 @@ impl VerdictSink {
         // mutex from inside the ring consumers, and a stalled exec ring is a
         // dropped record, which is a process with no in-kernel verdict.
         let known: std::collections::HashSet<u32> = live.iter().map(|p| p.pid).collect();
+        let map = self.map.lock();
         let mut orphans: Vec<u32> = map
             .keys()
             .flatten()
