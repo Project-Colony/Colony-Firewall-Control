@@ -902,9 +902,20 @@ pub(super) fn load_and_attach(
                     // path the pinned map holds the previous daemon's
                     // verdicts, made under the previous daemon's rules, and
                     // this is the reconciliation that makes them this
-                    // daemon's. The proc table is empty here, so it is the
-                    // orphan sweep that does the work - which is what it is
-                    // for.
+                    // daemon's.
+                    //
+                    // Which of its parts does that work is worth being exact
+                    // about, because a comment here once claimed the orphan
+                    // sweep did all of it and that was only half true. The
+                    // proc table is empty at this point - `set_live` has not
+                    // run yet - so the live loop no-ops, and the orphan sweep
+                    // reconciles the *denials* the previous daemon left in
+                    // `VERDICTS`. It cannot reconcile grants: `flush_fast_allow`
+                    // above has just emptied the map the sweep would walk, on
+                    // purpose. Re-seeding the grants is `sweep_fast_allow`'s
+                    // job, at the end of `resync`, and it walks /proc rather
+                    // than any map - which is the only way to reach a process
+                    // that was already running when this daemon started.
                     sink.resync();
                     let weak = std::sync::Arc::downgrade(&sink);
                     engine.set_on_change(Box::new(move || {

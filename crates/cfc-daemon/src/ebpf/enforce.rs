@@ -340,11 +340,47 @@ impl VerdictSink {
     }
 
     /// Recomputes the grant for one process, from any writer.
-    fn regrant(&self, pid: u32, proc: &Process) {
+    ///
+    /// `judged_at` is the start time the caller read `proc` at - see
+    /// [`grant_if_still`](Self::grant_if_still) for why a grant needs it and a
+    /// withdrawal does not.
+    fn regrant(&self, pid: u32, judged_at: Option<u64>, proc: &Process) {
+        self.grant_if_still(pid, judged_at, self.grant_for(proc));
+    }
+
+    /// Withdraws any grant for `pid`, unconditionally.
+    ///
+    /// The counterpart to `grant_if_still`, and deliberately unguarded:
+    /// removing a grant from a pid whose owner changed is harmless, because
+    /// the new owner has not earned one yet and its own exec flow will grant
+    /// it if a rule says so. Withdrawing is always the safe direction.
+    fn drop_grant(&self, pid: u32) {
+        if let Some(fast) = self.fast.as_ref() {
+            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No);
+        }
+    }
+
+    /// Applies a grant decision, but writes a *grant* only if `pid` still holds
+    /// the process the caller judged.
+    ///
+    /// Between the /proc read that produced the decision and this write there
+    /// is real work - the read itself, the engine call, and this lock - while
+    /// `on_exec` and the pinned exec program keep running. The pid can be
+    /// recycled in that window, and a grant landing on its new owner is a
+    /// marked socket that owner never earned: the fail-open direction, on a
+    /// process that may match no rule at all.
+    ///
+    /// The deny side has had this guard since the orphan sweep was written -
+    /// `doomed` carries the start time each pid was judged at - and the grant
+    /// side, which needs it more, did not have it.
+    fn grant_if_still(&self, pid: u32, judged_at: Option<u64>, grant: Grant) {
         let Some(fast) = self.fast.as_ref() else {
             return;
         };
-        let grant = self.grant_for(proc);
+        if matches!(grant, Grant::Yes(_)) && proc_starttime(pid) != judged_at {
+            debug!(pid, "not granting: the pid changed hands while it was judged");
+            return;
+        }
         Self::apply_grant(fast, &mut fast.map.lock(), pid, grant);
     }
 
@@ -459,16 +495,36 @@ impl VerdictSink {
         let mut denied = 0usize;
         let mut map = self.map.lock();
         for proc in &live {
-            let Some(exe) = proc.absolute_exe() else {
+            // From /proc, like every other decider - not from the exec record.
+            //
+            // Both loops in this function ask one question about one process,
+            // and for a long time they asked it of different inputs: this one
+            // of the `ExecEvent` (the execve *string*, and the uid the process
+            // had when it exec'd), the orphan sweep below of /proc. Two
+            // deciders that disagree about the same process is the defect, and
+            // all three ways it showed up were fail-open:
+            //
+            // * `execve("./foo")` records no absolute path, so `absolute_exe`
+            //   answered None and this loop `continue`d - skipping the pid
+            //   whole. Deleting the rule that granted such a process, or
+            //   replacing it with a Block, left the grant standing in the
+            //   kernel: a marked socket past the queue for a program no rule
+            //   allowed any more.
+            // * the execve string is what the caller typed, not what ran. A
+            //   rule naming a symlink - or `/bin/curl` on a merged-usr system -
+            //   granted here what `on_exec` and the packet path, both of which
+            //   resolve, refuse.
+            // * the recorded uid is the uid at exec. A process that dropped
+            //   privileges kept a uid-scoped grant it had stopped qualifying
+            //   for until its next execve, and absent one, forever.
+            let Some((as_process, judged_at)) = proc_view(proc.pid) else {
+                // Gone, or /proc unreadable. Do not fall back to the exec
+                // record - that is the guess this comment exists to refuse.
+                // Withdraw the grant (a grant kept in doubt is a marked socket)
+                // and leave the deny to the exit tracepoint, which owns
+                // eviction and can tell "exited" from "unreadable".
+                self.drop_grant(proc.pid);
                 continue;
-            };
-            let as_process = Process {
-                pid: proc.pid,
-                ppid: proc.ppid,
-                uid: Some(proc.uid),
-                gid: Some(proc.gid),
-                exe: exe.to_path_buf(),
-                ..Process::unknown(proc.pid)
             };
             // The same three-way answer as the orphan branch below, because
             // these are the same question at different ages. This loop used
@@ -494,10 +550,7 @@ impl VerdictSink {
             // abstention - which keeps a deny above - removes a grant here,
             // because a grant kept in doubt is a marked socket past the
             // queue.
-            if let Some(fast) = self.fast.as_ref() {
-                let grant = self.grant_for(&as_process);
-                Self::apply_grant(fast, &mut fast.map.lock(), proc.pid, grant);
-            }
+            self.grant_if_still(proc.pid, judged_at, self.grant_for(&as_process));
         }
         // And the entries the live list does not cover.
         //
@@ -555,33 +608,12 @@ impl VerdictSink {
             // about the process it is given, and a uid-less one does not match
             // a uid-scoped allow - so guessing would clear a denial the allow
             // was never meant to lift, which is the fail-open direction.
-            let Some(exe) = std::fs::read_link(format!("/proc/{pid}/exe")).ok() else {
+            let Some((proc, judged_at)) = proc_view(pid) else {
                 // Gone. Clear, or a recycled pid inherits its answer - and a
                 // grant even more so.
                 doomed.push((pid, None));
-                if let Some(fast) = self.fast.as_ref() {
-                    Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No);
-                }
+                self.drop_grant(pid);
                 continue;
-            };
-            // The kernel appends " (deleted)" once the binary is replaced on
-            // disk - a package upgrade under a running program, which
-            // process_resolve calls Tuesday on a rolling distribution. Rules
-            // match on exact path equality, so the raw suffixed path matched
-            // no rule and abstained for none: the sweep then read a standing
-            // deny for the *upgraded* binary as a deleted rule and cleared
-            // it. Same normalization as process_resolve, same reason.
-            let exe = {
-                let s = exe.to_string_lossy();
-                match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
-                    Some(stripped) => std::path::PathBuf::from(stripped),
-                    None => exe,
-                }
-            };
-            let proc = Process {
-                exe,
-                uid: proc_uid(pid),
-                ..Process::unknown(pid)
             };
             // `None` is two opposite answers and they must not be conflated.
             // An abstention that could still resolve to a refusal - a
@@ -595,18 +627,19 @@ impl VerdictSink {
             // of allow rules that could never justify one.
             match self.engine.process_wide_action(&proc) {
                 Some(Action::Deny | Action::Reject) => {}
-                Some(_) => doomed.push((pid, proc_starttime(pid))),
+                Some(_) => doomed.push((pid, judged_at)),
                 None => {
                     if !self.engine.deny_still_possible_for(&proc) {
-                        doomed.push((pid, proc_starttime(pid)));
+                        doomed.push((pid, judged_at));
                     }
                 }
             }
             // The grant answer for the same process, from the same /proc
             // read - with the real uid, so a process that dropped privileges
             // loses a uid-scoped grant here rather than keeping what it
-            // earned as root.
-            self.regrant(pid, &proc);
+            // earned as root - and against the same start time, so it cannot
+            // land on a pid the kernel recycled while this loop was working.
+            self.grant_if_still(pid, judged_at, self.grant_for(&proc));
         }
 
         if !doomed.is_empty() {
@@ -630,6 +663,70 @@ impl VerdictSink {
             processes = live.len(),
             denied, "resynced in-kernel verdicts after a rule change"
         );
+
+        // And the processes neither loop above can reach.
+        self.sweep_fast_allow();
+    }
+
+    /// Grants every process on the machine that a lasting rule allows.
+    ///
+    /// Every other writer of the grant map needs an *event*: `on_exec` needs an
+    /// execve, and the two loops above walk the proc table's recent execs and
+    /// the maps' own keys. None of them reaches a process that was already
+    /// running - which is exactly the population this feature exists for. It
+    /// showed up two ways, and in both the path reported `live` while doing
+    /// nothing at all:
+    ///
+    /// * after `systemctl restart colony-firewalld`. The pinned map is flushed
+    ///   at start (those grants were made under the previous daemon's rules)
+    ///   and the proc table starts empty, so the browser, the mail client -
+    ///   everything long-lived - was never granted again for the rest of that
+    ///   daemon's life. The restart is the common case: an upgrade, a crash, a
+    ///   config reload.
+    /// * `allow --exe .../firefox always` on a browser started three hours ago.
+    ///   The proc table's entries expire on a one-hour TTL, so the live loop
+    ///   never saw it either. The feature only ever worked for a process that
+    ///   exec'd *after* the daemon and less than an hour before its rule.
+    ///
+    /// So this walks /proc. O(processes) of three small reads each, on
+    /// whichever thread changed the rules - an IPC handler or startup, never
+    /// the packet path - and rule changes are paced by a human or the CLI.
+    ///
+    /// It only ever *adds*. Withdrawal is already covered and must stay where
+    /// it is: every pid holding a grant is re-decided by the live loop or the
+    /// orphan sweep above, and those two also handle pids that have left /proc
+    /// entirely, which this walk by construction cannot see.
+    pub(super) fn sweep_fast_allow(&self) {
+        if self.fast.is_none() {
+            return;
+        }
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("could not read /proc to seed fast-allow grants: {e}");
+                return;
+            }
+        };
+        let (mut seen, mut granted) = (0usize, 0usize);
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            seen += 1;
+            let Some((proc, judged_at)) = proc_view(pid) else {
+                continue;
+            };
+            let grant = self.grant_for(&proc);
+            if matches!(grant, Grant::Yes(_)) {
+                granted += 1;
+                self.grant_if_still(pid, judged_at, grant);
+            }
+        }
+        debug!(seen, granted, "swept /proc for fast-allow grants");
     }
 
     /// Decides whether this newly-exec'd process gets an in-kernel answer.
@@ -674,10 +771,21 @@ impl VerdictSink {
                     None => exe,
                 }
             });
+        // Dates the read above, for the grant at the end of this function.
+        let judged_at = resolved.is_some().then(|| proc_starttime(pid)).flatten();
         // When /proc is unreadable, the process already exec'd again or
         // exited; the event's own path is the only witness left, and a wrong
         // decision for a dead pid is cleaned by the exit program or the next
         // sweep.
+        //
+        // That sentence justifies a *refusal*, and it used to be made to carry
+        // the grant at the end of this function too. It cannot: a refusal
+        // written for a pid that has already gone is the safe direction and is
+        // swept away, while a grant written for one is a grant for whoever
+        // owns that pid next - a marked socket past the queue, for a process
+        // that may match no rule at all. So the deny below still falls back to
+        // the event's own path; the grant does not happen at all.
+        let readable = resolved.is_some();
         let corrected = match resolved {
             Some(exe) if exe != proc.exe => Some(Process {
                 exe,
@@ -716,7 +824,15 @@ impl VerdictSink {
         // The engine is asked once more rather than reusing `deny` because
         // the answer that matters here is "allow, from a rule that lasts",
         // which the deny decision above did not compute.
-        self.regrant(pid, as_process);
+        if readable {
+            self.regrant(pid, judged_at, as_process);
+        } else {
+            // Nothing to grant for a pid we could not read. The kernel's exec
+            // path already removed the predecessor's entry, so this only
+            // clears the daemon-side bookkeeping that would otherwise credit
+            // an allow event to a rule for a process that no longer exists.
+            self.drop_grant(pid);
+        }
     }
 
     /// Compiles the process-wide rules into the kernel's own table.
@@ -864,6 +980,46 @@ fn boottime_ns() -> anyhow::Result<u64> {
 /// treat that as "cannot decide" rather than "no uid": a uid-scoped allow does
 /// not match a process with no uid, so guessing turns an exemption into a
 /// refusal that stands.
+/// Everything a resync decision needs about one pid, read from /proc, plus the
+/// start time the read happened at.
+///
+/// This is *the* decider for both loops in `resync`. `matches_process` looks at
+/// three things - the executable path, its hash, and the uid - so a view built
+/// from the resolved path and the live uid is the whole decision surface; the
+/// hash stays `None` here on purpose, which is what makes a hash-scoped rule
+/// abstain and keeps the tri-state the sweep depends on.
+///
+/// `None` means the process is gone or its /proc is unreadable, which callers
+/// must treat as "no grant" rather than falling back to a guess.
+fn proc_view(pid: u32) -> Option<(Process, Option<u64>)> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    // The kernel appends " (deleted)" once the binary is replaced on disk - a
+    // package upgrade under a running program, which process_resolve calls
+    // Tuesday on a rolling distribution. Rules match on exact path equality, so
+    // the raw suffixed path matched no rule and abstained for none: the sweep
+    // then read a standing deny for the *upgraded* binary as a deleted rule and
+    // cleared it. Same normalization as process_resolve, same reason.
+    let exe = {
+        let s = exe.to_string_lossy();
+        match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
+            Some(stripped) => std::path::PathBuf::from(stripped),
+            None => exe,
+        }
+    };
+    let uid = proc_uid(pid);
+    // Read last, so it dates the whole view: a caller comparing it again at
+    // write time learns whether anything it read still describes this pid.
+    let starttime = proc_starttime(pid);
+    Some((
+        Process {
+            exe,
+            uid,
+            ..Process::unknown(pid)
+        },
+        starttime,
+    ))
+}
+
 fn proc_uid(pid: u32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status
@@ -1341,6 +1497,43 @@ pub(super) fn stats(map: &PerCpuArray<&MapData, u64>) -> anyhow::Result<EnforceS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of `proc_view` is that it reads the *resolved* path and
+    /// the *current* uid, which is what separates it from the exec record the
+    /// resync live loop used to decide from.
+    #[test]
+    fn proc_view_reads_the_resolved_path_and_the_live_uid() {
+        let me = std::process::id();
+        let (proc, starttime) = proc_view(me).expect("this process has a /proc");
+
+        let real = std::fs::read_link("/proc/self/exe").expect("readable /proc/self/exe");
+        assert_eq!(proc.exe, real, "the view must carry the resolved path");
+        assert!(
+            proc.exe.is_absolute(),
+            "a resolved path is absolute even when argv[0] was relative - the \
+             property the live loop lacked, which made it skip such a process \
+             and leave its grant standing after the rule was deleted"
+        );
+
+        // SAFETY: getuid(2) cannot fail and touches no memory.
+        assert_eq!(proc.uid, Some(unsafe { libc::getuid() }));
+        assert_eq!(
+            proc.sha256, None,
+            "the hash stays unread here on purpose: it is what makes a \
+             hash-scoped rule abstain, and the sweep's tri-state depends on it"
+        );
+        assert!(starttime.is_some(), "a live pid has a start time");
+    }
+
+    /// A view that cannot be read must not become a guess: both callers turn
+    /// `None` into "no grant", and the fallback to the exec record is exactly
+    /// the bug this replaced.
+    #[test]
+    fn proc_view_of_a_pid_that_cannot_exist_is_none() {
+        // Above /proc/sys/kernel/pid_max on every configuration; no process
+        // can hold it, so this is "gone", not "unreadable by us".
+        assert!(proc_view(u32::MAX).is_none());
+    }
 
     #[test]
     fn the_pin_directory_carries_the_event_abi_version() {
