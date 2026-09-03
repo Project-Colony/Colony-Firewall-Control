@@ -8,11 +8,14 @@
 //! | `tracepoint/sched/sched_process_exec` | record every `execve` in `PROCS` + `EXEC_EVENTS` |
 //! | `tracepoint/sched/sched_process_exit` | evict dead pids from `PROCS` + `EXIT_EVENTS`     |
 //! | `cgroup_skb/ingress`                 | copy DNS response payloads into `DNS_PACKETS`    |
-//! | `cgroup/connect4`, `cgroup/connect6` | refuse `connect()` for already-denied pids       |
+//! | `cgroup/connect4`, `cgroup/connect6` | refuse `connect()` for already-denied pids, and mark the sockets of fast-allowed ones |
+//! | `cgroup/sendmsg4`, `cgroup/sendmsg6` | the mark decision again, for UDP that never calls `connect()` |
 //!
-//! The first three *observe*. The last two **decide**, and are the only part of
+//! The first three *observe*. The rest **decide**, and are the only part of
 //! CFC that enforces without a userspace round trip: their link is pinned to
-//! bpffs, so every deny they hold survives the daemon being killed.
+//! bpffs, so every deny they hold survives the daemon being killed. The mark
+//! is the one decision that must NOT survive it, and `FAST_ALLOW_UNTIL` is
+//! how it does not.
 //!
 //! All the interesting arithmetic lives in `cfc-ebpf-common` so it can be
 //! unit-tested on the host; this file is the thin, verifier-shaped shell around
@@ -29,7 +32,7 @@
 use aya_ebpf::bindings::BPF_ANY;
 use aya_ebpf::helpers::{
     bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid,
-    bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
+    bpf_ktime_get_boot_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
 };
 use aya_ebpf::macros::{cgroup_skb, cgroup_sock_addr, map, tracepoint};
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf};
@@ -37,7 +40,7 @@ use aya_ebpf::programs::{SkBuffContext, SockAddrContext, TracePointContext};
 use aya_ebpf::{EbpfContext as _, Global};
 use cfc_ebpf_common::dns::DNS_HEADER_LEN;
 use cfc_ebpf_common::net::{self, IPV4_MIN_HEADER_LEN, UDP_HEADER_LEN};
-use cfc_ebpf_common::{ConnectDeny, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent, FILENAME_LEN};
+use cfc_ebpf_common::{ConnectReport, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent, FILENAME_LEN};
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -133,6 +136,49 @@ static ENFORCE_STATS: PerCpuArray<u64> =
 #[map]
 static DENY_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
+/// Processes the daemon has ruled allowed *process-wide* - no destination, port
+/// or protocol in the rule, and a rule that lasts (`always` / until restart).
+/// Read on the `connect()` and `sendmsg()` paths, where a hit marks the socket
+/// so nftables accepts its packets ahead of the queue.
+///
+/// A set, not a verdict map: the deny map next door is consulted first, and an
+/// entry here never overrides it. Cleared on exec and exit **in the kernel**
+/// (`try_exec`, `cfc_sched_process_exit`), because those are the two paths
+/// that must not depend on a daemon being alive - a stale grant on a recycled
+/// or exec'd-into pid is a firewall bypass, not an inconvenience. The daemon
+/// only ever *grants*; every grant is re-earned per execve.
+///
+/// Pinned, like `VERDICTS`, so a restarting daemon steers the map the
+/// still-attached programs read; emptied by the daemon at every start so the
+/// previous daemon's grants never outlive their reasons.
+#[map]
+static FAST_ALLOW: HashMap<u32, u32> = HashMap::with_max_entries(10_240, 0);
+
+/// `CLOCK_BOOTTIME` nanoseconds past which no `FAST_ALLOW` entry is honoured.
+///
+/// This is the whole fail-closed argument for the fast path. The programs are
+/// pinned and keep their maps alive, so nothing about a dead daemon empties
+/// `FAST_ALLOW`; what stops the marks is this deadline, which only a live
+/// daemon refreshes (every `fast_allow::HEARTBEAT_SECS`, to now +
+/// `DEADLINE_SECS`). `BOOTTIME` and not `MONOTONIC`: the deadline must be
+/// sixty wall-clock seconds, not sixty awake seconds across a laptop suspend.
+#[map]
+static FAST_ALLOW_UNTIL: Array<u64> = Array::with_max_entries(1, 0);
+
+/// The mark value the daemon drew at random for this run, or
+/// `fast_allow::UNARMED` (0) when the path is not armed. Read here, never
+/// compiled in: a value in the object would be a value in the package, and a
+/// published mark is a bypass token for any process with `CAP_NET_RAW`.
+#[map]
+static FAST_ALLOW_MARK: Array<u32> = Array::with_max_entries(1, 0);
+
+/// One record per fast-allowed `connect()`/`sendmsg()`, the `ConnectReport`
+/// shape shared with `DENY_EVENTS`. A marked flow never reaches NFQUEUE, so
+/// without this the live feed, the rule hit counts and the "enforcing" heuristic
+/// would all go quiet on exactly the traffic the firewall handles best.
+#[map]
+static ALLOW_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
 /// Stream of `execve` events. 256 KiB = 64 pages, a power-of-two multiple of
 /// the page size as the kernel requires.
 #[map]
@@ -205,7 +251,7 @@ static PKT_SCRATCH: PerCpuArray<[u8; PKT_SCRATCH_LEN]> = PerCpuArray::with_max_e
 /// terms of the constant. The `const` assertions in `cfc-ebpf-common` are what
 /// make a layout change that forgets to bump it a build error.
 #[unsafe(no_mangle)]
-static CFC_EBPF_ABI_V3: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
+static CFC_EBPF_ABI_V4: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
 
 /// Byte offset of `task_struct::real_parent`. 0 means "unresolved".
 #[unsafe(no_mangle)]
@@ -335,6 +381,17 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
     };
 
     read_exec_filename(ctx, event);
+
+    // Whatever this pid was allowed to do, it was a different program that
+    // earned it. On the one path every execve takes, before anything can
+    // return: a grant that survived exec would hand the successor binary a
+    // mark that skips the queue, with no daemon needed for the hand-over - and
+    // with the daemon alive, the exec-to-consumer window would be a bypass
+    // rather than a missed deny, because a marked flow never reaches the
+    // packet path that "covers" that window for denies. One hash delete per
+    // execve, paid unconditionally, the same price `precommit_verdict` already
+    // pays for `VERDICTS`.
+    let _ = FAST_ALLOW.remove(&tgid);
 
     // Answer for this process without asking anybody. This is the half that
     // keeps working when there is no daemon - the case the pinned `VERDICTS`
@@ -563,6 +620,9 @@ pub fn cfc_sched_process_exit(ctx: TracePointContext) -> u32 {
     // Cheap and idempotent: one map delete, in a program that already does one,
     // and deleting a key that is not there is not an error.
     let _ = VERDICTS.remove(&tgid);
+    // Same for a grant, and here the stale entry is the fail-open one: a
+    // recycled pid inheriting an allow would mark its sockets past the queue.
+    let _ = FAST_ALLOW.remove(&tgid);
 
     // Publish the eviction so the userspace cache drops the pid too. Without
     // this, a recycled pid would be attributed to the process that died.
@@ -887,17 +947,18 @@ fn bump(slot: u32) {
     }
 }
 
-/// Reports a refusal so it is not a silent one. See [`ConnectDeny`].
+/// Reports an in-kernel decision so it is not a silent one - a refusal to
+/// `DENY_EVENTS`, a fast-allow to `ALLOW_EVENTS`. See [`ConnectReport`].
 ///
 /// Best effort: a full ring buffer drops the record and the refusal stands.
 /// The alternative - letting the connection through because we could not
 /// describe it - is not a trade a firewall gets to make.
 #[inline(always)]
-fn report_deny(ctx: &SockAddrContext, tgid: u32, family: u8) {
-    let Some(mut entry) = DENY_EVENTS.reserve::<ConnectDeny>(0) else {
+fn report_connect(ring: &RingBuf, ctx: &SockAddrContext, tgid: u32, family: u8) {
+    let Some(mut entry) = ring.reserve::<ConnectReport>(0) else {
         return;
     };
-    let mut ev = ConnectDeny::zeroed();
+    let mut ev = ConnectReport::zeroed();
     ev.pid = tgid;
     ev.family = family;
     // SAFETY: `sock_addr` is the program's context pointer, non-null for the
@@ -907,6 +968,8 @@ fn report_deny(ctx: &SockAddrContext, tgid: u32, family: u8) {
         let sa = &*ctx.sock_addr;
         // `user_port` is a u32 holding a network-order u16 in its low half.
         ev.port = (sa.user_port & 0xffff) as u16;
+        // IPPROTO_*, truncated: every value this project cares about fits.
+        ev.protocol = sa.protocol as u8;
         if family == 4 {
             ev.addr[..4].copy_from_slice(&sa.user_ip4.to_ne_bytes());
         } else {
@@ -937,6 +1000,12 @@ fn report_deny(ctx: &SockAddrContext, tgid: u32, family: u8) {
 #[inline(always)]
 fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i32 {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // `record_cookie` doubles as "this is the full-featured variant": the
+    // `_basic` twins exist for kernels whose verifier lacks
+    // `bpf_get_socket_cookie` on sock_addr programs, and `bpf_setsockopt`
+    // arrived for them in the same era (5.7 and 5.8). A kernel with one and
+    // not the other is below the 5.10 floor; tying the two keeps this at two
+    // variants per family instead of four.
     // `record_cookie` is a literal at every call site and this function is
     // `inline(always)`, so the `false` variants compile to programs that never
     // reference the helper - which is the whole point: `bpf_get_socket_cookie`
@@ -960,20 +1029,127 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
     match unsafe { VERDICTS.get(&tgid) } {
         Some(&v) if v == cfc_ebpf_common::verdict::DENY => {
             bump(cfc_ebpf_common::enforce_stat::DENIED);
-            report_deny(ctx, tgid, family);
+            report_connect(&DENY_EVENTS, ctx, tgid, family);
             CONNECT_REFUSE
         }
-        Some(&v) if v == cfc_ebpf_common::verdict::ALLOW => {
-            bump(cfc_ebpf_common::enforce_stat::ALLOWED);
-            CONNECT_PROCEED
-        }
         // Absent, or a value from an ABI this object does not know. Both mean
-        // "no answer here"; the packet path decides. Never a deny - see the
+        // "no refusal here"; the fast path below may still wave it through,
+        // and otherwise the packet path decides. Never a deny - see the
         // `verdict` module's docs for why that direction is load-bearing.
         _ => {
-            bump(cfc_ebpf_common::enforce_stat::UNKNOWN);
+            if record_cookie {
+                mark_decision(ctx, tgid, family);
+            } else {
+                bump(cfc_ebpf_common::enforce_stat::UNKNOWN);
+            }
             CONNECT_PROCEED
         }
+    }
+}
+
+/// `SOL_SOCKET` / `SO_MARK` from the Linux UAPI, spelled here because the
+/// generated bindings carry helpers, not socket option numbers. These are the
+/// x86_64 (and aarch64) values; `ExclusiveArch: x86_64` in the spec is what
+/// makes hardcoding them honest. Alpha, MIPS, PA-RISC and SPARC number
+/// `SO_MARK` differently.
+const SOL_SOCKET: i32 = 1;
+const SO_MARK: i32 = 36;
+
+/// The fast path: decide, on every flow-initiating call, whether this socket
+/// carries the daemon's mark. Shared by the connect and sendmsg hooks.
+///
+/// **Re-decided every time, never left in place.** `SO_MARK` lives on the
+/// socket for as long as the socket does, and the socket may outlive the
+/// grant: the rule is deleted, the deadline lapses because the daemon died,
+/// the process drops privileges, or the fd crosses an execve into a program
+/// that earned nothing. So the decision is not "grant, then forget" but "at
+/// every `connect()` and every `sendmsg()`, set the mark if the grant is
+/// current and *strip it* if it is not". A stale mark then survives exactly
+/// until the next flow start, which is the first moment it could have
+/// mattered.
+///
+/// Sockets that already carry a mark of their own are left alone entirely,
+/// in both directions: a VPN or proxy that marks its sockets for policy
+/// routing would be broken by an overwrite, and stripping to zero would
+/// break it just as surely. Such a socket takes the queue - fail closed for
+/// the flow, and no interference with the routing the mark was there for.
+#[inline(always)]
+fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
+    use cfc_ebpf_common::{enforce_stat, fast_allow};
+
+    // Unarmed: the daemon never drew a value, or disarmed on the way out.
+    // Nothing to set, and nothing of ours to strip either.
+    let mark = match FAST_ALLOW_MARK.get(0) {
+        Some(&m) if m != fast_allow::UNARMED => m,
+        _ => {
+            bump(enforce_stat::UNKNOWN);
+            return;
+        }
+    };
+
+    let mut current: u32 = 0;
+    // SAFETY: the program's own context pointer, a stack variable the helper
+    // writes into, and its exact size; the verifier checks all three.
+    let read = unsafe {
+        aya_ebpf::helpers::generated::bpf_getsockopt(
+            ctx.as_ptr(),
+            SOL_SOCKET,
+            SO_MARK,
+            (&mut current as *mut u32).cast(),
+            core::mem::size_of::<u32>() as i32,
+        )
+    };
+    if read != 0 {
+        // Cannot read the mark: cannot know whether it is ours to touch.
+        bump(enforce_stat::UNKNOWN);
+        return;
+    }
+    if current != 0 && current != mark {
+        bump(enforce_stat::FOREIGN_MARK);
+        return;
+    }
+
+    // SAFETY: map reads from a program context; both borrow map memory that
+    // stays valid for this run.
+    let granted = unsafe { FAST_ALLOW.get(&tgid) }.is_some();
+    let until = match FAST_ALLOW_UNTIL.get(0) {
+        Some(&u) => u,
+        None => 0,
+    };
+    // SAFETY: a helper with no arguments and no memory effects; unsafe only
+    // because every generated helper is.
+    let fresh = unsafe { bpf_ktime_get_boot_ns() } < until;
+
+    let want = if granted && fresh { mark } else { 0 };
+    if current != want {
+        let mut value = want;
+        // SAFETY: as for the read above.
+        let set = unsafe {
+            aya_ebpf::helpers::generated::bpf_setsockopt(
+                ctx.as_ptr(),
+                SOL_SOCKET,
+                SO_MARK,
+                (&mut value as *mut u32).cast(),
+                core::mem::size_of::<u32>() as i32,
+            )
+        };
+        if set != 0 {
+            // Refused to set: the socket keeps whatever it had. For a grant
+            // that means the queue decides (fail closed); for a strip it means
+            // a stale mark lingers one flow longer, which the deadline bounds.
+            bump(enforce_stat::UNKNOWN);
+            return;
+        }
+    }
+    if want != 0 {
+        bump(enforce_stat::ALLOWED);
+        report_connect(&ALLOW_EVENTS, ctx, tgid, family);
+    } else if granted {
+        // Granted but the deadline has passed: the daemon that granted this is
+        // not refreshing. Counted so "the fast path stopped" has a reading.
+        bump(enforce_stat::STALE);
+    } else {
+        bump(enforce_stat::UNKNOWN);
     }
 }
 
@@ -1013,6 +1189,33 @@ pub fn cfc_connect4_basic(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(connect6)]
 pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
     connect_verdict(&ctx, 6, false)
+}
+
+/// The mark decision for UDP that never calls `connect()`.
+///
+/// `sendto()` on an unconnected socket starts a new flow without ever passing
+/// the connect hooks, so a socket marked at some earlier `connect()` and then
+/// reused toward another destination would carry a decision nobody re-made.
+/// These hooks close that: the same `mark_decision`, on every datagram send.
+/// No refusal here - the in-kernel deny is a `connect()` thing, and
+/// unconnected UDP has always been the packet path's to refuse.
+///
+/// No `_basic` twins: these exist only for the fast path, which the basic
+/// variants do not have, so on a kernel that verifies only the basic connect
+/// programs these are simply not attached.
+#[cgroup_sock_addr(sendmsg4)]
+pub fn cfc_sendmsg4(ctx: SockAddrContext) -> i32 {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    mark_decision(&ctx, tgid, 4);
+    CONNECT_PROCEED
+}
+
+/// See [`cfc_sendmsg4`].
+#[cgroup_sock_addr(sendmsg6)]
+pub fn cfc_sendmsg6(ctx: SockAddrContext) -> i32 {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    mark_decision(&ctx, tgid, 6);
+    CONNECT_PROCEED
 }
 
 // ---------------------------------------------------------------------------

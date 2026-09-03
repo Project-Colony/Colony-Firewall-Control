@@ -54,22 +54,38 @@ max = 40000
 
 [cfc_connect4]
 # One cookie read + LRU insert, one hash lookup, one counter increment, and -
-# only on the deny branch - a ring-buffer record. Still small because the
-# decision was already made at exec time and left in a map; anything that grows
-# this number means work moved onto the connect() path, which is the one place
-# in CFC where cost is paid by every process on the machine.
+# only on the deny branch - a ring-buffer record. Then the fast path: a mark
+# map read, a getsockopt, a set lookup, a deadline read and compare, and on a
+# change a setsockopt - with a ring record only when a grant is honoured.
+# Still small because the decision was already made at exec time and left in
+# a map; anything that grows this number means work moved onto the connect()
+# path, which is the one place in CFC where cost is paid by every process on
+# the machine.
 #
 # The cookie recording is what buys back the packet path's ~37 ms /proc walk per
-# new connection: 24 instructions here (106 against the 82 the no-cookie twin
-# costs) for a measured 44.9 -> 4.3 ms median connect. The cheapest millisecond
-# this project will ever purchase.
+# new connection: 24 instructions (106 against the 82 the no-cookie twin costs)
+# for a measured 44.9 -> 4.3 ms median connect. The fast path buys back the
+# round trip itself for process-wide allows; its own number is filled in by the
+# first matrix run, which is also the first time a verifier judges it.
+#
+# `observed` is the pre-fast-path figure and is deliberately left so the delta
+# is visible in the diff that ships the measurement.
 observed = 106
-max = 300
+max = 450
 
 [cfc_connect6]
 # Three more than v4: the address copy is four words instead of one.
 observed = 109
-max = 300
+max = 450
+
+# The mark decision alone: no deny lookup, no cookie, no ring record unless a
+# grant is honoured. Unmeasured until the matrix runs them; the ceiling is
+# the connect path's minus the parts they do not do.
+[cfc_sendmsg4]
+max = 350
+
+[cfc_sendmsg6]
+max = 350
 
 # The no-cookie twins, for kernels whose verifier does not offer
 # bpf_get_socket_cookie to sock_addr programs. Identical enforcement, no

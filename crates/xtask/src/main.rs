@@ -96,6 +96,8 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     // sock_addr programs; the loader tries the cookie ones first
     "cfc_connect4_basic",
     "cfc_connect6_basic",
+    "cfc_sendmsg4",
+    "cfc_sendmsg6",
     // maps
     "EXEC_EVENTS",
     "EXIT_EVENTS",
@@ -112,7 +114,7 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     "EXEC_FILENAME_DATA_LOC",
     // the ABI stamp the loader requires with must_exist = true. Keep in step
     // with `cfc_ebpf_common::ABI_SYMBOL`.
-    "CFC_EBPF_ABI_V3",
+    "CFC_EBPF_ABI_V4",
 ];
 
 /// Sections whose absence would break loading or diagnostics.
