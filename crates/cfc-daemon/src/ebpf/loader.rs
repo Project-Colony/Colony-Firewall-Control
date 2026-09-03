@@ -149,7 +149,12 @@ fn arm_kernel_side(sink: &enforce::VerdictSink, configured: Option<u32>) -> anyh
             }
             m
         }
-        None => pick_mark(|| uuid::Uuid::new_v4().as_u128() as u32),
+        None => pick_mark(|| uuid::Uuid::new_v4().as_u128() as u32).ok_or_else(|| {
+            anyhow!(
+                "could not draw a fast-allow mark that avoids the fwmark selectors this \
+                 host is likely to use; set [ebpf] fast_allow_mark to choose one by hand"
+            )
+        })?,
     };
     sink.arm(mark)
         .context("writing the fast-allow mark to the kernel")?;
@@ -207,24 +212,26 @@ fn collides_with(mark: u32) -> Option<&'static str> {
 /// quarter of the word survives the sieve - the two single-bit kube-proxy
 /// masks account for almost all of it - which leaves about thirty bits of
 /// entropy and takes four draws on average.
-fn pick_mark(mut draw: impl FnMut() -> u32) -> u32 {
-    // Bounded so a caller whose `draw` is degenerate cannot hang the daemon;
-    // the fallback below is still checked against the sieve.
+fn pick_mark(mut draw: impl FnMut() -> u32) -> Option<u32> {
+    // Bounded so a caller whose `draw` is degenerate cannot hang the daemon.
+    // About a quarter of the word survives the sieve, so 64 consecutive
+    // rejections is not chance - it is a broken source of randomness.
     for _ in 0..64 {
         let candidate = draw();
         if candidate != cfc_ebpf_common::fast_allow::UNARMED && collides_with(candidate).is_none() {
-            return candidate;
+            return Some(candidate);
         }
     }
-    // 64 consecutive rejections is not chance. Rather than loop forever, walk
-    // upward from an arbitrary point until the sieve passes - it always does
-    // within a few steps, because no selector here masks the low bits alone.
-    let mut candidate = 1u32;
-    while candidate == cfc_ebpf_common::fast_allow::UNARMED || collides_with(candidate).is_some() {
-        candidate = candidate.wrapping_add(1);
-    }
-    warn!("the fast-allow mark source is not producing usable values; using 0x{candidate:08x}");
-    candidate
+    // And then nothing, rather than a fallback.
+    //
+    // The obvious fallback - walk upward from 1 until the sieve passes - was
+    // worse than no fast path at all: it does not depend on `draw`, so it is
+    // the *same* value on every machine that reaches it. A published constant
+    // is precisely the bypass token the random draw exists to avoid, and
+    // `SO_MARK` needs only CAP_NET_RAW since 5.17. The path stays off, with
+    // the reason in `cfc status`, and every connection keeps taking the queue -
+    // which is the behaviour this whole feature degrades to anyway.
+    None
 }
 
 /// One attempt at the nftables side, at startup, reported as the state it
@@ -344,7 +351,7 @@ impl Drop for Attached {
         // nftables. Best effort - a daemon on its way out has only the log.
         if let Some(sink) = &self._sink {
             sink.disarm();
-            if let Err(e) = super::nft_set::disarm() {
+            if let Err(e) = super::nft_set::disarm_for_shutdown() {
                 tracing::warn!(
                     "could not flush the fast-allow mark from nftables on shutdown: {e:#}"
                 );
@@ -392,6 +399,30 @@ pub(super) fn load_and_attach(
         compiled_in: true,
         ..Report::default()
     };
+
+    // Whatever a previous daemon left accepted in the nftables set, drop it -
+    // first, before anything can return.
+    //
+    // This lived further down for a while, next to the code that arms, and
+    // that was wrong twice over. It ran only when this daemon was *eligible*
+    // and armed; and even after being made unconditional it still sat behind
+    // every early return in this function - a missing object (which is the
+    // single most common outcome on a default install), an untrusted one, a
+    // failed load. So a daemon that crashed while armed and came back to any
+    // of those left its predecessor's mark sitting in the set: accepted by the
+    // ruleset, refreshed by nobody, removed by nothing short of the table
+    // going away. That is a standing bypass token rather than a stale entry -
+    // every process that was ever fast-allowed can read the value back off its
+    // own socket with `getsockopt(SO_MARK)`, and setting it again needs only
+    // CAP_NET_RAW.
+    //
+    // Flushing before knowing whether this daemon will arm is the right order:
+    // an empty set accepts nothing, which is the safe state to pass through.
+    if let Err(e) = super::nft_set::disarm() {
+        report.notes.push(format!(
+            "could not flush a previous fast-allow mark from nftables: {e:#}"
+        ));
+    }
 
     // Vet before read, so a file we would refuse is never even pulled into
     // memory, and so the "not there at all" case is distinguishable from the
@@ -963,23 +994,6 @@ pub(super) fn load_and_attach(
     // enforcement did not come up, or when the caller has no rule engine to
     // consult (the live tests); in both cases the map simply stays empty and
     // every connect falls through to the packet path.
-    // Whatever a previous daemon left accepted, drop it - here, before any
-    // branch, because every branch needs it done.
-    //
-    // This used to live inside `arm_kernel_side`, which runs only when this
-    // daemon is *eligible* and armed. So a daemon that crashed while armed and
-    // came back with `fast_allow` off, on a kernel it now judges ineligible, or
-    // with no rule engine at all, left its predecessor's mark sitting in the
-    // set - accepted by the ruleset, refreshed by nobody, and removed by
-    // nothing short of the table being torn down. That is a standing bypass
-    // token rather than a stale entry: every process that was ever fast-allowed
-    // can read the value back off its own socket with `getsockopt(SO_MARK)`,
-    // and setting it again needs only CAP_NET_RAW.
-    if let Err(e) = super::nft_set::disarm() {
-        report.notes.push(format!(
-            "could not flush a previous fast-allow mark from nftables: {e:#}"
-        ));
-    }
     // The mark the kernel side was armed with, when it was: the heartbeat
     // task below needs it to finish the nftables half of arming.
     let mut armed_mark: Option<u32> = None;
@@ -1211,7 +1225,7 @@ pub(super) fn load_and_attach(
     // no heartbeat the kernel stops honouring grants within one deadline, and
     // with no element in the set it stops mattering immediately.
     if armed_mark.is_some() && !(report.exec_tracking && report.exit_tracking) {
-        let why = "the exec/exit ring consumers did not start, so nothing would                    grant or evict";
+        let why = "the exec/exit ring consumers did not start, so nothing would grant or evict";
         warn!("fast-allow withdrawn after arming: {why}");
         if let Err(e) = super::nft_set::disarm() {
             report
@@ -1872,7 +1886,7 @@ mod tests {
             seed
         };
         for _ in 0..2000 {
-            let mark = pick_mark(&mut draw);
+            let mark = pick_mark(&mut draw).expect("a healthy source always yields one");
             assert_ne!(mark, cfc_ebpf_common::fast_allow::UNARMED);
             assert_eq!(
                 collides_with(mark),
@@ -1883,16 +1897,15 @@ mod tests {
     }
 
     /// A source that only ever offers unusable values must not hang the
-    /// daemon, and must not be answered with an unusable value either.
+    /// daemon - and must not be answered with a *constant* either, which is
+    /// what an earlier fallback did: a value that does not depend on the draw
+    /// is the same on every machine that reaches it, which is the published
+    /// bypass token the random draw exists to avoid. Refusing leaves the fast
+    /// path off, which is where it degrades to anyway.
     #[test]
-    fn a_degenerate_draw_still_yields_a_usable_mark() {
-        let mark = pick_mark(|| 0x0000_8000);
-        assert_ne!(mark, cfc_ebpf_common::fast_allow::UNARMED);
-        assert_eq!(collides_with(mark), None);
-
-        let zero = pick_mark(|| cfc_ebpf_common::fast_allow::UNARMED);
-        assert_ne!(zero, cfc_ebpf_common::fast_allow::UNARMED);
-        assert_eq!(collides_with(zero), None);
+    fn a_degenerate_draw_arms_nothing_rather_than_a_constant() {
+        assert_eq!(pick_mark(|| 0x0000_8000), None);
+        assert_eq!(pick_mark(|| cfc_ebpf_common::fast_allow::UNARMED), None);
     }
 
     #[test]
@@ -2295,7 +2308,34 @@ mod tests {
             let pin = enforce::pin_dir().join(name);
             assert!(pin.exists(), "{} must be pinned", pin.display());
         }
-        println!("all seven attached programs pinned without CAP_SYS_ADMIN");
+
+        // And the rung the fast path's safety argument stands on: the exec and
+        // exit tracepoint links pinned, not merely attached.
+        //
+        // Only the pin makes their clears outlive the daemon, and the connect
+        // programs' links are pinned separately - so on a kernel where these
+        // two cannot be, the marking survives a dead daemon while the clearing
+        // does not. The loader used to throw the pin outcome away and the
+        // ladder could not see the difference; this is the assertion that
+        // stops it being thrown away again. Only this test can make it: the
+        // matrix guests have no bpffs.
+        for name in [enforce::LINK_EXEC, enforce::LINK_EXIT] {
+            let pin = enforce::pin_dir().join(name);
+            assert!(
+                pin.exists(),
+                "{} must be pinned, or the fast path's clears die with the daemon",
+                pin.display()
+            );
+        }
+        assert!(
+            report.lifecycle_pinned,
+            "the report must say both lifecycle links pinned when they did: {:?}",
+            report.notes
+        );
+        println!(
+            "seven programs attached; connect, sendmsg and lifecycle links plus \
+             every fast-path map pinned, without CAP_SYS_ADMIN"
+        );
 
         drop(attached);
         // Pins outlive the process by design, so this test has to take its own

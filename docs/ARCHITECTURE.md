@@ -375,14 +375,24 @@ safe to hand out at all.
 
 They do not reach a socket that has already been marked and does not pass a
 hook again - a **connected UDP socket**, whose later `send()` calls take
-neither path. Conntrack makes that mostly moot: the ruleset queues only
-`ct state new`, so those datagrams were never reaching the daemon anyway. The
-residual case is a connected UDP socket left idle long enough for its
-conntrack entry to expire and then used again - that datagram is `new`, and it
-carries a mark decided before the revocation. It is bounded by the conntrack
-timeout, it cannot be closed from inside a hook that does not run, and it is
-one of the reasons the path is opt-in. TCP has no equivalent: an established
-connection is not `ct state new` either way, with or without this feature.
+neither path. Its mark is the one it was given at `connect()`, for as long as
+it is open.
+
+For TCP that costs nothing: the ruleset queues `ct state new`, and an
+established connection is not that with or without a mark. **For UDP it is a
+real hole, and conntrack does not close it.** Unreplied UDP is conntrack-NEW on
+every datagram - this project's own packet path says so, and sizes a queue
+around it - so a connected UDP socket talking to something that never answers
+presents every datagram as a new flow, and a stale mark takes every one of them
+past the queue. Nor does the deadline reach it: the deadline is read at hook
+time, and there is no next hook, so this is also the one case where "a dead
+daemon fails closed within 60 s" does not hold. What does end it is the socket
+closing, or the process exiting.
+
+This is the sharpest edge of the feature, it cannot be closed from inside a
+hook that does not run, and it is the main reason the path ships opt-in and
+off. Restricting the mark to TCP would remove it outright, at the cost of not
+fast-allowing QUIC; see `TODO.md`.
 Nothing else here filters anything - the `cgroup_skb` program returns "pass"
 unconditionally. What the programs buy is *better answers to questions the
 daemon already asks*, and every one of them degrades independently: a missing

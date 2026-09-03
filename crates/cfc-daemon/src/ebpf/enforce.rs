@@ -345,7 +345,7 @@ impl VerdictSink {
     /// [`grant_if_still`](Self::grant_if_still) for why a grant needs it and a
     /// withdrawal does not.
     fn regrant(&self, pid: u32, judged_at: Option<u64>, proc: &Process) {
-        self.grant_if_still(pid, judged_at, self.grant_for(proc));
+        self.grant_if_still(pid, proc, judged_at, self.grant_for(proc));
     }
 
     /// Withdraws any grant for `pid`, unconditionally.
@@ -373,18 +373,71 @@ impl VerdictSink {
     /// The deny side has had this guard since the orphan sweep was written -
     /// `doomed` carries the start time each pid was judged at - and the grant
     /// side, which needs it more, did not have it.
-    fn grant_if_still(&self, pid: u32, judged_at: Option<u64>, grant: Grant) {
+    fn grant_if_still(&self, pid: u32, judged: &Process, judged_at: Option<u64>, grant: Grant) {
         let Some(fast) = self.fast.as_ref() else {
             return;
         };
-        if matches!(grant, Grant::Yes(_)) && proc_starttime(pid) != judged_at {
+        if !matches!(grant, Grant::Yes(_)) {
+            Self::apply_grant(fast, &mut fast.map.lock(), pid, grant);
+            return;
+        }
+
+        // `None` is not a start time, it is the absence of a process, and
+        // comparing it directly let a grant through on exactly the case that
+        // must refuse. `proc_view` reads the exe, then the uid, then the start
+        // time; a process that exits in between yields a full view with
+        // `judged_at = None`, and `None != None` is false, so the guard fell
+        // through and wrote a grant for a pid with no process. Nothing would
+        // have cleared it either: the kernel's exec and exit clears both
+        // belong to a process that has already gone, and a pid recycled by a
+        // fork that never execs would inherit the mark.
+        let Some(judged_at) = judged_at else {
+            debug!(pid, "not granting: no start time, so no process to grant");
+            return;
+        };
+        if proc_starttime(pid) != Some(judged_at) {
             debug!(
                 pid,
                 "not granting: the pid changed hands while it was judged"
             );
             return;
         }
+
         Self::apply_grant(fast, &mut fast.map.lock(), pid, grant);
+
+        // And once more, on the program rather than the pid - after the write,
+        // deliberately.
+        //
+        // `execve` keeps the start time (field 22 of /proc/<pid>/stat is when
+        // the *process* began, not when it last exec'd), so the guard above
+        // cannot see one. That matters because the kernel's exec program
+        // removes this pid's grant on every execve: a process judged as an
+        // allowed binary, exec'ing into a denied one while this function was
+        // deciding, would have its grant correctly cleared by the kernel and
+        // then reinstated here, for a program nothing granted.
+        //
+        // Checking afterwards is what makes it race-free rather than merely
+        // narrower. An execve that beat the write is visible in /proc by the
+        // time this reads, and this removes the grant; one that follows the
+        // write is cleared by the kernel itself.
+        let still = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|exe| {
+                match exe
+                    .to_string_lossy()
+                    .strip_suffix(crate::process_resolve::DELETED_SUFFIX)
+                {
+                    Some(stripped) => std::path::PathBuf::from(stripped),
+                    None => exe,
+                }
+            });
+        if still.as_deref() != Some(judged.exe.as_path()) {
+            debug!(
+                pid,
+                "withdrawing: the program changed while the grant was decided"
+            );
+            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No);
+        }
     }
 
     /// The rule that granted `pid`, for crediting an `ALLOW_EVENTS` record.
@@ -576,24 +629,61 @@ impl VerdictSink {
             })
             .collect();
 
+        // Decide, and re-date, before taking the lock.
+        //
+        // The re-dating is not decoration. Between the view and this write a
+        // pid can be recycled, and `on_exec` - which runs on the exec ring's
+        // own task - installs the new owner's verdict as soon as it sees the
+        // execve. Writing from the old view then overwrites a fresh DENY with
+        // whatever the *previous* holder's binary deserved, and the common
+        // shape of that is a `clear`: the refusal the new process had just
+        // earned, erased. The orphan sweep below has carried this guard since
+        // it was written; the live loop collected the start times and then
+        // dropped them on the floor.
+        //
+        // Both the read and the decision happen out here, so the lock covers
+        // map operations and nothing else.
+        enum DenyOp {
+            Deny,
+            Clear,
+            Keep,
+        }
+        let deny_work: Vec<(u32, DenyOp)> = views
+            .iter()
+            .filter(|(pid, _, judged_at)| {
+                // A pid with no start time now, or a different one, is not the
+                // process that was judged. `None` on the judged side means the
+                // process was already gone when it was read.
+                judged_at.is_some() && proc_starttime(*pid) == *judged_at
+            })
+            .map(|(pid, as_process, _)| {
+                // The same three-way answer as the orphan branch below,
+                // because these are the same question at different ages. This
+                // loop used to collapse it to deny-or-clear, so a hash-scoped
+                // rule that made the engine abstain *cleared* a standing
+                // kernel deny for a recently-exec'd process while the orphan
+                // branch kept it for an old one - identical binary, identical
+                // rules, opposite enforcement, selected by exec age.
+                let op = match self.engine.process_wide_action(as_process) {
+                    Some(Action::Deny | Action::Reject) => DenyOp::Deny,
+                    Some(_) => DenyOp::Clear,
+                    None if self.engine.deny_still_possible_for(as_process) => DenyOp::Keep,
+                    None => DenyOp::Clear,
+                };
+                (*pid, op)
+            })
+            .collect();
+
         let mut map = self.map.lock();
-        for (pid, as_process, _) in &views {
+        for (pid, op) in &deny_work {
             let pid = *pid;
-            // The same three-way answer as the orphan branch below, because
-            // these are the same question at different ages. This loop used
-            // to collapse it to deny-or-clear, so a hash-scoped rule that
-            // made the engine abstain *cleared* a standing kernel deny for a
-            // recently-exec'd process while the orphan branch kept it for an
-            // old one - identical binary, identical rules, opposite
-            // enforcement, selected by exec age.
-            let r = match self.engine.process_wide_action(as_process) {
-                Some(Action::Deny | Action::Reject) => {
+            let r = match op {
+                DenyOp::Deny => {
                     denied += 1;
                     map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
                 }
-                Some(_) => clear(&mut map, pid),
-                None if self.engine.deny_still_possible_for(as_process) => Ok(()),
-                None => clear(&mut map, pid),
+                DenyOp::Clear => clear(&mut map, pid),
+                DenyOp::Keep => Ok(()),
             };
             if let Err(e) = r {
                 warn!(pid, "verdict resync failed: {e}");
@@ -610,7 +700,7 @@ impl VerdictSink {
         // keeps a deny above - removes a grant, because a grant kept in doubt
         // is a marked socket past the queue.
         for (pid, as_process, judged_at) in &views {
-            self.grant_if_still(*pid, *judged_at, self.grant_for(as_process));
+            self.grant_if_still(*pid, as_process, *judged_at, self.grant_for(as_process));
         }
 
         // And the entries the live list does not cover.
@@ -701,22 +791,33 @@ impl VerdictSink {
             // loses a uid-scoped grant here rather than keeping what it
             // earned as root - and against the same start time, so it cannot
             // land on a pid the kernel recycled while this loop was working.
-            self.grant_if_still(pid, judged_at, self.grant_for(&proc));
+            self.grant_if_still(pid, &proc, judged_at, self.grant_for(&proc));
         }
 
         if !doomed.is_empty() {
+            // Re-date every doomed pid *before* the lock. Clear only what was
+            // judged: a process existing NOW with a different start time - or
+            // existing at all where "gone" was judged - is a new owner of a
+            // recycled pid, and its verdict was written by its own exec flow.
+            // A pid that has no process now still clears: the judged one
+            // exiting in the window only strengthens the judgment.
+            //
+            // These reads used to happen inside the loop below, under the
+            // lock. That is the hazard this function documents twice and the
+            // commit that moved the live loop's reads out claimed to have
+            // removed everywhere - and it had missed this one, which is the
+            // pass that runs over the *largest* pid set, every inherited entry
+            // at once after a restart.
+            let clearable: Vec<u32> = doomed
+                .into_iter()
+                .filter(|(pid, judged_at)| {
+                    let now = proc_starttime(*pid);
+                    now.is_none() || now == *judged_at
+                })
+                .map(|(pid, _)| pid)
+                .collect();
             let mut map = self.map.lock();
-            for (pid, judged_at) in doomed {
-                // Clear only what was judged. A process existing NOW with a
-                // different start time - or existing at all where "gone" was
-                // judged - is a new owner of a recycled pid, and its verdict
-                // was written by its own exec flow. A pid that has no process
-                // now still clears: the judged one exiting in the window only
-                // strengthens the judgment.
-                let now = proc_starttime(pid);
-                if now.is_some() && now != judged_at {
-                    continue;
-                }
+            for pid in clearable {
                 let _ = clear(&mut map, pid);
             }
         }
@@ -785,7 +886,7 @@ impl VerdictSink {
             let grant = self.grant_for(&proc);
             if matches!(grant, Grant::Yes(_)) {
                 granted += 1;
-                self.grant_if_still(pid, judged_at, grant);
+                self.grant_if_still(pid, &proc, judged_at, grant);
             }
         }
         debug!(seen, granted, "swept /proc for fast-allow grants");
@@ -835,6 +936,12 @@ impl VerdictSink {
             });
         // Dates the read above, for the grant at the end of this function.
         let judged_at = resolved.is_some().then(|| proc_starttime(pid)).flatten();
+        // The uid here stays the event's, not a fresh read: at the moment of an
+        // execve that *is* the process's uid, and a drop of privileges between
+        // the kernel's tracepoint and this consumer is both vanishingly narrow
+        // and re-decided by the next resync, whose live loop reads /proc for
+        // both. Mixing a live path with an event-time uid is worth naming
+        // rather than leaving for a reader to find.
         // When /proc is unreadable, the process already exec'd again or
         // exited; the event's own path is the only witness left, and a wrong
         // decision for a dead pid is cleaned by the exit program or the next
@@ -1567,7 +1674,20 @@ pub(super) fn sweep(verdicts: &mut BpfHashMap<&mut MapData, u32, u32>) -> usize 
 
 /// Sums the per-CPU counters.
 pub(super) fn stats(map: &PerCpuArray<&MapData, u64>) -> anyhow::Result<EnforceStats> {
+    // A pin from an earlier build of the *same* ABI version can be one slot
+    // short. `ENFORCE_STATS` is pinned, the pin directory is keyed on the ABI
+    // version, and `REPORT_DROPPED` was added inside v4 rather than across a
+    // bump - so a daemon upgraded in place reuses a five-slot pin while this
+    // build asks for six. Reading past the end must answer "this counter did
+    // not exist", not fail the whole read: every other counter is still true,
+    // and losing all of them would take the startup carry-over note and
+    // `cfc status` with it. The kernel side is already safe on its own -
+    // `get_ptr_mut` bounds-checks and `bump` silently does nothing.
+    let slots = map.len();
     let read = |slot: u32| -> anyhow::Result<u64> {
+        if slot >= slots {
+            return Ok(0);
+        }
         Ok(map
             .get(&slot, 0)
             .with_context(|| format!("reading {MAP_STATS}[{slot}]"))?

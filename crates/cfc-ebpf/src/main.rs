@@ -1074,15 +1074,29 @@ const SO_MARK: i32 = 36;
 /// The fast path: decide, on every flow-initiating call, whether this socket
 /// carries the daemon's mark. Shared by the connect and sendmsg hooks.
 ///
-/// **Re-decided every time, never left in place.** `SO_MARK` lives on the
-/// socket for as long as the socket does, and the socket may outlive the
-/// grant: the rule is deleted, the deadline lapses because the daemon died,
-/// the process drops privileges, or the fd crosses an execve into a program
-/// that earned nothing. So the decision is not "grant, then forget" but "at
-/// every `connect()` and every `sendmsg()`, set the mark if the grant is
-/// current and *strip it* if it is not". A stale mark then survives exactly
-/// until the next flow start, which is the first moment it could have
-/// mattered.
+/// **Re-decided at every hook that runs, never left in place.** `SO_MARK`
+/// lives on the socket for as long as the socket does, and the socket may
+/// outlive the grant: the rule is deleted, the deadline lapses because the
+/// daemon died, the process drops privileges, or the fd crosses an execve into
+/// a program that earned nothing. So the decision is not "grant, then forget"
+/// but "set the mark if the grant is current and *strip it* if it is not",
+/// every time one of these hooks runs.
+///
+/// Which is not the same as "at every flow start", and the difference is this
+/// feature's sharpest edge. `cgroup/connect{4,6}` runs at `connect()`;
+/// `cgroup/sendmsg{4,6}` runs for a send that carries a destination. A
+/// **connected UDP socket** passes neither again: its `send()` calls take the
+/// connected path, so whatever mark it was given at `connect()` is the mark it
+/// keeps until it is closed.
+///
+/// For TCP that costs nothing - the ruleset queues `ct state new`, and an
+/// established connection is not that with or without a mark. For UDP it is a
+/// real hole, and conntrack does not close it: this project's own packet path
+/// records that *unreplied* UDP is conntrack-NEW on every datagram (see
+/// `nfqueue.rs`), so a connected UDP socket talking to something that never
+/// answers presents every datagram as a new flow, and a stale mark takes every
+/// one of them past the queue. `docs/ARCHITECTURE.md` states the boundary; it
+/// is one of the reasons the whole path is opt-in.
 ///
 /// Sockets that already carry a mark of their own are left alone entirely,
 /// in both directions: a VPN or proxy that marks its sockets for policy

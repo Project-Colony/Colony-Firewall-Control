@@ -110,6 +110,29 @@ const NFT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Refuses [`fast_allow::UNARMED`] outright: zero is the mark every socket
 /// carries when nothing has marked it, and a zero element in the set would
 /// accept every unmarked packet on the machine.
+/// Serialises [`arm`] against the shutdown flush, and refuses an arm once that
+/// flush has begun.
+///
+/// Both run `nft`, and the heartbeat's arm runs inside `spawn_blocking`, which
+/// `JoinHandle::abort` cannot cancel: aborting the heartbeat task leaves any
+/// `nft add element` already in flight running to completion on the blocking
+/// pool. So `Drop for Attached` could flush the set and *then* have that add
+/// put the element back - leaving a mark accepted by the ruleset with no
+/// daemon alive to refresh a deadline, honour a revocation, or ever remove it.
+///
+/// The bool inside is "shutdown has started". Holding the lock across the
+/// check and the command is what makes the two orders both end flushed: if the
+/// heartbeat holds it, the shutdown flush waits and runs last; if the shutdown
+/// flush holds it, the heartbeat then sees the flag and does not arm.
+static SHUTDOWN: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Locks [`SHUTDOWN`], ignoring poisoning: the flag is a single bool that no
+/// panic can leave inconsistent, and refusing to shut down cleanly because
+/// some other thread panicked would be the worse failure.
+fn shutdown_gate() -> std::sync::MutexGuard<'static, bool> {
+    SHUTDOWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
     if mark == fast_allow::UNARMED {
         bail!(
@@ -117,6 +140,10 @@ pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
              socket nothing has marked, and accepting it would accept everything",
             mark_literal(mark)
         );
+    }
+    let gate = shutdown_gate();
+    if *gate {
+        bail!("not arming the fast-allow set: the daemon is shutting down");
     }
     match run(Op::ListSet) {
         Ok(()) => {}
@@ -146,9 +173,12 @@ pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
     // shape this set can be in: every process that ever held it can read it
     // back with `getsockopt(SO_MARK)` and set it again.
     if let Err(failed) = run(Op::FlushSet) {
-        // Not fatal, and not silent: the add below is still the operation that
-        // matters, and a set that could not be flushed is reported by the
-        // element check the heartbeat runs.
+        // Not fatal: the add below is still the operation that matters. Not
+        // compensated for either, which an earlier version of this comment
+        // claimed - `holds` asks whether *our* mark is in the set, so it
+        // cannot notice a stranger's left beside it. A failed flush here means
+        // a value this daemon did not choose may stay accepted until something
+        // else tears the table down; the log line is the only trace.
         if !failed.is_no_such_object() {
             debug!(
                 "could not flush the fast-allow set before arming: {}",
@@ -192,6 +222,22 @@ pub(super) fn holds(mark: u32) -> anyhow::Result<bool> {
 /// gone - `colony-firewall-nft.service` is `PartOf=` the daemon and stops
 /// first.
 pub(super) fn disarm() -> anyhow::Result<()> {
+    let _gate = shutdown_gate();
+    flush()
+}
+
+/// [`disarm`], and no [`arm`] after it.
+///
+/// For `Drop for Attached` only. Sets the flag the heartbeat's in-flight arm
+/// will see, under the same lock, so the set cannot be re-armed behind a
+/// daemon that has already stopped.
+pub(super) fn disarm_for_shutdown() -> anyhow::Result<()> {
+    let mut gate = shutdown_gate();
+    *gate = true;
+    flush()
+}
+
+fn flush() -> anyhow::Result<()> {
     match run(Op::FlushSet) {
         Ok(()) => {
             debug!("fast-allow set flushed");
