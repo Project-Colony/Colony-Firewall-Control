@@ -1373,6 +1373,45 @@ async fn stream_connections_maps_the_live_feed() {
     assert!(event.rule_id.is_empty());
 }
 
+/// Copies /usr/bin/sleep into a tempdir and starts it: the ~/.local/bin shape
+/// the hash-binding tests need - user-owned, small, alive long enough to hash.
+///
+/// `None` when the test has nothing true to assert here: no sleep binary, or
+/// running as root (the seal judgment legitimately flips).
+///
+/// Copy and spawn happen under one process-wide lock, and the lock is the
+/// point. Tests share one address space and therefore one fd table; `fork`
+/// snapshots all of it. When test B forked while test A's copy still held its
+/// destination open for writing, B's child carried A's write fd until its own
+/// exec - and if A exec'd its copy inside that window the kernel answered
+/// ETXTBSY ("Text file busy"). Rust opens files O_CLOEXEC, so the window is
+/// fork-to-exec in the *other* test's child: microseconds, and it fired on CI
+/// (the same race as rust-lang/cargo#5088). Serialising copy+spawn across the
+/// tests that do it removes the overlap instead of retrying past it.
+fn spawn_user_writable_copy() -> Option<(tempfile::TempDir, std::path::PathBuf, std::process::Child)>
+{
+    static EXEC_A_FRESH_COPY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _gate = EXEC_A_FRESH_COPY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let sealed_src = std::path::Path::new("/usr/bin/sleep");
+    if !sealed_src.exists() {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = dir.path().join("tool");
+    std::fs::copy(sealed_src, &tool).expect("copying sleep");
+    if cfc_core::exe_path::is_root_sealed(&tool).unwrap_or(false) {
+        return None;
+    }
+    let child = std::process::Command::new(&tool)
+        .arg("30")
+        .spawn()
+        .expect("spawning the tool");
+    Some((dir, tool, child))
+}
+
 #[tokio::test]
 async fn a_user_writable_binary_gets_its_allow_hash_bound() {
     // End to end, with a real process: a copy of /usr/bin/sleep in a
@@ -1381,21 +1420,9 @@ async fn a_user_writable_binary_gets_its_allow_hash_bound() {
     // persisted allow must carry the image's digest, and the note must say
     // so; a deny through the same prompt shape stays path-keyed (a
     // hash-bound deny is one file swap away from covering nothing).
-    let sealed_src = std::path::Path::new("/usr/bin/sleep");
-    if !sealed_src.exists() {
+    let Some((_dir, tool, mut child)) = spawn_user_writable_copy() else {
         return;
-    }
-    let dir = tempfile::tempdir().expect("tempdir");
-    let tool = dir.path().join("tool");
-    std::fs::copy(sealed_src, &tool).expect("copying sleep");
-    if cfc_core::exe_path::is_root_sealed(&tool).unwrap_or(false) {
-        // Running as root: the judgment legitimately flips.
-        return;
-    }
-    let mut child = std::process::Command::new(&tool)
-        .arg("30")
-        .spawn()
-        .expect("spawning the tool");
+    };
 
     let d = TestDaemon::build().await;
     let mut client = d.client().await;
@@ -1444,20 +1471,9 @@ async fn a_user_writable_binary_gets_its_allow_hash_bound() {
 async fn a_deny_on_a_user_writable_binary_stays_path_keyed() {
     // Same shape, opposite action: binding a deny to a hash would let a
     // file swap escape it, so the daemon must leave the deny on the path.
-    let sealed_src = std::path::Path::new("/usr/bin/sleep");
-    if !sealed_src.exists() {
+    let Some((_dir, tool, mut child)) = spawn_user_writable_copy() else {
         return;
-    }
-    let dir = tempfile::tempdir().expect("tempdir");
-    let tool = dir.path().join("tool");
-    std::fs::copy(sealed_src, &tool).expect("copying sleep");
-    if cfc_core::exe_path::is_root_sealed(&tool).unwrap_or(false) {
-        return;
-    }
-    let mut child = std::process::Command::new(&tool)
-        .arg("30")
-        .spawn()
-        .expect("spawning the tool");
+    };
 
     let d = TestDaemon::build().await;
     let mut client = d.client().await;
