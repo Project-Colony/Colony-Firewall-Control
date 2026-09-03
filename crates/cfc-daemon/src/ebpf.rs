@@ -465,6 +465,19 @@ pub struct Report {
     /// evicted late is an inconvenience; a fast-allow grant evicted late is a
     /// mark on a recycled pid, so the fast path requires the exact answer.
     pub exit_precise: bool,
+    /// Whether *both* lifecycle tracepoint links were pinned to bpffs, rather
+    /// than merely attached.
+    ///
+    /// The two are not the same and the difference is the fast path's whole
+    /// safety argument. `attach_tracepoint` re-attaches unpinned when a link
+    /// cannot be pinned - no `BPF_LINK_TYPE_PERF_EVENT` before 5.15, or a
+    /// read-only bpffs - which keeps eviction working for as long as this
+    /// daemon runs and stops the moment it does not. The connect programs' own
+    /// links are pinned separately and go on marking sockets either way, so
+    /// without this flag the ladder granted on a kernel where the clears die
+    /// with the daemon and only the sixty-second deadline stood between a
+    /// grant and a recycled pid.
+    pub lifecycle_pinned: bool,
 }
 
 impl Report {

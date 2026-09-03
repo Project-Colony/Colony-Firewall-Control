@@ -1100,6 +1100,9 @@ pub(super) struct EnforceStats {
     /// Grants not applied because the socket carried a foreign mark - a VPN
     /// or proxy marking its own sockets, left alone on purpose.
     pub foreign_mark: u64,
+    /// Decisions the kernel made and could not report, because the ring was
+    /// full. Non-zero means the daemon's view of the fast path undercounts.
+    pub report_dropped: u64,
 }
 
 /// The directory this build pins into.
@@ -1314,14 +1317,32 @@ pub(super) enum FastPathCapability {
     /// The connect hooks fell back to the `_basic` twins: no socket cookie
     /// and, in the same era of kernels, no `bpf_setsockopt` on sock_addr.
     BasicConnect,
-    /// The connect hooks verified with the mark decision in them, but the
-    /// sendmsg hooks did not: this kernel allows `bpf_getsockopt` /
-    /// `bpf_setsockopt` on connect programs and not yet on UDP sendmsg ones.
-    /// Observed on 5.10 (`unknown func bpf_getsockopt#57`); 6.12 accepts.
-    /// The fast path needs both - a connected UDP socket can still `sendto`
-    /// another peer without re-passing the connect hook, so without the
-    /// sendmsg re-decision a stale mark would follow it there.
-    SendmsgRejected,
+    /// The connect hooks took with the mark decision in them, and a sendmsg
+    /// hook did not load, attach or pin.
+    ///
+    /// The likely cause is the verifier: this kernel allows `bpf_getsockopt` /
+    /// `bpf_setsockopt` on connect programs and not yet on UDP sendmsg ones -
+    /// 5.10 answers `unknown func bpf_getsockopt#57`, 6.12 accepts. It is not
+    /// the only cause, which is why neither this comment nor `off_reason`
+    /// states it as fact: `attach_one` also fails at the attach, at taking the
+    /// link, and at pinning. The connect loop above learned this the same way
+    /// and says so; this arm used to make the mistake that comment warns
+    /// about, and would have sent a reader chasing a kernel version for an
+    /// EEXIST. The real error is in the log line beside it.
+    ///
+    /// The fast path needs both hooks - a connected UDP socket can still
+    /// `sendto` another peer without re-passing the connect hook, so without
+    /// the sendmsg re-decision a stale mark would follow it there.
+    SendmsgUnavailable,
+    /// Inherited pins, and no sendmsg pins beside them.
+    ///
+    /// The pin names do not say which connect variant is running, and the
+    /// sendmsg pins - written only after the cookie variants attached - are
+    /// the only evidence. Their absence is consistent with both `BasicConnect`
+    /// and `SendmsgUnavailable`, so this says neither. It used to be reported
+    /// as `BasicConnect`, which named a cause ("no bpf_get_socket_cookie on
+    /// sock_addr programs") that the inherited path has no way to know.
+    Inconclusive,
 }
 
 impl FastPathCapability {
@@ -1330,13 +1351,19 @@ impl FastPathCapability {
         match self {
             Self::Ready => None,
             Self::BasicConnect => Some(
-                "the kernel runs the basic connect programs (no bpf_get_socket_cookie / \
-                 bpf_setsockopt on sock_addr programs)",
+                "the connect hooks fell back to the basic variants (usually no \
+                 bpf_get_socket_cookie / bpf_setsockopt on sock_addr programs; the log \
+                 line beside this one has the kernel's actual answer)",
             ),
-            Self::SendmsgRejected => Some(
-                "this kernel's verifier refused the sendmsg hooks: bpf_getsockopt/setsockopt \
-                 on cgroup/sendmsg needs a newer kernel than on cgroup/connect (5.10 refuses, \
-                 6.12 accepts)",
+            Self::SendmsgUnavailable => Some(
+                "a cgroup/sendmsg hook did not load or attach (usually this kernel's \
+                 verifier: bpf_getsockopt/setsockopt on sendmsg needs a newer kernel than \
+                 on connect - 5.10 refuses, 6.12 accepts; the log line beside this one has \
+                 the kernel's actual answer)",
+            ),
+            Self::Inconclusive => Some(
+                "these are a previous daemon's pins and they do not say whether this \
+                 kernel runs the fast path's hooks; restart with the pins removed to find out",
             ),
         }
     }
@@ -1437,7 +1464,7 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
                         "{name} could not load or attach ({e:#}); the fast path is off on \
                          this kernel"
                     );
-                    fast_path = FastPathCapability::SendmsgRejected;
+                    fast_path = FastPathCapability::SendmsgUnavailable;
                     break;
                 }
             }
@@ -1494,6 +1521,7 @@ pub(super) fn stats(map: &PerCpuArray<&MapData, u64>) -> anyhow::Result<EnforceS
         unknown: read(enforce_stat::UNKNOWN)?,
         stale: read(enforce_stat::STALE)?,
         foreign_mark: read(enforce_stat::FOREIGN_MARK)?,
+        report_dropped: read(enforce_stat::REPORT_DROPPED)?,
     })
 }
 

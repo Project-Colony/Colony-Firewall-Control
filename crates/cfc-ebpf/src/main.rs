@@ -958,6 +958,9 @@ fn bump(slot: u32) {
 #[inline(always)]
 fn report_connect(ring: &RingBuf, ctx: &SockAddrContext, tgid: u32, family: u8) {
     let Some(mut entry) = ring.reserve::<ConnectReport>(0) else {
+        // The connection is already decided; this record is the only thing
+        // lost. Counted rather than dropped in silence - see REPORT_DROPPED.
+        bump(cfc_ebpf_common::enforce_stat::REPORT_DROPPED);
         return;
     };
     let mut ev = ConnectReport::zeroed();

@@ -775,12 +775,14 @@ pub(super) fn load_and_attach(
     if let Some(p) = exec_pin.as_deref() {
         drop_stale_link_pin(p);
     }
+    let mut exec_pinned = false;
     let r = attach_tracepoint(
         &mut bpf,
         PROG_EXEC,
         "sched",
         "sched_process_exec",
         exec_pin.as_deref(),
+        &mut exec_pinned,
     );
     report.exec_tracking = record_attach(&mut report, PROG_EXEC, "sched_process_exec", r);
 
@@ -791,14 +793,19 @@ pub(super) fn load_and_attach(
     if let Some(p) = exit_pin.as_deref() {
         drop_stale_link_pin(p);
     }
+    let mut exit_pinned = false;
     let r = attach_tracepoint(
         &mut bpf,
         PROG_EXIT,
         "sched",
         "sched_process_exit",
         exit_pin.as_deref(),
+        &mut exit_pinned,
     );
     report.exit_tracking = record_attach(&mut report, PROG_EXIT, "sched_process_exit", r);
+    // Both clears have to survive this daemon for a grant to be safe past its
+    // death, so this is one flag, not two.
+    report.lifecycle_pinned = exec_pinned && exit_pinned;
     let r = attach_dns(&mut bpf);
     report.dns_capture = record_attach(&mut report, PROG_DNS, "cgroup_skb/ingress", r);
 
@@ -812,11 +819,15 @@ pub(super) fn load_and_attach(
     report.enforcement = if inherited {
         // Inherited pins do not say which connect variant is running; the
         // sendmsg pins, made only after the cookie variants attached, are the
-        // evidence, and their absence could be either reason. "Basic" is the
-        // safe reading: it names the older kernel, the more likely one.
-        if pin_dir.as_deref().is_some_and(enforce::fast_path_attached) {
-            fast_path = enforce::FastPathCapability::Ready;
-        }
+        // evidence, and their absence could be either reason. So say neither:
+        // this used to report `BasicConnect`, whose reason names a cause -
+        // "no bpf_get_socket_cookie on sock_addr programs" - that nothing on
+        // this path established.
+        fast_path = if pin_dir.as_deref().is_some_and(enforce::fast_path_attached) {
+            enforce::FastPathCapability::Ready
+        } else {
+            enforce::FastPathCapability::Inconclusive
+        };
         report.notes.push(format!(
             "in-kernel enforcement was already attached and pinned at {}; \
              steering it rather than replacing it",
@@ -897,12 +908,26 @@ pub(super) fn load_and_attach(
             .and_then(|m| aya::maps::PerCpuArray::<_, u64>::try_from(m).map_err(Into::into))
             .and_then(|m| enforce::stats(&m))
         {
-            Ok(s) if s.denied > 0 || s.allowed > 0 || s.unknown > 0 || s.stale > 0 => {
+            // Every counter, in the guard and in the message. Two of them
+            // used to be read and then left out of both, so the one state an
+            // operator most wants named - a foreign mark keeping the fast path
+            // permanently disengaged for some program - could not be reached
+            // from the note at all.
+            Ok(s)
+                if s.denied > 0
+                    || s.allowed > 0
+                    || s.unknown > 0
+                    || s.stale > 0
+                    || s.foreign_mark > 0
+                    || s.report_dropped > 0 =>
+            {
                 report.notes.push(format!(
                     "in-kernel enforcement carried over: {} connect() refused, \
                      {} fast-allowed, {} passed to the packet path, {} grants \
-                     ignored as stale since the pins were made",
-                    s.denied, s.allowed, s.unknown, s.stale
+                     ignored as stale, {} sockets left alone for carrying \
+                     another marker's mark, {} decisions the report ring could \
+                     not hold, since the pins were made",
+                    s.denied, s.allowed, s.unknown, s.stale, s.foreign_mark, s.report_dropped
                 ))
             }
             Ok(_) => {}
@@ -990,11 +1015,27 @@ pub(super) fn load_and_attach(
                         // have nothing but the deadline standing between it
                         // and a recycled pid.
                         Some("enforcement is not pinned to bpffs")
-                    } else if !report.exit_tracking || !report.exit_precise {
+                    } else if !report.exit_tracking {
+                        Some("process exit is not tracked on this kernel")
+                    } else if !report.exit_precise {
                         // Leader-only exit detection leaks in the fail-closed
                         // direction for denies and the fail-open one for
                         // grants.
+                        //
+                        // Split from the condition above, which it used to
+                        // share: one reason string served two different facts,
+                        // so an exit tracepoint that simply failed to attach
+                        // was reported to the operator as a kernel that has no
+                        // readable `group_dead` - sending them to look at their
+                        // kernel version for a problem that was in the notes.
                         Some("process exit is not detected exactly on this kernel (no readable group_dead)")
+                    } else if !report.lifecycle_pinned {
+                        // Attached is not pinned. The connect programs' links
+                        // are pinned and go on marking sockets after this
+                        // daemon dies; if the exec and exit links are not, the
+                        // clears that make a grant safe die with it, and the
+                        // deadline is all that is left.
+                        Some("the exec/exit tracepoint links could not be pinned to bpffs, so their clears would not survive this daemon")
                     } else {
                         fast_path.off_reason()
                     };
@@ -1151,6 +1192,35 @@ pub(super) fn load_and_attach(
                 report.exit_tracking = false;
             }
         }
+    }
+
+    // The eligibility ladder ran before any of the consumers above existed,
+    // and two of them can retract what it assumed: a ring consumer that fails
+    // to start turns `exec_tracking` off, and the exit one turns both off. So
+    // the fast path could be armed, reported `live`, and marking sockets while
+    // `on_exec` - its only per-execve writer - could never run, and while
+    // nothing on the daemon side evicted a grant.
+    //
+    // Correct it here rather than moving the decision, because the decision
+    // needs the sink and the sink is what these consumers borrow. Flush what
+    // was granted, empty the set so the ruleset accepts nothing, and leave
+    // `armed_mark` unset so the heartbeat task below is never spawned - with
+    // no heartbeat the kernel stops honouring grants within one deadline, and
+    // with no element in the set it stops mattering immediately.
+    if armed_mark.is_some() && !(report.exec_tracking && report.exit_tracking) {
+        let why = "the exec/exit ring consumers did not start, so nothing would                    grant or evict";
+        warn!("fast-allow withdrawn after arming: {why}");
+        if let Err(e) = super::nft_set::disarm() {
+            report
+                .notes
+                .push(format!("could not flush the fast-allow set: {e:#}"));
+        }
+        if let Some(sink) = sink.as_ref() {
+            sink.flush_fast_allow();
+        }
+        armed_mark = None;
+        report.fast_allow = Some(FastAllow::Off(why.to_string()));
+        super::set_fast_allow_level(FastAllow::Off(why.to_string()));
     }
 
     // Denials refused in the kernel never reach NFQUEUE, so this consumer is
@@ -1439,6 +1509,7 @@ fn attach_tracepoint(
     category: &str,
     event: &str,
     pin: Option<&Path>,
+    pinned_out: &mut bool,
 ) -> anyhow::Result<Option<u32>> {
     let prog: &mut TracePoint = bpf
         .program_mut(name)
@@ -1454,6 +1525,7 @@ fn attach_tracepoint(
         .with_context(|| format!("attaching to {category}:{event}"))?;
 
     let Some(pin) = pin else {
+        *pinned_out = false;
         return Ok(insns);
     };
 
@@ -1477,6 +1549,15 @@ fn attach_tracepoint(
     // So a failed pin re-attaches. Losing the pin then costs only the "keeps
     // evicting after the daemon dies" property, which is what best-effort was
     // meant to mean.
+    //
+    // `pinned_out` carries that outcome to the caller, because one feature does
+    // depend on it. The fast path's eligibility ladder asks for `Pinned`
+    // enforcement and exit tracking, on the reasoning that a grant is always
+    // cleared even if the daemon dies - and that reasoning is the *pin's*, not
+    // the attach's. On a kernel with no BPF_LINK_TYPE_PERF_EVENT the connect
+    // programs stay pinned and go on marking sockets while the exec and exit
+    // clears die with the daemon, which the ladder could not see because this
+    // function used to return the same `Ok` either way.
     let pinned = prog
         .take_link(id)
         .map_err(anyhow::Error::new)
@@ -1490,6 +1571,7 @@ fn attach_tracepoint(
                 .map_err(anyhow::Error::new)
                 .with_context(|| format!("pinning to {}", pin.display()))
         });
+    *pinned_out = pinned.is_ok();
     match pinned {
         Ok(_) => debug!(program = name, path = %pin.display(), "tracepoint link pinned"),
         Err(e) => {

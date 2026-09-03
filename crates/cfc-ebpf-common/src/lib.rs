@@ -215,8 +215,19 @@ pub mod enforce_stat {
     /// counter covers every process with a foreign mark, granted or not, and
     /// reading it as "grants we could not honour" overstates it.
     pub const FOREIGN_MARK: u32 = 4;
+    /// A `ConnectReport` the ring had no room for.
+    ///
+    /// Both report rings drop silently when full - the decision has already
+    /// been made and taken effect by then, so there is nothing to fail. But
+    /// dropping *unaccounted* makes two different things look identical to
+    /// anyone reading `cfc status`: a fast path that let five connections
+    /// through, and one that let five thousand through and could only tell the
+    /// daemon about five. The counters are what the live tests read to prove
+    /// the hooks fire at all, so a silent drop also reads as a hook that did
+    /// not run.
+    pub const REPORT_DROPPED: u32 = 5;
     /// Number of slots, and the array's `max_entries`.
-    pub const SLOTS: u32 = 5;
+    pub const SLOTS: u32 = 6;
 }
 
 /// The fast-allow path: constants both sides must agree on.
