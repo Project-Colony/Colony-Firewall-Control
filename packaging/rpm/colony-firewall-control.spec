@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
-Version:        0.2.3
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -231,6 +231,12 @@ fi
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 
 %changelog
+* Wed Sep 02 2026 MotherSphere <linhajahad@gmail.com> - 0.3.0-1
+- Hash-bound prompt allows
+- Tray icon fallback
+- RPM packaging
+- Forty-seven findings from an adversarial audit of the 0.2.x line
+
 * Thu Aug 27 2026 MotherSphere <linhajahad@gmail.com> - 0.2.3-1
 - Inbound filtering, default-deny with no prompts
 - In-kernel enforcement that survives the daemon, for new processes too
