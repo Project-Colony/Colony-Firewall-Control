@@ -713,7 +713,10 @@ pub fn start(
             trust,
             observed,
             stats,
-            cfg.fast_allow,
+            loader::FastAllowCfg {
+                on: cfg.fast_allow,
+                mark: cfg.fast_allow_mark,
+            },
         ) {
             Ok((attached, mut report)) => {
                 // The loader builds its report before it knows how it was
@@ -757,6 +760,7 @@ mod tests {
             enabled: EbpfMode::Off,
             object_path: None,
             fast_allow: false,
+            fast_allow_mark: None,
         };
         let rt = start(
             &cfg,
@@ -791,6 +795,7 @@ mod tests {
             enabled: EbpfMode::On,
             object_path: Some(dir.path().join("cfc-ebpf.o")),
             fast_allow: false,
+            fast_allow_mark: None,
         };
         // An instance, not `proc_table::global()`: the assertion below is about
         // what *this* load did, and against the process-wide table it would be

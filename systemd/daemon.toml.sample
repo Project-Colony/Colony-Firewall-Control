@@ -268,6 +268,24 @@ enabled = true
 # # the cookie programs; `cfc status` prints the reason. Needs a restart.
 # fast_allow = false
 
+# # The mark value, when this machine needs a specific one. Needs a restart.
+# #
+# # Leave it unset and one is drawn at each start, which is what stops it
+# # being a token anyone can mint. The draw is not uniform over the word: the
+# # mark space belongs to the whole machine, and a consumer that selects on a
+# # MASK matches a random value at a rate its mask decides, freshly at every
+# # boot. kube-proxy's are single bits - `0x8000/0x8000` marks what it then
+# # DROPs - so an unfiltered draw broke every fast-allowed flow on a Kubernetes
+# # node about every other start. The daemon therefore rejects candidates that
+# # collide with the selectors it knows: kube-proxy's two, Tailscale's two, and
+# # wg-quick's.
+# #
+# # That list cannot be complete - nothing enumerates a host's fwmark users -
+# # so this is the escape hatch. If turning fast_allow on breaks routing for
+# # some traffic, compare `ip rule show` and `nft list ruleset` against the
+# # mark in `cfc status`, then pin one out of the way here. Zero is refused.
+# fast_allow_mark = 0x00033331
+
 # Needs a restart (the socket is secured once, right after bind).
 [ipc]
 # Access control for the gRPC control socket (/run/colony-firewall/cfc.sock).

@@ -116,29 +116,117 @@ fn vet_object(path: &Path) -> anyhow::Result<()> {
 /// The nftables side is not here: the table is normally not loaded yet when
 /// the daemon starts (`colony-firewall-nft.service` waits for the daemon),
 /// so the set is written by the heartbeat task, which retries until it can -
-/// see `nft_arm_state`. Until then the deadline stays zero and the kernel
-/// honours nothing, so a mark in the map with no element in the set is a
-/// wasted `setsockopt`, never a bypass. Any previous value is flushed from
-/// the set first, best effort; with no table loaded there is nothing to
-/// flush and the call says so quietly.
+/// see `nft_arm_state`. A mark in the map with no element in the set is a
+/// wasted `setsockopt`, never a bypass: the ruleset accepts a value only while
+/// it is in the set, and the caller flushed the set unconditionally before
+/// this ran.
+///
+/// It is *not* true that "the deadline stays zero until the heartbeat runs",
+/// which is what this comment used to claim. `FAST_ALLOW_UNTIL` is a pinned
+/// map, so after an unclean death it holds whatever deadline the previous
+/// daemon last wrote, up to a minute into the future. Nothing is honoured on
+/// the strength of it anyway - `flush_fast_allow` has emptied the grant map
+/// this deadline would qualify, and the set holds no mark - but the safety
+/// here comes from those two facts, not from a zero the code never writes.
 ///
 /// The mark is 32 random bits, never zero (`UNARMED`). Random per start
 /// because since kernel 5.17 `SO_MARK` needs only `CAP_NET_RAW`, which docker
 /// grants by default: a value anyone could read out of a package would be a
 /// bypass token for any such process on the host's network.
-fn arm_kernel_side(sink: &enforce::VerdictSink) -> anyhow::Result<u32> {
-    if let Err(e) = super::nft_set::disarm() {
-        debug!("could not flush a previous fast-allow mark from nftables: {e:#}");
-    }
-    let mark = loop {
-        let candidate = uuid::Uuid::new_v4().as_u128() as u32;
-        if candidate != cfc_ebpf_common::fast_allow::UNARMED {
-            break candidate;
+fn arm_kernel_side(sink: &enforce::VerdictSink, configured: Option<u32>) -> anyhow::Result<u32> {
+    let mark = match configured {
+        Some(m) if m == cfc_ebpf_common::fast_allow::UNARMED => {
+            return Err(anyhow!(
+                "[ebpf] fast_allow_mark = 0 is not a mark: zero is what every socket \
+                 nothing has marked carries, and accepting it would accept everything"
+            ))
         }
+        Some(m) => {
+            if let Some(who) = collides_with(m) {
+                // Their machine, their call - but not silently.
+                warn!(
+                    "the configured fast-allow mark 0x{m:08x} is one {who} selects on; \
+                     traffic this daemon marks may be routed or dropped by that rule"
+                );
+            }
+            m
+        }
+        None => pick_mark(|| uuid::Uuid::new_v4().as_u128() as u32),
     };
     sink.arm(mark)
         .context("writing the fast-allow mark to the kernel")?;
     Ok(mark)
+}
+
+/// fwmark selectors this machine is likely to already have, as
+/// (mask, value, who) - a candidate `m` collides when `m & mask == value`.
+///
+/// The mark is one 32-bit word shared by everything on the host, and the
+/// dangerous consumers are the ones that select on a *mask*: they do not need
+/// to guess our value, only to share a bit with it. A uniformly random word
+/// therefore collides at a rate the other rule's mask decides, freshly at every
+/// daemon start, which turns this into an intermittent and very hard to
+/// attribute network fault - the fast path is off by default, so the operator's
+/// first evidence is that turning it on breaks their VPN one boot in N.
+///
+/// The two kube-proxy entries are why this list is not optional. Their masks
+/// are a single bit, so a random word matches one of them **half the time**,
+/// and `0x8000/0x8000` is the mark kube-proxy attaches to packets it then
+/// DROPs. On such a node the previous code broke every fast-allowed flow on
+/// roughly every other daemon start.
+///
+/// This list is not, and cannot be, complete: nothing enumerates the fwmark
+/// users of a Linux host. It is the documented ones, and `[ebpf]
+/// fast_allow_mark` is the answer for a machine with a selector it misses.
+const KNOWN_SELECTORS: &[(u32, u32, &str)] = &[
+    // kube-proxy: masquerade, and drop.
+    (0x0000_4000, 0x0000_4000, "kube-proxy (masquerade)"),
+    (0x0000_8000, 0x0000_8000, "kube-proxy (drop)"),
+    // Tailscale's ip rules: "came from tailscale0", and "bypass tailscale".
+    (0x00ff_0000, 0x0008_0000, "Tailscale"),
+    (0x00ff_0000, 0x0004_0000, "Tailscale (bypass)"),
+    // wg-quick's `ip rule not fwmark <fwmark> lookup <table>`: an exact-word
+    // compare, so this one costs a single value out of four billion. Listed
+    // because excluding it is free and the failure - the tunnel's own table
+    // stops being consulted for our traffic - is silent.
+    (0xffff_ffff, 0x0000_ca6c, "wg-quick"),
+];
+
+/// The first entry of [`KNOWN_SELECTORS`] that would match `mark`.
+fn collides_with(mark: u32) -> Option<&'static str> {
+    KNOWN_SELECTORS
+        .iter()
+        .find(|(mask, value, _)| mark & mask == *value)
+        .map(|(_, _, who)| *who)
+}
+
+/// Draws a mark that is neither `UNARMED` nor something in
+/// [`KNOWN_SELECTORS`].
+///
+/// Rejection sampling rather than a claimed range, because a range is the
+/// thing that must not be predictable: `SO_MARK` needs only CAP_NET_RAW since
+/// 5.17, so a value an attacker can enumerate is a bypass token. Roughly a
+/// quarter of the word survives the sieve - the two single-bit kube-proxy
+/// masks account for almost all of it - which leaves about thirty bits of
+/// entropy and takes four draws on average.
+fn pick_mark(mut draw: impl FnMut() -> u32) -> u32 {
+    // Bounded so a caller whose `draw` is degenerate cannot hang the daemon;
+    // the fallback below is still checked against the sieve.
+    for _ in 0..64 {
+        let candidate = draw();
+        if candidate != cfc_ebpf_common::fast_allow::UNARMED && collides_with(candidate).is_none() {
+            return candidate;
+        }
+    }
+    // 64 consecutive rejections is not chance. Rather than loop forever, walk
+    // upward from an arbitrary point until the sieve passes - it always does
+    // within a few steps, because no selector here masks the low bits alone.
+    let mut candidate = 1u32;
+    while candidate == cfc_ebpf_common::fast_allow::UNARMED || collides_with(candidate).is_some() {
+        candidate = candidate.wrapping_add(1);
+    }
+    warn!("the fast-allow mark source is not producing usable values; using 0x{candidate:08x}");
+    candidate
 }
 
 /// One attempt at the nftables side, at startup, reported as the state it
@@ -276,6 +364,19 @@ impl Drop for Attached {
 /// rest running.
 // Eight injected dependencies, each a different thing the layer may read or
 // feed and none of which it should own; a bag struct to satisfy the lint
+/// The `[ebpf]` fast-path settings one load should honour.
+///
+/// Two fields rather than two parameters: the argument list is already at the
+/// lint's limit, and these two are one decision - whether the fast path runs,
+/// and with which mark - taken from one config section.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FastAllowCfg {
+    /// `[ebpf] fast_allow`.
+    pub on: bool,
+    /// `[ebpf] fast_allow_mark`, when the operator pinned one. `None` draws.
+    pub mark: Option<u32>,
+}
+
 // would name nothing that the parameter list does not already name.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_and_attach(
@@ -286,7 +387,7 @@ pub(super) fn load_and_attach(
     trust: Trust,
     observed: tokio::sync::broadcast::Sender<crate::nfqueue::ObservedConnection>,
     stats: crate::stats::Stats,
-    fast_allow_cfg: bool,
+    fast_allow: FastAllowCfg,
 ) -> Result<(Attached, Report), LoadError> {
     let mut report = Report {
         mode: crate::config::EbpfMode::On,
@@ -839,6 +940,23 @@ pub(super) fn load_and_attach(
     // enforcement did not come up, or when the caller has no rule engine to
     // consult (the live tests); in both cases the map simply stays empty and
     // every connect falls through to the packet path.
+    // Whatever a previous daemon left accepted, drop it - here, before any
+    // branch, because every branch needs it done.
+    //
+    // This used to live inside `arm_kernel_side`, which runs only when this
+    // daemon is *eligible* and armed. So a daemon that crashed while armed and
+    // came back with `fast_allow` off, on a kernel it now judges ineligible, or
+    // with no rule engine at all, left its predecessor's mark sitting in the
+    // set - accepted by the ruleset, refreshed by nobody, and removed by
+    // nothing short of the table being torn down. That is a standing bypass
+    // token rather than a stale entry: every process that was ever fast-allowed
+    // can read the value back off its own socket with `getsockopt(SO_MARK)`,
+    // and setting it again needs only CAP_NET_RAW.
+    if let Err(e) = super::nft_set::disarm() {
+        report.notes.push(format!(
+            "could not flush a previous fast-allow mark from nftables: {e:#}"
+        ));
+    }
     // The mark the kernel side was armed with, when it was: the heartbeat
     // task below needs it to finish the nftables half of arming.
     let mut armed_mark: Option<u32> = None;
@@ -859,7 +977,7 @@ pub(super) fn load_and_attach(
                     // Every reason the fast path stays off, in the order a
                     // reader can act on. Each is the one sentence `cfc status`
                     // will show.
-                    let off = if !fast_allow_cfg {
+                    let off = if !fast_allow.on {
                         Some("[ebpf] fast_allow is not set")
                     } else if !sink.has_fast_path() {
                         Some("the loaded object predates the fast path")
@@ -886,7 +1004,7 @@ pub(super) fn load_and_attach(
                             sink.withdraw_fast_path();
                             (FastAllow::Off(why.to_string()), None)
                         }
-                        None => match arm_kernel_side(&sink) {
+                        None => match arm_kernel_side(&sink, fast_allow.mark) {
                             Ok(mark) => (nft_arm_state(mark), Some(mark)),
                             Err(e) => {
                                 sink.withdraw_fast_path();
@@ -1072,6 +1190,9 @@ pub(super) fn load_and_attach(
                 cfc_ebpf_common::fast_allow::HEARTBEAT_SECS,
             ));
             let mut last_reason: Option<String> = None;
+            // Ticks between two checks that the set still holds the mark.
+            const CHECKS_EVERY: u8 = 6;
+            let mut since_check: u8 = 0;
             loop {
                 tick.tick().await;
                 if !armed {
@@ -1106,6 +1227,48 @@ pub(super) fn load_and_attach(
                     tracing::warn!(
                         "fast-allow heartbeat failed: {e:#}; grants lapse within a minute"
                     );
+                }
+
+                // Armed is not a fact that stays true, and this loop used to
+                // treat it as one: once the element went in, the only thing it
+                // ever did again was refresh the deadline. `systemctl restart
+                // nftables`, or any `nft -f` that reloads the machine's
+                // ruleset, recreates `table inet colony_firewall` with an
+                // empty set - and the daemon went on marking sockets, went on
+                // crediting rule hits from ALLOW_EVENTS, and went on telling
+                // `cfc status` that the fast path was live, while every one of
+                // those flows was in fact taking the queue and being counted
+                // a second time by the packet path.
+                //
+                // Checked every sixth tick rather than every tick: this is a
+                // fork and exec, the window it leaves is a minute of an
+                // over-optimistic status line, and nothing unsafe happens in
+                // it - the failure is the set accepting *less* than the daemon
+                // thinks, never more.
+                since_check += 1;
+                if since_check >= CHECKS_EVERY {
+                    since_check = 0;
+                    match tokio::task::spawn_blocking(move || super::nft_set::holds(mark)).await {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => {
+                            armed = false;
+                            last_reason = None;
+                            tracing::warn!(
+                                "the fast-allow mark is no longer in the nftables set (the \
+                                 ruleset was reloaded); re-arming"
+                            );
+                            super::set_fast_allow_level(FastAllow::Off(
+                                "the nftables set no longer holds this daemon's mark; re-arming"
+                                    .to_string(),
+                            ));
+                        }
+                        // Could not ask. Say nothing and keep the current
+                        // state: a failed probe is not evidence either way,
+                        // and disarming on it would take the path down on a
+                        // transient.
+                        Ok(Err(e)) => tracing::debug!("could not check the fast-allow set: {e:#}"),
+                        Err(e) => tracing::debug!("fast-allow set check did not run: {e}"),
+                    }
                 }
             }
         }));
@@ -1561,6 +1724,59 @@ mod tests {
         assert!(!dir_is_safe(0, 0o040775), "group-writable counts too");
     }
 
+    /// The regression this sieve exists for: kube-proxy selects on
+    /// `0x8000/0x8000` and DROPs what matches. A uniformly random word has
+    /// that bit set half the time, so on a Kubernetes node the previous
+    /// draw broke every fast-allowed flow on roughly every other start.
+    #[test]
+    fn a_mark_sharing_a_bit_with_a_known_selector_is_refused() {
+        assert_eq!(collides_with(0x0000_8000), Some("kube-proxy (drop)"));
+        assert_eq!(collides_with(0xdead_8000), Some("kube-proxy (drop)"));
+        assert_eq!(collides_with(0x0000_4000), Some("kube-proxy (masquerade)"));
+        assert_eq!(collides_with(0x0008_0000), Some("Tailscale"));
+        assert_eq!(collides_with(0x1208_0000), Some("Tailscale"));
+        assert_eq!(collides_with(0x0004_0000), Some("Tailscale (bypass)"));
+        // wg-quick's value is caught, though by kube-proxy's masquerade bit
+        // rather than by its own entry: 0xca6c has bit 14 set. Its entry is
+        // kept anyway - it documents the selector, and it is what would catch
+        // the value if the kube-proxy masks ever moved.
+        assert!(collides_with(0x0000_ca6c).is_some());
+
+        // And values no selector here claims.
+        assert_eq!(collides_with(0x0000_0a6c), None);
+        assert_eq!(collides_with(0x0003_3331), None);
+    }
+
+    #[test]
+    fn a_drawn_mark_is_never_unarmed_and_never_collides() {
+        // A deterministic walk over the space rather than a real rng: the
+        // property is about the sieve, and a test that draws randomly would
+        // pass or fail randomly.
+        let mut seed = 0x1234_5678u32;
+        let mut draw = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for _ in 0..2000 {
+            let mark = pick_mark(&mut draw);
+            assert_ne!(mark, cfc_ebpf_common::fast_allow::UNARMED);
+            assert_eq!(collides_with(mark), None, "drew a colliding mark 0x{mark:08x}");
+        }
+    }
+
+    /// A source that only ever offers unusable values must not hang the
+    /// daemon, and must not be answered with an unusable value either.
+    #[test]
+    fn a_degenerate_draw_still_yields_a_usable_mark() {
+        let mark = pick_mark(|| 0x0000_8000);
+        assert_ne!(mark, cfc_ebpf_common::fast_allow::UNARMED);
+        assert_eq!(collides_with(mark), None);
+
+        let zero = pick_mark(|| cfc_ebpf_common::fast_allow::UNARMED);
+        assert_ne!(zero, cfc_ebpf_common::fast_allow::UNARMED);
+        assert_eq!(collides_with(zero), None);
+    }
+
     #[test]
     fn a_world_writable_object_is_refused_but_only_under_refuse() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1578,7 +1794,7 @@ mod tests {
             Trust::Refuse,
             tokio::sync::broadcast::channel(8).0,
             crate::stats::Stats::new(),
-            false,
+            Default::default(),
         )
         .err()
         .expect("a world-writable object must not be loaded");
@@ -1595,7 +1811,7 @@ mod tests {
             Trust::Warn,
             tokio::sync::broadcast::channel(8).0,
             crate::stats::Stats::new(),
-            false,
+            Default::default(),
         )
         .err()
         .expect("`not an ELF` cannot load either way");
@@ -1620,7 +1836,7 @@ mod tests {
             Trust::Refuse,
             tokio::sync::broadcast::channel(8).0,
             crate::stats::Stats::new(),
-            false,
+            Default::default(),
         )
         .err()
         .expect("there is no object there");
@@ -1908,7 +2124,7 @@ mod tests {
             Trust::Warn,
             tokio::sync::broadcast::channel(8).0,
             crate::stats::Stats::new(),
-            false,
+            Default::default(),
         )
         .expect("the unit's capability set must be enough to load the object");
 
@@ -2011,7 +2227,7 @@ mod tests {
             Trust::Warn,
             tokio::sync::broadcast::channel(8).0,
             crate::stats::Stats::new(),
-            false,
+            Default::default(),
         )
         .expect("load");
         for note in &report.notes {

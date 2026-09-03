@@ -120,10 +120,54 @@ pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
         }
         Err(failed) => return Err(failed.into_error(Op::ListSet)),
     }
+    // Flush before adding, so this leaves the set holding *exactly* this
+    // daemon's mark rather than adding to whatever is already there.
+    //
+    // The startup flush is not enough on its own. It runs once, and on a boot
+    // it runs when the table does not exist yet - `colony-firewall-nft.service`
+    // is ordered after this daemon - so it flushes nothing. The heartbeat then
+    // retries this function every ten seconds until the table appears, and a
+    // plain `add element` at that point would leave a crashed predecessor's
+    // mark accepted alongside this daemon's, for as long as the ruleset lives.
+    // A mark that is still accepted but that nothing refreshes is the worst
+    // shape this set can be in: every process that ever held it can read it
+    // back with `getsockopt(SO_MARK)` and set it again.
+    if let Err(failed) = run(Op::FlushSet) {
+        // Not fatal, and not silent: the add below is still the operation that
+        // matters, and a set that could not be flushed is reported by the
+        // element check the heartbeat runs.
+        if !failed.is_no_such_object() {
+            debug!(
+                "could not flush the fast-allow set before arming: {}",
+                failed.into_error(Op::FlushSet)
+            );
+        }
+    }
     let op = Op::AddElement(mark);
     run(op).map_err(|failed| failed.into_error(op))?;
     debug!("fast-allow mark added to set {FAMILY} {TABLE} {SET}");
     Ok(())
+}
+
+/// Whether the ruleset still accepts `mark`.
+///
+/// Arming is not a fact that stays true. `systemctl restart nftables`, a
+/// `nft -f` that reloads the machine's ruleset, or anything else that
+/// recreates `table inet colony_firewall` leaves the set empty while this
+/// daemon goes on marking sockets and `cfc status` goes on saying `live`. The
+/// heartbeat calls this so that state is noticed and re-armed rather than
+/// reported.
+///
+/// A missing table or set answers `false`, not an error: they are the same
+/// answer for the caller - the mark is not accepted - and the caller's re-arm
+/// path already classifies which of the two it is.
+pub(super) fn holds(mark: u32) -> anyhow::Result<bool> {
+    let op = Op::GetElement(mark);
+    match run(op) {
+        Ok(()) => Ok(true),
+        Err(failed) if failed.is_no_such_object() => Ok(false),
+        Err(failed) => Err(failed.into_error(op)),
+    }
 }
 
 /// Flushes `set fast_allow`, so that no value (this daemon's or a previous
@@ -195,6 +239,10 @@ enum Op {
     AddElement(u32),
     /// `nft flush set inet colony_firewall fast_allow`.
     FlushSet,
+    /// `nft get element inet colony_firewall fast_allow { 0x<mark> }`: is
+    /// this daemon's mark still accepted? Status-only, like `ListSet`, which
+    /// is why it is a `get` and not a `list` the caller would have to parse.
+    GetElement(u32),
 }
 
 /// The argument vector for `op`, without the program.
@@ -208,9 +256,10 @@ fn argv(op: Op) -> Vec<String> {
         Op::ListTable => &["list", "table", FAMILY, TABLE],
         Op::AddElement(_) => &["add", "element", FAMILY, TABLE, SET],
         Op::FlushSet => &["flush", "set", FAMILY, TABLE, SET],
+        Op::GetElement(_) => &["get", "element", FAMILY, TABLE, SET],
     };
     let mut argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
-    if let Op::AddElement(mark) = op {
+    if let Op::AddElement(mark) | Op::GetElement(mark) = op {
         argv.push(format!("{{ {} }}", mark_literal(mark)));
     }
     argv
@@ -264,11 +313,14 @@ fn stderr_names_no_such_object(stderr: &str) -> bool {
     stderr.contains("No such file or directory")
 }
 
-/// Replaces the mark literal with a placeholder. Only [`Op::AddElement`]
-/// carries the mark; every other command's text is returned as it is.
+/// Replaces the mark literal with a placeholder. Only [`Op::AddElement`] and
+/// [`Op::GetElement`] carry the mark; every other command's text is returned
+/// as it is.
 fn redact(op: Op, text: String) -> String {
     match op {
-        Op::AddElement(mark) => text.replace(&mark_literal(mark), "<mark>"),
+        Op::AddElement(mark) | Op::GetElement(mark) => {
+            text.replace(&mark_literal(mark), "<mark>")
+        }
         _ => text,
     }
 }
@@ -351,6 +403,37 @@ fn run(op: Op) -> Result<(), Failed> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The element check is status-only, like the set probe: `get element`
+    /// exits non-zero with ENOENT when the element is absent, so nothing here
+    /// has to parse nft's output.
+    #[test]
+    fn the_element_check_names_the_element_and_carries_the_mark() {
+        assert_eq!(
+            argv(Op::GetElement(0x0012_3456)),
+            vec![
+                "get",
+                "element",
+                "inet",
+                "colony_firewall",
+                "fast_allow",
+                "{ 0x00123456 }",
+            ]
+        );
+    }
+
+    /// Both mark-carrying commands must be redacted, not just the add. nft
+    /// echoes the failing command line back verbatim, so a `get` that fails
+    /// would otherwise put the mark in the journal - where every reader of the
+    /// journal could set it.
+    #[test]
+    fn the_element_check_redacts_the_mark_from_what_nft_echoes() {
+        let mark = 0xdead_0a6c;
+        let echoed = format!("Error: No such file or directory\nget element inet colony_firewall fast_allow {{ {} }}", mark_literal(mark));
+        let safe = redact(Op::GetElement(mark), echoed);
+        assert!(!safe.contains(&mark_literal(mark)), "leaked the mark: {safe}");
+        assert!(safe.contains("<mark>"));
+    }
     use super::*;
     use std::os::unix::process::ExitStatusExt as _;
 

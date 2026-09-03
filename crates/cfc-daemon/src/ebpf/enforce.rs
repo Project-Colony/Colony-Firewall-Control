@@ -1614,7 +1614,7 @@ mod tests {
             super::super::loader::Trust::Warn,
             tokio::sync::broadcast::channel(8).0,
             crate::stats::Stats::new(),
-            false,
+            Default::default(),
         )
         .expect("load");
         assert_eq!(
@@ -1738,7 +1738,7 @@ mod tests {
             super::super::loader::Trust::Warn,
             tokio::sync::broadcast::channel(8).0,
             crate::stats::Stats::new(),
-            false,
+            Default::default(),
         )
         .expect("load");
         assert_eq!(
@@ -1853,7 +1853,7 @@ mod tests {
                 super::super::loader::Trust::Warn,
                 tokio::sync::broadcast::channel(8).0,
                 crate::stats::Stats::new(),
-                false,
+                Default::default(),
             )
             .expect("load");
             assert!(
