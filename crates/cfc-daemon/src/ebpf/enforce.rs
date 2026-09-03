@@ -411,14 +411,31 @@ impl VerdictSink {
         n
     }
 
-    /// Writes the mark value the kernel side will set, arming the path. The
-    /// deadline is still zero until the first `beat`, so nothing is honoured
-    /// before the heartbeat task is running.
+    /// Writes the mark value the kernel side will set, arming the path.
+    ///
+    /// The deadline is zeroed first, and by this function rather than by
+    /// assumption. Callers used to say "the deadline is still zero until the
+    /// first `beat`, so nothing is honoured before the heartbeat runs", which
+    /// is not a property the code had: `FAST_ALLOW_UNTIL` is a *pinned* map,
+    /// so after an unclean death it holds whatever deadline the previous
+    /// daemon last wrote - up to a minute into the future. Nothing was
+    /// actually honoured on the strength of it, because the grant map is
+    /// flushed at start and the nft set holds no mark yet, but the sentence
+    /// was load-bearing in two comments and true in neither. One `set` makes
+    /// it true.
+    ///
+    /// Order matters: zero the deadline, then write the mark. Between the two
+    /// the kernel reads an armed mark against a lapsed deadline, counts a
+    /// `STALE`, and marks nothing.
     pub(super) fn arm(&self, mark: u32) -> anyhow::Result<()> {
         let fast = self
             .fast
             .as_ref()
             .ok_or_else(|| anyhow!("no fast path to arm"))?;
+        fast.until
+            .lock()
+            .set(0, 0u64, 0)
+            .context("zeroing FAST_ALLOW_UNTIL")?;
         fast.mark
             .lock()
             .set(0, mark, 0)

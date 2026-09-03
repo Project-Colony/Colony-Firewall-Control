@@ -121,13 +121,11 @@ fn vet_object(path: &Path) -> anyhow::Result<()> {
 /// it is in the set, and the caller flushed the set unconditionally before
 /// this ran.
 ///
-/// It is *not* true that "the deadline stays zero until the heartbeat runs",
-/// which is what this comment used to claim. `FAST_ALLOW_UNTIL` is a pinned
-/// map, so after an unclean death it holds whatever deadline the previous
-/// daemon last wrote, up to a minute into the future. Nothing is honoured on
-/// the strength of it anyway - `flush_fast_allow` has emptied the grant map
-/// this deadline would qualify, and the set holds no mark - but the safety
-/// here comes from those two facts, not from a zero the code never writes.
+/// The deadline does stay zero until the heartbeat's first beat - but because
+/// `VerdictSink::arm` zeroes it, not by itself. `FAST_ALLOW_UNTIL` is a pinned
+/// map, so after an unclean death it holds whatever the previous daemon last
+/// wrote, up to a minute into the future; this comment asserted the zero for
+/// two releases before anything wrote it.
 ///
 /// The mark is 32 random bits, never zero (`UNARMED`). Random per start
 /// because since kernel 5.17 `SO_MARK` needs only `CAP_NET_RAW`, which docker
@@ -1005,7 +1003,12 @@ pub(super) fn load_and_attach(
                     let off = if !fast_allow.on {
                         Some("[ebpf] fast_allow is not set")
                     } else if !sink.has_fast_path() {
-                        Some("the loaded object predates the fast path")
+                        // Not reachable by an *old* object: the loader
+                        // requires the v4 ABI symbol with must_exist, and the
+                        // fast path arrived with that bump. What is left is an
+                        // object built from a tree with the maps taken out, so
+                        // the reason names the maps rather than a version.
+                        Some("the loaded object has no fast-allow maps")
                     } else if !matches!(
                         report.enforcement,
                         Enforcement::Pinned | Enforcement::Inherited

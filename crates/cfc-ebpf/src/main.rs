@@ -483,8 +483,19 @@ fn read_exec_filename(ctx: &TracePointContext, event: &mut ExecEvent) {
 /// rule table.
 ///
 /// The whole point: no daemon is consulted, so this keeps working when there
-/// is none. Writes only denials - an allow would buy nothing, because the
-/// absence of an entry already means "ask the packet path".
+/// is none. Writes only denials, and the reason has changed: it used to be
+/// that "an allow would buy nothing, because the absence of an entry already
+/// means ask the packet path". An in-kernel allow buys a great deal now - it
+/// is what the fast path is - but it must not be minted *here*.
+///
+/// A grant is a mark on a socket that walks past the queue, and this function
+/// runs with no daemon alive: nothing would refresh the deadline that bounds
+/// it, nothing would re-decide it when the rules change, and the table it
+/// would read from is a hash of the execve string, which is the spelling
+/// `on_exec` exists to correct. So `VERDICTS` stays denials-only and grants
+/// stay a daemon decision, written to `FAST_ALLOW` and honoured only while a
+/// heartbeat keeps the deadline ahead of now. `try_exec` clears this pid's
+/// grant before calling this, for the same reason.
 #[inline(always)]
 fn precommit_verdict(tgid: u32, event: &ExecEvent) {
     // Cheap gate - but the *clear* half runs regardless. Userspace's

@@ -41,6 +41,19 @@
 //! is, so the mark never appears in a log line or an error: nft echoes the
 //! failing command back on stderr, and that echo is redacted before it goes
 //! anywhere.
+//!
+//! There is a third read path, and naming two of them made this argument look
+//! stronger than it is: a process the fast path has **granted** can read the
+//! value straight off its own socket with `getsockopt(SO_MARK)`. Nothing
+//! prevents that and nothing should - that process is allowed by a rule, which
+//! is why the kernel marked it. What follows is the scope of the secret: it
+//! holds against processes that have never been granted, and not against one
+//! that has and then, say, execs into something a rule denies. The kernel
+//! clears `FAST_ALLOW` on exec, but it cannot unmark a socket the old program
+//! already passed on. The mark being redrawn at every daemon start is what
+//! bounds that, and it is why [`disarm`] runs unconditionally at start rather
+//! than only on the arming path - a value left accepted in the set that
+//! nothing refreshes is one every past grantee still knows.
 
 // The only caller is the loader, which is behind the `ebpf` feature. The
 // module itself stays in every build so its tests run in the default suite,

@@ -376,13 +376,21 @@ pub fn enforcement_level() -> Option<Enforcement> {
 /// Whether the fast-allow path - a process-wide allow marking its sockets so
 /// nftables accepts them ahead of the queue - is actually doing anything.
 ///
-/// Three-way on purpose. `Off` carries *why*, because the path has several
-/// ways to be silently inert (config, an inherited attach from a build that
-/// predates it, a kernel whose verifier lacks `bpf_setsockopt` on sock_addr,
-/// exit tracking without a readable `group_dead`, an nftables set the
-/// snippet does not declare) and a feature that is off for a reason nobody
-/// can read is a feature nobody can rely on. That lesson was learned once
-/// already with the enforcement level above.
+/// Two-way, with the reason attached. `Off` carries *why*, because the path
+/// has many ways to be silently inert - the config switch, a kernel whose
+/// verifier lacks `bpf_setsockopt` on sock_addr or on sendmsg, exit tracking
+/// without a readable `group_dead`, tracepoint links that could not be
+/// pinned, ring consumers that did not start, an nftables set the snippet
+/// does not declare, a table that is not loaded yet, a ruleset reload that
+/// emptied the set - and a feature that is off for a reason nobody can read is
+/// a feature nobody can rely on. That lesson was learned once already with the
+/// enforcement level above.
+///
+/// Not "an inherited attach from a build that predates it", which this list
+/// used to open with. The pin directory carries the ABI version and the fast
+/// path arrived with a version bump, so a daemon never inherits pins from a
+/// build that lacks it - it would find no pins at that path at all and attach
+/// fresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FastAllow {
     /// Marks are being set and the nftables set holds this daemon's value.

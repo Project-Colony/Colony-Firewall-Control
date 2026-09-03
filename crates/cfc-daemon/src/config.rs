@@ -332,8 +332,17 @@ pub struct EbpfConfig {
     /// on the packet path, so the counters and the live feed for them are only
     /// as timely as that consumer.
     ///
-    /// Inert without the layer pinned or inherited, exit tracking up and the
-    /// cookie program variants loaded; `cfc status` says which was missing.
+    /// Inert unless all of: enforcement pinned or inherited, exit tracking up
+    /// and exact, the exec/exit links actually pinned, the cookie connect
+    /// variants and *both* sendmsg hooks verified, the ring consumers started,
+    /// and the nftables set declared by the snippet and holding this daemon's
+    /// mark.
+    ///
+    /// The last two are the ones that fail in the field and the ones this list
+    /// used to omit: 5.10 verifies `bpf_setsockopt` on connect hooks and
+    /// refuses it on sendmsg ones, and the nft unit starts *after* the daemon,
+    /// so a fresh boot reports "waiting for the nftables table" until it does.
+    /// `cfc status` and the startup log line name whichever it was.
     pub fast_allow: bool,
     /// The `SO_MARK` value the fast path uses, when the machine needs a
     /// specific one.
