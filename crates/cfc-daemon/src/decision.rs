@@ -44,6 +44,33 @@ struct EngineInner {
     on_change: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
+/// What [`Engine::process_wide_verdict`] found: the action that holds for a
+/// process wherever it connects, and the rule that says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessWideVerdict {
+    pub action: cfc_core::Action,
+    pub rule_id: uuid::Uuid,
+    pub duration: cfc_core::Duration,
+}
+
+impl ProcessWideVerdict {
+    /// Whether this verdict may be handed to the in-kernel fast path.
+    ///
+    /// An allow, from a rule that lasts. `Once` never reaches here (it is
+    /// not stored), and a timed rule is excluded on purpose: the fast path
+    /// re-checks grants only on flow starts and rule changes, so a timed
+    /// allow would keep marking sockets until the next flush noticed its
+    /// deadline - up to thirty seconds past the moment the user chose.
+    /// Denies never qualify either way; they have their own map.
+    pub fn fast_allow_eligible(&self) -> bool {
+        self.action == cfc_core::Action::Allow
+            && matches!(
+                self.duration,
+                cfc_core::Duration::Always | cfc_core::Duration::UntilRestart
+            )
+    }
+}
+
 pub enum Decision {
     /// A persistent rule matched. Return the verdict immediately.
     Resolved(Verdict),
@@ -110,6 +137,14 @@ impl Engine {
         self.notify_changed();
     }
 
+    /// Credits a hit to `rule_id` for a flow the packet path never saw - a
+    /// fast-allowed connection reported by the kernel. The same counter
+    /// `evaluate` bumps, so the busiest allow rule stops reading as dead the
+    /// day its traffic skips the queue.
+    pub fn record_hit(&self, rule_id: uuid::Uuid) {
+        *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
+    }
+
     fn notify_changed(&self) {
         if let Some(f) = self.inner.on_change.read().as_ref() {
             f();
@@ -163,6 +198,15 @@ impl Engine {
     /// `None` means "ask the packet path", which is always a safe answer: it
     /// is what happened before this existed.
     pub fn process_wide_action(&self, proc: &Process) -> Option<cfc_core::Action> {
+        self.process_wide_verdict(proc).map(|v| v.action)
+    }
+
+    /// [`process_wide_action`](Self::process_wide_action) with the rule that
+    /// answered: its id, for crediting a hit the packet path will never see,
+    /// and its duration, because the fast path is offered only to rules that
+    /// last. A timed allow (`--for 1h`) keeps the packet path, so its expiry
+    /// is exact rather than "within the next flush tick".
+    pub fn process_wide_verdict(&self, proc: &Process) -> Option<ProcessWideVerdict> {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
         for rule in rules
@@ -192,7 +236,11 @@ impl Engine {
             if !rule.scope.matches_process(proc) {
                 continue;
             }
-            return (!rule.scope.constrains_destination()).then_some(rule.action);
+            return (!rule.scope.constrains_destination()).then_some(ProcessWideVerdict {
+                action: rule.action,
+                rule_id: rule.id,
+                duration: rule.duration,
+            });
         }
         None
     }
@@ -662,6 +710,67 @@ mod tests {
     /// packet path already skips expired rules, so a stale entry would only
     /// overstate a denial - but it would keep overstating it after the daemon
     /// is gone, which is the state this whole layer exists to make trustworthy.
+    #[test]
+    fn only_lasting_allows_are_fast_allow_eligible() {
+        // The fast path re-checks grants on flow starts and rule changes, not
+        // on a clock, so a timed allow would outlive its deadline by up to a
+        // flush tick. Denies have their own map and never qualify.
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let eligible = |action: Action, duration: cfc_core::Duration| {
+            let mut rule = Rule::new("r".to_string(), action, scope.clone());
+            rule.duration = duration;
+            let engine = engine_with(vec![rule]);
+            let proc = Process {
+                exe: PathBuf::from("/usr/bin/curl"),
+                ..Process::unknown(1)
+            };
+            engine
+                .process_wide_verdict(&proc)
+                .map(|v| v.fast_allow_eligible())
+        };
+        assert_eq!(
+            eligible(Action::Allow, cfc_core::Duration::Always),
+            Some(true)
+        );
+        assert_eq!(
+            eligible(Action::Allow, cfc_core::Duration::UntilRestart),
+            Some(true)
+        );
+        assert_eq!(
+            eligible(Action::Allow, cfc_core::Duration::Seconds(3600)),
+            Some(false),
+            "a timed allow keeps the packet path so its expiry is exact"
+        );
+        assert_eq!(
+            eligible(Action::Deny, cfc_core::Duration::Always),
+            Some(false)
+        );
+        assert_eq!(
+            eligible(Action::Reject, cfc_core::Duration::Always),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn process_wide_verdict_names_the_rule_that_answered() {
+        // The allow consumer credits hits by this id; the wrong id would
+        // credit the wrong rule, which is worse than crediting none.
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let rule = Rule::new("mine".to_string(), Action::Allow, scope);
+        let id = rule.id;
+        let engine = engine_with(vec![rule]);
+        let proc = Process {
+            exe: PathBuf::from("/usr/bin/curl"),
+            ..Process::unknown(1)
+        };
+        let v = engine.process_wide_verdict(&proc).expect("a verdict");
+        assert_eq!(v.rule_id, id);
+        assert_eq!(v.action, Action::Allow);
+        assert_eq!(engine.process_wide_action(&proc), Some(Action::Allow));
+    }
+
     #[test]
     fn an_expired_rule_is_not_compilable() {
         let mut scope = RuleScope::any();

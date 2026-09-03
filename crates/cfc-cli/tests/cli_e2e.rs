@@ -145,6 +145,7 @@ impl Firewall for FakeDaemon {
             skipped_rules: 2,
             enforcing: false,
             enforcement: "pinned".to_string(),
+            fast_allow: "off: [ebpf] fast_allow is not set".to_string(),
         }))
     }
 
@@ -533,6 +534,9 @@ async fn status_json_round_trips_over_a_real_socket() {
     assert_eq!(v["enforcing"], false);
     assert_eq!(v["skipped_rules"], 2);
     assert_eq!(v["timeout_action"], "deny");
+    // The daemon's own sentence, verbatim: a script must be able to read
+    // the reason, not only that there is one.
+    assert_eq!(v["fast_allow"], "off: [ebpf] fast_allow is not set");
     // Both warnings must be machine-readable too, not just printed.
     let warnings = v["warnings"].as_array().expect("warnings array");
     assert_eq!(warnings.len(), 2, "{warnings:?}");

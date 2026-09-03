@@ -317,6 +317,24 @@ pub struct EbpfConfig {
     /// Where the BPF object built by `cargo xtask build-ebpf` was installed.
     /// `None` means `crate::ebpf::DEFAULT_OBJECT_PATH`.
     pub object_path: Option<PathBuf>,
+    /// Let a process-wide allow skip the queue.
+    ///
+    /// Off by default, and opt-in on purpose. What it buys: a process whose
+    /// connections a rule allows outright, for the life of the rule, stops
+    /// paying the NFQUEUE round trip - the kernel marks its sockets at
+    /// `connect()`, nftables accepts the mark ahead of the queue, and no
+    /// packet of that process reaches the daemon. What it costs: those
+    /// decisions move off the one path every other guarantee here is built
+    /// on. The mark is a value drawn at random at each start and matched
+    /// exactly, so a process holding CAP_NET_RAW - enough for `SO_MARK`
+    /// since 5.17 - cannot forge it without first learning it; and the flows
+    /// it lets through are reported back over a ring buffer rather than seen
+    /// on the packet path, so the counters and the live feed for them are only
+    /// as timely as that consumer.
+    ///
+    /// Inert without the layer pinned or inherited, exit tracking up and the
+    /// cookie program variants loaded; `cfc status` says which was missing.
+    pub fast_allow: bool,
 }
 
 impl Default for EbpfConfig {
@@ -324,6 +342,7 @@ impl Default for EbpfConfig {
         Self {
             enabled: EbpfMode::Auto,
             object_path: None,
+            fast_allow: false,
         }
     }
 }
@@ -636,6 +655,24 @@ enabled = " Auto ""#
         assert_eq!(cfg.ebpf.enabled, EbpfMode::Auto);
     }
 
+    /// The fast path is opt-in: nothing short of `fast_allow = true` turns it
+    /// on, and the layer's own eligibility checks still get the last word.
+    #[test]
+    fn ebpf_fast_allow_is_off_unless_asked_for() {
+        let fast_allow = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.fast_allow;
+
+        assert!(!fast_allow(""), "absent means off");
+        assert!(
+            !fast_allow("[ebpf]\n"),
+            "an empty section keeps the default"
+        );
+        assert!(!fast_allow("[ebpf]\nfast_allow = false\n"));
+        assert!(fast_allow("[ebpf]\nfast_allow = true\n"));
+        // Parsed independently of `enabled`: the switch says what was asked
+        // for, and the layer decides whether it can honour it.
+        assert!(fast_allow("[ebpf]\nenabled = false\nfast_allow = true\n"));
+    }
+
     #[test]
     fn ebpf_mode_helpers_match_their_names() {
         assert!(EbpfMode::Auto.wants_load() && !EbpfMode::Auto.is_forced());
@@ -828,6 +865,10 @@ enabled = " Auto ""#
             EbpfMode::Auto,
             "the sample must leave the [ebpf] block commented out, so a shipped \
              config resolves to the automatic default"
+        );
+        assert!(
+            !cfg.ebpf.fast_allow,
+            "a shipped config must not take allows off the packet path"
         );
         assert_eq!(
             cfg.storage.path,

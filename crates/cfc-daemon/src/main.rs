@@ -189,8 +189,8 @@ async fn run() -> anyhow::Result<()> {
             engine.clone(),
             prompt_tx,
             verdict_rx,
-            observed_tx,
-            stats,
+            observed_tx.clone(),
+            stats.clone(),
             // Cloned rather than moved: the eBPF consumers write observed DNS
             // answers into the same cache, and they are started after READY=1
             // (see below) so the handle has to outlive this call.
@@ -345,6 +345,8 @@ async fn run() -> anyhow::Result<()> {
         // direction of the dependency the same as everywhere else: the eBPF
         // layer is handed what it may read, and owns nothing the daemon needs.
         Some(engine.clone()),
+        observed_tx.clone(),
+        stats.clone(),
     );
     _ebpf.report.log();
     // Publish it so `cfc status` can say where enforcement lives without anyone

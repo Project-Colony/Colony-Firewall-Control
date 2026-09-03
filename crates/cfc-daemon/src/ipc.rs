@@ -708,6 +708,9 @@ impl Firewall for FirewallService {
             enforcement: crate::ebpf::enforcement_level()
                 .map_or("starting", |l| l.as_str())
                 .to_string(),
+            fast_allow: crate::ebpf::fast_allow_level()
+                .map(|f| f.describe())
+                .unwrap_or_default(),
         }))
     }
 

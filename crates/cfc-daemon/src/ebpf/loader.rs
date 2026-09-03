@@ -10,6 +10,7 @@ use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use super::FastAllow;
 use anyhow::{anyhow, Context as _};
 use aya::maps::{HashMap as BpfHashMap, MapData, RingBuf};
 use aya::programs::links::FdLink;
@@ -17,7 +18,7 @@ use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, ProgramErr
 use aya::{Btf, Ebpf, EbpfLoader};
 use cfc_core::Process;
 use cfc_ebpf_common::dns::{self, DnsCursor, DNS_HEADER_LEN};
-use cfc_ebpf_common::{ConnectDeny, DnsAnswer, DnsPacket, ExecEvent, ExitEvent};
+use cfc_ebpf_common::{ConnectReport, DnsAnswer, DnsPacket, ExecEvent, ExitEvent};
 use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -110,6 +111,62 @@ fn vet_object(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Arms the kernel side of the fast path and returns the mark it will set.
+///
+/// The nftables side is not here: the table is normally not loaded yet when
+/// the daemon starts (`colony-firewall-nft.service` waits for the daemon),
+/// so the set is written by the heartbeat task, which retries until it can -
+/// see `nft_arm_state`. Until then the deadline stays zero and the kernel
+/// honours nothing, so a mark in the map with no element in the set is a
+/// wasted `setsockopt`, never a bypass. Any previous value is flushed from
+/// the set first, best effort; with no table loaded there is nothing to
+/// flush and the call says so quietly.
+///
+/// The mark is 32 random bits, never zero (`UNARMED`). Random per start
+/// because since kernel 5.17 `SO_MARK` needs only `CAP_NET_RAW`, which docker
+/// grants by default: a value anyone could read out of a package would be a
+/// bypass token for any such process on the host's network.
+fn arm_kernel_side(sink: &enforce::VerdictSink) -> anyhow::Result<u32> {
+    if let Err(e) = super::nft_set::disarm() {
+        debug!("could not flush a previous fast-allow mark from nftables: {e:#}");
+    }
+    let mark = loop {
+        let candidate = uuid::Uuid::new_v4().as_u128() as u32;
+        if candidate != cfc_ebpf_common::fast_allow::UNARMED {
+            break candidate;
+        }
+    };
+    sink.arm(mark)
+        .context("writing the fast-allow mark to the kernel")?;
+    Ok(mark)
+}
+
+/// One attempt at the nftables side, at startup, reported as the state it
+/// leaves the path in. On a daemon *restart* the table is already loaded and
+/// this comes back `Live` at once; on a boot it comes back waiting, and the
+/// heartbeat task finishes the job.
+fn nft_arm_state(mark: u32) -> FastAllow {
+    match super::nft_set::arm(mark) {
+        Ok(()) => FastAllow::Live,
+        Err(e) => nft_arm_state_from_error(&e),
+    }
+}
+
+/// The reported state for a failed nftables arm. A missing *table* is the
+/// normal boot order (the nft unit starts after this daemon) and reads as
+/// waiting; a missing *set* is an operator-visible fact - a snippet that
+/// predates the feature - and carries the fix; anything else is quoted.
+fn nft_arm_state_from_error(e: &anyhow::Error) -> FastAllow {
+    match e.downcast_ref::<super::nft_set::Absent>() {
+        Some(super::nft_set::Absent::Table) => FastAllow::Off(
+            "waiting for the nftables table (colony-firewall-nft.service starts after the daemon)"
+                .to_string(),
+        ),
+        Some(super::nft_set::Absent::Set) => FastAllow::Off(format!("{e}")),
+        None => FastAllow::Off(format!("could not arm nftables: {e:#}")),
+    }
+}
+
 /// Classifies a failure from `EbpfLoader::load` - parsing the ELF, creating
 /// maps, applying relocations.
 ///
@@ -196,6 +253,18 @@ impl Drop for Attached {
         for t in &self.tasks {
             t.abort();
         }
+        // A clean stop disarms now rather than letting the deadline lapse:
+        // zero deadline and unarmed mark in the kernel, the set flushed in
+        // nftables. Best effort - a daemon on its way out has only the log.
+        if let Some(sink) = &self._sink {
+            sink.disarm();
+            if let Err(e) = super::nft_set::disarm() {
+                tracing::warn!(
+                    "could not flush the fast-allow mark from nftables on shutdown: {e:#}"
+                );
+            }
+            super::set_fast_allow_level(FastAllow::Off("the daemon stopped".to_string()));
+        }
     }
 }
 
@@ -205,12 +274,19 @@ impl Drop for Attached {
 /// missing file, a malformed ELF, a kernel that refuses the whole program set.
 /// Individual attach failures are recorded in the [`Report`] and leave the
 /// rest running.
+// Eight injected dependencies, each a different thing the layer may read or
+// feed and none of which it should own; a bag struct to satisfy the lint
+// would name nothing that the parameter list does not already name.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_and_attach(
     object_path: &Path,
     dns: DnsCache,
     table: KernelProcTable,
     engine: Option<crate::decision::Engine>,
     trust: Trust,
+    observed: tokio::sync::broadcast::Sender<crate::nfqueue::ObservedConnection>,
+    stats: crate::stats::Stats,
+    fast_allow_cfg: bool,
 ) -> Result<(Attached, Report), LoadError> {
     let mut report = Report {
         mode: crate::config::EbpfMode::On,
@@ -328,6 +404,24 @@ pub(super) fn load_and_attach(
                 // Attribution rather than enforcement, but the same restart
                 // split applies; see the SOCK_PIDS paragraph below.
                 (enforce::MAP_SOCK_PIDS, dir.join(enforce::MAP_SOCK_PIDS)),
+                // The fast path's four. Pinned for the same restart reason
+                // as everything above, and it is the pinning that makes the
+                // deadline load-bearing: the programs keep these alive after
+                // the daemon dies, so only `FAST_ALLOW_UNTIL` running out
+                // stops the marks.
+                (enforce::MAP_FAST_ALLOW, dir.join(enforce::MAP_FAST_ALLOW)),
+                (
+                    enforce::MAP_FAST_ALLOW_UNTIL,
+                    dir.join(enforce::MAP_FAST_ALLOW_UNTIL),
+                ),
+                (
+                    enforce::MAP_FAST_ALLOW_MARK,
+                    dir.join(enforce::MAP_FAST_ALLOW_MARK),
+                ),
+                (
+                    enforce::MAP_ALLOW_EVENTS,
+                    dir.join(enforce::MAP_ALLOW_EVENTS),
+                ),
             ]
         })
         .unwrap_or_default();
@@ -406,6 +500,7 @@ pub(super) fn load_and_attach(
         }
         Ok(Some(off)) => {
             debug!(offset = off, "sched_process_exit carries group_dead");
+            report.exit_precise = true;
             off
         }
         Ok(None) => {
@@ -608,7 +703,13 @@ pub(super) fn load_and_attach(
 
     // --- enforcement ----------------------------------------------------
 
+    // Whether the kernel side of the fast path is in place: the cookie
+    // connect variants plus both sendmsg programs. On the inherited path the
+    // pin names do not say which connect variant is running, and the sendmsg
+    // pins - made only after the cookie variants attached - are the evidence.
+    let mut fast_capable = false;
     report.enforcement = if inherited {
+        fast_capable = pin_dir.as_deref().is_some_and(enforce::fast_path_attached);
         report.notes.push(format!(
             "in-kernel enforcement was already attached and pinned at {}; \
              steering it rather than replacing it",
@@ -617,8 +718,9 @@ pub(super) fn load_and_attach(
         Enforcement::Inherited
     } else {
         match enforce::attach(&mut bpf, pin_dir.as_deref()) {
-            Ok(programs) => {
-                for (name, insns) in programs {
+            Ok(attached) => {
+                fast_capable = attached.fast_capable;
+                for (name, insns) in attached.programs {
                     if let Some(n) = insns {
                         report.verified_insns.push((name, n));
                     }
@@ -688,11 +790,14 @@ pub(super) fn load_and_attach(
             .and_then(|m| aya::maps::PerCpuArray::<_, u64>::try_from(m).map_err(Into::into))
             .and_then(|m| enforce::stats(&m))
         {
-            Ok(s) if s.denied > 0 || s.allowed > 0 || s.unknown > 0 => report.notes.push(format!(
-                "in-kernel enforcement carried over: {} connect() refused, \
-                 {} allowed, {} passed to the packet path since the pins were made",
-                s.denied, s.allowed, s.unknown
-            )),
+            Ok(s) if s.denied > 0 || s.allowed > 0 || s.unknown > 0 || s.stale > 0 => {
+                report.notes.push(format!(
+                    "in-kernel enforcement carried over: {} connect() refused, \
+                     {} fast-allowed, {} passed to the packet path, {} grants \
+                     ignored as stale since the pins were made",
+                    s.denied, s.allowed, s.unknown, s.stale
+                ))
+            }
             Ok(_) => {}
             Err(e) => report
                 .notes
@@ -728,27 +833,75 @@ pub(super) fn load_and_attach(
     // enforcement did not come up, or when the caller has no rule engine to
     // consult (the live tests); in both cases the map simply stays empty and
     // every connect falls through to the packet path.
+    // The mark the kernel side was armed with, when it was: the heartbeat
+    // task below needs it to finish the nftables half of arming.
+    let mut armed_mark: Option<u32> = None;
     let sink = match (report.enforcement.is_live(), engine) {
         (true, Some(engine)) => {
             match enforce::VerdictSink::new(&mut bpf, engine.clone(), table.clone()) {
-                Ok(sink) => {
-                    // A rule change invalidates every live process's verdict,
-                    // and there is no event to hang that off - their `exec`
-                    // already happened.
-                    //
-                    // `Weak` on purpose, and the strong `Arc` is kept in
-                    // `Attached`: the sink holds this engine, so a strong
-                    // capture in the callback would be a cycle that never
-                    // drops. It has to be a *real* Arc that something outlives
-                    // the callback - downgrading a temporary would hand the
-                    // engine a Weak that is dead on arrival and a resync that
-                    // silently never runs.
+                Ok(mut sink) => {
+                    // Whatever the previous daemon granted, it granted under
+                    // its rules. The map is pinned, so those grants are still
+                    // here; nothing below writes a grant until this is done.
+                    let dropped = sink.flush_fast_allow();
+                    if dropped > 0 {
+                        debug!(
+                            "dropped {dropped} fast-allow grants inherited from a previous daemon"
+                        );
+                    }
+
+                    // Every reason the fast path stays off, in the order a
+                    // reader can act on. Each is the one sentence `cfc status`
+                    // will show.
+                    let off = if !fast_allow_cfg {
+                        Some("[ebpf] fast_allow is not set")
+                    } else if !sink.has_fast_path() {
+                        Some("the loaded object predates the fast path")
+                    } else if !matches!(
+                        report.enforcement,
+                        Enforcement::Pinned | Enforcement::Inherited
+                    ) {
+                        // A Process-mode link dies with the daemon and takes
+                        // the exit eviction with it; a stale grant would then
+                        // have nothing but the deadline standing between it
+                        // and a recycled pid.
+                        Some("enforcement is not pinned to bpffs")
+                    } else if !report.exit_tracking || !report.exit_precise {
+                        // Leader-only exit detection leaks in the fail-closed
+                        // direction for denies and the fail-open one for
+                        // grants.
+                        Some("process exit is not detected exactly on this kernel (no readable group_dead)")
+                    } else if !fast_capable {
+                        Some("the kernel runs the basic connect programs (no bpf_setsockopt on sock_addr)")
+                    } else {
+                        None
+                    };
+
+                    let (state, mark_opt) = match off {
+                        Some(why) => {
+                            sink.withdraw_fast_path();
+                            (FastAllow::Off(why.to_string()), None)
+                        }
+                        None => match arm_kernel_side(&sink) {
+                            Ok(mark) => (nft_arm_state(mark), Some(mark)),
+                            Err(e) => {
+                                sink.withdraw_fast_path();
+                                (FastAllow::Off(format!("could not arm: {e:#}")), None)
+                            }
+                        },
+                    };
+                    report.fast_allow = Some(state);
+                    armed_mark = mark_opt;
+
                     let sink = std::sync::Arc::new(sink);
-                    // Once at startup, before any rule changes. Without this the
-                    // kernel's table stays empty until someone edits a rule, and
-                    // a daemon that starts and is then killed would leave nothing
-                    // behind - which is the case this whole layer exists for.
-                    sink.compile_rules();
+                    // resync rather than compile_rules alone: on the inherited
+                    // path the pinned map holds the previous daemon's
+                    // verdicts, made under the previous daemon's rules, and
+                    // this is the reconciliation that makes them this
+                    // daemon's. The proc table is empty here, so it is the
+                    // orphan sweep that does the work - which is what it is
+                    // for.
+                    sink.resync();
                     let weak = std::sync::Arc::downgrade(&sink);
                     engine.set_on_change(Box::new(move || {
                         if let Some(sink) = weak.upgrade() {
@@ -767,6 +920,16 @@ pub(super) fn load_and_attach(
         }
         _ => None,
     };
+    if report.fast_allow.is_none() {
+        report.fast_allow = Some(FastAllow::Off(
+            if report.enforcement.is_live() {
+                "no decision engine was handed to the layer"
+            } else {
+                "in-kernel enforcement is not live"
+            }
+            .to_string(),
+        ));
+    }
 
     // Exec without exit tracking would let entries age out on the TTL alone,
     // which is a materially weaker pid-reuse story. Refuse the combination
@@ -850,7 +1013,7 @@ pub(super) fn load_and_attach(
     if report.enforcement.is_live() {
         let t = table.clone();
         match spawn_ring(&mut bpf, enforce::MAP_DENY_EVENTS, move |bytes| {
-            let Some(ev) = decode::<ConnectDeny>(bytes) else {
+            let Some(ev) = decode::<ConnectReport>(bytes) else {
                 return;
             };
             let who = t
@@ -869,6 +1032,124 @@ pub(super) fn load_and_attach(
                 "{} consumer not started: {e:#}; in-kernel denials will be \
                  enforced but not reported",
                 enforce::MAP_DENY_EVENTS
+            )),
+        }
+    }
+
+    // The fast path's two tasks, only while it is live: the heartbeat that
+    // keeps the kernel honouring grants, and the consumer that keeps the
+    // rest of the daemon honest about flows the packet path never sees.
+    if let (Some(mark), Some(sink)) = (armed_mark, sink.as_ref()) {
+        // Heartbeat, and the nftables side of arming. The two are one task on
+        // purpose: `colony-firewall-nft.service` is After= this daemon and
+        // waits for it to be active, so at daemon start the table is not
+        // loaded yet and the set cannot be written - on every boot, not as
+        // an edge case. The kernel side is armed (mark written) but the
+        // deadline stays zero, so nothing is honoured, until the element is
+        // in the set; then every tick refreshes the deadline. If this task
+        // ever stops - abort on shutdown, a wedged runtime, the daemon dying
+        // - the kernel stops honouring grants within one deadline. That is
+        // the design, not a failure mode.
+        let beat = sink.clone();
+        let mut armed = matches!(report.fast_allow, Some(FastAllow::Live));
+        tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                cfc_ebpf_common::fast_allow::HEARTBEAT_SECS,
+            ));
+            let mut last_reason: Option<String> = None;
+            loop {
+                tick.tick().await;
+                if !armed {
+                    // Off the async threads: this execs nft and waits on it.
+                    let attempt = tokio::task::spawn_blocking(move || super::nft_set::arm(mark))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow!("arming task failed: {e}")));
+                    let state = match attempt {
+                        Ok(()) => {
+                            armed = true;
+                            tracing::info!(
+                                "fast-allow armed: the nftables set now holds this daemon's mark"
+                            );
+                            FastAllow::Live
+                        }
+                        Err(e) => nft_arm_state_from_error(&e),
+                    };
+                    // Say each reason once, not every ten seconds.
+                    let reason = state.describe();
+                    if last_reason.as_deref() != Some(reason.as_str()) {
+                        if !armed {
+                            tracing::info!("fast-allow {reason}");
+                        }
+                        last_reason = Some(reason);
+                    }
+                    super::set_fast_allow_level(state);
+                    if !armed {
+                        continue;
+                    }
+                }
+                if let Err(e) = beat.beat() {
+                    tracing::warn!(
+                        "fast-allow heartbeat failed: {e:#}; grants lapse within a minute"
+                    );
+                }
+            }
+        }));
+
+        // ALLOW_EVENTS: one record per flow the kernel waved past the queue.
+        // Credited to the rule that granted, counted where NFQUEUE counts,
+        // and fed to the same observed stream - so the busiest allow rule
+        // does not read as dead and the enforcing heuristic does not flip
+        // to "not enforcing" while the firewall is doing its job.
+        let credit = sink.clone();
+        let engine_hits = sink.engine().clone();
+        let observed_tx = observed.clone();
+        let stats_tx = stats.clone();
+        match spawn_ring(&mut bpf, enforce::MAP_ALLOW_EVENTS, move |bytes| {
+            let Some(ev) = decode::<ConnectReport>(bytes) else {
+                return;
+            };
+            stats_tx.record_allow();
+            let verdict = match credit.granted_by(ev.pid) {
+                Some(rule) => {
+                    engine_hits.record_hit(rule);
+                    cfc_core::Verdict::from_rule(cfc_core::Action::Allow, rule)
+                }
+                // A grant this daemon did not make (a previous one's, in the
+                // window before the startup flush). Reported, credited to no
+                // rule rather than to the wrong one.
+                None => cfc_core::Verdict::from_policy(cfc_core::Action::Allow),
+            };
+            let protocol = match ev.protocol {
+                6 => cfc_core::Protocol::Tcp,
+                17 => cfc_core::Protocol::Udp,
+                other => cfc_core::Protocol::Other(other),
+            };
+            let unspecified = if ev.family == 4 {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            } else {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            };
+            let dst = ev.destination();
+            let connection = cfc_core::Connection::new(
+                protocol,
+                cfc_core::Direction::Outbound,
+                unspecified,
+                0,
+                dst.ip(),
+                dst.port(),
+            );
+            let process = crate::process_resolve::resolve(ev.pid);
+            let _ = observed_tx.send(crate::nfqueue::ObservedConnection {
+                connection,
+                process,
+                verdict,
+            });
+        }) {
+            Ok(task) => tasks.push(task),
+            Err(e) => report.notes.push(format!(
+                "{} consumer not started: {e:#}; fast-allowed flows will be \
+                 unreported and their rules uncredited",
+                enforce::MAP_ALLOW_EVENTS
             )),
         }
     }
@@ -1280,6 +1561,9 @@ mod tests {
             KernelProcTable::new(),
             None,
             Trust::Refuse,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+            false,
         )
         .err()
         .expect("a world-writable object must not be loaded");
@@ -1294,6 +1578,9 @@ mod tests {
             KernelProcTable::new(),
             None,
             Trust::Warn,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+            false,
         )
         .err()
         .expect("`not an ELF` cannot load either way");
@@ -1316,6 +1603,9 @@ mod tests {
             KernelProcTable::new(),
             None,
             Trust::Refuse,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+            false,
         )
         .err()
         .expect("there is no object there");
@@ -1601,6 +1891,9 @@ mod tests {
             KernelProcTable::new(),
             None,
             Trust::Warn,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+            false,
         )
         .expect("the unit's capability set must be enough to load the object");
 
@@ -1638,6 +1931,21 @@ mod tests {
             "{} must be pinned alongside the verdict maps",
             sock_pids_pin.display()
         );
+        // The fast path's maps and links. Unpinned, a restart would split
+        // them from the programs still attached (the SOCK_PIDS lesson), and
+        // an unpinned deadline map would be one no restarted daemon could
+        // ever refresh.
+        for name in [
+            enforce::MAP_FAST_ALLOW,
+            enforce::MAP_FAST_ALLOW_UNTIL,
+            enforce::MAP_FAST_ALLOW_MARK,
+            enforce::MAP_ALLOW_EVENTS,
+            enforce::LINK_SENDMSG4,
+            enforce::LINK_SENDMSG6,
+        ] {
+            let pin = enforce::pin_dir().join(name);
+            assert!(pin.exists(), "{} must be pinned", pin.display());
+        }
         println!("all five programs attached and pinned without CAP_SYS_ADMIN");
 
         drop(attached);
@@ -1686,6 +1994,9 @@ mod tests {
             table.clone(),
             None,
             Trust::Warn,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+            false,
         )
         .expect("load");
         for note in &report.notes {
@@ -1735,6 +2046,28 @@ mod tests {
             "cgroup/connect4|6 must load and attach on every matrix kernel: {:?}",
             report.notes
         );
+        // The fast path's kernel side rides with the cookie connect variants:
+        // where those verified, the sendmsg programs must have too. Where the
+        // basic twins run, neither exists, and that is the documented shape.
+        println!("fast_allow = {:?}", report.fast_allow);
+        let measured = |name: &str| report.verified_insns.iter().any(|(p, _)| p == name);
+        if report.enforcement != Enforcement::Inherited && measured(enforce::PROG_CONNECT4) {
+            assert!(
+                measured(enforce::PROG_SENDMSG4) && measured(enforce::PROG_SENDMSG6),
+                "the cookie connect variants verified but the sendmsg pair did not: {:?}",
+                report.notes
+            );
+        }
+        // Off, and off for the reason this test asked for: the config flag.
+        // Every other reason would mean the layer judged itself ineligible on
+        // a kernel the matrix says is fine, which is a finding, not a pass.
+        match &report.fast_allow {
+            Some(FastAllow::Off(why)) => assert!(
+                why.contains("fast_allow is not set"),
+                "fast-allow is off for a reason the test did not choose: {why}"
+            ),
+            other => panic!("fast-allow should be off by config here, got {other:?}"),
+        }
         // `bpf_prog_info.verified_insns` exists since kernel 5.16; before
         // that, an empty report is the correct answer, not a recording
         // failure. On a kernel that does report counts, every program that

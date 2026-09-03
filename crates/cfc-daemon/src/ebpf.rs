@@ -87,6 +87,7 @@ pub mod tracefs;
 mod enforce;
 #[cfg(feature = "ebpf")]
 mod loader;
+mod nft_set;
 
 /// Socket-cookie -> pid, answered from the kernel's `SOCK_PIDS` map.
 ///
@@ -372,6 +373,53 @@ pub fn enforcement_level() -> Option<Enforcement> {
     }
 }
 
+/// Whether the fast-allow path - a process-wide allow marking its sockets so
+/// nftables accepts them ahead of the queue - is actually doing anything.
+///
+/// Three-way on purpose. `Off` carries *why*, because the path has several
+/// ways to be silently inert (config, an inherited attach from a build that
+/// predates it, a kernel whose verifier lacks `bpf_setsockopt` on sock_addr,
+/// exit tracking without a readable `group_dead`, an nftables set the
+/// snippet does not declare) and a feature that is off for a reason nobody
+/// can read is a feature nobody can rely on. That lesson was learned once
+/// already with the enforcement level above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastAllow {
+    /// Marks are being set and the nftables set holds this daemon's value.
+    Live,
+    /// Not doing anything, and this is the one sentence that says why.
+    Off(String),
+}
+
+impl FastAllow {
+    /// One token plus the reason, for `cfc status`: `live` or `off: <why>`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Live => "live".to_string(),
+            Self::Off(why) => format!("off: {why}"),
+        }
+    }
+}
+
+static FAST_ALLOW_LEVEL: std::sync::RwLock<Option<FastAllow>> = std::sync::RwLock::new(None);
+
+/// Records what [`start`] achieved for the fast path. Called once, at the end
+/// of startup, and again if the path is disarmed at shutdown.
+pub fn set_fast_allow_level(level: FastAllow) {
+    *FAST_ALLOW_LEVEL
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(level);
+}
+
+/// The fast path's state, `None` until startup has answered - the same
+/// "ask again" sentinel `enforcement_level` uses, for the same reason.
+pub fn fast_allow_level() -> Option<FastAllow> {
+    FAST_ALLOW_LEVEL
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// What actually came up. Reported once at startup and otherwise inert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -409,6 +457,14 @@ pub struct Report {
     /// more expensive" into something visible here, rather than into "it
     /// stopped loading on someone else's kernel".
     pub verified_insns: Vec<(String, u32)>,
+    /// The fast path's state after startup, `None` when the layer never got
+    /// far enough to have an opinion (eBPF off, object not loaded).
+    pub fast_allow: Option<FastAllow>,
+    /// Whether process exit is detected exactly (`group_dead` read from the
+    /// tracepoint record) rather than approximated by leader exit. A deny
+    /// evicted late is an inconvenience; a fast-allow grant evicted late is a
+    /// mark on a recycled pid, so the fast path requires the exact answer.
+    pub exit_precise: bool,
 }
 
 impl Report {
@@ -584,7 +640,18 @@ pub fn start(
     #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))] engine: Option<
         crate::decision::Engine,
     >,
+    // The fast path's reporting: flows the kernel waved past the queue are
+    // fed back into the same observed stream and the same counters NFQUEUE
+    // feeds, so the live feed and the enforcing heuristic keep telling the
+    // truth about traffic the packet path never sees.
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))]
+    observed: tokio::sync::broadcast::Sender<crate::nfqueue::ObservedConnection>,
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))] stats: crate::stats::Stats,
 ) -> Runtime {
+    // The answer until the layer says otherwise. Every early return below
+    // leaves it standing, which is the truthful default: no layer, no fast
+    // path.
+    set_fast_allow_level(FastAllow::Off("the in-kernel layer is not up".to_string()));
     if !cfg.enabled.wants_load() {
         return Runtime {
             report: Report::inert(
@@ -638,7 +705,16 @@ pub fn start(
                 loader::Trust::Refuse,
             ),
         };
-        match loader::load_and_attach(&path, dns, table.clone(), engine, trust) {
+        match loader::load_and_attach(
+            &path,
+            dns,
+            table.clone(),
+            engine,
+            trust,
+            observed,
+            stats,
+            cfg.fast_allow,
+        ) {
             Ok((attached, mut report)) => {
                 // The loader builds its report before it knows how it was
                 // asked for; only `start` does. Without this an `auto` host
@@ -646,6 +722,11 @@ pub fn start(
                 // error policy.
                 report.mode = cfg.enabled;
                 table.set_live(report.exec_tracking);
+                // Published here, where the report is final, so `cfc status`
+                // never reads a state startup has not finished deciding.
+                set_fast_allow_level(report.fast_allow.clone().unwrap_or_else(|| {
+                    FastAllow::Off("the in-kernel layer did not come up".to_string())
+                }));
                 Runtime {
                     report,
                     _attached: Some(attached),
@@ -675,12 +756,15 @@ mod tests {
         let cfg = EbpfConfig {
             enabled: EbpfMode::Off,
             object_path: None,
+            fast_allow: false,
         };
         let rt = start(
             &cfg,
             DnsCache::new(),
             proc_table::KernelProcTable::new(),
             None,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
         );
         assert!(!rt.report.any_active());
         assert_eq!(rt.report.mode, EbpfMode::Off);
@@ -706,12 +790,20 @@ mod tests {
         let cfg = EbpfConfig {
             enabled: EbpfMode::On,
             object_path: Some(dir.path().join("cfc-ebpf.o")),
+            fast_allow: false,
         };
         // An instance, not `proc_table::global()`: the assertion below is about
         // what *this* load did, and against the process-wide table it would be
         // an assertion about every other test in the binary as well.
         let table = proc_table::KernelProcTable::new();
-        let rt = start(&cfg, DnsCache::new(), table.clone(), None);
+        let rt = start(
+            &cfg,
+            DnsCache::new(),
+            table.clone(),
+            None,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+        );
         assert_eq!(rt.report.mode, EbpfMode::On);
         assert!(!rt.report.any_active(), "nothing can have attached");
         assert_eq!(rt.report.ring0(), Ring0::Unavailable);
@@ -765,7 +857,14 @@ mod tests {
         );
 
         let table = proc_table::KernelProcTable::new();
-        let rt = start(&cfg, DnsCache::new(), table.clone(), None);
+        let rt = start(
+            &cfg,
+            DnsCache::new(),
+            table.clone(),
+            None,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+        );
         for note in &rt.report.notes {
             println!("note: {note}");
         }
