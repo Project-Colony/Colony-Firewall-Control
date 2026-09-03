@@ -31,11 +31,21 @@ could not be patched, and what replaced them:
   the bypass to a binary that earned nothing. So the mark is re-decided - set
   or stripped - at every flow start, `connect()` and `sendmsg()` alike, and
   sockets already carrying someone else's mark (a VPN, a proxy) are left
-  alone in both directions.
+  alone in both directions. Exactly which hooks that is, is the boundary the
+  *implementation* review then found: `cgroup/sendmsg` runs for a send that
+  carries a destination, not for `send()` on a connected socket, so a
+  connected UDP socket keeps the mark it was given at `connect()`. Conntrack
+  covers most of it - only `ct state new` is queued - and the remainder is
+  documented in `docs/ARCHITECTURE.md` rather than claimed away.
 - *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
   default. A published mark value is a bypass token. The value is drawn at
   random per start and lives in a pinned map and an nftables set, never in a
-  package.
+  package. Two things the implementation review added: the draw is sieved
+  against the fwmark selectors other software uses - kube-proxy's masks are a
+  single bit each, so an unsieved word collided half the time on a Kubernetes
+  node - and the set is flushed unconditionally at start, because a value left
+  accepted that nothing refreshes is one every past grantee can still read off
+  its own socket with `getsockopt(SO_MARK)`.
 - *A static accept rule is a token on every install.* The snippet ships the
   set empty; the daemon fills it only when the path is armed - the one thing
   the daemon does to nftables.
@@ -44,17 +54,29 @@ Grants are cleared in the kernel on exec and exit, so no daemon is needed for
 the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline refreshed every 10 s
 makes a dead daemon fail-closed within 60 s; and the path stays off - with
 the reason in `cfc status` - unless enforcement is pinned, exit is detected
-exactly (`group_dead`), the cookie connect variants *and* the sendmsg hooks
-verified, and `[ebpf] fast_allow` is set. The matrix drew that last line on
+exactly (`group_dead`), the exec/exit links actually *pinned* rather than
+merely attached, their ring consumers running, the cookie connect variants
+*and* the sendmsg hooks verified, the nftables set present and holding this
+daemon's mark, and `[ebpf] fast_allow` is set. The matrix drew that last line on
 the first run: 5.10 accepts `bpf_getsockopt` on a connect hook and refuses it
 on a sendmsg hook (`unknown func bpf_getsockopt#57`), 6.12 accepts both - so
 on the RHEL-floor kernel the fast path reports itself off with that sentence,
 rather than shipping half-present without the UDP re-decision that closes the
 reused-socket hole. **Off by default** for this release: the
-blast radius named above has not changed, only its edges. What is not done:
-the latency win is not yet *measured* on the veth bench - the number that
-justifies the feature is still the pre-feature 0.28 ms per new flow - and 1b
-below is untouched.
+blast radius named above has not changed, only its edges.
+
+An adversarial review of the *implementation* then found 23 confirmed defects
+on top of the design's 59, all fixed on this branch. The ones worth
+remembering as classes: a second decider that read the execve string and the
+exec-time uid where every other decider reads `/proc` (which skipped
+relative-exec processes entirely, so a grant survived its rule's deletion);
+grants written with no liveness guard where the deny side had carried one
+since it was written; and the feature being **inert for its own motivating
+case** - nothing granted a process that was already running, so every restart
+silently switched the fast path off for every long-lived program while
+`cfc status` said `live`. What is not done: the latency win is not yet
+*measured* on the veth bench - the number that justifies the feature is still
+the pre-feature 0.28 ms per new flow - and 1b below is untouched.
 
 **1b. Rules that depend on a destination still cannot be precomputed.**
 `process_wide_action` deliberately answers `None` for them, which is correct and
