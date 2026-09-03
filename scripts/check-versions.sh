@@ -5,6 +5,12 @@
 #   - pkg/PKGBUILD       pkgver=
 #   - pkg/colony.json    every "version" field and every version embedded
 #                        in an "asset" filename
+#   - packaging/rpm/colony-firewall-control.spec   Version:
+#
+# The spec is here because the job that compared it lived in rhel.yml, which
+# only runs when packaging paths change - so a version bump that touched none
+# of them shipped a 0.3.0 tree with a spec still saying 0.2.3, and nothing ran
+# to say so. This script runs on every push.
 #
 # Exits non-zero listing every mismatch. Wired into CI (check.yml).
 
@@ -59,6 +65,10 @@ if [[ "${n}" -eq 0 ]]; then
     mismatches+=("pkg/colony.json: no \"asset\" filename with a version found")
     fail=1
 fi
+
+# packaging/rpm/colony-firewall-control.spec -> Version: X.Y.Z
+spec_ver="$(sed -n 's/^Version:[[:space:]]*//p' "${ROOT}/packaging/rpm/colony-firewall-control.spec" | head -n1)"
+check "packaging/rpm/colony-firewall-control.spec Version" "${spec_ver}"
 
 if [[ "${fail}" -ne 0 ]]; then
     echo "version mismatch (canonical: Cargo.toml [workspace.package] = ${cargo_ver}):" >&2
