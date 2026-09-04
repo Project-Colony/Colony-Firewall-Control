@@ -26,18 +26,19 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   this first release; `cfc status` and the startup log line show
   `fast-allow live` or `off: <the one reason>`.
 
-  Two things worth knowing before turning it on. **A UDP socket is not marked
-  at `connect()`**, deliberately: it would pass no hook again, so that mark
-  could never be taken back - not by a revocation, not by the deadline. It
-  costs almost nothing, because a UDP peer that answers makes the flow
-  conntrack-established and its later datagrams were not being queued anyway;
-  a connected UDP socket only kept gaining from the mark while its peer stayed
-  silent, which is exactly when an unrevocable mark does the most damage. TCP
-  and unconnected UDP keep the fast path in full. And the mark shares one
-  32-bit word with everything else on the machine: the daemon refuses values
-  that collide with the fwmark selectors it knows (kube-proxy's two single-bit
-  masks, Tailscale's, wg-quick's), and `[ebpf] fast_allow_mark` pins one by
-  hand for a host with a selector it does not know.
+  Two things worth knowing before turning it on. **Only TCP sockets are
+  marked**, deliberately: they are the only ones that pass a hook again, and
+  the mark lives on the socket, so a mark given to anything else could never be
+  taken back - not by a revocation, not by the deadline, not by the daemon
+  dying. It costs little where it lands: a UDP peer that answers makes the flow
+  conntrack-established and its later datagrams were not being queued anyway,
+  so a marked UDP socket only kept gaining while its peer stayed silent, which
+  is exactly when an unrevocable mark does the most damage. What is given up in
+  practice is the fast path for QUIC. And the mark shares one 32-bit word with
+  everything else on the machine: the daemon refuses values that collide with
+  the fwmark selectors it knows (kube-proxy's two single-bit masks,
+  Tailscale's, wg-quick's), and `[ebpf] fast_allow_mark` pins one by hand for a
+  host with a selector it does not know.
 
   Needs a kernel that allows `bpf_getsockopt` on `cgroup/sendmsg` hooks: 5.10
   does not (and says so in the status line), 6.12 and later do.

@@ -73,12 +73,13 @@ max = 40000
 # 318 on the first matrix run. Three times the instructions
 # for the whole round trip: still the cheapest millisecond on offer.
 #
-# 318 predates the UDP guard - the protocol read and branch that stop this hook
-# marking a socket it will never see again. That is a context load and a
-# compare, so the cost is a handful of instructions and nowhere near `max`, but
-# nothing here has measured it: this machine cannot run the root test, and the
-# number below is only ever what a verifier actually reported. The next matrix
-# run prints the real one; do not guess it into this file.
+# 318 predates the protocol guard, and the guard's first shape is why this
+# comment is longer than it should be. Written at the top of `mark_decision`,
+# the flag stayed live across the whole body and made the verifier walk it in
+# two states: 356 -> 474 on 6.12, over the 450 ceiling, and the matrix caught
+# it. Computed one line before its only use it is a context load and a compare.
+# The number below is still the 7.1.8 measurement from before either shape;
+# `max` is the check, and only a matrix run may replace `observed`.
 observed = 318
 max = 450
 

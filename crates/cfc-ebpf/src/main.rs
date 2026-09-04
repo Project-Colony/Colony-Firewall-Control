@@ -1054,7 +1054,7 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
         // `verdict` module's docs for why that direction is load-bearing.
         _ => {
             if record_cookie {
-                mark_decision(ctx, tgid, family, true);
+                mark_decision(ctx, tgid, family);
             } else {
                 bump(cfc_ebpf_common::enforce_stat::UNKNOWN);
             }
@@ -1068,9 +1068,9 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
 /// x86_64 (and aarch64) values; `ExclusiveArch: x86_64` in the spec is what
 /// makes hardcoding them honest. Alpha, MIPS, PA-RISC and SPARC number
 /// `SO_MARK` differently.
-/// `IPPROTO_UDP`. Read from the sock_addr context to keep the connect hooks
-/// from marking a socket that will never pass a hook again.
-const IPPROTO_UDP: u32 = 17;
+/// `IPPROTO_TCP`. The only protocol whose sockets are ever marked - read from
+/// the sock_addr context. See `mark_decision`.
+const IPPROTO_TCP: u32 = 6;
 
 const SOL_SOCKET: i32 = 1;
 const SO_MARK: i32 = 36;
@@ -1108,52 +1108,47 @@ const SO_MARK: i32 = 36;
 /// break it just as surely. Such a socket takes the queue - fail closed for
 /// the flow, and no interference with the routing the mark was there for.
 #[inline(always)]
-fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8, at_connect: bool) {
+fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     use cfc_ebpf_common::{enforce_stat, fast_allow};
 
-    // A UDP socket is never marked at `connect()`.
+    // Only a TCP socket is ever marked, from either hook.
     //
-    // This is the one case where the mark cannot be taken back. `connect()`
-    // fixes the peer, and the socket's later `send()` calls name no
-    // destination, so they pass neither this hook nor the sendmsg one: the
-    // mark it gets here is the mark it keeps until it is closed. Deleting the
-    // rule cannot reach it, and neither can the deadline, which is only read
-    // at a hook that runs - so this is also the only case where "a dead daemon
-    // fails closed within sixty seconds" would not hold.
+    // The property that matters is not "which protocol" but "does this socket
+    // pass one of our hooks again after it is set up?" - because the mark
+    // lives on the socket and only a hook can take it back. TCP does: it
+    // passes the connect hook for every connection it opens. Nothing else
+    // reliably does. A UDP socket that has called `connect()` sends with
+    // `send()`, which carries no destination and so passes neither hook; the
+    // mark it holds at that point is the mark it keeps until it is closed,
+    // past a revocation, past the deadline, and past the daemon's death. That
+    // is the one case where "a dead daemon fails closed within sixty seconds"
+    // would not hold.
     //
-    // Refusing costs almost nothing, which is what settles it. The ruleset
-    // queues `ct state new`; a UDP peer that answers makes the flow
+    // Two narrower guards were tried before this one and both leaked, which is
+    // why this is an allowlist and not a list of protocols to exclude:
+    //
+    // * refusing UDP only at `connect()` left the sendmsg hooks free to mark a
+    //   socket that was *already* connected - `sendto` with an explicit
+    //   address is legal on a connected UDP socket, and `udp_sendmsg` runs the
+    //   hook whenever `msg_name` is supplied. Closed one door, left the other.
+    // * naming UDP at all only covers what someone thought to name. UDP-Lite,
+    //   DCCP and SCTP connect the same way and have no sendmsg hook here
+    //   either.
+    //
+    // The cost is small and lands where it does least harm. The ruleset queues
+    // `ct state new`; a UDP peer that answers makes the flow
     // conntrack-established after one exchange, and established traffic is not
-    // queued with or without a mark. So a marked connected-UDP socket only
-    // keeps *gaining* anything while its peer stays silent - and unreplied UDP
-    // is conntrack-NEW on every datagram, which is exactly the shape in which
-    // an unrevocable mark does the most damage. The benefit and the hazard are
-    // the same case.
+    // queued with or without a mark. A marked UDP socket only kept *gaining*
+    // anything while its peer stayed silent - and unreplied UDP is
+    // conntrack-NEW on every datagram, which is exactly the shape in which an
+    // unrevocable mark does the most damage. Benefit and hazard were the same
+    // case.
     //
-    // Unconnected UDP is unaffected: `sendto` carries a destination, so it
-    // passes the sendmsg hooks and is re-decided on every datagram. TCP is
-    // unaffected: it passes this hook for every connection it opens.
+    // Refusing is never a bare `return`: a socket that already carries our
+    // mark must still be stripped of it, and returning early here reopened the
+    // very hole this closes. Never set, always strip - the flag below only
+    // forces the *wanted* mark to zero.
     //
-    // **Never set, always strip.** This must not return early, and the first
-    // version of it did - which reopened the hole it was written to close, by
-    // the door it had just built. A socket can be marked by a sendmsg hook and
-    // *then* connected:
-    //
-    //     socket() -> sendto(peer)   the sendmsg hook marks it
-    //     connect(peer)              this hook - the last one it will ever see
-    //     send()                     no hook, forever
-    //
-    // Returning here left that mark in place with nothing left to remove it,
-    // which is strictly worse than the behaviour being fixed: the old code at
-    // least re-decided such a socket and stripped the mark when the grant was
-    // gone. So the flag below only forces the *wanted* mark to zero and lets
-    // the strip below run exactly as it does for any other refusal.
-    let refuse_udp = at_connect && {
-        // SAFETY: a context field the verifier permits a `cgroup_sock_addr`
-        // program to read directly.
-        (unsafe { (*ctx.sock_addr).protocol }) == IPPROTO_UDP
-    };
-
     // Unarmed: the daemon never drew a value, or disarmed on the way out.
     // Nothing to set, and nothing of ours to strip either.
     let mark = match FAST_ALLOW_MARK.get(0) {
@@ -1197,7 +1192,17 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8, at_connect: bool)
     // because every generated helper is.
     let fresh = unsafe { bpf_ktime_get_boot_ns() } < until;
 
-    let want = if granted && fresh && !refuse_udp { mark } else { 0 };
+    // Computed here, one line before its only use, and not at the top of the
+    // function where it reads more naturally. A boolean that stays live across
+    // this whole body makes the verifier walk the rest of it in two states,
+    // and that is not free on the hottest path in CFC: at the top it cost 118
+    // instructions on 6.12 (356 -> 474) and put `cfc_connect4` over its
+    // ceiling. The budget tripwire is what caught it.
+    //
+    // SAFETY: a context field the verifier permits a `cgroup_sock_addr`
+    // program to read directly.
+    let not_tcp = (unsafe { (*ctx.sock_addr).protocol }) != IPPROTO_TCP;
+    let want = if granted && fresh && !not_tcp { mark } else { 0 };
     if current != want {
         let mut value = want;
         // SAFETY: as for the read above.
@@ -1221,12 +1226,11 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8, at_connect: bool)
     if want != 0 {
         bump(enforce_stat::ALLOWED);
         report_connect(&ALLOW_EVENTS, ctx, tgid, family);
-    } else if refuse_udp {
-        // Refused because it is a UDP `connect()`, not because anything is
-        // wrong. Counted as a fall-through to the packet path, which is
-        // exactly what it is - and never as STALE, which would read as "the
-        // daemon stopped refreshing" and send someone to look at a heartbeat
-        // that is perfectly healthy.
+    } else if not_tcp {
+        // Refused for the protocol, not because anything is wrong. Counted as
+        // a fall-through to the packet path, which is exactly what it is - and
+        // never as STALE, which would read as "the daemon stopped refreshing"
+        // and send someone to look at a heartbeat that is perfectly healthy.
         bump(enforce_stat::UNKNOWN);
     } else if granted {
         // Granted but the deadline has passed: the daemon that granted this is
@@ -1302,7 +1306,7 @@ pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(sendmsg4)]
 pub fn cfc_sendmsg4(ctx: SockAddrContext) -> i32 {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    mark_decision(&ctx, tgid, 4, false);
+    mark_decision(&ctx, tgid, 4);
     CONNECT_PROCEED
 }
 
@@ -1310,7 +1314,7 @@ pub fn cfc_sendmsg4(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(sendmsg6)]
 pub fn cfc_sendmsg6(ctx: SockAddrContext) -> i32 {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    mark_decision(&ctx, tgid, 6, false);
+    mark_decision(&ctx, tgid, 6);
     CONNECT_PROCEED
 }
 

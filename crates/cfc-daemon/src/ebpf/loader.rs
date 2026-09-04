@@ -419,6 +419,12 @@ pub(super) fn load_and_attach(
     // Flushing before knowing whether this daemon will arm is the right order:
     // an empty set accepts nothing, which is the safe state to pass through.
     if let Err(e) = super::nft_set::disarm_for_start() {
+        // Logged as well as noted, because the note alone reaches nobody on
+        // the paths that matter most: every early return below builds a
+        // `LoadError` and drops this `Report` on the floor, and a failed flush
+        // followed by a failed load is exactly the shape that leaves a
+        // predecessor's mark accepted with no daemon to explain it.
+        warn!("could not flush a previous fast-allow mark from nftables: {e:#}");
         report.notes.push(format!(
             "could not flush a previous fast-allow mark from nftables: {e:#}"
         ));

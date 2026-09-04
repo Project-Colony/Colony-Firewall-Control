@@ -372,29 +372,35 @@ rule, replacing it with a Block, the process exec'ing, the process exiting, and
 the daemon going away for more than a minute all take effect at the next such
 hook, which is what makes the mark safe to hand out at all.
 
-**A UDP socket is therefore never marked at `connect()`.** That is the one
-socket that would pass no hook again: `connect()` fixes the peer, and the later
-`send()` calls name no destination, so the mark given there could never be
-taken back - not by a revocation, not by the deadline, which is only read at a
-hook that runs. Refusing costs almost nothing, and that is what settles it: the
-ruleset queues `ct state new`, so a UDP peer that answers makes the flow
-conntrack-established after one exchange and its later datagrams were not being
-queued with or without a mark. A marked connected-UDP socket only keeps gaining
-anything while its peer stays *silent* - and unreplied UDP is conntrack-NEW on
-every datagram, which is precisely the shape in which an unrevocable mark does
-the most damage. The benefit and the hazard were the same case.
+**Only a TCP socket is ever marked.** The property that decides this is not
+the protocol but whether a socket passes one of our hooks *again* after it is
+set up - because the mark lives on the socket and only a hook can take it back.
+TCP does: it passes the connect hook for every connection it opens. A UDP
+socket that has called `connect()` sends with `send()`, which carries no
+destination and so passes neither hook; the mark it holds then is the mark it
+keeps until it is closed, past a revocation, past the deadline, and past the
+daemon's death - the one case where "a dead daemon fails closed within sixty
+seconds" would not hold.
 
-The connect hook still *strips* a mark from such a socket - it only never
-*sets* one. That distinction is the whole of it: a UDP socket can be marked by
-a sendmsg hook and connected afterwards (`sendto`, then `connect`, then bare
-`send`), and if the connect hook simply declined to act, that mark would sit
-there with nothing left in its life able to remove it. Never set, always strip.
+Two narrower rules were tried first and both leaked, which is why this is an
+allowlist rather than a list of protocols to exclude. Refusing UDP only at
+`connect()` left the sendmsg hooks free to mark a socket that was *already*
+connected: `sendto` with an explicit address is legal on a connected UDP
+socket, and the hook runs whenever a destination is supplied. And naming UDP at
+all covers only what someone thought to name - UDP-Lite, DCCP and SCTP connect
+the same way and have no sendmsg hook here either.
 
-Unconnected UDP keeps the fast path in full: `sendto` carries a destination, so
-it passes the sendmsg hooks and is re-decided on every datagram. TCP keeps it in
-full: it passes the connect hook for every connection it opens. What is given up
-is the fast path for QUIC and anything else that `connect()`s a UDP socket -
-which, its peer answering, was only ever getting its first packet through it.
+Refusing is never a bare early return: a socket that already carries our mark
+is still stripped of it. Never set, always strip.
+
+The cost lands where it does least harm. The ruleset queues `ct state new`; a
+UDP peer that answers makes the flow conntrack-established after one exchange,
+and established traffic is not queued with or without a mark. A marked UDP
+socket only kept *gaining* anything while its peer stayed silent - and
+unreplied UDP is conntrack-NEW on every datagram, which is exactly the shape in
+which an unrevocable mark does the most damage. Benefit and hazard were the
+same case. What is given up in practice is the fast path for QUIC, which was
+getting its first packet through it and nothing more.
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately

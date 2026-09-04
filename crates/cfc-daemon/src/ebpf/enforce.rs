@@ -403,6 +403,16 @@ impl VerdictSink {
             return;
         }
 
+        // Before the write, so an execve that has already happened is not paid
+        // for with a real marked flow.
+        if proc_exe(pid).as_deref() != Some(judged.exe.as_path()) {
+            debug!(
+                pid,
+                "not granting: the program changed while the grant was decided"
+            );
+            return;
+        }
+
         Self::apply_grant(fast, &mut fast.map.lock(), pid, grant);
 
         // And once more, on the program rather than the pid - after the write,
@@ -416,22 +426,19 @@ impl VerdictSink {
         // deciding, would have its grant correctly cleared by the kernel and
         // then reinstated here, for a program nothing granted.
         //
-        // Checking afterwards is what makes it race-free rather than merely
-        // narrower. An execve that beat the write is visible in /proc by the
-        // time this reads, and this removes the grant; one that follows the
-        // write is cleared by the kernel itself.
-        let still = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .map(|exe| {
-                match exe
-                    .to_string_lossy()
-                    .strip_suffix(crate::process_resolve::DELETED_SUFFIX)
-                {
-                    Some(stripped) => std::path::PathBuf::from(stripped),
-                    None => exe,
-                }
-            });
-        if still.as_deref() != Some(judged.exe.as_path()) {
+        // Checked before the write as well as after - and neither makes this
+        // race-free, which the comment here used to claim.
+        //
+        // What remains is the interval between the pre-check and the insert.
+        // An execve landing there has its grant cleared by the kernel and then
+        // re-added by this write, and the post-write check removes it again
+        // only after a `read_link`. A `connect()` inside *that* window finds
+        // the entry present and marks the socket, and removing the map entry
+        // afterwards does not unmark it. So the exposure is one flow rather
+        // than none. It is bounded, and no standing refusal is skipped -
+        // `VERDICTS` is consulted before `mark_decision` - but "narrower" is
+        // the honest word and "race-free" was not.
+        if proc_exe(pid).as_deref() != Some(judged.exe.as_path()) {
             debug!(
                 pid,
                 "withdrawing: the program changed while the grant was decided"
@@ -1149,6 +1156,22 @@ fn boottime_ns() -> anyhow::Result<u64> {
 /// treat that as "cannot decide" rather than "no uid": a uid-scoped allow does
 /// not match a process with no uid, so guessing turns an exemption into a
 /// refusal that stands.
+/// `/proc/<pid>/exe`, with the kernel's `" (deleted)"` suffix stripped.
+///
+/// One reader, because three callers want the same normalisation and two of
+/// them are a guard and its counter-check - a difference between those two
+/// would be a grant kept or withdrawn for a reason nobody wrote down.
+fn proc_exe(pid: u32) -> Option<std::path::PathBuf> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let s = exe.to_string_lossy();
+    Some(
+        match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
+            Some(stripped) => std::path::PathBuf::from(stripped),
+            None => exe,
+        },
+    )
+}
+
 /// Everything a resync decision needs about one pid, read from /proc, plus the
 /// start time the read happened at.
 ///
@@ -1161,20 +1184,12 @@ fn boottime_ns() -> anyhow::Result<u64> {
 /// `None` means the process is gone or its /proc is unreadable, which callers
 /// must treat as "no grant" rather than falling back to a guess.
 fn proc_view(pid: u32) -> Option<(Process, Option<u64>)> {
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    // The kernel appends " (deleted)" once the binary is replaced on disk - a
-    // package upgrade under a running program, which process_resolve calls
-    // Tuesday on a rolling distribution. Rules match on exact path equality, so
-    // the raw suffixed path matched no rule and abstained for none: the sweep
-    // then read a standing deny for the *upgraded* binary as a deleted rule and
-    // cleared it. Same normalization as process_resolve, same reason.
-    let exe = {
-        let s = exe.to_string_lossy();
-        match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
-            Some(stripped) => std::path::PathBuf::from(stripped),
-            None => exe,
-        }
-    };
+    // `proc_exe` strips the kernel's " (deleted)" suffix - a package upgrade
+    // under a running program, which process_resolve calls Tuesday on a rolling
+    // distribution. Rules match on exact path equality, so the raw suffixed
+    // path matched no rule and abstained for none: the sweep then read a
+    // standing deny for the *upgraded* binary as a deleted rule and cleared it.
+    let exe = proc_exe(pid)?;
     let uid = proc_uid(pid);
     // Read last, so it dates the whole view: a caller comparing it again at
     // write time learns whether anything it read still describes this pid.
@@ -1190,7 +1205,13 @@ fn proc_view(pid: u32) -> Option<(Process, Option<u64>)> {
 }
 
 fn proc_uid(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    // Bytes, decoded lossily - not `read_to_string`. The `Name:` line carries
+    // the process's comm raw, so a program whose name is not valid UTF-8 (an
+    // execve of such a filename, or any `prctl(PR_SET_NAME)`) made this answer
+    // `None` for a live process, permanently. U+FFFD cannot introduce a colon
+    // or a digit, so the parse below is unchanged.
+    let status =
+        String::from_utf8_lossy(&std::fs::read(format!("/proc/{pid}/status")).ok()?).into_owned();
     status
         .lines()
         .find_map(|l| l.strip_prefix("Uid:"))?
@@ -1208,7 +1229,14 @@ fn proc_uid(pid: u32) -> Option<u32> {
 /// The orphan sweep compares it across its judge-then-clear window so a clear
 /// aimed at one process cannot land on the pid's next owner.
 fn proc_starttime(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Same reason as `proc_uid`, and it matters more here: the kernel writes
+    // comm unescaped into this file, and every guard built on this function
+    // treats `None` as "no process". A program named with non-UTF-8 bytes was
+    // therefore never granted the fast path, and - once the deny pass started
+    // filtering on the start time - never given an in-kernel deny either,
+    // which is resync's whole job. Permanently, not transiently.
+    let stat =
+        String::from_utf8_lossy(&std::fs::read(format!("/proc/{pid}/stat")).ok()?).into_owned();
     // The comm field is parenthesised and may itself contain spaces and
     // parentheses, so counting fields from the LEFT miscounts for a process
     // named, say, ":-) 1 2 3". Everything after the last ')' is fixed-format;
@@ -1683,16 +1711,22 @@ pub(super) fn stats(map: &PerCpuArray<&MapData, u64>) -> anyhow::Result<EnforceS
     // and losing all of them would take the startup carry-over note and
     // `cfc status` with it. The kernel side is already safe on its own -
     // `get_ptr_mut` bounds-checks and `bump` silently does nothing.
-    let slots = map.len();
     let read = |slot: u32| -> anyhow::Result<u64> {
-        if slot >= slots {
-            return Ok(0);
+        match map.get(&slot, 0) {
+            Ok(v) => Ok(v.iter().sum()),
+            // The pin is one slot short. `map.len()` cannot see that - it
+            // reports the `max_entries` this build's *object* declares, not
+            // the pinned map's, so the two disagree exactly when it matters
+            // and a guard written on it was inert on the only path it existed
+            // for. The kernel answers ENOENT for an index past its own end,
+            // which aya reports as `KeyNotFound`; that is the one place the
+            // real slot count is observable here. An in-range lookup on a
+            // PERCPU_ARRAY can never answer KeyNotFound, so reading it as
+            // "this counter did not exist in the build that made this pin" is
+            // unambiguous.
+            Err(aya::maps::MapError::KeyNotFound) => Ok(0),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("reading {MAP_STATS}[{slot}]"))),
         }
-        Ok(map
-            .get(&slot, 0)
-            .with_context(|| format!("reading {MAP_STATS}[{slot}]"))?
-            .iter()
-            .sum())
     };
     Ok(EnforceStats {
         allowed: read(enforce_stat::ALLOWED)?,

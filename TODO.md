@@ -33,12 +33,22 @@ could not be patched, and what replaced them:
   sockets already carrying someone else's mark (a VPN, a proxy) are left
   alone in both directions. Exactly which hooks that is, is what the
   *implementation* review pinned down: `cgroup/sendmsg` runs for a send that
-  carries a destination, not for `send()` on a connected socket. So a UDP
-  socket is not marked at `connect()` at all - it would pass no hook again, and
-  that mark could never be taken back. The cost is nil in the case that
-  matters: a UDP peer that answers makes the flow conntrack-established, and
-  only `ct state new` is queued. What is given up is the fast path for QUIC,
-  which was getting its first packet through it and nothing more.
+  carries a destination, not for `send()` on a connected socket. So **only TCP
+  is ever marked** - an allowlist, after two narrower rules leaked in a row
+  (refusing UDP at `connect()` alone left the sendmsg hooks marking sockets
+  that were already connected; naming UDP at all missed UDP-Lite, DCCP and
+  SCTP). The cost is nil in the case that matters: a UDP peer that answers
+  makes the flow conntrack-established, and only `ct state new` is queued. What
+  is given up is the fast path for QUIC, which was getting its first packet
+  through it and nothing more.
+
+  **Open question this leaves.** With no UDP socket ever marked, the two
+  `cgroup/sendmsg` programs have nothing left to set and nothing of ours left
+  to strip. Removing them would delete two programs, shrink the object, and -
+  because they are the only reason the fast path reports itself off on 5.10
+  (`unknown func bpf_getsockopt` on a sendmsg hook) - would make it available
+  on the RHEL floor. It is an ABI change and deletes kernel code, so it is a
+  decision to take deliberately rather than a tidy-up.
 - *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
   default. A published mark value is a bypass token. The value is drawn at
   random per start and lives in a pinned map and an nftables set, never in a

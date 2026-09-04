@@ -140,6 +140,12 @@ fn shutdown_gate() -> std::sync::MutexGuard<'static, bool> {
     SHUTDOWN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Puts `mark` in the set, and only `mark`.
+///
+/// Flushes first, so the set is left holding exactly this daemon's value
+/// rather than this one added to whatever a predecessor left. Refuses once
+/// [`disarm_for_shutdown`] has run - see [`SHUTDOWN`], whose doc comment this
+/// one was accidentally donated to when that gate was added.
 pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
     if mark == fast_allow::UNARMED {
         bail!(
