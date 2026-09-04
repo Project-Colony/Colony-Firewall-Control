@@ -418,7 +418,7 @@ pub(super) fn load_and_attach(
     //
     // Flushing before knowing whether this daemon will arm is the right order:
     // an empty set accepts nothing, which is the safe state to pass through.
-    if let Err(e) = super::nft_set::disarm() {
+    if let Err(e) = super::nft_set::disarm_for_start() {
         report.notes.push(format!(
             "could not flush a previous fast-allow mark from nftables: {e:#}"
         ));

@@ -124,6 +124,13 @@ const NFT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// check and the command is what makes the two orders both end flushed: if the
 /// heartbeat holds it, the shutdown flush waits and runs last; if the shutdown
 /// flush holds it, the heartbeat then sees the flag and does not arm.
+///
+/// It says "has started", not "has happened", so it belongs to one layer's
+/// lifetime and [`disarm_for_start`] clears it. Leaving it set was a real bug
+/// for as long as it existed: this is a process-global, so the first `Attached`
+/// dropped would have refused every arm for the rest of that process - every
+/// later test in one test binary, and any reload of the eBPF layer that did
+/// not also restart the daemon.
 static SHUTDOWN: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Locks [`SHUTDOWN`], ignoring poisoning: the flag is a single bool that no
@@ -224,6 +231,22 @@ pub(super) fn holds(mark: u32) -> anyhow::Result<bool> {
 pub(super) fn disarm() -> anyhow::Result<()> {
     let _gate = shutdown_gate();
     flush()
+}
+
+/// [`disarm`], beginning a new layer lifetime.
+///
+/// For the one call at the top of `load_and_attach`. Clears the flag a
+/// previous `Attached`'s shutdown set: that flag means "the layer that owned
+/// this set is going away", and by here it has gone.
+pub(super) fn disarm_for_start() -> anyhow::Result<()> {
+    begin_lifetime();
+    flush()
+}
+
+/// The flag half of [`disarm_for_start`], split out so the regression it
+/// exists for can be tested without running `nft`.
+fn begin_lifetime() {
+    *shutdown_gate() = false;
 }
 
 /// [`disarm`], and no [`arm`] after it.
@@ -460,6 +483,40 @@ fn run(op: Op) -> Result<(), Failed> {
 
 #[cfg(test)]
 mod tests {
+
+    /// One test, not three: the flag is a process-global, so separate tests
+    /// touching it would race each other under the parallel harness.
+    ///
+    /// Neither half reaches `nft`. `arm` checks the gate before it runs
+    /// anything, and `begin_lifetime` is the flag half of `disarm_for_start`
+    /// split out for exactly this.
+    #[test]
+    fn a_shutdown_refuses_arming_until_a_new_layer_begins() {
+        let mark = 0x0003_3331;
+
+        *shutdown_gate() = true;
+        let e = arm(mark).expect_err("an arm after shutdown must be refused");
+        assert!(
+            e.to_string().contains("shutting down"),
+            "refused for the wrong reason: {e}"
+        );
+
+        // The regression: the flag was set by shutdown and cleared by nothing,
+        // so the first `Attached` dropped refused every arm for the rest of
+        // the process - every later test in one binary, and any reload of the
+        // layer that did not also restart the daemon.
+        begin_lifetime();
+        assert!(
+            !*shutdown_gate(),
+            "a new layer lifetime must clear a previous shutdown's flag"
+        );
+
+        // Deliberately not "and now an arm succeeds": getting past the gate is
+        // the only thing left to check, and checking it means letting `arm`
+        // run nft - which on a machine that *does* have the table loaded would
+        // put a live element in a live ruleset from a unit test. The gate is
+        // two lines and the flag above is the whole of its state.
+    }
 
     /// The element check is status-only, like the set probe: `get element`
     /// exits non-zero with ENOENT when the element is absent, so nothing here
