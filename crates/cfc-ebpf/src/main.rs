@@ -391,9 +391,12 @@ fn try_exec(ctx: &TracePointContext) -> Result<(), i64> {
     // with the daemon alive, the exec-to-consumer window would be a bypass
     // rather than a missed deny, because a marked flow never reaches the
     // packet path that "covers" that window for denies. One hash delete per
-    // execve, paid unconditionally, the same price `precommit_verdict` already
-    // pays for `VERDICTS`.
-    let _ = FAST_ALLOW.remove(&tgid);
+    // execve - behind one array read, because on a host where the fast path is
+    // off (the default) the map is empty and the delete would be a hash op for
+    // nothing, on every execve on the machine.
+    if fast_path_armed() {
+        let _ = FAST_ALLOW.remove(&tgid);
+    }
 
     // Answer for this process without asking anybody. This is the half that
     // keeps working when there is no daemon - the case the pinned `VERDICTS`
@@ -635,7 +638,10 @@ pub fn cfc_sched_process_exit(ctx: TracePointContext) -> u32 {
     let _ = VERDICTS.remove(&tgid);
     // Same for a grant, and here the stale entry is the fail-open one: a
     // recycled pid inheriting an allow would mark its sockets past the queue.
-    let _ = FAST_ALLOW.remove(&tgid);
+    // Gated like the exec side: with the fast path off the map is empty.
+    if fast_path_armed() {
+        let _ = FAST_ALLOW.remove(&tgid);
+    }
 
     // Publish the eviction so the userspace cache drops the pid too. Without
     // this, a recycled pid would be attributed to the process that died.
@@ -958,6 +964,19 @@ fn bump(slot: u32) {
         // a non-null pointer to this CPU's slot. See EXEC_SCRATCH.
         unsafe { *ptr = (*ptr).wrapping_add(1) };
     }
+}
+
+/// Whether any daemon has armed the fast path.
+///
+/// `UNARMED` in the mark map means `FAST_ALLOW` is empty, by construction: the
+/// daemon flushes the map before it withdraws or disarms, and both of those
+/// write `UNARMED`. So a program that only needs to *clear* a grant can skip
+/// the hash delete when this says no - which is every host by default, since
+/// the feature is opt-in. One array read against one hash op, on the two
+/// paths every process on the machine takes.
+#[inline(always)]
+fn fast_path_armed() -> bool {
+    matches!(FAST_ALLOW_MARK.get(0), Some(&m) if m != cfc_ebpf_common::fast_allow::UNARMED)
 }
 
 /// Reports an in-kernel decision so it is not a silent one - a refusal to

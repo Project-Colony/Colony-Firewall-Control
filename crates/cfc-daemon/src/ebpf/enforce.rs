@@ -312,10 +312,29 @@ impl VerdictSink {
     /// Withdraws the ability to grant, for a daemon that loaded the maps but
     /// then judged the path ineligible (config off, basic connect variants,
     /// exit not tracked, could not arm) or lost it after arming (the ring
-    /// consumers did not start). Also empties the map, so the kernel side has
-    /// nothing left to honour whatever the deadline says.
+    /// consumers did not start). Also unarms the kernel side and empties the
+    /// map, so every hook takes its cheapest exit and nothing is left to
+    /// honour whatever the deadline says.
     pub(super) fn withdraw_fast_path(&mut self) {
         if let Some(fast) = self.fast.take() {
+            // Unarm the kernel side too, not only empty the map. The maps are
+            // pinned, so a daemon that crashed while armed leaves
+            // `FAST_ALLOW_MARK` set; a successor started with the fast path
+            // *off* used to leave it that way, and every TCP `connect()` on the
+            // machine then paid a `getsockopt` and two map reads to strip a
+            // mark nobody would ever set - for as long as that daemon ran. With
+            // `UNARMED` written, `mark_decision` returns at its first array
+            // read, and the exec/exit programs skip their grant delete as well.
+            if let Err(e) = fast.until.lock().set(0, 0u64, 0) {
+                warn!("could not zero FAST_ALLOW_UNTIL while withdrawing the fast path: {e}");
+            }
+            if let Err(e) = fast
+                .mark
+                .lock()
+                .set(0, cfc_ebpf_common::fast_allow::UNARMED, 0)
+            {
+                warn!("could not unarm FAST_ALLOW_MARK while withdrawing the fast path: {e}");
+            }
             let mut map = fast.map.lock();
             let pids: Vec<u32> = map.keys().flatten().collect();
             for pid in pids {
@@ -944,6 +963,15 @@ impl VerdictSink {
     /// entirely, which this walk by construction cannot see.
     pub(super) fn sweep_fast_allow(&self) {
         if self.fast.is_none() {
+            return;
+        }
+        // A rule set that cannot grant anyone - only denies, only timed or
+        // flow-scoped allows - makes the walk below a few hundred /proc reads
+        // and engine calls for an answer already known. That is the common
+        // shape of a rule set with the fast path switched on, and this runs on
+        // every rule change.
+        if !self.engine.any_fast_allow_rule() {
+            debug!("no rule could grant the fast path; not walking /proc");
             return;
         }
         let entries = match std::fs::read_dir("/proc") {

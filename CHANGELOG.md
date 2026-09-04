@@ -63,6 +63,23 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Three costs removed from paths every process on the machine takes, none of
+  them measured on a live kernel - this machine cannot run the daemon - and
+  each argued from what the code does rather than from a number. The exec and
+  exit programs deleted a fast-allow grant on every `execve` and every exit,
+  unconditionally, on hosts where the feature is off (which is every host by
+  default); the delete is now behind one array read of the mark, which is
+  `UNARMED` exactly when the grant map is empty. Withdrawing the fast path left
+  `FAST_ALLOW_MARK` armed in the pinned map, so a daemon restarted with
+  `fast_allow = false` after an unclean death made every TCP `connect()` pay a
+  `getsockopt` and two map reads to strip a mark nobody would ever set, for as
+  long as it ran; withdrawing unarms. And the `/proc` walk that re-seeds grants
+  on every rule change now asks first whether any rule could grant anyone, and
+  a rule set of denies, timed allows and port-scoped allows is answered in a
+  few comparisons instead. The verifier counts in the kernel matrix are the one
+  measurement these changes get, and a count is not a runtime cost - the exec
+  program may well verify a few instructions *longer* for the branch that lets
+  it skip a hash delete at runtime.
 - **eBPF ABI v4.** New maps and programs the connect hooks read; v3 pins
   would enforce fine and never mark, so a restarting daemon now replaces
   them rather than inheriting them. `verdict::ALLOW`, matched by the kernel

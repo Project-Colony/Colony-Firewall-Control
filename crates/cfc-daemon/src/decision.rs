@@ -245,6 +245,34 @@ impl Engine {
         None
     }
 
+    /// Whether any enabled rule could grant the fast path to *some* process.
+    ///
+    /// The same predicate `process_wide_verdict` applies per process, asked of
+    /// the rule set as a whole: outbound, not flow-scoped, and eligible - an
+    /// `Allow` that lasts. Reuses [`ProcessWideVerdict::fast_allow_eligible`]
+    /// rather than restating it, so there is one definition of "could grant".
+    ///
+    /// For `sweep_fast_allow`, which otherwise walks /proc on every rule
+    /// change to reach a conclusion this answers in a few comparisons.
+    pub fn any_fast_allow_rule(&self) -> bool {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let rules = self.inner.rules.read();
+        rules
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
+            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
+            .filter(|r| !r.scope.constrains_destination())
+            .any(|r| {
+                ProcessWideVerdict {
+                    action: r.action,
+                    rule_id: r.id,
+                    duration: r.duration,
+                }
+                .fast_allow_eligible()
+            })
+    }
+
     /// Whether some resolution of the rules this caller cannot decide would
     /// still deny this process outright - the question that separates the two
     /// meanings of `process_wide_action`'s `None`.
@@ -753,6 +781,56 @@ mod tests {
         assert_eq!(
             eligible(Action::Reject, cfc_core::Duration::Always),
             Some(false)
+        );
+    }
+
+    /// The rule-set-wide question `sweep_fast_allow` asks before walking /proc:
+    /// one case per way a rule set can fail to grant anyone, and one that can.
+    #[test]
+    fn a_rule_set_that_cannot_grant_anyone_says_so() {
+        use cfc_core::Duration;
+        let exe = || Some(PathBuf::from("/usr/bin/curl"));
+        let rule = |action: Action, duration: Duration, f: fn(&mut RuleScope)| {
+            let mut scope = RuleScope::any();
+            scope.exe_path = exe();
+            f(&mut scope);
+            let mut r = Rule::new("r".to_string(), action, scope);
+            r.duration = duration;
+            r
+        };
+        let none = |_: &mut RuleScope| {};
+
+        assert!(!engine_with(vec![]).any_fast_allow_rule(), "no rules");
+        assert!(
+            !engine_with(vec![rule(Action::Deny, Duration::Always, none)]).any_fast_allow_rule(),
+            "only denies"
+        );
+        assert!(
+            !engine_with(vec![rule(Action::Allow, Duration::Seconds(3600), none)])
+                .any_fast_allow_rule(),
+            "only a timed allow"
+        );
+        assert!(
+            !engine_with(vec![rule(Action::Allow, Duration::Always, |s| s
+                .dst_port =
+                Some(443))])
+            .any_fast_allow_rule(),
+            "only a flow-scoped allow"
+        );
+        let mut disabled = rule(Action::Allow, Duration::Always, none);
+        disabled.enabled = false;
+        assert!(
+            !engine_with(vec![disabled]).any_fast_allow_rule(),
+            "only a disabled allow"
+        );
+
+        assert!(
+            engine_with(vec![
+                rule(Action::Deny, Duration::Always, none),
+                rule(Action::Allow, Duration::Always, none),
+            ])
+            .any_fast_allow_rule(),
+            "one lasting outright allow among denies is enough"
         );
     }
 
