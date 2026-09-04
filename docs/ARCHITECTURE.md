@@ -366,40 +366,29 @@ one element added when the path is armed, flushed unconditionally at every
 start and at shutdown - and it ships empty, so a default install carries no
 bypass value.
 
-**Where revocation reaches, and where it does not.** A grant is re-decided at
-every hook that opens a flow: `connect()`, and a `sendmsg` that carries a
-destination. Deleting the rule, replacing it with a Block, the process
-exec'ing, the process exiting, and the daemon going away for more than a
-minute all take effect at the next such hook, which is what makes the mark
-safe to hand out at all.
+**Where revocation reaches.** A grant is re-decided at every hook that opens a
+flow: `connect()`, and a `sendmsg` that carries a destination. Deleting the
+rule, replacing it with a Block, the process exec'ing, the process exiting, and
+the daemon going away for more than a minute all take effect at the next such
+hook, which is what makes the mark safe to hand out at all.
 
-They do not reach a socket that has already been marked and does not pass a
-hook again - a **connected UDP socket**, whose later `send()` calls take
-neither path. Its mark is the one it was given at `connect()`, for as long as
-it is open.
+**A UDP socket is therefore never marked at `connect()`.** That is the one
+socket that would pass no hook again: `connect()` fixes the peer, and the later
+`send()` calls name no destination, so the mark given there could never be
+taken back - not by a revocation, not by the deadline, which is only read at a
+hook that runs. Refusing costs almost nothing, and that is what settles it: the
+ruleset queues `ct state new`, so a UDP peer that answers makes the flow
+conntrack-established after one exchange and its later datagrams were not being
+queued with or without a mark. A marked connected-UDP socket only keeps gaining
+anything while its peer stays *silent* - and unreplied UDP is conntrack-NEW on
+every datagram, which is precisely the shape in which an unrevocable mark does
+the most damage. The benefit and the hazard were the same case.
 
-For TCP that costs nothing: the ruleset queues `ct state new`, and an
-established connection is not that with or without a mark. **For UDP it is a
-real hole, and conntrack does not close it.** Unreplied UDP is conntrack-NEW on
-every datagram - this project's own packet path says so, and sizes a queue
-around it - so a connected UDP socket talking to something that never answers
-presents every datagram as a new flow, and a stale mark takes every one of them
-past the queue. Nor does the deadline reach it: the deadline is read at hook
-time, and there is no next hook, so this is also the one case where "a dead
-daemon fails closed within 60 s" does not hold. What does end it is the socket
-closing, or the process exiting.
-
-This is the sharpest edge of the feature, it cannot be closed from inside a
-hook that does not run, and it is the main reason the path ships opt-in and
-off. Restricting the mark to TCP would remove it outright, at the cost of not
-fast-allowing QUIC; see `TODO.md`.
-Nothing else here filters anything - the `cgroup_skb` program returns "pass"
-unconditionally. What the programs buy is *better answers to questions the
-daemon already asks*, and every one of them degrades independently: a missing
-object, no `CAP_BPF`, a kernel without BTF, a verifier rejection or a host with
-no cgroup v2 each cost one capability and produce one warning. There is no
-configuration in which the firewall stops filtering because eBPF was
-unavailable.
+Unconnected UDP keeps the fast path in full: `sendto` carries a destination, so
+it passes the sendmsg hooks and is re-decided on every datagram. TCP keeps it in
+full: it passes the connect hook for every connection it opens. What is given up
+is the fast path for QUIC and anything else that `connect()`s a UDP socket -
+which, its peer answering, was only ever getting its first packet through it.
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately

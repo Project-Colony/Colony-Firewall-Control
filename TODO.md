@@ -31,12 +31,14 @@ could not be patched, and what replaced them:
   the bypass to a binary that earned nothing. So the mark is re-decided - set
   or stripped - at every flow start, `connect()` and `sendmsg()` alike, and
   sockets already carrying someone else's mark (a VPN, a proxy) are left
-  alone in both directions. Exactly which hooks that is, is the boundary the
-  *implementation* review then found: `cgroup/sendmsg` runs for a send that
-  carries a destination, not for `send()` on a connected socket, so a
-  connected UDP socket keeps the mark it was given at `connect()`. Conntrack
-  covers most of it - only `ct state new` is queued - and the remainder is
-  documented in `docs/ARCHITECTURE.md` rather than claimed away.
+  alone in both directions. Exactly which hooks that is, is what the
+  *implementation* review pinned down: `cgroup/sendmsg` runs for a send that
+  carries a destination, not for `send()` on a connected socket. So a UDP
+  socket is not marked at `connect()` at all - it would pass no hook again, and
+  that mark could never be taken back. The cost is nil in the case that
+  matters: a UDP peer that answers makes the flow conntrack-established, and
+  only `ct state new` is queued. What is given up is the fast path for QUIC,
+  which was getting its first packet through it and nothing more.
 - *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
   default. A published mark value is a bypass token. The value is drawn at
   random per start and lives in a pinned map and an nftables set, never in a

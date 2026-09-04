@@ -1054,7 +1054,7 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
         // `verdict` module's docs for why that direction is load-bearing.
         _ => {
             if record_cookie {
-                mark_decision(ctx, tgid, family);
+                mark_decision(ctx, tgid, family, true);
             } else {
                 bump(cfc_ebpf_common::enforce_stat::UNKNOWN);
             }
@@ -1068,6 +1068,10 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
 /// x86_64 (and aarch64) values; `ExclusiveArch: x86_64` in the spec is what
 /// makes hardcoding them honest. Alpha, MIPS, PA-RISC and SPARC number
 /// `SO_MARK` differently.
+/// `IPPROTO_UDP`. Read from the sock_addr context to keep the connect hooks
+/// from marking a socket that will never pass a hook again.
+const IPPROTO_UDP: u32 = 17;
+
 const SOL_SOCKET: i32 = 1;
 const SO_MARK: i32 = 36;
 
@@ -1104,8 +1108,40 @@ const SO_MARK: i32 = 36;
 /// break it just as surely. Such a socket takes the queue - fail closed for
 /// the flow, and no interference with the routing the mark was there for.
 #[inline(always)]
-fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
+fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8, at_connect: bool) {
     use cfc_ebpf_common::{enforce_stat, fast_allow};
+
+    // A UDP socket is never marked at `connect()`.
+    //
+    // This is the one case where the mark cannot be taken back. `connect()`
+    // fixes the peer, and the socket's later `send()` calls name no
+    // destination, so they pass neither this hook nor the sendmsg one: the
+    // mark it gets here is the mark it keeps until it is closed. Deleting the
+    // rule cannot reach it, and neither can the deadline, which is only read
+    // at a hook that runs - so this is also the only case where "a dead daemon
+    // fails closed within sixty seconds" would not hold.
+    //
+    // Refusing costs almost nothing, which is what settles it. The ruleset
+    // queues `ct state new`; a UDP peer that answers makes the flow
+    // conntrack-established after one exchange, and established traffic is not
+    // queued with or without a mark. So a marked connected-UDP socket only
+    // keeps *gaining* anything while its peer stays silent - and unreplied UDP
+    // is conntrack-NEW on every datagram, which is exactly the shape in which
+    // an unrevocable mark does the most damage. The benefit and the hazard are
+    // the same case.
+    //
+    // Unconnected UDP is unaffected: `sendto` carries a destination, so it
+    // passes the sendmsg hooks and is re-decided on every datagram. TCP is
+    // unaffected: it passes this hook for every connection it opens.
+    if at_connect {
+        // SAFETY: a context field the verifier permits a `cgroup_sock_addr`
+        // program to read directly.
+        let protocol = unsafe { (*ctx.sock_addr).protocol };
+        if protocol == IPPROTO_UDP {
+            bump(enforce_stat::UNKNOWN);
+            return;
+        }
+    }
 
     // Unarmed: the daemon never drew a value, or disarmed on the way out.
     // Nothing to set, and nothing of ours to strip either.
@@ -1233,22 +1269,14 @@ pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
 /// **Not "on every datagram send"**, which is what this comment used to claim
 /// and what the design was reviewed against. `cgroup/sendmsg{4,6}` runs for a
 /// send that carries a destination; a `send()` or `write()` on a socket that
-/// has already been `connect()`ed does not pass it. So a connected UDP socket
-/// is marked once, at its `connect()`, and never re-decided:
+/// has already been `connect()`ed does not pass it, so such a socket would
+/// keep whatever mark it was given at `connect()` for as long as it is open -
+/// past a revocation, past the deadline, past the daemon's death.
 ///
-/// * revoking the grant does not unmark it. The map entry goes, but the mark
-///   lives on the socket, and no hook of ours will run for that socket again.
-/// * the deadline does not reach it either, for the same reason - the deadline
-///   is consulted at hook time, and there is no next hook.
-///
-/// What bounds it is conntrack, not this program. The ruleset queues
-/// `ct state new`, so the second and later datagrams of a connected UDP socket
-/// were never going to the daemon regardless of any mark. The residual window
-/// is a socket idle long enough for its conntrack entry to expire and then
-/// used again: that datagram is `new`, and its stale mark takes it past the
-/// queue where a prompt was due. It is real, it is not closable from inside
-/// this hook, and `docs/ARCHITECTURE.md` states it as a boundary of the
-/// feature rather than leaving it to be discovered.
+/// That is why `mark_decision` refuses to mark a UDP socket at `connect()` at
+/// all. These hooks are then the *only* place a UDP socket is ever marked, and
+/// every one of them is re-decided per datagram, which is what makes the mark
+/// safe to hand out here.
 ///
 /// No `_basic` twins: these exist only for the fast path, which the basic
 /// variants do not have, so on a kernel that verifies only the basic connect
@@ -1256,7 +1284,7 @@ pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(sendmsg4)]
 pub fn cfc_sendmsg4(ctx: SockAddrContext) -> i32 {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    mark_decision(&ctx, tgid, 4);
+    mark_decision(&ctx, tgid, 4, false);
     CONNECT_PROCEED
 }
 
@@ -1264,7 +1292,7 @@ pub fn cfc_sendmsg4(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(sendmsg6)]
 pub fn cfc_sendmsg6(ctx: SockAddrContext) -> i32 {
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    mark_decision(&ctx, tgid, 6);
+    mark_decision(&ctx, tgid, 6, false);
     CONNECT_PROCEED
 }
 
