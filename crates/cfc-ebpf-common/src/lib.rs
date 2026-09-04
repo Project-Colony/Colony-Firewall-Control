@@ -198,7 +198,15 @@ pub mod enforce_stat {
     pub const ALLOWED: u32 = 0;
     /// `connect()` refused in-kernel.
     pub const DENIED: u32 = 1;
-    /// No entry for this pid; fell through to NFQUEUE.
+    /// The fast path did not apply, and the flow went on to NFQUEUE.
+    ///
+    /// Reads as "fell through", not as "something went wrong", and it counts
+    /// more than a missing map entry: no mark armed, a socket whose mark could
+    /// not be read, and - since only TCP is ever marked - *every* non-TCP hook,
+    /// which on a busy host means every UDP datagram that carries a
+    /// destination. Comparing it against `ALLOWED` to judge how much the fast
+    /// path is buying will therefore understate it; the honest comparison is
+    /// against the connect hooks alone.
     pub const UNKNOWN: u32 = 2;
     /// Granted, but the deadline had passed: the daemon that granted this is
     /// no longer refreshing. Non-zero here reads "the fast path stopped".
@@ -249,8 +257,8 @@ pub mod enforce_stat {
 ///   any such process. A random one is guessable only by 2^32 connections
 ///   through a queue that prompts on every miss.
 /// * the **deadline** is a `CLOCK_BOOTTIME` instant, not `CLOCK_MONOTONIC`:
-///   sixty seconds must be sixty wall-clock seconds, not sixty awake seconds
-///   across a laptop suspend. The daemon refreshes it every
+///   a sixty-second deadline must be sixty wall-clock seconds, not sixty awake
+///   seconds across a laptop suspend. The daemon refreshes it every
 ///   [`fast_allow::HEARTBEAT_SECS`] to now + [`fast_allow::DEADLINE_SECS`];
 ///   with the daemon dead, every fast-allow goes inert within the deadline
 ///   and the machine is fail-closed again. This is what an unpinned map

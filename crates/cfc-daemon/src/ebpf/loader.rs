@@ -1340,7 +1340,11 @@ pub(super) fn load_and_attach(
             // Ticks between two checks that the set still holds the mark.
             // Expressed in ticks, so it has to follow the tick length: one
             // minute either way, whichever deadline pair is in force.
-            let checks_every: u32 = (60 / heartbeat_secs.max(1)) as u32;
+            // Clamped at both ends: a divisor of zero would panic, and a
+            // heartbeat longer than the check period would make this zero,
+            // which reads as "check on every tick" - a fork and exec every
+            // beat, forever.
+            let checks_every: u32 = ((60 / heartbeat_secs.max(1)) as u32).max(1);
             let mut since_check: u32 = 0;
             loop {
                 tick.tick().await;
@@ -1359,7 +1363,7 @@ pub(super) fn load_and_attach(
                         }
                         Err(e) => nft_arm_state_from_error(&e),
                     };
-                    // Say each reason once, not every ten seconds.
+                    // Say each reason once, not on every beat.
                     let reason = state.describe();
                     if last_reason.as_deref() != Some(reason.as_str()) {
                         if !armed {
@@ -1373,8 +1377,12 @@ pub(super) fn load_and_attach(
                     }
                 }
                 if let Err(e) = beat.beat(deadline_secs) {
+                    // The number, not "a minute": on a kernel whose lifecycle
+                    // links could not be pinned this deadline is six seconds,
+                    // and a warning that names the wrong one sends a reader
+                    // looking for a window that closed long ago.
                     tracing::warn!(
-                        "fast-allow heartbeat failed: {e:#}; grants lapse within a minute"
+                        "fast-allow heartbeat failed: {e:#}; grants lapse within {deadline_secs}s"
                     );
                 }
 

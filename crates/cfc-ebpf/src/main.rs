@@ -1121,8 +1121,8 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     // `send()`, which carries no destination and so passes neither hook; the
     // mark it holds at that point is the mark it keeps until it is closed,
     // past a revocation, past the deadline, and past the daemon's death. That
-    // is the one case where "a dead daemon fails closed within sixty seconds"
-    // would not hold.
+    // is the one case where "a dead daemon fails closed within one deadline"
+    // would not hold - no hook runs, so the deadline is never consulted.
     //
     // Two narrower guards were tried before this one and both leaked, which is
     // why this is an allowlist and not a list of protocols to exclude:
@@ -1146,9 +1146,10 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     //
     // Refusing is never a bare `return`: a socket that already carries our
     // mark must still be stripped of it, and returning early here reopened the
-    // very hole this closes. Never set, always strip - the flag below only
-    // forces the *wanted* mark to zero.
-    //
+    // very hole this closes. Never set, always strip - the protocol test folds
+    // into `granted` below, so a refusal takes the same path as any other
+    // ungranted socket and the strip runs exactly as it would.
+
     // Unarmed: the daemon never drew a value, or disarmed on the way out.
     // Nothing to set, and nothing of ours to strip either.
     let mark = match FAST_ALLOW_MARK.get(0) {
@@ -1202,15 +1203,19 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     // verifier permits a `cgroup_sock_addr` program to read directly.
     let granted = (unsafe { (*ctx.sock_addr).protocol }) == IPPROTO_TCP
         && unsafe { FAST_ALLOW.get(&tgid) }.is_some();
-    let until = match FAST_ALLOW_UNTIL.get(0) {
-        Some(&u) => u,
-        None => 0,
-    };
+    // The deadline read and the clock helper both sit inside the `&&`, so a
+    // hook that is not granted pays for neither - and most are not: every DNS
+    // query on the machine reaches this line.
+    //
     // SAFETY: a helper with no arguments and no memory effects; unsafe only
     // because every generated helper is.
-    let fresh = unsafe { bpf_ktime_get_boot_ns() } < until;
-
-    let want = if granted && fresh { mark } else { 0 };
+    let want = if granted
+        && unsafe { bpf_ktime_get_boot_ns() } < FAST_ALLOW_UNTIL.get(0).map_or(0, |&u| u)
+    {
+        mark
+    } else {
+        0
+    };
     if current != want {
         let mut value = want;
         // SAFETY: as for the read above.

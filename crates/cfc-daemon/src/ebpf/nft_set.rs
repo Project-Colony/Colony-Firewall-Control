@@ -179,7 +179,7 @@ pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
     // The startup flush is not enough on its own. It runs once, and on a boot
     // it runs when the table does not exist yet - `colony-firewall-nft.service`
     // is ordered after this daemon - so it flushes nothing. The heartbeat then
-    // retries this function every ten seconds until the table appears, and a
+    // retries this function on every heartbeat until the table appears, and a
     // plain `add element` at that point would leave a crashed predecessor's
     // mark accepted alongside this daemon's, for as long as the ruleset lives.
     // A mark that is still accepted but that nothing refreshes is the worst

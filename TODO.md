@@ -70,8 +70,10 @@ could not be patched, and what replaced them:
   the daemon does to nftables.
 
 Grants are cleared in the kernel on exec and exit, so no daemon is needed for
-the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline refreshed every 10 s
-makes a dead daemon fail-closed within 60 s; and the path stays off - with
+the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline the daemon refreshes
+makes a dead daemon fail-closed within one deadline (60 s refreshed every 10 s,
+or 6 s refreshed every 2 s where the lifecycle links cannot be pinned); and the
+path stays off - with
 the reason in `cfc status` - unless enforcement is pinned, exit is detected
 exactly (`group_dead`), their ring consumers running, the cookie connect
 variants *and* the sendmsg hooks verified, the nftables set present and holding

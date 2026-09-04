@@ -18,8 +18,9 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the rule: the daemon walks `/proc` at start and at every rule change. The
   mark is re-decided at every hook that opens a flow and stripped when the
   grant is gone; the kernel clears grants on exec and exit by itself; and a
-  `CLOCK_BOOTTIME` deadline the daemon refreshes every 10 s means a dead
-  daemon leaves the machine fail-closed again within 60 s. Fast-allowed
+  `CLOCK_BOOTTIME` deadline the daemon refreshes means a dead daemon leaves
+  the machine fail-closed again within one deadline - 60 s, refreshed every
+  10 s, or the shorter pair below. Fast-allowed
   flows are reported on a ring, with their destination named from the same
   reverse-DNS cache the packet path uses, so the live feed, rule hit counts
   and the `enforcing` heuristic keep telling the truth. Off by default for

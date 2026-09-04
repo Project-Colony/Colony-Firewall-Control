@@ -520,8 +520,8 @@ impl VerdictSink {
     }
 
     /// Disarms immediately: zero deadline, unarmed mark, empty map. For a
-    /// clean shutdown, so the marks stop now rather than within sixty
-    /// seconds. Best effort in every step - a daemon on its way out has
+    /// clean shutdown, so the marks stop now rather than when the deadline
+    /// this daemon last wrote runs out. Best effort in every step - a daemon on its way out has
     /// nowhere to report a failure but the log.
     pub(super) fn disarm(&self) {
         let Some(fast) = self.fast.as_ref() else {
