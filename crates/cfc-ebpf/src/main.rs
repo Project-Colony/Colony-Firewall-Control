@@ -1181,9 +1181,20 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
         return;
     }
 
-    // SAFETY: map reads from a program context; both borrow map memory that
-    // stays valid for this run.
-    let granted = unsafe { FAST_ALLOW.get(&tgid) }.is_some();
+    // "Granted *and* markable", one boolean rather than two.
+    //
+    // The protocol test folds in here instead of standing beside `want` as its
+    // own flag. Two booleans live across the tail made the verifier walk the
+    // setsockopt and all three counter arms in four states rather than two,
+    // and this is the hottest path in CFC. Folding also deletes a tail branch:
+    // a socket that is not TCP is simply not granted, so it falls to the same
+    // `UNKNOWN` arm as a pid with no entry - which is exactly what it is, a
+    // fall-through to the packet path.
+    //
+    // SAFETY: map reads from a program context, and a context field the
+    // verifier permits a `cgroup_sock_addr` program to read directly.
+    let granted = unsafe { FAST_ALLOW.get(&tgid) }.is_some()
+        && (unsafe { (*ctx.sock_addr).protocol }) == IPPROTO_TCP;
     let until = match FAST_ALLOW_UNTIL.get(0) {
         Some(&u) => u,
         None => 0,
@@ -1192,17 +1203,7 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     // because every generated helper is.
     let fresh = unsafe { bpf_ktime_get_boot_ns() } < until;
 
-    // Computed here, one line before its only use, and not at the top of the
-    // function where it reads more naturally. A boolean that stays live across
-    // this whole body makes the verifier walk the rest of it in two states,
-    // and that is not free on the hottest path in CFC: at the top it cost 118
-    // instructions on 6.12 (356 -> 474) and put `cfc_connect4` over its
-    // ceiling. The budget tripwire is what caught it.
-    //
-    // SAFETY: a context field the verifier permits a `cgroup_sock_addr`
-    // program to read directly.
-    let not_tcp = (unsafe { (*ctx.sock_addr).protocol }) != IPPROTO_TCP;
-    let want = if granted && fresh && !not_tcp { mark } else { 0 };
+    let want = if granted && fresh { mark } else { 0 };
     if current != want {
         let mut value = want;
         // SAFETY: as for the read above.
@@ -1226,12 +1227,6 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     if want != 0 {
         bump(enforce_stat::ALLOWED);
         report_connect(&ALLOW_EVENTS, ctx, tgid, family);
-    } else if not_tcp {
-        // Refused for the protocol, not because anything is wrong. Counted as
-        // a fall-through to the packet path, which is exactly what it is - and
-        // never as STALE, which would read as "the daemon stopped refreshing"
-        // and send someone to look at a heartbeat that is perfectly healthy.
-        bump(enforce_stat::UNKNOWN);
     } else if granted {
         // Granted but the deadline has passed: the daemon that granted this is
         // not refreshing. Counted so "the fast path stopped" has a reading.
