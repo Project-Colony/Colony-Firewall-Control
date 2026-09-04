@@ -137,6 +137,49 @@ const REQUIRED_SYMBOLS: &[&str] = &[
 /// Sections whose absence would break loading or diagnostics.
 const REQUIRED_SECTIONS: &[&str] = &[".BTF", ".BTF.ext", "license"];
 
+/// Writes to `FAST_ALLOW` that the kernel side must never contain.
+///
+/// The grant map is the one place in this project where an entry *widens* what
+/// is allowed, and every guard that decides whether an entry may exist lives in
+/// the daemon: the rule must be an `Allow`, its duration must be lasting, its
+/// scope must not constrain the flow, the pid's start time must still match,
+/// and the program behind it must not have changed. A write from inside a BPF
+/// program answers to none of that.
+///
+/// The kernel therefore only ever *removes* - on exec and on exit - and reads.
+/// That was true because nobody had written the other thing yet, and a comment
+/// saying so is not a guarantee. This is.
+const FORBIDDEN_KERNEL_WRITES: &[&str] = &["FAST_ALLOW.insert", "FAST_ALLOW.set"];
+
+/// Refuses a kernel source that grants for itself.
+///
+/// Reads the source rather than the object because that is where the property
+/// is legible: an ELF says a program calls `bpf_map_update_elem`, not which map
+/// it calls it on.
+fn check_no_kernel_grants(src: &Path) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(src).map_err(|e| format!("reading {} : {e}", src.display()))?;
+    for (n, line) in text.lines().enumerate() {
+        for forbidden in FORBIDDEN_KERNEL_WRITES {
+            if line.contains(forbidden) {
+                return Err(format!(
+                    "{}:{}: `{}` - the kernel side must never write the fast-allow \
+                     grant map. Every guard that decides whether a grant may exist \
+                     is in the daemon (allow, lasting duration, no flow scope, the \
+                     pid still the one judged, the program unchanged), and a write \
+                     from a BPF program answers to none of them. If this is a \
+                     deliberate design change, it is one to argue for, not one to \
+                     let a test wave through.",
+                    src.display(),
+                    n + 1,
+                    forbidden
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Structural checks on the built object.
 ///
 /// Deliberately thresholdless: it answers "would the loader find what it looks
@@ -163,6 +206,8 @@ fn ebpf_check(path: &Path) -> Result<(), String> {
 
     let sections = rd.section_names(&buf)?;
     let symbols = rd.symbol_names(&buf)?;
+
+    check_no_kernel_grants(&ebpf_dir().join("src/main.rs"))?;
 
     let mut missing = Vec::new();
     for want in REQUIRED_SYMBOLS {

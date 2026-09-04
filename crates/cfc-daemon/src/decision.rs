@@ -752,6 +752,120 @@ mod tests {
         );
     }
 
+    /// The one predicate the fast path's safety rests on, over its whole
+    /// input space rather than a sample: three actions and four durations is
+    /// all of it.
+    ///
+    /// The expected answers are a table, not the implementation's own
+    /// expression rewritten - a test that recomputes what it is checking
+    /// passes for a wrong implementation too. Adding a variant to either enum
+    /// breaks this test, which is the point: a new action or a new duration is
+    /// a decision about whether it may mark a socket, and it should not be
+    /// possible to make it by accident.
+    #[test]
+    fn only_a_lasting_allow_may_ever_mark_a_socket() {
+        use cfc_core::{Action, Duration};
+
+        // Everything that may. Everything else may not.
+        let may_mark = [
+            (Action::Allow, Duration::Always),
+            (Action::Allow, Duration::UntilRestart),
+        ];
+
+        let every_action = [Action::Allow, Action::Deny, Action::Reject];
+        let every_duration = [
+            Duration::Once,
+            Duration::UntilRestart,
+            Duration::Always,
+            // Both ends of the timed range: a timed allow must never mark,
+            // because the mark outlives the second it expires on - nothing
+            // re-passes a hook just because a clock ticked.
+            Duration::Seconds(0),
+            Duration::Seconds(u32::MAX),
+        ];
+
+        for action in every_action {
+            for duration in every_duration {
+                let verdict = ProcessWideVerdict {
+                    action,
+                    rule_id: uuid::Uuid::nil(),
+                    duration,
+                };
+                let expected = may_mark.contains(&(action, duration));
+                assert_eq!(
+                    verdict.fast_allow_eligible(),
+                    expected,
+                    "{action:?} + {duration:?} must {} be fast-allow eligible",
+                    if expected { "" } else { "not" }
+                );
+            }
+        }
+    }
+
+    /// A rule that says anything about the flow must never become a blanket
+    /// mark on a process's sockets.
+    ///
+    /// `allow --dst-port 443` means "this program may reach 443", and a mark
+    /// means "every packet this program sends skips the queue". Conflating
+    /// them would be the widest possible failure of this feature, so each
+    /// predicate that makes a rule flow-scoped is checked on its own - a
+    /// missing one would only show up as a rule type that quietly grants
+    /// everything.
+    #[test]
+    fn a_flow_scoped_allow_never_grants_the_fast_path() {
+        let exe = PathBuf::from("/usr/bin/curl");
+        let proc = Process {
+            exe: exe.clone(),
+            ..Process::unknown(1)
+        };
+
+        // The unconstrained rule does grant - otherwise the cases below would
+        // pass for the wrong reason.
+        let mut open = RuleScope::any();
+        open.exe_path = Some(exe.clone());
+        let engine = engine_with(vec![Rule::new("open".to_string(), Action::Allow, open)]);
+        assert!(
+            engine
+                .process_wide_verdict(&proc)
+                .is_some_and(|v| v.fast_allow_eligible()),
+            "an exe-only allow is the case this feature exists for"
+        );
+
+        // Named, because clippy is right that the bare tuple is a mouthful -
+        // and because the name says what the table is: one way each of making
+        // a rule flow-scoped.
+        type Constrain = fn(&mut RuleScope);
+        let flow_scoped: &[(&str, Constrain)] = &[
+            ("dst_host", |s| s.dst_host = Some("example.com".into())),
+            ("dst_net", |s| {
+                s.dst_net = Some("10.0.0.0/8".parse().unwrap())
+            }),
+            ("dst_port", |s| s.dst_port = Some(443)),
+            ("protocol", |s| s.protocol = Some(cfc_core::Protocol::Tcp)),
+            ("src_net", |s| {
+                s.src_net = Some("10.0.0.0/8".parse().unwrap())
+            }),
+            ("src_port", |s| s.src_port = Some(1234)),
+            ("direction=in", |s| {
+                s.direction = Some(cfc_core::Direction::Inbound)
+            }),
+        ];
+
+        for (what, constrain) in flow_scoped {
+            let mut scope = RuleScope::any();
+            scope.exe_path = Some(exe.clone());
+            constrain(&mut scope);
+            let engine = engine_with(vec![Rule::new(what.to_string(), Action::Allow, scope)]);
+            let granted = engine
+                .process_wide_verdict(&proc)
+                .is_some_and(|v| v.fast_allow_eligible());
+            assert!(
+                !granted,
+                "an allow scoped by {what} must not mark every socket this process opens"
+            );
+        }
+    }
+
     #[test]
     fn process_wide_verdict_names_the_rule_that_answered() {
         // The allow consumer credits hits by this id; the wrong id would
