@@ -1181,7 +1181,14 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
         return;
     }
 
-    // "Granted *and* markable", one boolean rather than two.
+    // "Markable *and* granted", one boolean rather than two - and in that
+    // order, which is not cosmetic.
+    //
+    // `&&` short-circuits, so the cheaper test goes first: reading a context
+    // field against comparing a hash-map key. The sendmsg hooks see only UDP
+    // and now never grant, so with the map lookup first every `sendto` on the
+    // machine - every DNS query - paid a hash lookup to reach a conclusion the
+    // protocol alone settles. Reversed, they pay a load and a compare.
     //
     // The protocol test folds in here instead of standing beside `want` as its
     // own flag. Two booleans live across the tail made the verifier walk the
@@ -1193,8 +1200,8 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     //
     // SAFETY: map reads from a program context, and a context field the
     // verifier permits a `cgroup_sock_addr` program to read directly.
-    let granted = unsafe { FAST_ALLOW.get(&tgid) }.is_some()
-        && (unsafe { (*ctx.sock_addr).protocol }) == IPPROTO_TCP;
+    let granted = (unsafe { (*ctx.sock_addr).protocol }) == IPPROTO_TCP
+        && unsafe { FAST_ALLOW.get(&tgid) }.is_some();
     let until = match FAST_ALLOW_UNTIL.get(0) {
         Some(&u) => u,
         None => 0,

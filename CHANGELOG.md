@@ -40,6 +40,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Tailscale's, wg-quick's), and `[ebpf] fast_allow_mark` pins one by hand for a
   host with a selector it does not know.
 
+  On a kernel that cannot pin the exec/exit tracepoint links - no
+  `BPF_LINK_TYPE_PERF_EVENT` before 5.15, or a read-only bpffs - the path runs
+  with a six-second grant deadline refreshed every two seconds instead of sixty
+  and ten, and `cfc status` says `live, grants lapse within 6s`. Those links
+  are what clears grants after the daemon dies, so without them the deadline is
+  the only backstop; shortening it is the proportionate answer where refusing
+  the feature outright would have withheld it from every kernel between 5.10
+  and 5.14.
+
   Needs a kernel that allows `bpf_getsockopt` on `cgroup/sendmsg` hooks: 5.10
   does not (and says so in the status line), 6.12 and later do.
 

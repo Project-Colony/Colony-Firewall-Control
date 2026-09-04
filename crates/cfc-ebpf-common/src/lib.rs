@@ -262,9 +262,32 @@ pub mod fast_allow {
     pub const GRANTED: u32 = 1;
     /// How far ahead of now the daemon sets `FAST_ALLOW_UNTIL`, in seconds.
     pub const DEADLINE_SECS: u64 = 60;
-    /// How often the daemon refreshes it. Three beats fit in one deadline so
+    /// How often the daemon refreshes it. Several beats fit in one deadline so
     /// a single late tick never lets the fast path lapse on a live daemon.
     pub const HEARTBEAT_SECS: u64 = 10;
+
+    /// The deadline for a daemon whose exec/exit tracepoint links could not be
+    /// pinned to bpffs - no `BPF_LINK_TYPE_PERF_EVENT` before 5.15, or a
+    /// read-only bpffs.
+    ///
+    /// Those links are what keeps the kernel clearing grants after the daemon
+    /// dies. Without them, an unclean death leaves the connect hooks still
+    /// pinned and still marking while nothing evicts, and the deadline is the
+    /// only thing left: the exposure is a granted pid exiting, being recycled,
+    /// and its new owner connecting, all inside one deadline.
+    ///
+    /// The fast path used to be refused outright on such a kernel. That
+    /// refused the feature where degrading the parameter was enough - and it
+    /// refused it on every kernel from 5.10 to 5.14, which is the RHEL floor
+    /// this project targets. Ten times shorter costs one eight-byte map write
+    /// every two seconds and shrinks the window by the same factor.
+    ///
+    /// Both numbers are the daemon's alone: the kernel only ever compares
+    /// `now < until`, so this changes no ABI and no kernel program.
+    pub const DEADLINE_SECS_UNPINNED: u64 = 6;
+    /// How often the daemon refreshes [`DEADLINE_SECS_UNPINNED`]. Three beats
+    /// per deadline, the same ratio as the pinned pair.
+    pub const HEARTBEAT_SECS_UNPINNED: u64 = 2;
     /// `FAST_ALLOW_MARK` holds this when no daemon has armed the path. Zero
     /// is also what a socket with no mark reads, which is why the kernel side
     /// treats "mark map says 0" as "fast-allow is off" rather than "mark

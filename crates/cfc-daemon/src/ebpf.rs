@@ -394,7 +394,18 @@ pub fn enforcement_level() -> Option<Enforcement> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FastAllow {
     /// Marks are being set and the nftables set holds this daemon's value.
-    Live,
+    ///
+    /// `deadline_secs` is how long a grant outlives a daemon that stops
+    /// refreshing it. It is the full [`fast_allow::DEADLINE_SECS`] when the
+    /// exec/exit tracepoint links are pinned - they go on clearing grants
+    /// without a daemon, so the deadline is a backstop - and the shorter
+    /// [`fast_allow::DEADLINE_SECS_UNPINNED`] when they are not, where it is
+    /// the only thing standing between a dead daemon and a recycled pid.
+    ///
+    /// Carried rather than assumed, because a status line that says `live`
+    /// without saying which guarantee is a status line that misleads on
+    /// exactly the kernels where the guarantee is weaker.
+    Live { deadline_secs: u64 },
     /// Not doing anything, and this is the one sentence that says why.
     Off(String),
 }
@@ -403,7 +414,14 @@ impl FastAllow {
     /// One token plus the reason, for `cfc status`: `live` or `off: <why>`.
     pub fn describe(&self) -> String {
         match self {
-            Self::Live => "live".to_string(),
+            Self::Live { deadline_secs }
+                if *deadline_secs == cfc_ebpf_common::fast_allow::DEADLINE_SECS =>
+            {
+                "live".to_string()
+            }
+            Self::Live { deadline_secs } => {
+                format!("live, grants lapse within {deadline_secs}s")
+            }
             Self::Off(why) => format!("off: {why}"),
         }
     }

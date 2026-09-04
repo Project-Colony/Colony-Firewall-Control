@@ -503,15 +503,15 @@ impl VerdictSink {
         Ok(())
     }
 
-    /// Pushes the deadline out to now + `DEADLINE_SECS` on `CLOCK_BOOTTIME`,
+    /// Pushes the deadline out to now + `deadline_secs` on `CLOCK_BOOTTIME`,
     /// the clock `bpf_ktime_get_boot_ns` reads. Called every `HEARTBEAT_SECS`
     /// by the runtime; if it ever stops being called, the kernel side stops
     /// honouring grants within one deadline - by design, not by accident.
-    pub(super) fn beat(&self) -> anyhow::Result<()> {
+    pub(super) fn beat(&self, deadline_secs: u64) -> anyhow::Result<()> {
         let Some(fast) = self.fast.as_ref() else {
             return Ok(());
         };
-        let until = boottime_ns()? + cfc_ebpf_common::fast_allow::DEADLINE_SECS * 1_000_000_000;
+        let until = boottime_ns()? + deadline_secs * 1_000_000_000;
         fast.until
             .lock()
             .set(0, until, 0)

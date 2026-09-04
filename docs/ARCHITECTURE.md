@@ -402,6 +402,26 @@ which an unrevocable mark does the most damage. Benefit and hazard were the
 same case. What is given up in practice is the fast path for QUIC, which was
 getting its first packet through it and nothing more.
 
+**A kernel that cannot pin the lifecycle links gets a shorter deadline, not a
+refusal.** The exec and exit tracepoint links are what keeps the kernel clearing
+grants after the daemon dies; pinning them needs `BPF_LINK_TYPE_PERF_EVENT`,
+which arrived in 5.15, and a writable bpffs. Without them an unclean death
+leaves the connect hooks still pinned and still marking while nothing evicts, so
+the deadline is the only thing left - and the exposure is a granted pid exiting,
+being recycled, and its new owner connecting, all inside one deadline. On such a
+kernel the daemon writes a six-second deadline refreshed every two seconds
+instead of sixty and ten, which shrinks that window by the same factor it costs
+an eight-byte map write. `cfc status` says `live, grants lapse within 6s` rather
+than `live`, because one word for two different guarantees misleads on exactly
+the kernels where the weaker one applies.
+
+Refusing the feature there was the first design and it was the wrong
+instrument: it withheld the fast path from every kernel between 5.10 and 5.14 -
+the RHEL floor this project targets - for a risk the deadline already bounds.
+Both numbers are the daemon's alone; the kernel only ever compares
+`now < until`, so this is no part of the ABI.
+
+
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately
 excluded from this workspace so a plain stable build never touches any of that.

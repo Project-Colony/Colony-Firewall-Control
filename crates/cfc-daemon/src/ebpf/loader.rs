@@ -234,13 +234,28 @@ fn pick_mark(mut draw: impl FnMut() -> u32) -> Option<u32> {
     None
 }
 
+/// The (deadline, heartbeat) pair a daemon should use, in seconds.
+///
+/// Pinned exec/exit links keep clearing grants after the daemon dies, so the
+/// deadline there is a backstop. Unpinned, it is the only thing standing
+/// between a dead daemon and a recycled pid, so it is ten times shorter and
+/// refreshed five times as often.
+fn deadline_pair(lifecycle_pinned: bool) -> (u64, u64) {
+    use cfc_ebpf_common::fast_allow as fa;
+    if lifecycle_pinned {
+        (fa::DEADLINE_SECS, fa::HEARTBEAT_SECS)
+    } else {
+        (fa::DEADLINE_SECS_UNPINNED, fa::HEARTBEAT_SECS_UNPINNED)
+    }
+}
+
 /// One attempt at the nftables side, at startup, reported as the state it
 /// leaves the path in. On a daemon *restart* the table is already loaded and
 /// this comes back `Live` at once; on a boot it comes back waiting, and the
 /// heartbeat task finishes the job.
-fn nft_arm_state(mark: u32) -> FastAllow {
+fn nft_arm_state(mark: u32, deadline_secs: u64) -> FastAllow {
     match super::nft_set::arm(mark) {
-        Ok(()) => FastAllow::Live,
+        Ok(()) => FastAllow::Live { deadline_secs },
         Err(e) => nft_arm_state_from_error(&e),
     }
 }
@@ -1001,8 +1016,13 @@ pub(super) fn load_and_attach(
     // consult (the live tests); in both cases the map simply stays empty and
     // every connect falls through to the packet path.
     // The mark the kernel side was armed with, when it was: the heartbeat
-    // task below needs it to finish the nftables half of arming.
+    // task below needs it to finish the nftables half of arming. Alongside it,
+    // the deadline pair that task must write and pace itself by - the full one,
+    // or the shortened one for a kernel whose lifecycle links could not be
+    // pinned. Both are decided inside the block below and used after it.
     let mut armed_mark: Option<u32> = None;
+    let mut deadline_secs = cfc_ebpf_common::fast_allow::DEADLINE_SECS;
+    let mut heartbeat_secs = cfc_ebpf_common::fast_allow::HEARTBEAT_SECS;
     let sink = match (report.enforcement.is_live(), engine) {
         (true, Some(engine)) => {
             match enforce::VerdictSink::new(&mut bpf, engine.clone(), table.clone()) {
@@ -1052,16 +1072,37 @@ pub(super) fn load_and_attach(
                         // readable `group_dead` - sending them to look at their
                         // kernel version for a problem that was in the notes.
                         Some("process exit is not detected exactly on this kernel (no readable group_dead)")
-                    } else if !report.lifecycle_pinned {
-                        // Attached is not pinned. The connect programs' links
-                        // are pinned and go on marking sockets after this
-                        // daemon dies; if the exec and exit links are not, the
-                        // clears that make a grant safe die with it, and the
-                        // deadline is all that is left.
-                        Some("the exec/exit tracepoint links could not be pinned to bpffs, so their clears would not survive this daemon")
                     } else {
                         fast_path.off_reason()
                     };
+
+                    // Attached is not pinned, and that is a shorter deadline
+                    // rather than a refusal.
+                    //
+                    // The connect programs' links are pinned and go on marking
+                    // sockets after this daemon dies; if the exec and exit
+                    // links are not - no BPF_LINK_TYPE_PERF_EVENT before 5.15,
+                    // or a read-only bpffs - the clears that make a grant safe
+                    // die with it, and the deadline is all that is left. The
+                    // exposure is then a granted pid exiting, being recycled,
+                    // and its new owner connecting, all inside one deadline.
+                    //
+                    // This was a rung on the ladder above for a day, and that
+                    // was the wrong instrument: it refused the feature on every
+                    // kernel from 5.10 to 5.14 - the floor this project targets
+                    // - for a bounded risk the deadline already bounds. Ten
+                    // times shorter costs an eight-byte map write every two
+                    // seconds and shrinks the window by the same factor, and
+                    // `cfc status` says which guarantee is in force.
+                    (deadline_secs, heartbeat_secs) = deadline_pair(report.lifecycle_pinned);
+                    if off.is_none() && !report.lifecycle_pinned {
+                        let note = format!(
+                            "the exec/exit tracepoint links could not be pinned to bpffs, so                              their clears would not survive this daemon; fast-allow grants                              lapse within {deadline_secs}s instead of {}s",
+                            cfc_ebpf_common::fast_allow::DEADLINE_SECS
+                        );
+                        warn!("{note}");
+                        report.notes.push(note);
+                    }
 
                     let (state, mark_opt) = match off {
                         Some(why) => {
@@ -1069,7 +1110,7 @@ pub(super) fn load_and_attach(
                             (FastAllow::Off(why.to_string()), None)
                         }
                         None => match arm_kernel_side(&sink, fast_allow.mark) {
-                            Ok(mark) => (nft_arm_state(mark), Some(mark)),
+                            Ok(mark) => (nft_arm_state(mark, deadline_secs), Some(mark)),
                             Err(e) => {
                                 sink.withdraw_fast_path();
                                 (FastAllow::Off(format!("could not arm: {e:#}")), None)
@@ -1292,15 +1333,15 @@ pub(super) fn load_and_attach(
         // - the kernel stops honouring grants within one deadline. That is
         // the design, not a failure mode.
         let beat = sink.clone();
-        let mut armed = matches!(report.fast_allow, Some(FastAllow::Live));
+        let mut armed = matches!(report.fast_allow, Some(FastAllow::Live { .. }));
         tasks.push(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
-                cfc_ebpf_common::fast_allow::HEARTBEAT_SECS,
-            ));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
             let mut last_reason: Option<String> = None;
             // Ticks between two checks that the set still holds the mark.
-            const CHECKS_EVERY: u8 = 6;
-            let mut since_check: u8 = 0;
+            // Expressed in ticks, so it has to follow the tick length: one
+            // minute either way, whichever deadline pair is in force.
+            let checks_every: u32 = (60 / heartbeat_secs.max(1)) as u32;
+            let mut since_check: u32 = 0;
             loop {
                 tick.tick().await;
                 if !armed {
@@ -1314,7 +1355,7 @@ pub(super) fn load_and_attach(
                             tracing::info!(
                                 "fast-allow armed: the nftables set now holds this daemon's mark"
                             );
-                            FastAllow::Live
+                            FastAllow::Live { deadline_secs }
                         }
                         Err(e) => nft_arm_state_from_error(&e),
                     };
@@ -1331,7 +1372,7 @@ pub(super) fn load_and_attach(
                         continue;
                     }
                 }
-                if let Err(e) = beat.beat() {
+                if let Err(e) = beat.beat(deadline_secs) {
                     tracing::warn!(
                         "fast-allow heartbeat failed: {e:#}; grants lapse within a minute"
                     );
@@ -1348,13 +1389,14 @@ pub(super) fn load_and_attach(
                 // those flows was in fact taking the queue and being counted
                 // a second time by the packet path.
                 //
-                // Checked every sixth tick rather than every tick: this is a
+                // Checked once a minute rather than every tick: this is a
                 // fork and exec, the window it leaves is a minute of an
                 // over-optimistic status line, and nothing unsafe happens in
                 // it - the failure is the set accepting *less* than the daemon
-                // thinks, never more.
+                // thinks, never more. A minute either way, so a shortened
+                // heartbeat does not turn this into a fork every two seconds.
                 since_check += 1;
-                if since_check >= CHECKS_EVERY {
+                if since_check >= checks_every {
                     since_check = 0;
                     match tokio::task::spawn_blocking(move || super::nft_set::holds(mark)).await {
                         Ok(Ok(true)) => {}
@@ -1862,6 +1904,61 @@ mod tests {
     /// `0x8000/0x8000` and DROPs what matches. A uniformly random word has
     /// that bit set half the time, so on a Kubernetes node the previous
     /// draw broke every fast-allowed flow on roughly every other start.
+    /// The property that makes a late tick harmless: several beats fit inside
+    /// one deadline, for *both* pairs. A ratio of one would mean a single
+    /// delayed heartbeat lapses the fast path on a perfectly healthy daemon.
+    #[test]
+    fn several_beats_fit_inside_every_deadline() {
+        for pinned in [true, false] {
+            let (deadline, heartbeat) = deadline_pair(pinned);
+            assert!(heartbeat > 0, "a zero heartbeat would spin");
+            assert!(
+                deadline >= heartbeat * 3,
+                "pinned={pinned}: {deadline}s deadline against a {heartbeat}s beat leaves \
+                 no room for a late tick"
+            );
+        }
+    }
+
+    /// The unpinned pair exists to shrink the window a dead daemon leaves, so
+    /// it has to actually be shorter - and the pinned one has to be the value
+    /// every document quotes.
+    #[test]
+    fn the_unpinned_deadline_is_the_shorter_one() {
+        let (pinned, _) = deadline_pair(true);
+        let (unpinned, beat) = deadline_pair(false);
+        assert_eq!(pinned, cfc_ebpf_common::fast_allow::DEADLINE_SECS);
+        assert!(
+            unpinned < pinned,
+            "an unpinned kernel must not get the longer guarantee: {unpinned} vs {pinned}"
+        );
+        // The heartbeat must speed up with it, or the ratio above breaks.
+        assert!(beat < cfc_ebpf_common::fast_allow::HEARTBEAT_SECS);
+    }
+
+    /// `cfc status` must not say plain `live` on a kernel where the guarantee
+    /// is weaker - that is the whole reason the deadline is carried.
+    #[test]
+    fn a_shortened_deadline_is_visible_in_the_status_line() {
+        let full = FastAllow::Live {
+            deadline_secs: cfc_ebpf_common::fast_allow::DEADLINE_SECS,
+        };
+        assert_eq!(full.describe(), "live");
+
+        let short = FastAllow::Live {
+            deadline_secs: cfc_ebpf_common::fast_allow::DEADLINE_SECS_UNPINNED,
+        };
+        let said = short.describe();
+        assert_ne!(
+            said, "live",
+            "a weaker guarantee must not read as the full one"
+        );
+        assert!(
+            said.contains(&cfc_ebpf_common::fast_allow::DEADLINE_SECS_UNPINNED.to_string()),
+            "the status line must name the number: {said}"
+        );
+    }
+
     #[test]
     fn a_mark_sharing_a_bit_with_a_known_selector_is_refused() {
         assert_eq!(collides_with(0x0000_8000), Some("kube-proxy (drop)"));

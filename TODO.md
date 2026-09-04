@@ -42,13 +42,20 @@ could not be patched, and what replaced them:
   is given up is the fast path for QUIC, which was getting its first packet
   through it and nothing more.
 
-  **Open question this leaves.** With no UDP socket ever marked, the two
-  `cgroup/sendmsg` programs have nothing left to set and nothing of ours left
-  to strip. Removing them would delete two programs, shrink the object, and -
-  because they are the only reason the fast path reports itself off on 5.10
-  (`unknown func bpf_getsockopt` on a sendmsg hook) - would make it available
-  on the RHEL floor. It is an ABI change and deletes kernel code, so it is a
-  decision to take deliberately rather than a tidy-up.
+  **Follow-up, deliberately not done here.** With no UDP socket ever marked,
+  the two `cgroup/sendmsg` programs can no longer set a mark, and they can no
+  longer strip one either: a strip fires only for *our current* mark, which by
+  construction can only be on a TCP socket, while any other value takes the
+  `FOREIGN_MARK` early return and is left alone. They are provably dead except
+  as a speed bump against a process that forges the mark on an unconnected UDP
+  socket - which, holding CAP_NET_RAW, can simply set it again. Removing them
+  would delete two programs and ~300 verifier instructions each.
+
+  Not free, though. `fast_path_attached()` uses their pins as the inherited
+  path's only evidence of which connect variant is running, so that signal
+  needs replacing first. And it does **not** unlock 5.10: that was claimed here
+  once and was wrong - the eligibility ladder stops earlier. Worth doing the
+  next time the ABI moves for another reason, not on its own.
 - *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
   default. A published mark value is a bypass token. The value is drawn at
   random per start and lives in a pinned map and an nftables set, never in a
@@ -66,10 +73,12 @@ Grants are cleared in the kernel on exec and exit, so no daemon is needed for
 the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline refreshed every 10 s
 makes a dead daemon fail-closed within 60 s; and the path stays off - with
 the reason in `cfc status` - unless enforcement is pinned, exit is detected
-exactly (`group_dead`), the exec/exit links actually *pinned* rather than
-merely attached, their ring consumers running, the cookie connect variants
-*and* the sendmsg hooks verified, the nftables set present and holding this
-daemon's mark, and `[ebpf] fast_allow` is set. The matrix drew that last line on
+exactly (`group_dead`), their ring consumers running, the cookie connect
+variants *and* the sendmsg hooks verified, the nftables set present and holding
+this daemon's mark, and `[ebpf] fast_allow` is set. Whether the exec/exit links
+could be *pinned* is not on that list any more: it decides the grant deadline
+(sixty seconds, or six) rather than whether the path runs at all - refusing it
+withheld the feature from 5.10 through 5.14 for a risk the deadline bounds. The matrix drew that last line on
 the first run: 5.10 accepts `bpf_getsockopt` on a connect hook and refuses it
 on a sendmsg hook (`unknown func bpf_getsockopt#57`), 6.12 accepts both - so
 on the RHEL-floor kernel the fast path reports itself off with that sentence,
