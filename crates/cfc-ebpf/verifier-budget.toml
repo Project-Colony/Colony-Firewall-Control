@@ -37,14 +37,20 @@ measured_on = "7.1.8"
 # every execve on the machine. The `EXE_RULES_ON` gate exists for exactly that:
 # the loop is skipped entirely on a host with no exe-scoped deny rule, which is
 # the common case.
-# 2355 before the fast path; the unconditional FAST_ALLOW delete on the exec
-# path is the difference.
-observed = 2388
+# 2355 before the fast path; the FAST_ALLOW delete on the exec path is the
+# difference. 2388 with that delete unconditional, 2408 with it behind a read of
+# the mark: the verifier walks both arms of the branch, so the count goes *up*
+# by twenty for a change that, at runtime, lets every execve on a host with the
+# fast path off - every host by default - skip a hash operation. The two
+# numbers measure different things; do not read this one as a regression.
+observed = 2408
 max = 3000
 
 [cfc_sched_process_exit]
-# 25 before the fast path; one more map delete (FAST_ALLOW) per exit.
-observed = 52
+# 25 before the fast path; one more map delete (FAST_ALLOW) per exit. 52 with
+# that delete unconditional, 75 with it behind a read of the mark - same shape
+# and same reading as the exec program above.
+observed = 75
 max = 200
 
 [cfc_dns_ingress]
