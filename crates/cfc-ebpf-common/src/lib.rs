@@ -275,36 +275,39 @@ pub mod fast_allow {
     /// a single late tick never lets the fast path lapse on a live daemon.
     pub const HEARTBEAT_SECS: u64 = 10;
 
-    /// The deadline for a daemon whose exec/exit tracepoint links could not be
-    /// pinned to bpffs - no `BPF_LINK_TYPE_PERF_EVENT` before 5.15, or a
-    /// read-only bpffs.
+    /// The deadline for a daemon whose guarantees are weaker than the full
+    /// ones - two causes, either of which selects this pair:
     ///
-    /// Those links are what keeps the kernel clearing grants after the daemon
-    /// dies. Without them, an unclean death leaves the connect hooks still
-    /// pinned and still marking while nothing evicts, and the deadline is the
-    /// only thing left: the exposure is a granted pid exiting, being recycled,
-    /// and its new owner connecting, all inside one deadline.
+    /// * **the exec/exit tracepoint links could not be pinned** to bpffs (no
+    ///   `BPF_LINK_TYPE_PERF_EVENT` before 5.15, a read-only bpffs, or no
+    ///   bpffs at all). Those links are what keeps the kernel clearing grants
+    ///   after the daemon dies; without them an unclean death leaves the
+    ///   connect hooks marking while nothing evicts, and the deadline is the
+    ///   only thing left.
+    /// * **process exit is detected by thread-group leader only** - the
+    ///   kernel's `sched_process_exit` record has no readable `group_dead`,
+    ///   which the matrix shows absent on 5.10 and 6.12 and present on 6.18.
+    ///   Then a process whose leader exits first and dies later is never
+    ///   evicted by the kernel, *while the daemon is alive* - so a shorter
+    ///   deadline alone bounds nothing, and the daemon sweeps its grants on
+    ///   every heartbeat, dropping any pid whose start time no longer matches
+    ///   the one recorded when it was granted. The exposure becomes a pid
+    ///   recycled and connecting within one heartbeat, without an exec.
     ///
-    /// The fast path used to be refused outright on such a kernel; degrading
-    /// the parameter is enough, and ten times shorter costs one eight-byte map
-    /// write every two seconds while shrinking the window by the same factor.
-    ///
-    /// Be exact about who this reaches, because the first version of this
-    /// comment was not. It was written as "5.10 to 5.14 get the fast path",
-    /// and they do not: a kernel without `group_dead` in its exit tracepoint
-    /// is refused one rung *earlier*, at exit precision, and that refusal
-    /// stands (see the ladder). The matrix shows `group_dead` absent on 6.12
-    /// and present on 6.18, so the kernels this pair actually serves are the
-    /// ones that have it but cannot pin a perf-event link - in practice a
-    /// modern kernel with a read-only bpffs. Narrower than claimed, and still
-    /// worth having: refusing there was the wrong instrument regardless.
+    /// Both used to be refusals. Refusing was the wrong instrument where
+    /// degrading the parameter - and, for the second, adding a sweep - bounds
+    /// the risk; and refusing the second withheld the fast path from every
+    /// kernel RHEL ships. Ten times shorter costs one eight-byte map write
+    /// every two seconds; the sweep costs one `/proc` read per granted pid per
+    /// beat, and granted pids are the few a lasting rule allows outright.
     ///
     /// Both numbers are the daemon's alone: the kernel only ever compares
     /// `now < until`, so this changes no ABI and no kernel program.
-    pub const DEADLINE_SECS_UNPINNED: u64 = 6;
-    /// How often the daemon refreshes [`DEADLINE_SECS_UNPINNED`]. Three beats
-    /// per deadline, the same ratio as the pinned pair.
-    pub const HEARTBEAT_SECS_UNPINNED: u64 = 2;
+    pub const DEADLINE_SECS_REDUCED: u64 = 6;
+    /// How often the daemon refreshes [`DEADLINE_SECS_REDUCED`], and how often
+    /// it sweeps stale grants when exit detection is imprecise. Three beats
+    /// per deadline, the same ratio as the full pair.
+    pub const HEARTBEAT_SECS_REDUCED: u64 = 2;
     /// `FAST_ALLOW_MARK` holds this when no daemon has armed the path. Zero
     /// is also what a socket with no mark reads, which is why the kernel side
     /// treats "mark map says 0" as "fast-allow is off" rather than "mark

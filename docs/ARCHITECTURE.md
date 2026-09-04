@@ -402,34 +402,51 @@ which an unrevocable mark does the most damage. Benefit and hazard were the
 same case. What is given up in practice is the fast path for QUIC, which was
 getting its first packet through it and nothing more.
 
-**A kernel that cannot pin the lifecycle links gets a shorter deadline, not a
-refusal.** The exec and exit tracepoint links are what keeps the kernel clearing
-grants after the daemon dies; pinning them needs `BPF_LINK_TYPE_PERF_EVENT`,
-which arrived in 5.15, and a writable bpffs. Without them an unclean death
-leaves the connect hooks still pinned and still marking while nothing evicts, so
-the deadline is the only thing left - and the exposure is a granted pid exiting,
-being recycled, and its new owner connecting, all inside one deadline. On such a
-kernel the daemon writes a six-second deadline refreshed every two seconds
-instead of sixty and ten, which shrinks that window by the same factor it costs
-an eight-byte map write. `cfc status` says `live, grants lapse within 6s` rather
-than `live`, because one word for two different guarantees misleads on exactly
-the kernels where the weaker one applies.
+**Two guarantees can be weaker than the full ones, and neither is a refusal.**
+The full guarantee is: a grant is cleared by the kernel the moment its process
+exits or execs, with or without a daemon, and a dead daemon is honoured for at
+most sixty seconds. Two kernel facts can weaken it, and the eligibility
+decision - a pure function, `fast_path_decision`, with a test - reduces rather
+than refuses in both cases:
 
-Refusing the feature there was the first design and it was the wrong
-instrument for a risk the deadline already bounds. Both numbers are the daemon's
-alone; the kernel only ever compares `now < until`, so this is no part of the
-ABI.
+- **The exec/exit tracepoint links could not be pinned** (no
+  `BPF_LINK_TYPE_PERF_EVENT` before 5.15, a read-only bpffs, or no bpffs at
+  all). Those links are what clears grants after the daemon dies; without them
+  an unclean death leaves the connect hooks marking while nothing evicts, and
+  the deadline is all that is left. So the deadline drops to six seconds,
+  refreshed every two.
+- **Process exit is detected by thread-group leader only** - the kernel's
+  `sched_process_exit` record has no readable `group_dead`, which the matrix
+  shows absent on 5.10 and 6.12 and present on 6.18. Then a process whose leader
+  exits first and dies later is never evicted by the kernel, *while the daemon
+  is alive*, so a shorter deadline alone bounds nothing. The daemon therefore
+  sweeps its grants on every heartbeat, dropping any pid whose `/proc` start
+  time no longer matches the one recorded when it was granted. What remains is
+  a pid recycled and connecting within one two-second beat, without an exec in
+  between - an exec clears the grant in the kernel regardless.
 
-Be exact about who this reaches, because the first write-up was not: it does
-**not** bring the fast path to 5.10-5.14. A kernel whose `sched_process_exit`
-record has no `group_dead` field is refused one rung earlier, at exit
-precision, and that refusal stands - without exact exit detection the daemon's
-*own* eviction is wrong while it is alive, and no deadline bounds a grant the
-heartbeat keeps refreshing. The matrix shows `group_dead` absent on 6.12 and
-present on 6.18, so the fast path today needs a kernel at least that new, and
-the shortened deadline serves the ones that have `group_dead` but cannot pin a
-perf-event link: a modern kernel with a read-only bpffs.
+`cfc status` names which applies - `live, grants lapse within 6s (exit is
+detected by thread-group leader only, ...)` - because two different weaknesses
+give the same number and the word `live` alone would hide both.
 
+Both were refusals in the first design. Refusing the first withheld the path
+from a bpffs mounted read-only; refusing the second withheld it from every
+kernel RHEL ships, for a risk a per-beat sweep bounds. What still refuses is
+where nothing could ever mark - the basic connect variants carry no mark
+decision - or nothing could ever evict - exit not tracked at all. And
+`Enforcement` is no longer an input: Process mode was refused on the reasoning
+that a stale grant would have "nothing but the deadline", which was backwards -
+there every link and map dies with the daemon, so a stale grant cannot exist
+after it.
+
+**The sendmsg hooks are a caveat, not a requirement.** They used to re-decide a
+UDP socket's mark per datagram and were load-bearing; with no UDP socket ever
+marked, all they can do is strip a mark somebody *forged* onto an unconnected
+UDP socket. Where the kernel's verifier refuses them - 5.10 does - the path
+runs, and the report says what it runs without. On the inherited path the
+previous daemon leaves a directory marker in bpffs once its cookie connect
+variants attached, which is what tells its successor that the pinned programs
+carry the mark decision at all; the pin names do not say.
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately

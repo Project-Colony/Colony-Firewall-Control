@@ -236,26 +236,99 @@ fn pick_mark(mut draw: impl FnMut() -> u32) -> Option<u32> {
 
 /// The (deadline, heartbeat) pair a daemon should use, in seconds.
 ///
-/// Pinned exec/exit links keep clearing grants after the daemon dies, so the
-/// deadline there is a backstop. Unpinned, it is the only thing standing
-/// between a dead daemon and a recycled pid, so it is ten times shorter and
-/// refreshed five times as often.
-fn deadline_pair(lifecycle_pinned: bool) -> (u64, u64) {
+/// With every guarantee in place the deadline is a backstop and the full pair
+/// applies. With any reduced - see [`fast_path_decision`] - it is ten times
+/// shorter and refreshed five times as often, and where exit detection is
+/// imprecise that same beat is also the cadence of the stale-grant sweep.
+fn deadline_pair(reduced: bool) -> (u64, u64) {
     use cfc_ebpf_common::fast_allow as fa;
-    if lifecycle_pinned {
-        (fa::DEADLINE_SECS, fa::HEARTBEAT_SECS)
+    if reduced {
+        (fa::DEADLINE_SECS_REDUCED, fa::HEARTBEAT_SECS_REDUCED)
     } else {
-        (fa::DEADLINE_SECS_UNPINNED, fa::HEARTBEAT_SECS_UNPINNED)
+        (fa::DEADLINE_SECS, fa::HEARTBEAT_SECS)
     }
+}
+
+/// What the eligibility decision is made from, so the decision can be a pure
+/// function with a test rather than a ladder of `else if` that only a live
+/// kernel exercises.
+#[derive(Debug, Clone, Copy)]
+struct LadderFacts {
+    config_on: bool,
+    has_maps: bool,
+    exit_tracking: bool,
+    exit_precise: bool,
+    lifecycle_pinned: bool,
+    capability: enforce::FastPathCapability,
+}
+
+/// The reduced guarantee when exit is detected by leader only.
+const REDUCED_IMPRECISE_EXIT: &str =
+    "exit is detected by thread-group leader only, so stale grants are swept every beat";
+/// The reduced guarantee when the lifecycle links are not pinned.
+const REDUCED_UNPINNED_LINKS: &str =
+    "the exec/exit tracepoint links are not pinned, so their clears die with this daemon";
+
+/// Off, with the one sentence for `cfc status` - or on, with the list of
+/// guarantees that are weaker than the full ones (empty means all hold).
+///
+/// What refuses and what merely reduces is the whole policy of the fast path,
+/// so it is worth reading as a list:
+///
+/// * **refuse** when nothing could ever mark (config off, no maps, basic
+///   connect variants) or nothing could ever evict (exit not tracked at all).
+/// * **reduce** when eviction is weaker but boundable: exit detected by leader
+///   only (the daemon sweeps its grants every beat), or lifecycle links that
+///   die with the daemon (the deadline is all that is left after it does).
+///   Both select the short deadline pair.
+/// * **note, and run** when the sendmsg hooks are missing: they can only strip
+///   a forged mark from an unconnected UDP socket now, and that is not worth
+///   the whole feature.
+///
+/// `Enforcement` is deliberately not an input. It used to be - Process mode
+/// was refused on the reasoning that a stale grant would have "nothing but the
+/// deadline" - and that reasoning was backwards: in Process mode every link
+/// and every map dies with the daemon, so a stale grant cannot exist after it,
+/// which is the safest case there is. The unpinned-links reduction covers what
+/// is genuinely weaker about it while the daemon is up.
+fn fast_path_decision(f: &LadderFacts) -> Result<Vec<&'static str>, &'static str> {
+    if !f.config_on {
+        return Err("[ebpf] fast_allow is not set");
+    }
+    if !f.has_maps {
+        // Not reachable by an *old* object: the loader requires the v4 ABI
+        // symbol with must_exist, and the fast path arrived with that bump.
+        // What is left is an object built from a tree with the maps taken out.
+        return Err("the loaded object has no fast-allow maps");
+    }
+    if !f.exit_tracking {
+        // Without exit events nothing evicts while the daemon is alive, and no
+        // sweep cadence makes up for a kernel that never says a process died.
+        return Err("process exit is not tracked on this kernel");
+    }
+    if let Some(why) = f.capability.refusal() {
+        return Err(why);
+    }
+    let mut reduced = Vec::new();
+    if !f.exit_precise {
+        reduced.push(REDUCED_IMPRECISE_EXIT);
+    }
+    if !f.lifecycle_pinned {
+        reduced.push(REDUCED_UNPINNED_LINKS);
+    }
+    Ok(reduced)
 }
 
 /// One attempt at the nftables side, at startup, reported as the state it
 /// leaves the path in. On a daemon *restart* the table is already loaded and
 /// this comes back `Live` at once; on a boot it comes back waiting, and the
 /// heartbeat task finishes the job.
-fn nft_arm_state(mark: u32, deadline_secs: u64) -> FastAllow {
+fn nft_arm_state(mark: u32, deadline_secs: u64, reduced: Option<String>) -> FastAllow {
     match super::nft_set::arm(mark) {
-        Ok(()) => FastAllow::Live { deadline_secs },
+        Ok(()) => FastAllow::Live {
+            deadline_secs,
+            reduced,
+        },
         Err(e) => nft_arm_state_from_error(&e),
     }
 }
@@ -861,22 +934,26 @@ pub(super) fn load_and_attach(
 
     // --- enforcement ----------------------------------------------------
 
-    // Whether the kernel side of the fast path is in place: the cookie
-    // connect variants plus both sendmsg programs. On the inherited path the
-    // pin names do not say which connect variant is running, and the sendmsg
-    // pins - made only after the cookie variants attached - are the evidence.
+    // Whether the kernel side of the fast path is in place. On the inherited
+    // path the pin names do not say which connect variant is running; the
+    // previous daemon's cookie marker does (see `enforce::COOKIE_MARKER`), and
+    // the sendmsg pins say whether that daemon had those hooks too.
     let mut fast_path = enforce::FastPathCapability::BasicConnect;
     report.enforcement = if inherited {
-        // Inherited pins do not say which connect variant is running; the
-        // sendmsg pins, made only after the cookie variants attached, are the
-        // evidence, and their absence could be either reason. So say neither:
-        // this used to report `BasicConnect`, whose reason names a cause -
-        // "no bpf_get_socket_cookie on sock_addr programs" - that nothing on
-        // this path established.
-        fast_path = if pin_dir.as_deref().is_some_and(enforce::fast_path_attached) {
-            enforce::FastPathCapability::Ready
-        } else {
-            enforce::FastPathCapability::Inconclusive
+        fast_path = match pin_dir.as_deref() {
+            Some(d) if enforce::cookie_variants_pinned(d) => {
+                if enforce::sendmsg_pinned(d) {
+                    enforce::FastPathCapability::Ready
+                } else {
+                    enforce::FastPathCapability::SendmsgUnavailable
+                }
+            }
+            // No marker: a basic-connect daemon, or one that could not create
+            // the marker and said so. Either way nothing here is known to mark,
+            // so the packet path decides - fail closed, and the reason names
+            // the marker so the fix (a restart with the pins removed) is
+            // legible.
+            _ => enforce::FastPathCapability::BasicConnect,
         };
         report.notes.push(format!(
             "in-kernel enforcement was already attached and pinned at {}; \
@@ -1023,6 +1100,13 @@ pub(super) fn load_and_attach(
     let mut armed_mark: Option<u32> = None;
     let mut deadline_secs = cfc_ebpf_common::fast_allow::DEADLINE_SECS;
     let mut heartbeat_secs = cfc_ebpf_common::fast_allow::HEARTBEAT_SECS;
+    // And the reason the guarantee is weaker, if it is, for every `Live` the
+    // heartbeat will ever publish. Hoisted rather than read back out of
+    // `report.fast_allow` at spawn time, because on a boot that field is
+    // `Off("waiting for the nftables table")` when the task starts - the
+    // common case, not an edge - and deriving from it lost the reason on
+    // every first arm.
+    let mut reduced_because: Option<String> = None;
     let sink = match (report.enforcement.is_live(), engine) {
         (true, Some(engine)) => {
             match enforce::VerdictSink::new(&mut bpf, engine.clone(), table.clone()) {
@@ -1037,81 +1121,48 @@ pub(super) fn load_and_attach(
                         );
                     }
 
-                    // Every reason the fast path stays off, in the order a
-                    // reader can act on. Each is the one sentence `cfc status`
-                    // will show.
-                    let off = if !fast_allow.on {
-                        Some("[ebpf] fast_allow is not set")
-                    } else if !sink.has_fast_path() {
-                        // Not reachable by an *old* object: the loader
-                        // requires the v4 ABI symbol with must_exist, and the
-                        // fast path arrived with that bump. What is left is an
-                        // object built from a tree with the maps taken out, so
-                        // the reason names the maps rather than a version.
-                        Some("the loaded object has no fast-allow maps")
-                    } else if !matches!(
-                        report.enforcement,
-                        Enforcement::Pinned | Enforcement::Inherited
-                    ) {
-                        // A Process-mode link dies with the daemon and takes
-                        // the exit eviction with it; a stale grant would then
-                        // have nothing but the deadline standing between it
-                        // and a recycled pid.
-                        Some("enforcement is not pinned to bpffs")
-                    } else if !report.exit_tracking {
-                        Some("process exit is not tracked on this kernel")
-                    } else if !report.exit_precise {
-                        // Leader-only exit detection leaks in the fail-closed
-                        // direction for denies and the fail-open one for
-                        // grants.
-                        //
-                        // Split from the condition above, which it used to
-                        // share: one reason string served two different facts,
-                        // so an exit tracepoint that simply failed to attach
-                        // was reported to the operator as a kernel that has no
-                        // readable `group_dead` - sending them to look at their
-                        // kernel version for a problem that was in the notes.
-                        Some("process exit is not detected exactly on this kernel (no readable group_dead)")
-                    } else {
-                        fast_path.off_reason()
+                    // The decision is a pure function of the facts, so it has a
+                    // test; this is only the gathering. `enforcement` is not
+                    // among the facts - see `fast_path_decision` for why the
+                    // Process-mode refusal was backwards.
+                    let facts = LadderFacts {
+                        config_on: fast_allow.on,
+                        has_maps: sink.has_fast_path(),
+                        exit_tracking: report.exit_tracking,
+                        exit_precise: report.exit_precise,
+                        lifecycle_pinned: report.lifecycle_pinned,
+                        capability: fast_path,
+                    };
+                    let (off, reduced): (Option<&str>, Vec<&str>) = match fast_path_decision(&facts)
+                    {
+                        Ok(reduced) => (None, reduced),
+                        Err(why) => (Some(why), Vec::new()),
                     };
 
-                    // Attached is not pinned, and that is a shorter deadline
-                    // rather than a refusal.
-                    //
-                    // The connect programs' links are pinned and go on marking
-                    // sockets after this daemon dies; if the exec and exit
-                    // links are not - no BPF_LINK_TYPE_PERF_EVENT before 5.15,
-                    // or a read-only bpffs - the clears that make a grant safe
-                    // die with it, and the deadline is all that is left. The
-                    // exposure is then a granted pid exiting, being recycled,
-                    // and its new owner connecting, all inside one deadline.
-                    //
-                    // This was a rung on the ladder above for a day, and that
-                    // was the wrong instrument for a risk the deadline already
-                    // bounds. Ten times shorter costs an eight-byte map write
-                    // every two seconds and shrinks the window by the same
-                    // factor, and `cfc status` says which guarantee is in force.
-                    //
-                    // Who it reaches is narrower than it was first written up
-                    // as. It does *not* bring the fast path to 5.10-5.14: a
-                    // kernel without `group_dead` in its exit record fails the
-                    // `exit_precise` rung above, before this is ever consulted,
-                    // and the matrix shows `group_dead` absent on 6.12 and
-                    // present on 6.18. What this serves is a kernel that has
-                    // `group_dead` but cannot pin a perf-event link - a modern
-                    // kernel with a read-only bpffs. That rung stays a refusal
-                    // on purpose: without exact exit detection the daemon's
-                    // *own* eviction is wrong while it is alive, and no
-                    // deadline bounds a grant the heartbeat keeps refreshing.
-                    (deadline_secs, heartbeat_secs) = deadline_pair(report.lifecycle_pinned);
-                    if off.is_none() && !report.lifecycle_pinned {
-                        let note = format!(
-                            "the exec/exit tracepoint links could not be pinned to bpffs, so their clears would not survive this daemon; fast-allow grants lapse within {deadline_secs}s instead of {}s",
-                            cfc_ebpf_common::fast_allow::DEADLINE_SECS
-                        );
-                        warn!("{note}");
-                        report.notes.push(note);
+                    // Weaker guarantees are said, once each, in the log and the
+                    // report, and carried in the status so `live` never hides
+                    // them. Both select the short deadline pair; where exit
+                    // detection is imprecise the heartbeat also sweeps grants,
+                    // which is what makes that reduction boundable at all.
+                    (deadline_secs, heartbeat_secs) = deadline_pair(!reduced.is_empty());
+                    reduced_because = if off.is_none() && !reduced.is_empty() {
+                        for why in &reduced {
+                            let note = format!(
+                                "fast-allow runs with a weaker guarantee: {why}; grants lapse within {deadline_secs}s instead of {}s",
+                                cfc_ebpf_common::fast_allow::DEADLINE_SECS
+                            );
+                            warn!("{note}");
+                            report.notes.push(note);
+                        }
+                        Some(reduced.join("; "))
+                    } else {
+                        None
+                    };
+                    if off.is_none() {
+                        if let Some(caveat) = fast_path.caveat() {
+                            warn!("fast-allow: {caveat}");
+                            report.notes.push(format!("fast-allow: {caveat}"));
+                        }
                     }
 
                     let (state, mark_opt) = match off {
@@ -1120,7 +1171,10 @@ pub(super) fn load_and_attach(
                             (FastAllow::Off(why.to_string()), None)
                         }
                         None => match arm_kernel_side(&sink, fast_allow.mark) {
-                            Ok(mark) => (nft_arm_state(mark, deadline_secs), Some(mark)),
+                            Ok(mark) => (
+                                nft_arm_state(mark, deadline_secs, reduced_because.clone()),
+                                Some(mark),
+                            ),
                             Err(e) => {
                                 sink.withdraw_fast_path();
                                 (FastAllow::Off(format!("could not arm: {e:#}")), None)
@@ -1344,6 +1398,10 @@ pub(super) fn load_and_attach(
         // the design, not a failure mode.
         let beat = sink.clone();
         let mut armed = matches!(report.fast_allow, Some(FastAllow::Live { .. }));
+        // What the status must keep saying every time this task re-arms, and
+        // whether each beat also sweeps grants.
+        let reduced_for_status = reduced_because.clone();
+        let sweep_grants = !report.exit_precise;
         tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
             let mut last_reason: Option<String> = None;
@@ -1369,7 +1427,10 @@ pub(super) fn load_and_attach(
                             tracing::info!(
                                 "fast-allow armed: the nftables set now holds this daemon's mark"
                             );
-                            FastAllow::Live { deadline_secs }
+                            FastAllow::Live {
+                                deadline_secs,
+                                reduced: reduced_for_status.clone(),
+                            }
                         }
                         Err(e) => nft_arm_state_from_error(&e),
                     };
@@ -1394,6 +1455,26 @@ pub(super) fn load_and_attach(
                     tracing::warn!(
                         "fast-allow heartbeat failed: {e:#}; grants lapse within {deadline_secs}s"
                     );
+                }
+
+                // On a kernel without `group_dead` the exit program evicts on
+                // leader exit only, so a process whose leader exits first and
+                // dies later keeps its grant while this daemon lives and
+                // refreshes the deadline. This is what bounds that: every
+                // beat, every granted pid is re-dated against the start time
+                // it was granted with. Off the async threads - it reads /proc
+                // once per granted pid, and granted pids are the few a lasting
+                // rule allows outright.
+                if sweep_grants {
+                    let sweeper = beat.clone();
+                    match tokio::task::spawn_blocking(move || sweeper.sweep_stale_grants()).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::debug!(dropped = n, "swept stale fast-allow grants"),
+                        // A panic inside the sweep; the grants it did not reach
+                        // are re-checked next beat, so this is worth a line and
+                        // nothing more.
+                        Err(e) => tracing::debug!("fast-allow grant sweep did not run: {e}"),
+                    }
                 }
 
                 // Armed is not a fact that stays true, and this loop used to
@@ -1675,7 +1756,7 @@ fn attach_tracepoint(
             // The link is gone; put the program back on the tracepoint.
             prog.attach(category, event).with_context(|| {
                 format!(
-                    "could not pin the tracepoint link ({e}), and re-attaching                      after it failed too"
+                    "could not pin the tracepoint link ({e}), and re-attaching after it failed too"
                 )
             })?;
             warn!(
@@ -1927,12 +2008,12 @@ mod tests {
     /// delayed heartbeat lapses the fast path on a perfectly healthy daemon.
     #[test]
     fn several_beats_fit_inside_every_deadline() {
-        for pinned in [true, false] {
-            let (deadline, heartbeat) = deadline_pair(pinned);
+        for reduced in [false, true] {
+            let (deadline, heartbeat) = deadline_pair(reduced);
             assert!(heartbeat > 0, "a zero heartbeat would spin");
             assert!(
                 deadline >= heartbeat * 3,
-                "pinned={pinned}: {deadline}s deadline against a {heartbeat}s beat leaves \
+                "reduced={reduced}: {deadline}s deadline against a {heartbeat}s beat leaves \
                  no room for a late tick"
             );
         }
@@ -1942,16 +2023,100 @@ mod tests {
     /// it has to actually be shorter - and the pinned one has to be the value
     /// every document quotes.
     #[test]
-    fn the_unpinned_deadline_is_the_shorter_one() {
-        let (pinned, _) = deadline_pair(true);
-        let (unpinned, beat) = deadline_pair(false);
-        assert_eq!(pinned, cfc_ebpf_common::fast_allow::DEADLINE_SECS);
+    fn the_reduced_deadline_is_the_shorter_one() {
+        let (full, _) = deadline_pair(false);
+        let (reduced, beat) = deadline_pair(true);
+        assert_eq!(full, cfc_ebpf_common::fast_allow::DEADLINE_SECS);
         assert!(
-            unpinned < pinned,
-            "an unpinned kernel must not get the longer guarantee: {unpinned} vs {pinned}"
+            reduced < full,
+            "a reduced guarantee must not get the longer deadline: {reduced} vs {full}"
         );
         // The heartbeat must speed up with it, or the ratio above breaks.
         assert!(beat < cfc_ebpf_common::fast_allow::HEARTBEAT_SECS);
+    }
+
+    /// The policy, over the cases that decide it. Refusals are where nothing
+    /// could mark or nothing could evict; everything weaker but boundable
+    /// reduces; a missing sendmsg hook is a note. `Enforcement` is not an
+    /// input at all, which is itself the assertion.
+    #[test]
+    fn the_ladder_refuses_only_where_nothing_could_mark_or_evict() {
+        use enforce::FastPathCapability as Cap;
+        let full = LadderFacts {
+            config_on: true,
+            has_maps: true,
+            exit_tracking: true,
+            exit_precise: true,
+            lifecycle_pinned: true,
+            capability: Cap::Ready,
+        };
+        assert_eq!(
+            fast_path_decision(&full),
+            Ok(vec![]),
+            "everything in place: full guarantee"
+        );
+
+        // Refusals.
+        assert!(fast_path_decision(&LadderFacts {
+            config_on: false,
+            ..full
+        })
+        .is_err());
+        assert!(fast_path_decision(&LadderFacts {
+            has_maps: false,
+            ..full
+        })
+        .is_err());
+        assert!(fast_path_decision(&LadderFacts {
+            exit_tracking: false,
+            ..full
+        })
+        .is_err());
+        assert!(
+            fast_path_decision(&LadderFacts {
+                capability: Cap::BasicConnect,
+                ..full
+            })
+            .is_err(),
+            "basic connect variants carry no mark decision: nothing would ever mark"
+        );
+
+        // Reductions - the two that used to refuse.
+        assert_eq!(
+            fast_path_decision(&LadderFacts {
+                exit_precise: false,
+                ..full
+            }),
+            Ok(vec![REDUCED_IMPRECISE_EXIT]),
+            "no group_dead is a swept, short-deadline path - not a refusal"
+        );
+        assert_eq!(
+            fast_path_decision(&LadderFacts {
+                lifecycle_pinned: false,
+                ..full
+            }),
+            Ok(vec![REDUCED_UNPINNED_LINKS])
+        );
+        assert_eq!(
+            fast_path_decision(&LadderFacts {
+                exit_precise: false,
+                lifecycle_pinned: false,
+                ..full
+            }),
+            Ok(vec![REDUCED_IMPRECISE_EXIT, REDUCED_UNPINNED_LINKS]),
+            "both reductions are reported, not just the first"
+        );
+
+        // A missing sendmsg hook is a caveat: the path runs with the full
+        // guarantee, and the caveat is a separate note.
+        let no_sendmsg = LadderFacts {
+            capability: Cap::SendmsgUnavailable,
+            ..full
+        };
+        assert_eq!(fast_path_decision(&no_sendmsg), Ok(vec![]));
+        assert!(Cap::SendmsgUnavailable.caveat().is_some());
+        assert!(Cap::Ready.caveat().is_none());
+        assert!(Cap::BasicConnect.refusal().is_some());
     }
 
     /// `cfc status` must not say plain `live` on a kernel where the guarantee
@@ -1960,11 +2125,13 @@ mod tests {
     fn a_shortened_deadline_is_visible_in_the_status_line() {
         let full = FastAllow::Live {
             deadline_secs: cfc_ebpf_common::fast_allow::DEADLINE_SECS,
+            reduced: None,
         };
         assert_eq!(full.describe(), "live");
 
         let short = FastAllow::Live {
-            deadline_secs: cfc_ebpf_common::fast_allow::DEADLINE_SECS_UNPINNED,
+            deadline_secs: cfc_ebpf_common::fast_allow::DEADLINE_SECS_REDUCED,
+            reduced: Some(REDUCED_IMPRECISE_EXIT.to_string()),
         };
         let said = short.describe();
         assert_ne!(
@@ -1972,8 +2139,13 @@ mod tests {
             "a weaker guarantee must not read as the full one"
         );
         assert!(
-            said.contains(&cfc_ebpf_common::fast_allow::DEADLINE_SECS_UNPINNED.to_string()),
+            said.contains(&cfc_ebpf_common::fast_allow::DEADLINE_SECS_REDUCED.to_string()),
             "the status line must name the number: {said}"
+        );
+        assert!(
+            said.contains("leader only"),
+            "two different weaknesses give the same six seconds, so the status must say \
+             which: {said}"
         );
     }
 

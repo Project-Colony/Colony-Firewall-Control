@@ -112,16 +112,17 @@ max = 450
 # grant is honoured. Note what the matrix taught on the first run: 5.10
 # refuses these outright - `unknown func bpf_getsockopt` on a sendmsg hook,
 # while the same helper verifies on the connect hooks of that kernel - and
-# 6.12 onward accepts them. It is not, as this comment first said, why the fast
-# path is off on the matrix floor: those kernels are refused earlier, for want
-# of `group_dead` in the exit record (absent on 6.12, present on 6.18), and the
-# ladder never reaches the sendmsg rung there.
+# 6.12 onward accepts them. Neither fact switches the fast path off any more:
+# a missing sendmsg hook is a caveat in the report (they can only strip a forged
+# mark now), and a missing `group_dead` in the exit record (absent on 5.10 and
+# 6.12, present on 6.18) selects the short deadline plus a per-beat sweep of the
+# granted pids rather than a refusal.
 #
 # These two carry the protocol guard as well, and now pay for a decision they
 # can no longer reach: with only TCP ever marked, nothing here ever sets a mark,
-# and the only thing left to strip is one a process forged. See TODO.md for
-# whether they stay; whether removing them would lift the 5.10 restriction is
-# not known - it depends on `exit_precise` there, which nothing has measured.
+# and the only thing left to strip is one a process forged. They stay as
+# defence in depth where the kernel verifies them; there is no restriction left
+# for their removal to lift.
 [cfc_sendmsg4]
 observed = 267
 max = 350

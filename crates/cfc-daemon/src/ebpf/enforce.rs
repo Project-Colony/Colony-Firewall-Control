@@ -205,11 +205,26 @@ pub(super) struct FastAllowMaps {
     map: Arc<Mutex<BpfHashMap<MapData, u32, u32>>>,
     until: Arc<Mutex<aya::maps::Array<MapData, u64>>>,
     mark: Arc<Mutex<aya::maps::Array<MapData, u32>>>,
-    /// pid -> the rule that granted, so an `ALLOW_EVENTS` record can credit
-    /// the hit the packet path will never see. Userspace-only; a pid missing
-    /// here when its event arrives is a grant from a previous daemon, credited
-    /// to nobody rather than to the wrong rule.
-    granted_by: Arc<Mutex<std::collections::HashMap<u32, uuid::Uuid>>>,
+    /// pid -> the rule that granted and the start time it was judged at.
+    ///
+    /// The rule is so an `ALLOW_EVENTS` record can credit the hit the packet
+    /// path will never see. The start time is what `sweep_stale_grants` compares
+    /// against, on a kernel whose exit detection is leader-only: a pid whose
+    /// start time no longer matches is not the process that was granted.
+    /// Userspace-only; a pid missing here when its event arrives is a grant
+    /// from a previous daemon, credited to nobody rather than to the wrong
+    /// rule.
+    granted_by: Arc<Mutex<std::collections::HashMap<u32, Granted>>>,
+}
+
+/// What the daemon remembers about one grant it wrote.
+#[derive(Debug, Clone, Copy)]
+struct Granted {
+    rule: uuid::Uuid,
+    /// `/proc/<pid>/stat` field 22 when the grant was judged. `None` cannot
+    /// reach the map - `grant_if_still` refuses to grant without one - but the
+    /// type says so rather than the comment.
+    starttime: Option<u64>,
 }
 
 /// One grant decision, for the three writers to share.
@@ -295,9 +310,10 @@ impl VerdictSink {
     }
 
     /// Withdraws the ability to grant, for a daemon that loaded the maps but
-    /// then judged the path ineligible (exit tracking imprecise, sendmsg not
-    /// attached, nft set absent, config off). Also empties the map, so the
-    /// kernel side has nothing left to honour whatever the deadline says.
+    /// then judged the path ineligible (config off, basic connect variants,
+    /// exit not tracked, could not arm) or lost it after arming (the ring
+    /// consumers did not start). Also empties the map, so the kernel side has
+    /// nothing left to honour whatever the deadline says.
     pub(super) fn withdraw_fast_path(&mut self) {
         if let Some(fast) = self.fast.take() {
             let mut map = fast.map.lock();
@@ -317,11 +333,14 @@ impl VerdictSink {
     }
 
     /// Applies a grant decision to the kernel map, under the caller's lock.
+    /// `judged_at` is the start time a `Yes` was decided against; a `No` does
+    /// not need one.
     fn apply_grant(
         fast: &FastAllowMaps,
         map: &mut BpfHashMap<MapData, u32, u32>,
         pid: u32,
         grant: Grant,
+        judged_at: Option<u64>,
     ) {
         match grant {
             Grant::Yes(rule) => {
@@ -329,7 +348,13 @@ impl VerdictSink {
                     warn!(pid, "could not write a fast-allow grant: {e}");
                     return;
                 }
-                fast.granted_by.lock().insert(pid, rule);
+                fast.granted_by.lock().insert(
+                    pid,
+                    Granted {
+                        rule,
+                        starttime: judged_at,
+                    },
+                );
             }
             Grant::No => {
                 // Absent is the common case and not an error: see `clear`.
@@ -356,7 +381,7 @@ impl VerdictSink {
     /// it if a rule says so. Withdrawing is always the safe direction.
     fn drop_grant(&self, pid: u32) {
         if let Some(fast) = self.fast.as_ref() {
-            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No);
+            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No, None);
         }
     }
 
@@ -378,7 +403,7 @@ impl VerdictSink {
             return;
         };
         if !matches!(grant, Grant::Yes(_)) {
-            Self::apply_grant(fast, &mut fast.map.lock(), pid, grant);
+            Self::apply_grant(fast, &mut fast.map.lock(), pid, grant, None);
             return;
         }
 
@@ -413,7 +438,7 @@ impl VerdictSink {
             return;
         }
 
-        Self::apply_grant(fast, &mut fast.map.lock(), pid, grant);
+        Self::apply_grant(fast, &mut fast.map.lock(), pid, grant, Some(judged_at));
 
         // And once more, on the program rather than the pid - after the write,
         // deliberately.
@@ -443,7 +468,7 @@ impl VerdictSink {
                 pid,
                 "withdrawing: the program changed while the grant was decided"
             );
-            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No);
+            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No, None);
         }
     }
 
@@ -451,7 +476,55 @@ impl VerdictSink {
     pub(super) fn granted_by(&self, pid: u32) -> Option<uuid::Uuid> {
         self.fast
             .as_ref()
-            .and_then(|f| f.granted_by.lock().get(&pid).copied())
+            .and_then(|f| f.granted_by.lock().get(&pid).map(|g| g.rule))
+    }
+
+    /// Drops every grant whose pid no longer holds the process it was judged
+    /// for, and returns how many.
+    ///
+    /// For a kernel whose `sched_process_exit` record has no readable
+    /// `group_dead`. There the exit program evicts on thread-group *leader*
+    /// exit, so a process whose leader exits first and dies later is never
+    /// evicted - while this daemon is alive and refreshing the deadline, which
+    /// therefore bounds nothing. This is the bound instead: called on every
+    /// heartbeat, it compares each granted pid's current start time with the
+    /// one recorded when it was granted; a mismatch, or no process at all, is
+    /// a grant for whoever owns the pid next. The exposure that remains is a
+    /// pid recycled *and* connecting within one heartbeat, without an exec in
+    /// between (an exec clears the grant in the kernel).
+    ///
+    /// Snapshot first, then read /proc with no lock held: `on_exec` and
+    /// `on_exit` take `granted_by` from the ring consumers.
+    pub(super) fn sweep_stale_grants(&self) -> usize {
+        let Some(fast) = self.fast.as_ref() else {
+            return 0;
+        };
+        let snapshot: Vec<(u32, Option<u64>)> = fast
+            .granted_by
+            .lock()
+            .iter()
+            .map(|(pid, g)| (*pid, g.starttime))
+            .collect();
+        let mut dropped = 0usize;
+        for (pid, recorded) in snapshot {
+            if !grant_is_stale(recorded, proc_starttime(pid)) {
+                continue;
+            }
+            // Re-read what is recorded *now*, not what the snapshot said. In
+            // the window since the snapshot this pid may have died, been
+            // recycled, exec'd, and been granted afresh by `on_exec` with its
+            // own start time - and dropping that grant on the strength of the
+            // old one would take a legitimate grant from a legitimate process
+            // until the next rule change. If the record moved, it is someone
+            // else's decision and stands.
+            let recorded_now = fast.granted_by.lock().get(&pid).map(|g| g.starttime);
+            if recorded_now != Some(recorded) {
+                continue;
+            }
+            self.drop_grant(pid);
+            dropped += 1;
+        }
+        dropped
     }
 
     /// Empties `FAST_ALLOW`. At every start, before anything is granted: the
@@ -1153,12 +1226,21 @@ fn boottime_ns() -> anyhow::Result<u64> {
         + u64::try_from(ts.tv_nsec).unwrap_or(0))
 }
 
-/// Real uid of a live process, from `/proc/<pid>/status`.
+/// Whether a grant judged at `recorded` still belongs to the process now
+/// holding its pid, given the start time read `now`.
 ///
-/// `None` when the process is gone or the line is missing, and the caller must
-/// treat that as "cannot decide" rather than "no uid": a uid-scoped allow does
-/// not match a process with no uid, so guessing turns an exemption into a
-/// refusal that stands.
+/// Only an exact match keeps a grant. `None` on either side is "no process":
+/// a grant recorded without a start time cannot happen (`grant_if_still`
+/// refuses it) but is treated as stale rather than trusted, and a pid with no
+/// process now is a grant for whoever gets the pid next. Two live processes
+/// never share a (pid, start time) pair within a boot.
+fn grant_is_stale(recorded: Option<u64>, now: Option<u64>) -> bool {
+    match (recorded, now) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
 /// `/proc/<pid>/exe`, with the kernel's `" (deleted)"` suffix stripped.
 ///
 /// One reader, because three callers want the same normalisation and two of
@@ -1207,6 +1289,12 @@ fn proc_view(pid: u32) -> Option<(Process, Option<u64>)> {
     ))
 }
 
+/// Real uid of a live process, from `/proc/<pid>/status`.
+///
+/// `None` when the process is gone or the line is missing, and the caller must
+/// treat that as "cannot decide" rather than "no uid": a uid-scoped allow does
+/// not match a process with no uid, so guessing turns an exemption into a
+/// refusal that stands.
 fn proc_uid(pid: u32) -> Option<u32> {
     // Bytes, decoded lossily - not `read_to_string`. The `Name:` line carries
     // the process's comm raw, so a program whose name is not valid UTF-8 (an
@@ -1404,11 +1492,27 @@ pub(super) fn already_attached(dir: &Path) -> bool {
     dir.join("connect4").exists() && dir.join("connect6").exists()
 }
 
-/// True when the previous daemon left the fast path's programs pinned too.
-/// They are pinned only after the cookie connect variants attached, so their
-/// presence is also the inherited path's only evidence of *which* connect
-/// variant is running - the pin names do not say.
-pub(super) fn fast_path_attached(dir: &Path) -> bool {
+/// A directory `attach` creates beside the connect pins once *both* cookie
+/// connect variants have attached, and nothing else.
+///
+/// The inherited path needs to know which connect variant a previous daemon
+/// left running, and the pin names do not say: `connect4` is `connect4`
+/// whether it holds the cookie program or the basic twin. The sendmsg pins used
+/// to be the evidence - written only after the cookie variants took - which
+/// made a daemon that ran cookie variants *without* sendmsg (a kernel that
+/// refuses `bpf_getsockopt` there) look, to its successor, like a basic-connect
+/// daemon, and refuse the fast path on every restart. bpffs allows directories,
+/// so the evidence is now its own object and says one thing only.
+pub(super) const COOKIE_MARKER: &str = "cookie-variants";
+
+/// True when a previous daemon left the marker: the pinned connect programs
+/// are the cookie variants, which carry `mark_decision`.
+pub(super) fn cookie_variants_pinned(dir: &Path) -> bool {
+    dir.join(COOKIE_MARKER).is_dir()
+}
+
+/// True when a previous daemon left both sendmsg programs pinned.
+pub(super) fn sendmsg_pinned(dir: &Path) -> bool {
     dir.join(LINK_SENDMSG4).exists() && dir.join(LINK_SENDMSG6).exists()
 }
 
@@ -1420,6 +1524,18 @@ pub(super) fn fast_path_attached(dir: &Path) -> bool {
 /// the packet path like any other unenforced moment - is the price of not
 /// being wedged forever.
 fn drop_half_attached(dir: &Path) {
+    // The marker goes with the pins it describes; a marker outliving them
+    // would tell the next daemon the cookie variants are running when nothing
+    // is.
+    let marker = dir.join(COOKIE_MARKER);
+    if marker.is_dir() {
+        if let Err(e) = std::fs::remove_dir(&marker) {
+            warn!(
+                "could not remove the stale cookie marker at {}: {e}",
+                marker.display()
+            );
+        }
+    }
     for name in ["connect4", "connect6", LINK_SENDMSG4, LINK_SENDMSG6] {
         let pin = dir.join(name);
         if !pin.exists() {
@@ -1511,64 +1627,54 @@ pub(super) struct AttachedPrograms {
 pub(super) enum FastPathCapability {
     /// Cookie connect variants and both sendmsg programs verified.
     Ready,
-    /// The connect hooks fell back to the `_basic` twins: no socket cookie
-    /// and, in the same era of kernels, no `bpf_setsockopt` on sock_addr.
+    /// The connect hooks fell back to the `_basic` twins, which carry no
+    /// `mark_decision` at all: nothing would ever mark a socket, so the fast
+    /// path cannot run. In the same era of kernels, no `bpf_setsockopt` on
+    /// sock_addr either.
     BasicConnect,
     /// The connect hooks took with the mark decision in them, and a sendmsg
-    /// hook did not load, attach or pin.
+    /// hook did not load, attach or pin. The path runs; this is a caveat.
     ///
     /// The likely cause is the verifier: this kernel allows `bpf_getsockopt` /
     /// `bpf_setsockopt` on connect programs and not yet on UDP sendmsg ones -
     /// 5.10 answers `unknown func bpf_getsockopt#57`, 6.12 accepts. It is not
-    /// the only cause, which is why neither this comment nor `off_reason`
-    /// states it as fact: `attach_one` also fails at the attach, at taking the
-    /// link, and at pinning. The connect loop above learned this the same way
-    /// and says so; this arm used to make the mistake that comment warns
-    /// about, and would have sent a reader chasing a kernel version for an
-    /// EEXIST. The real error is in the log line beside it.
+    /// the only cause, which is why neither this comment nor `caveat` states it
+    /// as fact: `attach_one` also fails at the attach, at taking the link, and
+    /// at pinning. The real error is in the log line beside it.
     ///
-    /// What the sendmsg hooks are *for* has changed under this variant, and
-    /// the reason it still switches the path off deserves to be read rather
-    /// than inherited. They used to re-decide a UDP socket's mark per
-    /// datagram; no UDP socket is marked any more, so all they can do now is
-    /// strip a mark somebody *forged* onto an unconnected UDP socket - a
-    /// process that was granted, learned the value with `getsockopt`, was
-    /// revoked, and set it back. That is defence in depth against a narrow
-    /// attacker, not the load-bearing half of the design it was when this
-    /// variant was written. Whether its absence should still refuse the whole
-    /// fast path is an open question recorded in TODO.md, not a settled one.
+    /// Why this stopped refusing the path: the sendmsg hooks used to re-decide
+    /// a UDP socket's mark per datagram, and were load-bearing. No UDP socket
+    /// is marked any more, so all they can do is strip a mark somebody
+    /// *forged* onto an unconnected UDP socket - a process that was granted,
+    /// learned the value with `getsockopt`, was revoked, and set it back.
+    /// Defence in depth against a narrow attacker, worth having where the
+    /// kernel allows it and not worth the whole feature where it does not.
     SendmsgUnavailable,
-    /// Inherited pins, and no sendmsg pins beside them.
-    ///
-    /// The pin names do not say which connect variant is running, and the
-    /// sendmsg pins - written only after the cookie variants attached - are
-    /// the only evidence. Their absence is consistent with both `BasicConnect`
-    /// and `SendmsgUnavailable`, so this says neither. It used to be reported
-    /// as `BasicConnect`, which named a cause ("no bpf_get_socket_cookie on
-    /// sock_addr programs") that the inherited path has no way to know.
-    Inconclusive,
 }
 
 impl FastPathCapability {
-    /// The reason for `cfc status`, or `None` when ready.
-    pub(super) fn off_reason(self) -> Option<&'static str> {
+    /// The one reason the fast path cannot run at all, or `None`.
+    pub(super) fn refusal(self) -> Option<&'static str> {
         match self {
-            Self::Ready => None,
             Self::BasicConnect => Some(
-                "the connect hooks fell back to the basic variants (usually no \
-                 bpf_get_socket_cookie / bpf_setsockopt on sock_addr programs; the log \
-                 line beside this one has the kernel's actual answer)",
+                "the connect hooks fell back to the basic variants, which carry no mark \
+                 decision (usually no bpf_get_socket_cookie / bpf_setsockopt on sock_addr \
+                 programs; the log line beside this one has the kernel's actual answer)",
             ),
+            Self::Ready | Self::SendmsgUnavailable => None,
+        }
+    }
+
+    /// A guarantee the path runs without, for the report, or `None`.
+    pub(super) fn caveat(self) -> Option<&'static str> {
+        match self {
             Self::SendmsgUnavailable => Some(
-                "a cgroup/sendmsg hook did not load or attach (usually this kernel's \
-                 verifier: bpf_getsockopt/setsockopt on sendmsg needs a newer kernel than \
-                 on connect - 5.10 refuses, 6.12 accepts; the log line beside this one has \
-                 the kernel's actual answer)",
+                "the cgroup/sendmsg hooks did not load or attach, so a mark forged onto an \
+                 unconnected UDP socket is not stripped (usually this kernel's verifier: \
+                 bpf_getsockopt/setsockopt on sendmsg needs a newer kernel than on connect - \
+                 5.10 refuses, 6.12 accepts; the log line beside this one has the actual answer)",
             ),
-            Self::Inconclusive => Some(
-                "these are a previous daemon's pins and they do not say whether this \
-                 kernel runs the fast path's hooks; restart with the pins removed to find out",
-            ),
+            Self::Ready | Self::BasicConnect => None,
         }
     }
 }
@@ -1656,6 +1762,22 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
         FastPathCapability::BasicConnect
     };
     if fast_path == FastPathCapability::Ready {
+        // Evidence for the next daemon: see COOKIE_MARKER. Best effort - a
+        // failure here costs a restart its knowledge of which variant runs,
+        // and it will say so, but attaches nothing differently.
+        if let Some(d) = dir {
+            let marker = d.join(COOKIE_MARKER);
+            if let Err(e) = std::fs::create_dir(&marker) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    warn!(
+                        "could not leave the cookie-variant marker at {}: {e}; a restart will \
+                         not know which connect variant is running and will fall back to the \
+                         packet path",
+                        marker.display()
+                    );
+                }
+            }
+        }
         for (name, pin_name) in [
             (PROG_SENDMSG4, LINK_SENDMSG4),
             (PROG_SENDMSG6, LINK_SENDMSG6),
@@ -1665,8 +1787,7 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
                 Ok(i) => out.push((name.to_string(), i)),
                 Err(e) => {
                     warn!(
-                        "{name} could not load or attach ({e:#}); the fast path is off on \
-                         this kernel"
+                        "{name} could not load or attach ({e:#}); the fast path runs without the sendmsg hooks - a mark forged onto an unconnected UDP socket is not stripped on this kernel"
                     );
                     fast_path = FastPathCapability::SendmsgUnavailable;
                     break;
@@ -1787,6 +1908,38 @@ mod tests {
         // Above /proc/sys/kernel/pid_max on every configuration; no process
         // can hold it, so this is "gone", not "unreadable by us".
         assert!(proc_view(u32::MAX).is_none());
+    }
+
+    /// The predicate the heartbeat sweep rests on, over its whole input space.
+    /// Only an exact match keeps a grant; every other shape is "not the
+    /// process that was granted" and goes.
+    #[test]
+    fn only_a_matching_start_time_keeps_a_grant() {
+        assert!(!grant_is_stale(Some(100), Some(100)), "same process, keep");
+        assert!(grant_is_stale(Some(100), Some(101)), "recycled pid, drop");
+        assert!(grant_is_stale(Some(100), None), "process gone, drop");
+        // A grant recorded without a start time cannot be written - but if it
+        // ever were, trusting it would be the fail-open direction.
+        assert!(grant_is_stale(None, Some(100)), "unknown at grant, drop");
+        assert!(grant_is_stale(None, None), "unknown both ways, drop");
+    }
+
+    /// The marker is a directory because bpffs allows directories and nothing
+    /// else that is not a BPF object; a plain tmpdir stands in for bpffs here
+    /// since only the shape is under test.
+    #[test]
+    fn the_cookie_marker_is_read_as_a_directory_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        assert!(!cookie_variants_pinned(dir.path()), "absent is absent");
+        std::fs::write(dir.path().join(COOKIE_MARKER), b"").expect("write");
+        assert!(
+            !cookie_variants_pinned(dir.path()),
+            "a file with the right name is not the marker: only attach makes it, and \
+             attach makes a directory"
+        );
+        std::fs::remove_file(dir.path().join(COOKIE_MARKER)).expect("rm");
+        std::fs::create_dir(dir.path().join(COOKIE_MARKER)).expect("mkdir");
+        assert!(cookie_variants_pinned(dir.path()));
     }
 
     #[test]

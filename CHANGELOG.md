@@ -43,25 +43,23 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Tailscale's, wg-quick's), and `[ebpf] fast_allow_mark` pins one by hand for a
   host with a selector it does not know.
 
-  On a kernel that has `group_dead` but cannot pin the exec/exit tracepoint
-  links - in practice a read-only bpffs, since perf-event links have been
-  pinnable since 5.15 - the path runs with a six-second grant deadline
-  refreshed every two seconds instead of sixty and ten, and `cfc status` says
-  `live, grants lapse within 6s`. Those links
-  are what clears grants after the daemon dies, so without them the deadline is
-  the only backstop; shortening it is the proportionate answer where refusing
-  the feature outright was not. In practice that means a modern kernel with a
-  read-only bpffs - see the next paragraph for why not an older kernel.
+  Two kernel facts weaken the guarantee without switching the path off, and
+  `cfc status` says which: the exec/exit tracepoint links could not be pinned
+  (a read-only bpffs; perf-event links have been pinnable since 5.15), or the
+  exit tracepoint has no `group_dead` and a process's death cannot be told from
+  one of its threads' - absent on 5.10 and 6.12 in the kernel matrix, present
+  on 6.18. In both cases the grant deadline drops from sixty seconds to six,
+  refreshed every two; in the second the daemon also re-checks every granted
+  pid's start time on every beat and drops any that changed hands, since there
+  the kernel's own eviction can miss a death while the daemon is alive. That
+  second case was a refusal in the first design, which put the fast path out
+  of reach of every kernel RHEL ships.
 
-  Needs a kernel whose `sched_process_exit` tracepoint carries `group_dead`,
-  so that a process's death is told apart from one of its threads' - without
-  it a grant could outlive its process while the daemon is alive, which no
-  deadline bounds, so the path is refused there and the status line says so.
-  In the kernel matrix that is present on 6.18 and absent on 6.12, which puts
-  the floor for the fast path above every kernel RHEL currently ships. Also
-  needs `bpf_getsockopt` on `cgroup/sendmsg` hooks, which 5.10 refuses and
-  6.12 onward accepts - but that rung is never reached on the kernels
-  `group_dead` already excludes.
+  The `cgroup/sendmsg` hooks are no longer required: with no UDP socket ever
+  marked they can only strip a forged mark, so where the kernel refuses them
+  (5.10 does) the path runs and the report notes what it runs without. On a
+  restart the previous daemon's cookie-variant marker in bpffs is what tells
+  the new one that the pinned connect programs carry the mark decision.
 
 ### Changed
 

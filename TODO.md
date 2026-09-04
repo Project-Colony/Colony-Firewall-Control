@@ -42,24 +42,15 @@ could not be patched, and what replaced them:
   is given up is the fast path for QUIC, which was getting its first packet
   through it and nothing more.
 
-  **Follow-up, deliberately not done here.** With no UDP socket ever marked,
-  the two `cgroup/sendmsg` programs can no longer set a mark, and they can no
-  longer strip one either: a strip fires only for *our current* mark, which by
-  construction can only be on a TCP socket, while any other value takes the
-  `FOREIGN_MARK` early return and is left alone. They are provably dead except
-  as a speed bump against a process that forges the mark on an unconnected UDP
-  socket - which, holding CAP_NET_RAW, can simply set it again. Removing them
-  would delete two programs and ~300 verifier instructions each.
-
-  Not free, though. `fast_path_attached()` uses their pins as the inherited
-  path's only evidence of which connect variant is running, so that signal
-  needs replacing first. Whether it would unlock 5.10 has been claimed both
-  ways here and both claims were premature: the rung that used to stop the
-  ladder earlier (`lifecycle_pinned`) is gone, so what decides 5.10 now is
-  whether its `sched_process_exit` record exposes `group_dead`
-  (`exit_precise`) - and nothing in CI attaches an engine on 5.10, so nothing
-  has measured that. Find out before promising either. Worth doing the next
-  time the ABI moves for another reason, not on its own.
+  **Resolved on this branch.** With no UDP socket ever marked, the two
+  `cgroup/sendmsg` programs can only strip a mark somebody forged onto an
+  unconnected UDP socket, so their absence no longer refuses the fast path - it
+  is a caveat in the report. The inherited path stopped using their pins as
+  evidence of which connect variant runs; `attach` now leaves a directory
+  marker in bpffs once the cookie variants took, and that is what a restart
+  reads. The programs themselves stay: where the kernel verifies them they are
+  worth their ~270 instructions as defence in depth, and removing them is an
+  ABI change for another day.
 - *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
   default. A published mark value is a bypass token. The value is drawn at
   random per start and lives in a pinned map and an nftables set, never in a
@@ -82,20 +73,24 @@ the reason in `cfc status` - unless enforcement is pinned, exit is detected
 exactly (`group_dead`), their ring consumers running, the cookie connect
 variants *and* the sendmsg hooks verified, the nftables set present and holding
 this daemon's mark, and `[ebpf] fast_allow` is set. Whether the exec/exit links
-could be *pinned* is not on that list any more: it decides the grant deadline
-(sixty seconds, or six) rather than whether the path runs at all. That change
-was first written up as "5.10-5.14 get the fast path", and it does not: the
-`group_dead` rung refuses those kernels first, and the matrix shows
-`group_dead` absent on 6.12 and present on 6.18. **So the fast path today
-needs a kernel newer than anything RHEL ships**, and the reason is exit
-precision, not the sendmsg hooks - on 5.10 those are refused too (`unknown
-func bpf_getsockopt#57` on a sendmsg hook, accepted from 6.12), but the ladder
-never gets that far. Whether exit precision could itself be degraded rather
-than refused is the real question for reaching RHEL, and it is harder than the
-deadline was: without `group_dead` the daemon's own eviction is wrong while it
-is alive, so a shorter deadline bounds nothing - it would take something like a
-periodic orphan sweep on the heartbeat. Not attempted here. **Off by default** for this release: the
-blast radius named above has not changed, only its edges.
+could be *pinned* is not on that list any more, and neither is whether exit is
+detected *exactly* (`group_dead`) or whether enforcement is *pinned*: each of
+those used to refuse the path, and each was the wrong instrument. Now the
+decision is a pure function (`fast_path_decision`, with a test) that **refuses**
+only where nothing could ever mark (config off, no maps, basic connect variants)
+or nothing could ever evict (exit not tracked), and **reduces** otherwise:
+unpinned lifecycle links or leader-only exit detection both drop the deadline to
+six seconds refreshed every two, and leader-only exit also makes every beat
+sweep the granted pids against the start time recorded at grant - because there
+the kernel can miss a death while the daemon is alive, and no deadline bounds a
+grant the heartbeat keeps refreshing. `Enforcement` is not an input at all:
+refusing Process mode was backwards, since there everything dies with the
+daemon. The matrix shows `group_dead` absent on 5.10 and 6.12 and present on
+6.18, so this is what puts the fast path within reach of the kernels RHEL
+ships; nothing in CI has yet run it there with a rule engine attached, so that
+reach is reasoned from the ladder and the guest logs, not observed.
+**Off by default** for this release: the blast radius named above has not
+changed, only its edges.
 
 An adversarial review of the *implementation* then found 23 confirmed defects
 on top of the design's 59, all fixed on this branch. The ones worth

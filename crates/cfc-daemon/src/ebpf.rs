@@ -378,11 +378,10 @@ pub fn enforcement_level() -> Option<Enforcement> {
 ///
 /// Two-way, with the reason attached. `Off` carries *why*, because the path
 /// has many ways to be silently inert - the config switch, a kernel whose
-/// verifier lacks `bpf_setsockopt` on sock_addr or on sendmsg, exit tracking
-/// without a readable `group_dead`, ring consumers that did not start, an
-/// nftables set the snippet does not declare, a table that is not loaded yet,
-/// a ruleset reload that emptied the set - and a feature that is off for a
-/// reason nobody can read is
+/// verifier lacks `bpf_setsockopt` on sock_addr, exit not tracked at all, ring
+/// consumers that did not start, an nftables set the snippet does not declare,
+/// a table that is not loaded yet, a ruleset reload that emptied the set - and
+/// a feature that is off for a reason nobody can read is
 /// a feature nobody can rely on. That lesson was learned once already with the
 /// enforcement level above.
 ///
@@ -396,16 +395,20 @@ pub enum FastAllow {
     /// Marks are being set and the nftables set holds this daemon's value.
     ///
     /// `deadline_secs` is how long a grant outlives a daemon that stops
-    /// refreshing it. It is the full [`fast_allow::DEADLINE_SECS`] when the
-    /// exec/exit tracepoint links are pinned - they go on clearing grants
-    /// without a daemon, so the deadline is a backstop - and the shorter
-    /// [`fast_allow::DEADLINE_SECS_UNPINNED`] when they are not, where it is
-    /// the only thing standing between a dead daemon and a recycled pid.
+    /// refreshing it: the full [`fast_allow::DEADLINE_SECS`] when every
+    /// guarantee holds, the shorter [`fast_allow::DEADLINE_SECS_REDUCED`] when
+    /// one does not. `reduced` says which - the exec/exit links could not be
+    /// pinned, or exit is detected by leader only and grants are swept every
+    /// beat - or is `None` for the full guarantee.
     ///
     /// Carried rather than assumed, because a status line that says `live`
     /// without saying which guarantee is a status line that misleads on
-    /// exactly the kernels where the guarantee is weaker.
-    Live { deadline_secs: u64 },
+    /// exactly the kernels where the guarantee is weaker. Two different
+    /// weaknesses give the same six seconds, so the number alone would not do.
+    Live {
+        deadline_secs: u64,
+        reduced: Option<String>,
+    },
     /// Not doing anything, and this is the one sentence that says why.
     Off(String),
 }
@@ -414,14 +417,17 @@ impl FastAllow {
     /// One token plus the reason, for `cfc status`: `live` or `off: <why>`.
     pub fn describe(&self) -> String {
         match self {
-            Self::Live { deadline_secs }
-                if *deadline_secs == cfc_ebpf_common::fast_allow::DEADLINE_SECS =>
-            {
-                "live".to_string()
-            }
-            Self::Live { deadline_secs } => {
-                format!("live, grants lapse within {deadline_secs}s")
-            }
+            Self::Live {
+                reduced: None,
+                deadline_secs,
+            } if *deadline_secs == cfc_ebpf_common::fast_allow::DEADLINE_SECS => "live".to_string(),
+            Self::Live {
+                deadline_secs,
+                reduced,
+            } => match reduced {
+                Some(why) => format!("live, grants lapse within {deadline_secs}s ({why})"),
+                None => format!("live, grants lapse within {deadline_secs}s"),
+            },
             Self::Off(why) => format!("off: {why}"),
         }
     }
@@ -494,7 +500,11 @@ pub struct Report {
     /// Whether process exit is detected exactly (`group_dead` read from the
     /// tracepoint record) rather than approximated by leader exit. A deny
     /// evicted late is an inconvenience; a fast-allow grant evicted late is a
-    /// mark on a recycled pid, so the fast path requires the exact answer.
+    /// mark on a recycled pid - so when this is false the fast path runs with
+    /// the reduced deadline and sweeps its grants on every heartbeat, dropping
+    /// any pid whose start time no longer matches the one recorded at grant.
+    /// It used to refuse the path outright, which withheld it from every
+    /// kernel without `group_dead` - 5.10 and 6.12 in the matrix.
     pub exit_precise: bool,
     /// Whether *both* lifecycle tracepoint links were pinned to bpffs, rather
     /// than merely attached.
@@ -505,15 +515,13 @@ pub struct Report {
     /// read-only bpffs - which keeps eviction working for as long as this
     /// daemon runs and stops the moment it does not. The connect programs' own
     /// links are pinned separately and go on marking sockets either way, so
-    /// and this flag is what tells them apart.
+    /// the difference is whether a grant can outlive this daemon at all - and
+    /// this flag is what tells the two cases apart.
     ///
-    /// It chooses the grant deadline rather than gating the path: pinned gets
-    /// the full [`fast_allow::DEADLINE_SECS`], unpinned the short
-    /// [`fast_allow::DEADLINE_SECS_UNPINNED`], and `cfc status` names which.
-    /// For a day it was a rung on the eligibility ladder instead. Note that
-    /// turning it into a deadline did not open the fast path to 5.10-5.14 as
-    /// was first claimed: those kernels lack `group_dead` and are refused at
-    /// the exit-precision rung before this flag is consulted.
+    /// It is one of the two facts that select the reduced deadline rather than
+    /// gating the path - the other is `exit_precise` - and `cfc status` names
+    /// which of the two applies. For a day it was a rung on the eligibility
+    /// ladder instead.
     pub lifecycle_pinned: bool,
 }
 
