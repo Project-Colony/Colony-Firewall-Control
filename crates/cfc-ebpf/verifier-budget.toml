@@ -73,31 +73,37 @@ max = 40000
 # 318 on the first matrix run. Three times the instructions
 # for the whole round trip: still the cheapest millisecond on offer.
 #
-# 318 predates the protocol guard - the test that keeps this hook from marking
-# a socket that will never pass a hook again - and how that guard was *written*
-# turned out to matter far more than what it tests. Measured on 6.12, where the
-# pre-guard number is 356:
+# 318 was the number before the protocol guard - the test that keeps this hook
+# from marking a socket that will never pass a hook again - and how that guard
+# was *written* turned out to matter more than what it tests. Measured on 6.12,
+# where the pre-guard number is 356:
 #
 #   flag at the top of mark_decision, live across the whole body   474  (over)
 #   same flag computed one line before its only use                494  (over)
-#   folded into `granted`, no extra boolean, one fewer tail branch  ~356 expected
+#   folded into `granted`, no extra boolean, one fewer tail branch 412  (under)
 #
 # The cost was never the context load. It was a second boolean alive across the
-# setsockopt and the three counter arms, which makes the verifier walk that tail
-# in four states instead of two; moving the computation later did not help
-# because the live range that mattered was the one *after* it. Folding the test
-# into `granted` removes the boolean and one arm, and brings the object section
-# back to within 8 bytes of the pre-guard build.
+# setsockopt, its error path and the three counter arms, which makes the
+# verifier walk that tail in four states instead of two; moving the computation
+# later did not help, because the live range that mattered was the one *after*
+# it. Folding the test into `granted` removes the boolean and one arm.
 #
-# `max` is the check and `observed` is only ever a real measurement, so the
-# number below stays at the 7.1.8 reading until a matrix run replaces it.
-observed = 318
-max = 450
+# One inference to distrust next time: the folded build's on-disk section came
+# back to within 8 bytes of the pre-guard one, and the verifier still charges
+# +66. Section size is not a proxy for verifier cost, and only the matrix knows.
+#
+# `max` goes 450 -> 600 with that measurement in hand. Not to turn red green -
+# the ceiling did its job twice here - but because 384 against 450 leaves 17%,
+# and this file's own rule is roughly 2x, "enough headroom that ordinary edits
+# do not trip it". A deliberate, measured, then optimised addition is exactly
+# when the ceiling moves.
+observed = 384
+max = 600
 
 [cfc_connect6]
 # A few more than v4: the address copy is four words instead of one.
-observed = 323
-max = 450
+observed = 389
+max = 600
 
 # The mark decision alone: no deny lookup, no cookie, no ring record unless a
 # grant is honoured. Note what the matrix taught on the first run: 5.10
@@ -105,13 +111,18 @@ max = 450
 # while the same helper verifies on the connect hooks of that kernel - and
 # 6.12 onward accepts them. That is why the fast path is off with its reason
 # on the matrix floor rather than half-present.
+#
+# These two carry the protocol guard as well, and now pay for a decision they
+# can no longer reach: with only TCP ever marked, nothing here ever sets a mark
+# and there is none of ours left to strip. See TODO.md - removing them would
+# take this cost and the 5.10 restriction with it.
 [cfc_sendmsg4]
-observed = 257
-max = 350
+observed = 297
+max = 400
 
 [cfc_sendmsg6]
-observed = 259
-max = 350
+observed = 299
+max = 400
 
 # The no-cookie twins, for kernels whose verifier does not offer
 # bpf_get_socket_cookie to sock_addr programs. Identical enforcement, no
