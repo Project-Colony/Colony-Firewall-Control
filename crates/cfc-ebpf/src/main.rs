@@ -1133,15 +1133,26 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8, at_connect: bool)
     // Unconnected UDP is unaffected: `sendto` carries a destination, so it
     // passes the sendmsg hooks and is re-decided on every datagram. TCP is
     // unaffected: it passes this hook for every connection it opens.
-    if at_connect {
+    //
+    // **Never set, always strip.** This must not return early, and the first
+    // version of it did - which reopened the hole it was written to close, by
+    // the door it had just built. A socket can be marked by a sendmsg hook and
+    // *then* connected:
+    //
+    //     socket() -> sendto(peer)   the sendmsg hook marks it
+    //     connect(peer)              this hook - the last one it will ever see
+    //     send()                     no hook, forever
+    //
+    // Returning here left that mark in place with nothing left to remove it,
+    // which is strictly worse than the behaviour being fixed: the old code at
+    // least re-decided such a socket and stripped the mark when the grant was
+    // gone. So the flag below only forces the *wanted* mark to zero and lets
+    // the strip below run exactly as it does for any other refusal.
+    let refuse_udp = at_connect && {
         // SAFETY: a context field the verifier permits a `cgroup_sock_addr`
         // program to read directly.
-        let protocol = unsafe { (*ctx.sock_addr).protocol };
-        if protocol == IPPROTO_UDP {
-            bump(enforce_stat::UNKNOWN);
-            return;
-        }
-    }
+        (unsafe { (*ctx.sock_addr).protocol }) == IPPROTO_UDP
+    };
 
     // Unarmed: the daemon never drew a value, or disarmed on the way out.
     // Nothing to set, and nothing of ours to strip either.
@@ -1186,7 +1197,7 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8, at_connect: bool)
     // because every generated helper is.
     let fresh = unsafe { bpf_ktime_get_boot_ns() } < until;
 
-    let want = if granted && fresh { mark } else { 0 };
+    let want = if granted && fresh && !refuse_udp { mark } else { 0 };
     if current != want {
         let mut value = want;
         // SAFETY: as for the read above.
@@ -1210,6 +1221,13 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8, at_connect: bool)
     if want != 0 {
         bump(enforce_stat::ALLOWED);
         report_connect(&ALLOW_EVENTS, ctx, tgid, family);
+    } else if refuse_udp {
+        // Refused because it is a UDP `connect()`, not because anything is
+        // wrong. Counted as a fall-through to the packet path, which is
+        // exactly what it is - and never as STALE, which would read as "the
+        // daemon stopped refreshing" and send someone to look at a heartbeat
+        // that is perfectly healthy.
+        bump(enforce_stat::UNKNOWN);
     } else if granted {
         // Granted but the deadline has passed: the daemon that granted this is
         // not refreshing. Counted so "the fast path stopped" has a reading.

@@ -384,6 +384,12 @@ anything while its peer stays *silent* - and unreplied UDP is conntrack-NEW on
 every datagram, which is precisely the shape in which an unrevocable mark does
 the most damage. The benefit and the hazard were the same case.
 
+The connect hook still *strips* a mark from such a socket - it only never
+*sets* one. That distinction is the whole of it: a UDP socket can be marked by
+a sendmsg hook and connected afterwards (`sendto`, then `connect`, then bare
+`send`), and if the connect hook simply declined to act, that mark would sit
+there with nothing left in its life able to remove it. Never set, always strip.
+
 Unconnected UDP keeps the fast path in full: `sendto` carries a destination, so
 it passes the sendmsg hooks and is re-decided on every datagram. TCP keeps it in
 full: it passes the connect hook for every connection it opens. What is given up
