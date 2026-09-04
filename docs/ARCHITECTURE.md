@@ -369,8 +369,8 @@ bypass value.
 **Where revocation reaches.** A grant is re-decided at every hook that opens a
 flow: `connect()`, and a `sendmsg` that carries a destination. Deleting the
 rule, replacing it with a Block, the process exec'ing, the process exiting, and
-the daemon going away for more than a minute all take effect at the next such
-hook, which is what makes the mark safe to hand out at all.
+the daemon going away for more than one deadline all take effect at the next
+such hook, which is what makes the mark safe to hand out at all.
 
 **Only a TCP socket is ever marked.** The property that decides this is not
 the protocol but whether a socket passes one of our hooks *again* after it is
@@ -416,10 +416,19 @@ than `live`, because one word for two different guarantees misleads on exactly
 the kernels where the weaker one applies.
 
 Refusing the feature there was the first design and it was the wrong
-instrument: it withheld the fast path from every kernel between 5.10 and 5.14 -
-the RHEL floor this project targets - for a risk the deadline already bounds.
-Both numbers are the daemon's alone; the kernel only ever compares
-`now < until`, so this is no part of the ABI.
+instrument for a risk the deadline already bounds. Both numbers are the daemon's
+alone; the kernel only ever compares `now < until`, so this is no part of the
+ABI.
+
+Be exact about who this reaches, because the first write-up was not: it does
+**not** bring the fast path to 5.10-5.14. A kernel whose `sched_process_exit`
+record has no `group_dead` field is refused one rung earlier, at exit
+precision, and that refusal stands - without exact exit detection the daemon's
+*own* eviction is wrong while it is alive, and no deadline bounds a grant the
+heartbeat keeps refreshing. The matrix shows `group_dead` absent on 6.12 and
+present on 6.18, so the fast path today needs a kernel at least that new, and
+the shortened deadline serves the ones that have `group_dead` but cannot pin a
+perf-event link: a modern kernel with a read-only bpffs.
 
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated

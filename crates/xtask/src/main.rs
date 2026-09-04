@@ -88,9 +88,12 @@ const SHT_SYMTAB: u32 = 2;
 /// The list is maintained by hand - this crate takes no dependencies, so it
 /// cannot import the daemon's constants - which means it drifts, and it has:
 /// the fast path added four maps and two programs to the loader and only the
-/// programs were added here. Every `MAP_*` and `PROG_*`/`LINK_*` constant in
-/// `cfc-daemon/src/ebpf/{loader,enforce}.rs` has to appear below; `grep -h
-/// 'const MAP_' crates/cfc-daemon/src/ebpf/*.rs` is the list to check against.
+/// programs were added here. Every `MAP_*` and `PROG_*` constant in
+/// `cfc-daemon/src/ebpf/{loader,enforce}.rs` has to appear below - and *not*
+/// the `LINK_*` ones, which are bpffs pin file names, not ELF symbols; an
+/// earlier version of this sentence would have sent someone adding "sendmsg4"
+/// to a list the object can never satisfy. `grep -hE 'const (MAP|PROG)_'
+/// crates/cfc-daemon/src/ebpf/*.rs` is the list to check against.
 const REQUIRED_SYMBOLS: &[&str] = &[
     // programs (aya keys `program_mut` on the symbol, not the section)
     "cfc_sched_process_exec",

@@ -204,9 +204,10 @@ libs_read_lib_files(colony_firewalld_t)
 # the probe that tells a missing set from a missing table, and `get element`
 # is the periodic check that the mark is still accepted after a ruleset
 # reload. Nor is it twice in a daemon's life: the nft unit starts *after* the
-# daemon, so arming is a retry every ten seconds until the table appears, and
-# once armed the check runs every sixty. On a host where this is denied that
-# is an AVC every ten seconds, for as long as the daemon runs with
+# daemon, so arming is a retry on every heartbeat - ten seconds, or two on a
+# kernel that cannot pin the exec/exit tracepoint links - until the table
+# appears, and once armed the check runs every sixty. On a host where this is
+# denied that is an AVC every heartbeat, for as long as the daemon runs with
 # fast_allow = true - loud on purpose, but worth knowing before reading a log.
 #
 # A denial costs the fast path and nothing else. The daemon reports it as off

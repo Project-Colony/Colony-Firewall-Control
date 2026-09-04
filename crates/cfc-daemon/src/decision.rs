@@ -704,12 +704,16 @@ mod tests {
         assert_eq!(engine.process_wide_action(&without), Some(Action::Deny));
     }
 
-    /// An expired rule must drop out of what gets compiled into the kernel.
+    /// The eligibility predicate, reached the way the daemon reaches it: through
+    /// `process_wide_verdict` on a real engine with a real rule, one case per
+    /// shape of answer.
     ///
-    /// The kernel table is rebuilt on rule edits, and expiry is not one. The
-    /// packet path already skips expired rules, so a stale entry would only
-    /// overstate a denial - but it would keep overstating it after the daemon
-    /// is gone, which is the state this whole layer exists to make trustworthy.
+    /// The exhaustive version further down tests the predicate on its own over
+    /// the whole Action x Duration space; this one is the through-the-engine
+    /// complement, and the pair is deliberate. (The doc comment that used to
+    /// sit here described a rule-expiry test that lives elsewhere - a leftover
+    /// from a move, and a reader looking for the expiry test would have been
+    /// sent to the wrong function.)
     #[test]
     fn only_lasting_allows_are_fast_allow_eligible() {
         // The fast path re-checks grants on flow starts and rule changes, not
@@ -885,6 +889,12 @@ mod tests {
         assert_eq!(engine.process_wide_action(&proc), Some(Action::Allow));
     }
 
+    /// An expired rule must drop out of what gets compiled into the kernel.
+    ///
+    /// The kernel table is rebuilt on rule edits, and expiry is not one. The
+    /// packet path already skips expired rules, so a stale entry would only
+    /// overstate a denial - but it would keep overstating it after the daemon
+    /// is gone, which is the state this whole layer exists to make trustworthy.
     #[test]
     fn an_expired_rule_is_not_compilable() {
         let mut scope = RuleScope::any();

@@ -53,9 +53,13 @@ could not be patched, and what replaced them:
 
   Not free, though. `fast_path_attached()` uses their pins as the inherited
   path's only evidence of which connect variant is running, so that signal
-  needs replacing first. And it does **not** unlock 5.10: that was claimed here
-  once and was wrong - the eligibility ladder stops earlier. Worth doing the
-  next time the ABI moves for another reason, not on its own.
+  needs replacing first. Whether it would unlock 5.10 has been claimed both
+  ways here and both claims were premature: the rung that used to stop the
+  ladder earlier (`lifecycle_pinned`) is gone, so what decides 5.10 now is
+  whether its `sched_process_exit` record exposes `group_dead`
+  (`exit_precise`) - and nothing in CI attaches an engine on 5.10, so nothing
+  has measured that. Find out before promising either. Worth doing the next
+  time the ABI moves for another reason, not on its own.
 - *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
   default. A published mark value is a bypass token. The value is drawn at
   random per start and lives in a pinned map and an nftables set, never in a
@@ -79,13 +83,18 @@ exactly (`group_dead`), their ring consumers running, the cookie connect
 variants *and* the sendmsg hooks verified, the nftables set present and holding
 this daemon's mark, and `[ebpf] fast_allow` is set. Whether the exec/exit links
 could be *pinned* is not on that list any more: it decides the grant deadline
-(sixty seconds, or six) rather than whether the path runs at all - refusing it
-withheld the feature from 5.10 through 5.14 for a risk the deadline bounds. The matrix drew that last line on
-the first run: 5.10 accepts `bpf_getsockopt` on a connect hook and refuses it
-on a sendmsg hook (`unknown func bpf_getsockopt#57`), 6.12 accepts both - so
-on the RHEL-floor kernel the fast path reports itself off with that sentence,
-rather than shipping half-present without the UDP re-decision that closes the
-reused-socket hole. **Off by default** for this release: the
+(sixty seconds, or six) rather than whether the path runs at all. That change
+was first written up as "5.10-5.14 get the fast path", and it does not: the
+`group_dead` rung refuses those kernels first, and the matrix shows
+`group_dead` absent on 6.12 and present on 6.18. **So the fast path today
+needs a kernel newer than anything RHEL ships**, and the reason is exit
+precision, not the sendmsg hooks - on 5.10 those are refused too (`unknown
+func bpf_getsockopt#57` on a sendmsg hook, accepted from 6.12), but the ladder
+never gets that far. Whether exit precision could itself be degraded rather
+than refused is the real question for reaching RHEL, and it is harder than the
+deadline was: without `group_dead` the daemon's own eviction is wrong while it
+is alive, so a shorter deadline bounds nothing - it would take something like a
+periodic orphan sweep on the heartbeat. Not attempted here. **Off by default** for this release: the
 blast radius named above has not changed, only its edges.
 
 An adversarial review of the *implementation* then found 23 confirmed defects

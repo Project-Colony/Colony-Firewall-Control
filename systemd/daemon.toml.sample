@@ -267,10 +267,12 @@ enabled = true
 # # Silently inert without the layer pinned or inherited, exit tracking and
 # # the cookie programs; `cfc status` prints the reason. Needs a restart.
 # #
-# # On a kernel that cannot pin the exec/exit tracepoint links - before 5.15,
-# # or with a read-only bpffs - the path still runs, with a six-second grant
-# # deadline instead of sixty. `cfc status` says which. That is the window a
-# # daemon killed uncleanly leaves before the kernel stops honouring grants.
+# # Needs a kernel whose exit tracepoint carries `group_dead` (6.18 has it,
+# # 6.12 does not) - without it the path is refused and `cfc status` says so.
+# # On a kernel that has it but cannot pin the exec/exit tracepoint links (a
+# # read-only bpffs) the path still runs, with a six-second grant deadline
+# # instead of sixty; `cfc status` says which. That is the window a daemon
+# # killed uncleanly leaves before the kernel stops honouring grants.
 # fast_allow = false
 
 # # The mark value, when this machine needs a specific one. Needs a restart.

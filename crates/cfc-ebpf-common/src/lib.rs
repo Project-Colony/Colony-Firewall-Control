@@ -254,8 +254,9 @@ pub mod enforce_stat {
 ///   there. Since kernel 5.17 `SO_MARK` needs only `CAP_NET_RAW` - which
 ///   docker grants by default, and a `--network=host` container sits in the
 ///   host's output chain - so a published value would be a bypass token for
-///   any such process. A random one is guessable only by 2^32 connections
-///   through a queue that prompts on every miss.
+///   any such process. A random one is guessable only by brute force - about
+///   2^30 candidates once the daemon has excluded the bits well-known fwmark
+///   consumers select on - through a queue that prompts on every miss.
 /// * the **deadline** is a `CLOCK_BOOTTIME` instant, not `CLOCK_MONOTONIC`:
 ///   a sixty-second deadline must be sixty wall-clock seconds, not sixty awake
 ///   seconds across a laptop suspend. The daemon refreshes it every
@@ -284,11 +285,19 @@ pub mod fast_allow {
     /// only thing left: the exposure is a granted pid exiting, being recycled,
     /// and its new owner connecting, all inside one deadline.
     ///
-    /// The fast path used to be refused outright on such a kernel. That
-    /// refused the feature where degrading the parameter was enough - and it
-    /// refused it on every kernel from 5.10 to 5.14, which is the RHEL floor
-    /// this project targets. Ten times shorter costs one eight-byte map write
-    /// every two seconds and shrinks the window by the same factor.
+    /// The fast path used to be refused outright on such a kernel; degrading
+    /// the parameter is enough, and ten times shorter costs one eight-byte map
+    /// write every two seconds while shrinking the window by the same factor.
+    ///
+    /// Be exact about who this reaches, because the first version of this
+    /// comment was not. It was written as "5.10 to 5.14 get the fast path",
+    /// and they do not: a kernel without `group_dead` in its exit tracepoint
+    /// is refused one rung *earlier*, at exit precision, and that refusal
+    /// stands (see the ladder). The matrix shows `group_dead` absent on 6.12
+    /// and present on 6.18, so the kernels this pair actually serves are the
+    /// ones that have it but cannot pin a perf-event link - in practice a
+    /// modern kernel with a read-only bpffs. Narrower than claimed, and still
+    /// worth having: refusing there was the wrong instrument regardless.
     ///
     /// Both numbers are the daemon's alone: the kernel only ever compares
     /// `now < until`, so this changes no ABI and no kernel program.

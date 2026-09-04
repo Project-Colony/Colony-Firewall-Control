@@ -554,9 +554,11 @@ impl VerdictSink {
     /// rule added for a running process was honoured by NFQUEUE
     /// (`source="rule"`) and the kernel counters never moved.
     ///
-    /// Cost, since it is no longer only map operations: three small /proc
-    /// reads per recently-exec'd process, three more per orphan, and one walk
-    /// of /proc for `sweep_fast_allow` at the end. All of it on whichever
+    /// Cost, since it is no longer only map operations: a handful of small
+    /// /proc reads per process - three for the view, one to re-date it before
+    /// the deny write, and up to three more inside `grant_if_still` when the
+    /// answer is a grant - for every recently-exec'd process and every orphan,
+    /// and one walk of /proc for `sweep_fast_allow` at the end. All of it on whichever
     /// thread changed the rules - an IPC handler or startup, never the packet
     /// path - and only when a human or the CLI actually changed something.
     ///
@@ -858,8 +860,9 @@ impl VerdictSink {
     ///   never saw it either. The feature only ever worked for a process that
     ///   exec'd *after* the daemon and less than an hour before its rule.
     ///
-    /// So this walks /proc. O(processes) of three small reads each, on
-    /// whichever thread changed the rules - an IPC handler or startup, never
+    /// So this walks /proc. O(processes), three small reads each and up to
+    /// three more for the ones a rule grants, on whichever thread changed the
+    /// rules - an IPC handler or startup, never
     /// the packet path - and rule changes are paced by a human or the CLI.
     ///
     /// It only ever *adds*. Withdrawal is already covered and must stay where
@@ -1524,9 +1527,16 @@ pub(super) enum FastPathCapability {
     /// about, and would have sent a reader chasing a kernel version for an
     /// EEXIST. The real error is in the log line beside it.
     ///
-    /// The fast path needs both hooks - a connected UDP socket can still
-    /// `sendto` another peer without re-passing the connect hook, so without
-    /// the sendmsg re-decision a stale mark would follow it there.
+    /// What the sendmsg hooks are *for* has changed under this variant, and
+    /// the reason it still switches the path off deserves to be read rather
+    /// than inherited. They used to re-decide a UDP socket's mark per
+    /// datagram; no UDP socket is marked any more, so all they can do now is
+    /// strip a mark somebody *forged* onto an unconnected UDP socket - a
+    /// process that was granted, learned the value with `getsockopt`, was
+    /// revoked, and set it back. That is defence in depth against a narrow
+    /// attacker, not the load-bearing half of the design it was when this
+    /// variant was written. Whether its absence should still refuse the whole
+    /// fast path is an open question recorded in TODO.md, not a settled one.
     SendmsgUnavailable,
     /// Inherited pins, and no sendmsg pins beside them.
     ///

@@ -1063,15 +1063,16 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
     }
 }
 
+/// `IPPROTO_TCP`. The only protocol whose sockets are ever marked - read from
+/// the sock_addr context. See `mark_decision`. Protocol numbers are the same on
+/// every architecture, unlike the two below.
+const IPPROTO_TCP: u32 = 6;
+
 /// `SOL_SOCKET` / `SO_MARK` from the Linux UAPI, spelled here because the
 /// generated bindings carry helpers, not socket option numbers. These are the
 /// x86_64 (and aarch64) values; `ExclusiveArch: x86_64` in the spec is what
 /// makes hardcoding them honest. Alpha, MIPS, PA-RISC and SPARC number
 /// `SO_MARK` differently.
-/// `IPPROTO_TCP`. The only protocol whose sockets are ever marked - read from
-/// the sock_addr context. See `mark_decision`.
-const IPPROTO_TCP: u32 = 6;
-
 const SOL_SOCKET: i32 = 1;
 const SO_MARK: i32 = 36;
 
@@ -1086,21 +1087,15 @@ const SO_MARK: i32 = 36;
 /// but "set the mark if the grant is current and *strip it* if it is not",
 /// every time one of these hooks runs.
 ///
-/// Which is not the same as "at every flow start", and the difference is this
-/// feature's sharpest edge. `cgroup/connect{4,6}` runs at `connect()`;
+/// Which is not the same as "at every flow start", and the difference is why
+/// only TCP is ever marked. `cgroup/connect{4,6}` runs at `connect()`;
 /// `cgroup/sendmsg{4,6}` runs for a send that carries a destination. A
-/// **connected UDP socket** passes neither again: its `send()` calls take the
-/// connected path, so whatever mark it was given at `connect()` is the mark it
-/// keeps until it is closed.
-///
-/// For TCP that costs nothing - the ruleset queues `ct state new`, and an
-/// established connection is not that with or without a mark. For UDP it is a
-/// real hole, and conntrack does not close it: this project's own packet path
-/// records that *unreplied* UDP is conntrack-NEW on every datagram (see
-/// `nfqueue.rs`), so a connected UDP socket talking to something that never
-/// answers presents every datagram as a new flow, and a stale mark takes every
-/// one of them past the queue. `docs/ARCHITECTURE.md` states the boundary; it
-/// is one of the reasons the whole path is opt-in.
+/// **connected UDP socket** passes neither again, so a mark given to one could
+/// never be taken back - and unreplied UDP is conntrack-NEW on every datagram
+/// (see `nfqueue.rs`), so that mark would carry every datagram past the queue
+/// for as long as the socket lived. The body below is the allowlist that
+/// closes this; `docs/ARCHITECTURE.md` records the two narrower rules that
+/// leaked first.
 ///
 /// Sockets that already carry a mark of their own are left alone entirely,
 /// in both directions: a VPN or proxy that marks its sockets for policy
@@ -1289,11 +1284,9 @@ pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
 /// The mark decision for UDP that never calls `connect()`.
 ///
 /// `sendto()` on an unconnected socket starts a new flow without ever passing
-/// the connect hooks, so a socket marked at some earlier `connect()` and then
-/// reused toward another destination would carry a decision nobody re-made.
-/// These hooks close that, with the same `mark_decision`. No refusal here -
-/// the in-kernel deny is a `connect()` thing, and unconnected UDP has always
-/// been the packet path's to refuse.
+/// the connect hooks. These hooks run the same `mark_decision` there. No
+/// refusal here - the in-kernel deny is a `connect()` thing, and unconnected
+/// UDP has always been the packet path's to refuse.
 ///
 /// **Not "on every datagram send"**, which is what this comment used to claim
 /// and what the design was reviewed against. `cgroup/sendmsg{4,6}` runs for a
@@ -1302,10 +1295,15 @@ pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
 /// keep whatever mark it was given at `connect()` for as long as it is open -
 /// past a revocation, past the deadline, past the daemon's death.
 ///
-/// That is why `mark_decision` refuses to mark a UDP socket at `connect()` at
-/// all. These hooks are then the *only* place a UDP socket is ever marked, and
-/// every one of them is re-decided per datagram, which is what makes the mark
-/// safe to hand out here.
+/// That is why `mark_decision` never marks a UDP socket at all, from either
+/// hook - see the allowlist there. What these hooks still do for UDP is the
+/// other half of the decision: a socket that carries our mark without having
+/// been granted it - forged by a process that learned the value and was then
+/// revoked - has it stripped on its next addressed send. Defence in depth, per
+/// datagram, on the one socket type the connect hook cannot reach again. Two
+/// earlier versions of this paragraph described designs that had already been
+/// replaced; the test in `cargo xtask ebpf-check` that the kernel never writes
+/// the grant map is what this one rests on.
 ///
 /// No `_basic` twins: these exist only for the fast path, which the basic
 /// variants do not have, so on a kernel that verifies only the basic connect

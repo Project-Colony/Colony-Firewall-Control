@@ -144,8 +144,7 @@ fn shutdown_gate() -> std::sync::MutexGuard<'static, bool> {
 ///
 /// Flushes first, so the set is left holding exactly this daemon's value
 /// rather than this one added to whatever a predecessor left. Refuses once
-/// [`disarm_for_shutdown`] has run - see [`SHUTDOWN`], whose doc comment this
-/// one was accidentally donated to when that gate was added.
+/// [`disarm_for_shutdown`] has run - see [`SHUTDOWN`].
 pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
     if mark == fast_allow::UNARMED {
         bail!(
@@ -227,8 +226,13 @@ pub(super) fn holds(mark: u32) -> anyhow::Result<bool> {
 }
 
 /// Flushes `set fast_allow`, so that no value (this daemon's or a previous
-/// one's) is accepted by the ruleset. Called at every start before arming,
-/// and at shutdown.
+/// one's) is accepted by the ruleset.
+///
+/// This is the plain flush: the late withdrawal in `load_and_attach` calls it
+/// when the ring consumers failed after arming. The start and shutdown
+/// flushes are [`disarm_for_start`] and [`disarm_for_shutdown`], which also
+/// move the gate - an earlier version of this comment named them as this
+/// function's callers, and they are not.
 ///
 /// A missing table or a missing set is success: there is nothing in either
 /// that could accept a mark, and at shutdown the table is usually already

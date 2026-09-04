@@ -1088,16 +1088,26 @@ pub(super) fn load_and_attach(
                     // and its new owner connecting, all inside one deadline.
                     //
                     // This was a rung on the ladder above for a day, and that
-                    // was the wrong instrument: it refused the feature on every
-                    // kernel from 5.10 to 5.14 - the floor this project targets
-                    // - for a bounded risk the deadline already bounds. Ten
-                    // times shorter costs an eight-byte map write every two
-                    // seconds and shrinks the window by the same factor, and
-                    // `cfc status` says which guarantee is in force.
+                    // was the wrong instrument for a risk the deadline already
+                    // bounds. Ten times shorter costs an eight-byte map write
+                    // every two seconds and shrinks the window by the same
+                    // factor, and `cfc status` says which guarantee is in force.
+                    //
+                    // Who it reaches is narrower than it was first written up
+                    // as. It does *not* bring the fast path to 5.10-5.14: a
+                    // kernel without `group_dead` in its exit record fails the
+                    // `exit_precise` rung above, before this is ever consulted,
+                    // and the matrix shows `group_dead` absent on 6.12 and
+                    // present on 6.18. What this serves is a kernel that has
+                    // `group_dead` but cannot pin a perf-event link - a modern
+                    // kernel with a read-only bpffs. That rung stays a refusal
+                    // on purpose: without exact exit detection the daemon's
+                    // *own* eviction is wrong while it is alive, and no
+                    // deadline bounds a grant the heartbeat keeps refreshing.
                     (deadline_secs, heartbeat_secs) = deadline_pair(report.lifecycle_pinned);
                     if off.is_none() && !report.lifecycle_pinned {
                         let note = format!(
-                            "the exec/exit tracepoint links could not be pinned to bpffs, so                              their clears would not survive this daemon; fast-allow grants                              lapse within {deadline_secs}s instead of {}s",
+                            "the exec/exit tracepoint links could not be pinned to bpffs, so their clears would not survive this daemon; fast-allow grants lapse within {deadline_secs}s instead of {}s",
                             cfc_ebpf_common::fast_allow::DEADLINE_SECS
                         );
                         warn!("{note}");

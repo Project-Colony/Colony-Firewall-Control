@@ -10,10 +10,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Fast allow (opt-in, `[ebpf] fast_allow = true`).** A process a lasting
   rule allows outright no longer pays an NFQUEUE round trip per connection:
-  the `cgroup/connect4|6` hooks (and new `sendmsg4|6` hooks, for UDP sends
-  that carry a destination) mark its sockets with a value the daemon draws
-  at random on each start, and a `meta mark @fast_allow accept` rule the
-  snippet ships with an *empty* set takes them ahead of the queue. Grants
+  the `cgroup/connect4|6` hooks mark its TCP sockets with a value the daemon
+  draws at random on each start, and a `meta mark @fast_allow accept` rule the
+  snippet ships with an *empty* set takes them ahead of the queue. New
+  `sendmsg4|6` hooks run the same decision for UDP sends that carry a
+  destination; since no UDP socket is ever marked, what they do there is strip
+  a mark that should not be present. Grants
   reach processes that were already running, not only ones that exec after
   the rule: the daemon walks `/proc` at start and at every rule change. The
   mark is re-decided at every hook that opens a flow and stripped when the
@@ -41,17 +43,25 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Tailscale's, wg-quick's), and `[ebpf] fast_allow_mark` pins one by hand for a
   host with a selector it does not know.
 
-  On a kernel that cannot pin the exec/exit tracepoint links - no
-  `BPF_LINK_TYPE_PERF_EVENT` before 5.15, or a read-only bpffs - the path runs
-  with a six-second grant deadline refreshed every two seconds instead of sixty
-  and ten, and `cfc status` says `live, grants lapse within 6s`. Those links
+  On a kernel that has `group_dead` but cannot pin the exec/exit tracepoint
+  links - in practice a read-only bpffs, since perf-event links have been
+  pinnable since 5.15 - the path runs with a six-second grant deadline
+  refreshed every two seconds instead of sixty and ten, and `cfc status` says
+  `live, grants lapse within 6s`. Those links
   are what clears grants after the daemon dies, so without them the deadline is
   the only backstop; shortening it is the proportionate answer where refusing
-  the feature outright would have withheld it from every kernel between 5.10
-  and 5.14.
+  the feature outright was not. In practice that means a modern kernel with a
+  read-only bpffs - see the next paragraph for why not an older kernel.
 
-  Needs a kernel that allows `bpf_getsockopt` on `cgroup/sendmsg` hooks: 5.10
-  does not (and says so in the status line), 6.12 and later do.
+  Needs a kernel whose `sched_process_exit` tracepoint carries `group_dead`,
+  so that a process's death is told apart from one of its threads' - without
+  it a grant could outlive its process while the daemon is alive, which no
+  deadline bounds, so the path is refused there and the status line says so.
+  In the kernel matrix that is present on 6.18 and absent on 6.12, which puts
+  the floor for the fast path above every kernel RHEL currently ships. Also
+  needs `bpf_getsockopt` on `cgroup/sendmsg` hooks, which 5.10 refuses and
+  6.12 onward accepts - but that rung is never reached on the kernels
+  `group_dead` already excludes.
 
 ### Changed
 

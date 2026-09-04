@@ -379,10 +379,10 @@ pub fn enforcement_level() -> Option<Enforcement> {
 /// Two-way, with the reason attached. `Off` carries *why*, because the path
 /// has many ways to be silently inert - the config switch, a kernel whose
 /// verifier lacks `bpf_setsockopt` on sock_addr or on sendmsg, exit tracking
-/// without a readable `group_dead`, tracepoint links that could not be
-/// pinned, ring consumers that did not start, an nftables set the snippet
-/// does not declare, a table that is not loaded yet, a ruleset reload that
-/// emptied the set - and a feature that is off for a reason nobody can read is
+/// without a readable `group_dead`, ring consumers that did not start, an
+/// nftables set the snippet does not declare, a table that is not loaded yet,
+/// a ruleset reload that emptied the set - and a feature that is off for a
+/// reason nobody can read is
 /// a feature nobody can rely on. That lesson was learned once already with the
 /// enforcement level above.
 ///
@@ -429,8 +429,13 @@ impl FastAllow {
 
 static FAST_ALLOW_LEVEL: std::sync::RwLock<Option<FastAllow>> = std::sync::RwLock::new(None);
 
-/// Records what [`start`] achieved for the fast path. Called once, at the end
-/// of startup, and again if the path is disarmed at shutdown.
+/// Records the fast path's current state for `cfc status`.
+///
+/// Not "called once": the loader publishes the startup decision before the
+/// heartbeat exists, the heartbeat publishes every arm and every loss of the
+/// nftables element, the late withdrawal publishes its refusal, and `Drop`
+/// publishes the stop. Last writer wins, which is why the loader must publish
+/// *before* spawning the heartbeat rather than after it returns.
 pub fn set_fast_allow_level(level: FastAllow) {
     *FAST_ALLOW_LEVEL
         .write()
@@ -500,9 +505,15 @@ pub struct Report {
     /// read-only bpffs - which keeps eviction working for as long as this
     /// daemon runs and stops the moment it does not. The connect programs' own
     /// links are pinned separately and go on marking sockets either way, so
-    /// without this flag the ladder granted on a kernel where the clears die
-    /// with the daemon and only the sixty-second deadline stood between a
-    /// grant and a recycled pid.
+    /// and this flag is what tells them apart.
+    ///
+    /// It chooses the grant deadline rather than gating the path: pinned gets
+    /// the full [`fast_allow::DEADLINE_SECS`], unpinned the short
+    /// [`fast_allow::DEADLINE_SECS_UNPINNED`], and `cfc status` names which.
+    /// For a day it was a rung on the eligibility ladder instead. Note that
+    /// turning it into a deadline did not open the fast path to 5.10-5.14 as
+    /// was first claimed: those kernels lack `group_dead` and are refused at
+    /// the exit-precision rung before this flag is consulted.
     pub lifecycle_pinned: bool,
 }
 
