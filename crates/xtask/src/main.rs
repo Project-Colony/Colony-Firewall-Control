@@ -84,6 +84,16 @@ const SHT_SYMTAB: u32 = 2;
 /// Everything the daemon's loader looks up by name. If any of these is missing
 /// the object will fail at run time on a user's machine; this turns that into a
 /// build failure here.
+///
+/// The list is maintained by hand - this crate takes no dependencies, so it
+/// cannot import the daemon's constants - which means it drifts, and it has:
+/// the fast path added four maps and two programs to the loader and only the
+/// programs were added here. Every `MAP_*` and `PROG_*` constant in
+/// `cfc-daemon/src/ebpf/{loader,enforce}.rs` has to appear below - and *not*
+/// the `LINK_*` ones, which are bpffs pin file names, not ELF symbols; an
+/// earlier version of this sentence would have sent someone adding "sendmsg4"
+/// to a list the object can never satisfy. `grep -hE 'const (MAP|PROG)_'
+/// crates/cfc-daemon/src/ebpf/*.rs` is the list to check against.
 const REQUIRED_SYMBOLS: &[&str] = &[
     // programs (aya keys `program_mut` on the symbol, not the section)
     "cfc_sched_process_exec",
@@ -96,6 +106,8 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     // sock_addr programs; the loader tries the cookie ones first
     "cfc_connect4_basic",
     "cfc_connect6_basic",
+    "cfc_sendmsg4",
+    "cfc_sendmsg6",
     // maps
     "EXEC_EVENTS",
     "EXIT_EVENTS",
@@ -106,17 +118,70 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     "ENFORCE_STATS",
     "DENY_EVENTS",
     "SOCK_PIDS",
+    // the table the exec program reads when no daemon is running, and its
+    // "is it worth hashing?" guard
+    "EXE_RULES",
+    "EXE_RULES_ON",
+    // the fast path: the grant map, the deadline the daemon's heartbeat
+    // refreshes, the mark to set, and the ring the grants are reported on
+    "FAST_ALLOW",
+    "FAST_ALLOW_UNTIL",
+    "FAST_ALLOW_MARK",
+    "ALLOW_EVENTS",
     // patchable .rodata globals
     "TASK_REAL_PARENT_OFFSET",
     "TASK_TGID_OFFSET",
     "EXEC_FILENAME_DATA_LOC",
     // the ABI stamp the loader requires with must_exist = true. Keep in step
     // with `cfc_ebpf_common::ABI_SYMBOL`.
-    "CFC_EBPF_ABI_V3",
+    "CFC_EBPF_ABI_V4",
 ];
 
 /// Sections whose absence would break loading or diagnostics.
 const REQUIRED_SECTIONS: &[&str] = &[".BTF", ".BTF.ext", "license"];
+
+/// Writes to `FAST_ALLOW` that the kernel side must never contain.
+///
+/// The grant map is the one place in this project where an entry *widens* what
+/// is allowed, and every guard that decides whether an entry may exist lives in
+/// the daemon: the rule must be an `Allow`, its duration must be lasting, its
+/// scope must not constrain the flow, the pid's start time must still match,
+/// and the program behind it must not have changed. A write from inside a BPF
+/// program answers to none of that.
+///
+/// The kernel therefore only ever *removes* - on exec and on exit - and reads.
+/// That was true because nobody had written the other thing yet, and a comment
+/// saying so is not a guarantee. This is.
+const FORBIDDEN_KERNEL_WRITES: &[&str] = &["FAST_ALLOW.insert", "FAST_ALLOW.set"];
+
+/// Refuses a kernel source that grants for itself.
+///
+/// Reads the source rather than the object because that is where the property
+/// is legible: an ELF says a program calls `bpf_map_update_elem`, not which map
+/// it calls it on.
+fn check_no_kernel_grants(src: &Path) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(src).map_err(|e| format!("reading {} : {e}", src.display()))?;
+    for (n, line) in text.lines().enumerate() {
+        for forbidden in FORBIDDEN_KERNEL_WRITES {
+            if line.contains(forbidden) {
+                return Err(format!(
+                    "{}:{}: `{}` - the kernel side must never write the fast-allow \
+                     grant map. Every guard that decides whether a grant may exist \
+                     is in the daemon (allow, lasting duration, no flow scope, the \
+                     pid still the one judged, the program unchanged), and a write \
+                     from a BPF program answers to none of them. If this is a \
+                     deliberate design change, it is one to argue for, not one to \
+                     let a test wave through.",
+                    src.display(),
+                    n + 1,
+                    forbidden
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Structural checks on the built object.
 ///
@@ -144,6 +209,8 @@ fn ebpf_check(path: &Path) -> Result<(), String> {
 
     let sections = rd.section_names(&buf)?;
     let symbols = rd.symbol_names(&buf)?;
+
+    check_no_kernel_grants(&ebpf_dir().join("src/main.rs"))?;
 
     let mut missing = Vec::new();
     for want in REQUIRED_SYMBOLS {

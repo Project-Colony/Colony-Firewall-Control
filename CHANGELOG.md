@@ -6,6 +6,117 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Fast allow (opt-in, `[ebpf] fast_allow = true`).** A process a lasting
+  rule allows outright no longer pays an NFQUEUE round trip per connection:
+  the `cgroup/connect4|6` hooks mark its TCP sockets with a value the daemon
+  draws at random on each start, and a `meta mark @fast_allow accept` rule the
+  snippet ships with an *empty* set takes them ahead of the queue. New
+  `sendmsg4|6` hooks run the same decision for UDP sends that carry a
+  destination; since no UDP socket is ever marked, what they do there is strip
+  a mark that should not be present. Grants
+  reach processes that were already running, not only ones that exec after
+  the rule: the daemon walks `/proc` at start and at every rule change. The
+  mark is re-decided at every hook that opens a flow and stripped when the
+  grant is gone; the kernel clears grants on exec and exit by itself; and a
+  `CLOCK_BOOTTIME` deadline the daemon refreshes means a dead daemon leaves
+  the machine fail-closed again within one deadline - 60 s, refreshed every
+  10 s, or the shorter pair below. Fast-allowed
+  flows are reported on a ring, with their destination named from the same
+  reverse-DNS cache the packet path uses, so the live feed, rule hit counts
+  and the `enforcing` heuristic keep telling the truth. Off by default for
+  this first release; `cfc status` and the startup log line show
+  `fast-allow live` or `off: <the one reason>`.
+
+  Two things worth knowing before turning it on. **Only TCP sockets are
+  marked**, deliberately: they are the only ones that pass a hook again, and
+  the mark lives on the socket, so a mark given to anything else could never be
+  taken back - not by a revocation, not by the deadline, not by the daemon
+  dying. It costs little where it lands: a UDP peer that answers makes the flow
+  conntrack-established and its later datagrams were not being queued anyway,
+  so a marked UDP socket only kept gaining while its peer stayed silent, which
+  is exactly when an unrevocable mark does the most damage. What is given up in
+  practice is the fast path for QUIC. And the mark shares one 32-bit word with
+  everything else on the machine: the daemon refuses values that collide with
+  the fwmark selectors it knows (kube-proxy's two single-bit masks,
+  Tailscale's, wg-quick's), and `[ebpf] fast_allow_mark` pins one by hand for a
+  host with a selector it does not know.
+
+  Two kernel facts weaken the guarantee without switching the path off, and
+  `cfc status` says which: the exec/exit tracepoint links could not be pinned
+  (a read-only bpffs; perf-event links have been pinnable since 5.15), or the
+  exit tracepoint has no `group_dead` and a process's death cannot be told from
+  one of its threads' - absent on 5.10 and 6.12 in the kernel matrix, present
+  on 6.18. In both cases the grant deadline drops from sixty seconds to six,
+  refreshed every two; in the second the daemon also re-checks every granted
+  pid's start time on every beat and drops any that changed hands, since there
+  the kernel's own eviction can miss a death while the daemon is alive. That
+  second case was a refusal in the first design, which put the fast path out
+  of reach of every kernel RHEL ships.
+
+  The `cgroup/sendmsg` hooks are no longer required: with no UDP socket ever
+  marked they can only strip a forged mark, so where the kernel refuses them
+  (5.10 does) the path runs and the report notes what it runs without. On a
+  restart the previous daemon's cookie-variant marker in bpffs is what tells
+  the new one that the pinned connect programs carry the mark decision.
+
+- **`scripts/bench-latency.sh`**, the veth bench the fast path has to be
+  measured on: a network namespace on the other end of a veth pair, a TCP
+  listener on each side, and connect latency in both directions reported as
+  percentiles. It never touches nftables, the daemon or its rules; run it
+  once per state and compare, on a VM where CFC may be armed.
+- **The kernel matrix brackets RHEL 9.** A 5.15 entry joins 5.10: the LTS
+  below and the LTS above the 5.14 that Rocky and RHEL 9 ship. What both
+  allow, 5.14 allows unless Red Hat took it out; what only 5.15 allows, 5.14
+  has only if they backported it; what both refuse, 5.14 may still have
+  through a backport. Where the two disagree is the list of things to check
+  on a Rocky host rather than assume. The first 5.15 run named one: it
+  already takes the sendmsg hooks that 5.10 refuses, and neither has
+  `group_dead`.
+- **The startup report says what the fast path's kernel side is capable
+  of** (`fast_path=ready|sendmsg-unavailable|basic-connect` on the log
+  line, `none` where no connect hook attached), and the matrix test asserts it per kernel along with `group_dead`
+  where a run has already shown the answer: 5.10 takes the connect hooks and
+  refuses the sendmsg ones, 5.15 and 6.12 take both and still have no
+  `group_dead`, 6.18 and 7.1 have everything. A kernel that changes its
+  answer fails in CI rather than degrading quietly on a host; one without a
+  recorded answer is
+  printed, and the matrix summary carries the line.
+
+### Changed
+
+- Three costs removed from paths every process on the machine takes, none of
+  them measured on a live kernel - this machine cannot run the daemon - and
+  each argued from what the code does rather than from a number. The exec and
+  exit programs deleted a fast-allow grant on every `execve` and every exit,
+  unconditionally, on hosts where the feature is off (which is every host by
+  default); the delete is now behind one array read of the mark, which is
+  `UNARMED` exactly when the grant map is empty. Withdrawing the fast path left
+  `FAST_ALLOW_MARK` armed in the pinned map, so a daemon restarted with
+  `fast_allow = false` after an unclean death made every TCP `connect()` pay a
+  `getsockopt` and two map reads to strip a mark nobody would ever set, for as
+  long as it ran; withdrawing unarms. And the `/proc` walk that re-seeds grants
+  on every rule change now asks first whether any rule could grant anyone, and
+  a rule set of denies, timed allows and port-scoped allows is answered in a
+  few comparisons instead. The verifier counts in the kernel matrix are the one
+  measurement these changes get, and a count is not a runtime cost - the exec
+  program may well verify a few instructions *longer* for the branch that lets
+  it skip a hash delete at runtime.
+- **eBPF ABI v4.** New maps and programs the connect hooks read; v3 pins
+  would enforce fine and never mark, so a restarting daemon now replaces
+  them rather than inheriting them. `verdict::ALLOW`, matched by the kernel
+  and written by nobody for two releases, is gone.
+- The daemon now runs `nft` to put its fast-allow value into one set and
+  take it out again - the first time it touches nftables; the SELinux policy
+  grants exactly that. The set is flushed unconditionally at every start, so
+  a daemon that crashed while armed and came back with the path off does not
+  leave its predecessor's mark accepted; and once armed the daemon re-checks
+  every minute that the element is still there, so an `nft -f` that reloads
+  the ruleset is noticed and re-armed rather than reported as live. The
+  nftables snippet gains the set and the accept rule; an older snippet leaves
+  fast-allow off with the reason spelled out.
+
 ## [0.3.0] - 2026-09-02
 
 ### Added

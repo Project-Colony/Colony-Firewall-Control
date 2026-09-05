@@ -234,6 +234,18 @@ message StatusResponse {
   //
   // "pinned" and "inherited" are the two that survive the daemon.
   string enforcement = 15;
+
+  // Whether process-wide allows are skipping the queue: "live", "off: <why>",
+  // or empty when the daemon predates this field or startup has not answered
+  // yet.
+  //
+  // It carries its reason because the path has several ways to be inert
+  // with nothing else changing - the switch left off, an attach inherited
+  // from a build without it, a kernel whose verifier lacks bpf_setsockopt on
+  // sock_addr, exit tracking without group_dead, an nftables set the snippet
+  // does not declare - and an allow that quietly takes the slow path looks
+  // exactly like one that is working, only later.
+  string fast_allow = 16;
 }
 
 message SetPausedRequest {

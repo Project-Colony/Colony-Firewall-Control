@@ -20,14 +20,94 @@ longer lifts anything; `nft delete table` no longer lifts the denies it holds.
 Two pieces of it are deliberately not done, and both are real work rather than
 oversights:
 
-**1a. An in-kernel *allow* buys nothing yet.** The connect hook cannot skip
-NFQUEUE, so a pre-approved program still takes a userspace round trip per
-connection - which is the actual latency cost of CFC, and it is paid dozens of
-times per page load in a browser. Making it real needs
-`bpf_setsockopt(SO_MARK)` on the connect path plus an nft rule that accepts the
-mark before the queue rule. That is a performance change with a
-traffic-bypasses-the-firewall blast radius, so it wants its own change and its
-own tests, not a line in this one.
+**1a. An in-kernel *allow* now buys the round trip - opt-in.** Done, along
+the line sketched here (`bpf_setsockopt(SO_MARK)` on the connect path, an nft
+rule ahead of the queue), and then reshaped by an adversarial review of the
+design that stood 59 objections before a line was written. The three that
+could not be patched, and what replaced them:
+
+- *The mark lives on the socket, not in the map.* Revoking a grant left every
+  already-marked socket marked, and an fd inherited across `execve` carried
+  the bypass to a binary that earned nothing. So the mark is re-decided - set
+  or stripped - at every flow start, `connect()` and `sendmsg()` alike, and
+  sockets already carrying someone else's mark (a VPN, a proxy) are left
+  alone in both directions. Exactly which hooks that is, is what the
+  *implementation* review pinned down: `cgroup/sendmsg` runs for a send that
+  carries a destination, not for `send()` on a connected socket. So **only TCP
+  is ever marked** - an allowlist, after two narrower rules leaked in a row
+  (refusing UDP at `connect()` alone left the sendmsg hooks marking sockets
+  that were already connected; naming UDP at all missed UDP-Lite, DCCP and
+  SCTP). The cost is nil in the case that matters: a UDP peer that answers
+  makes the flow conntrack-established, and only `ct state new` is queued. What
+  is given up is the fast path for QUIC, which was getting its first packet
+  through it and nothing more.
+
+  **Resolved on this branch.** With no UDP socket ever marked, the two
+  `cgroup/sendmsg` programs can only strip a mark somebody forged onto an
+  unconnected UDP socket, so their absence no longer refuses the fast path - it
+  is a caveat in the report. The inherited path stopped using their pins as
+  evidence of which connect variant runs; `attach` now leaves a directory
+  marker in bpffs once the cookie variants took, and that is what a restart
+  reads. The programs themselves stay: where the kernel verifies them they are
+  worth their ~270 instructions as defence in depth, and removing them is an
+  ABI change for another day.
+- *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
+  default. A published mark value is a bypass token. The value is drawn at
+  random per start and lives in a pinned map and an nftables set, never in a
+  package. Two things the implementation review added: the draw is sieved
+  against the fwmark selectors other software uses - kube-proxy's masks are a
+  single bit each, so an unsieved word collided half the time on a Kubernetes
+  node - and the set is flushed unconditionally at start, because a value left
+  accepted that nothing refreshes is one every past grantee can still read off
+  its own socket with `getsockopt(SO_MARK)`.
+- *A static accept rule is a token on every install.* The snippet ships the
+  set empty; the daemon fills it only when the path is armed - the one thing
+  the daemon does to nftables.
+
+Grants are cleared in the kernel on exec and exit, so no daemon is needed for
+the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline the daemon refreshes
+makes a dead daemon fail-closed within one deadline (60 s refreshed every 10 s,
+or 6 s refreshed every 2 s where the lifecycle links cannot be pinned); and the
+path stays off - with
+the reason in `cfc status` - unless enforcement is pinned, exit is detected
+exactly (`group_dead`), their ring consumers running, the cookie connect
+variants *and* the sendmsg hooks verified, the nftables set present and holding
+this daemon's mark, and `[ebpf] fast_allow` is set. Whether the exec/exit links
+could be *pinned* is not on that list any more, and neither is whether exit is
+detected *exactly* (`group_dead`) or whether enforcement is *pinned*: each of
+those used to refuse the path, and each was the wrong instrument. Now the
+decision is a pure function (`fast_path_decision`, with a test) that **refuses**
+only where nothing could ever mark (config off, no maps, basic connect variants)
+or nothing could ever evict (exit not tracked), and **reduces** otherwise:
+unpinned lifecycle links or leader-only exit detection both drop the deadline to
+six seconds refreshed every two, and leader-only exit also makes every beat
+sweep the granted pids against the start time recorded at grant - because there
+the kernel can miss a death while the daemon is alive, and no deadline bounds a
+grant the heartbeat keeps refreshing. `Enforcement` is not an input at all:
+refusing Process mode was backwards, since there everything dies with the
+daemon. The matrix shows `group_dead` absent on 5.10 and 6.12 and present on
+6.18, so this is what puts the fast path within reach of the kernels RHEL
+ships; nothing in CI has yet run it there with a rule engine attached, so that
+reach is reasoned from the ladder and the guest logs, not observed.
+**Off by default** for this release: the blast radius named above has not
+changed, only its edges.
+
+An adversarial review of the *implementation* then found 23 confirmed defects
+on top of the design's 59, all fixed on this branch. The ones worth
+remembering as classes: a second decider that read the execve string and the
+exec-time uid where every other decider reads `/proc` (which skipped
+relative-exec processes entirely, so a grant survived its rule's deletion);
+grants written with no liveness guard where the deny side had carried one
+since it was written; and the feature being **inert for its own motivating
+case** - nothing granted a process that was already running, so every restart
+silently switched the fast path off for every long-lived program while
+`cfc status` said `live`. What is not done: the latency win is not yet
+*measured* on the veth bench - the number that justifies the feature is still
+the pre-feature 0.28 ms per new flow - and 1b below is untouched. The bench
+that produces that number is `scripts/bench-latency.sh`: a veth pair into a
+network namespace, both directions, run once per state (client under a
+lasting Allow rule, under a flow-scoped one, table absent) on a VM where CFC
+may be armed.
 
 **1b. Rules that depend on a destination still cannot be precomputed.**
 `process_wide_action` deliberately answers `None` for them, which is correct and
@@ -42,7 +122,14 @@ be resolved to addresses in advance.
 
 Mostly done in `8db949b` and `b05eefc`: the SELinux module, the RPM provenance
 backend, the `.spec`, and a 5.10 entry in the kernel matrix that sits *below*
-RHEL 9's backported 5.14.
+RHEL 9's backported 5.14. The fast-allow branch adds 5.15 above it, so the pair
+brackets the RHEL kernel: what both allow, 5.14 allows unless Red Hat took it
+out; what only 5.15 allows, 5.14 has only if they backported it; what both
+refuse, 5.14 may still have through a backport. Where the two disagree is the
+list of things to check on a Rocky host rather than assume. The first 5.15 run
+named one such thing: 5.15 already accepts `bpf_getsockopt` on the sendmsg hooks
+that 5.10 refuses, so whether RHEL 9's 5.14 does is exactly what a Rocky host
+has to answer; neither kernel has `group_dead`.
 
 What remains needs a real enforcing machine - except 2b, which turned out to
 be doable from CI after all:
@@ -58,12 +145,14 @@ rule enforced is an outage, not a log line), one exercise per policy group,
 missing rule it finds is a bug in `packaging/selinux/colony_firewall.te`,
 not something to add locally.
 
-**2b. Written, awaiting its first green run - the `rpm end to end (fedora)`
-job in `rhel.yml` builds, installs and verifies the RPM end to end.** This
-file has been burned once by declaring CI verified before it ran (see
-section 6: "expect one round" became nine), so: the job exists, every local
-check passes, and "done" is one green run away, not here yet.
-`rpmbuild -ba` in a Fedora container (the
+**2b. Done - the `rpm end to end (fedora)` job in `rhel.yml` builds,
+installs and verifies the RPM end to end, and has run green on every push
+since.** It took three rounds to get there, none at a predicted failure
+point: git's dubious-ownership refusal inside the container, then a
+`pkgconfig(systemd)` build dependency Fedora 44's generator injects that the
+spec never declares. (This file had been burned once by declaring CI verified
+before it ran - see section 6 - so the previous wording here was "one green
+run away"; the run came.) `rpmbuild -ba` in a Fedora container (the
 tarball laid out the way `%autosetup` expects, built as an unprivileged
 user), then a real `dnf install` of both packages: binaries report the
 packaged version, units and the sysusers file land where the spec says, the

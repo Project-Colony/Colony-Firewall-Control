@@ -3,9 +3,11 @@
 Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 
 Phases 0-3 are done and have since been through a hardening pass
-(Phase 3.5). The eBPF backend and the system tray have since landed
-too. What is left is the whitelist fast-path map, VirusTotal lookups,
-and one end-to-end test that is still manual.
+(Phase 3.5). The eBPF backend, the system tray and the whitelist fast
+path (opt-in, `[ebpf] fast_allow`; its latency win is still to be
+measured, see `TODO.md` 1a) have since landed too. What is left is
+VirusTotal lookups, publishing to the AUR, and one end-to-end test that
+is still manual.
 
 ## Phase 0 - Foundation [done]
 
@@ -144,7 +146,7 @@ were wrong or missing once the happy path worked.
 - [x] AUR-ready PKGBUILD, desktop/autostart/icon, sysusers group
 - [x] `colony-firewall-nft.service` with `ExecStop` cleanup
 
-## Phase 4 - eBPF backend [mostly done]
+## Phase 4 - eBPF backend [done]
 
 Compiled in by default (the `ebpf` cargo feature); still off at runtime
 until `[ebpf] enabled` is set in `daemon.toml`. Verified end to end on
@@ -162,12 +164,17 @@ kernel 7.1.8.
       in userspace, because the in-kernel version hit the verifier's
       1,000,000-instruction complexity limit (see
       `crates/cfc-ebpf/README.md` for the full write-up)
-- [ ] Whitelist fast-path map for already-allowed flows. Note the
-      shape of this one is not what it looks like: nftables enqueues
-      only `ct state new`, so the per-packet cost is already paid once
-      per connection, and the cgroup egress hook runs *after*
-      NF_INET_LOCAL_OUT - it cannot short-circuit NFQUEUE. The win
-      available here is attribution cost, not packet cost
+- [x] Whitelist fast path for already-allowed flows (`[ebpf]
+      fast_allow`). Not the shape first imagined: a cgroup *egress*
+      hook runs after NF_INET_LOCAL_OUT and cannot short-circuit
+      NFQUEUE, but the `connect()` hook runs before any packet exists.
+      A process a lasting Allow rule covers gets an entry in a kernel
+      map; its TCP connects are marked with SO_MARK at connect time
+      and `meta mark @fast_allow accept` takes them before the queue
+      rule. TCP only, grants evicted on exec and exit, the whole path
+      bounded by a heartbeat deadline so a dead daemon strips itself
+      out. Two degradations shorten the deadline instead of turning
+      the feature off; see `docs/ARCHITECTURE.md`
 
 ## Phase 5 - Polish
 

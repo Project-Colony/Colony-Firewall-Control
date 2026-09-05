@@ -21,6 +21,8 @@ policy_module(colony_firewall, 0.2.0)
 #     resolve struct offsets without CO-RE;
 #   * walks other processes' /proc entries to attribute a socket to a program;
 #   * runs rpm(8) once per package-database generation, for provenance;
+#   * runs nft(8) at start and at stop, to put its fast-allow mark into one
+#     nftables set and take it out again;
 #   * serves a unix socket under /run/colony-firewall to the CLI, tray and GUI.
 #
 # Every one of those is a separate way to be denied, and the failure modes
@@ -62,7 +64,7 @@ systemd_unit_file(colony_firewall_unit_file_t)
 #
 # The same seven the unit grants, and no more. CAP_SYS_ADMIN is deliberately
 # absent: that it is unnecessary is proven by a test that drops to uid 1000
-# holding the unit's set and requires all five BPF programs to attach
+# holding the unit's set and requires all seven attached BPF programs to load
 # (`attaches_with_only_the_units_capabilities`). If an AVC here ever asks for
 # sys_admin, something regressed - do not add it.
 #
@@ -187,6 +189,38 @@ optional_policy(`
 # and unwritable by anyone else (`vet_object`), so this read is the second
 # check on the same file rather than the only one.
 libs_read_lib_files(colony_firewalld_t)
+
+# The fast-allow path. The connect hooks mark the sockets of a process the
+# daemon has ruled allowed process-wide, and the shipped snippet accepts that
+# mark ahead of the queue - but only for values in a set the snippet declares
+# empty. The daemon runs nft(8) to put its per-start random value in and to
+# flush the set again, executed in this domain like rpm below rather than
+# transitioning to iptables_t, which may rewrite the whole ruleset. nft then
+# opens a netlink_netfilter socket, already allowed in the filtering group
+# above: it is the socket class NFQUEUE itself lives on.
+#
+# Five subcommands, not the two an earlier version of this comment claimed:
+# `flush set` and `add element` do the work, `list set` and `list table` are
+# the probe that tells a missing set from a missing table, and `get element`
+# is the periodic check that the mark is still accepted after a ruleset
+# reload. Nor is it twice in a daemon's life: the nft unit starts *after* the
+# daemon, so arming is a retry on every heartbeat - ten seconds, or two on a
+# kernel that cannot pin the exec/exit tracepoint links - until the table
+# appears, and once armed the check runs every sixty. On a host where this is
+# denied that is an AVC every heartbeat, for as long as the daemon runs with
+# fast_allow = true - loud on purpose, but worth knowing before reading a log.
+#
+# A denial costs the fast path and nothing else. The daemon reports it as off
+# with the reason in `cfc status`, and every connection keeps taking the queue.
+#
+# Fedora labels /usr/bin/nft iptables_exec_t (RHEL: /usr/sbin/nft); the same
+# type covers both spellings, and the daemon tries both paths.
+optional_policy(`
+	gen_require(`
+		type iptables_exec_t;
+	')
+	can_exec(colony_firewalld_t, iptables_exec_t)
+')
 
 ########################################
 #

@@ -50,6 +50,10 @@ headless machine gets a say.
 ```
 kernel (nftables OUTPUT hook)
    |
+   |  meta mark @fast_allow accept   (opt-in fast path: a socket the connect
+   |                                  hook marked for an already-allowed
+   |                                  process skips the queue; the set holds
+   |                                  one element while armed, none otherwise)
    |  ct state new   queue num 0
    v
 NFQUEUE 0
@@ -347,15 +351,102 @@ inert as one built with `--no-default-features`.
 | `tracepoint/sched/sched_process_exec` | `sched:sched_process_exec` | fills a pid -> (exe, comm, uid, gid, ppid) table |
 | `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts from that table |
 | `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads out; the daemon parses them and lifts the `A`/`AAAA` records |
+| `cgroup/connect4`, `cgroup/connect6` | cgroup v2 root, link **pinned** | refuse `connect()` for pids the daemon has denied outright, before a packet exists - and, under `[ebpf] fast_allow`, mark the sockets of pids a lasting rule allows outright |
+| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | the same mark decision for a UDP send that carries a destination; no refusal |
 
-**This is enrichment, not a fast path.** Verdicts still come from NFQUEUE, and
-nothing here filters anything - the `cgroup_skb` program returns "pass"
-unconditionally. What the programs buy is *better answers to questions the
-daemon already asks*, and every one of them degrades independently: a missing
-object, no `CAP_BPF`, a kernel without BTF, a verifier rejection or a host with
-no cgroup v2 each cost one capability and produce one warning. There is no
-configuration in which the firewall stops filtering because eBPF was
-unavailable.
+**Two decisions happen in the kernel; everything else is enrichment.** The
+connect hooks refuse a denied program's `connect()` with `EPERM` - pinned, so
+the refusal outlives the daemon - and, with one opt-in fast path, wave an
+allowed one past the queue. Every other verdict comes from NFQUEUE,
+with a single exception: under `[ebpf] fast_allow`, the sockets of a process
+the daemon has already ruled allowed process-wide are marked in the connect
+hook, and the snippet's `meta mark @fast_allow accept` rule takes them ahead
+of the queue. That set is the one thing the daemon ever writes to nftables -
+one element added when the path is armed, flushed unconditionally at every
+start and at shutdown - and it ships empty, so a default install carries no
+bypass value.
+
+**Where revocation reaches.** A grant is re-decided at every hook that opens a
+flow: `connect()`, and a `sendmsg` that carries a destination. Deleting the
+rule, replacing it with a Block, the process exec'ing, the process exiting, and
+the daemon going away for more than one deadline all take effect at the next
+such hook, which is what makes the mark safe to hand out at all.
+
+**Only a TCP socket is ever marked.** The property that decides this is not
+the protocol but whether a socket passes one of our hooks *again* after it is
+set up - because the mark lives on the socket and only a hook can take it back.
+TCP does: it passes the connect hook for every connection it opens. A UDP
+socket that has called `connect()` sends with `send()`, which carries no
+destination and so passes neither hook; the mark it holds then is the mark it
+keeps until it is closed, past a revocation, past the deadline, and past the
+daemon's death - the one case where "a dead daemon fails closed within sixty
+seconds" would not hold.
+
+Two narrower rules were tried first and both leaked, which is why this is an
+allowlist rather than a list of protocols to exclude. Refusing UDP only at
+`connect()` left the sendmsg hooks free to mark a socket that was *already*
+connected: `sendto` with an explicit address is legal on a connected UDP
+socket, and the hook runs whenever a destination is supplied. And naming UDP at
+all covers only what someone thought to name - UDP-Lite, DCCP and SCTP connect
+the same way and have no sendmsg hook here either.
+
+Refusing is never a bare early return: a socket that already carries our mark
+is still stripped of it. Never set, always strip.
+
+The cost lands where it does least harm. The ruleset queues `ct state new`; a
+UDP peer that answers makes the flow conntrack-established after one exchange,
+and established traffic is not queued with or without a mark. A marked UDP
+socket only kept *gaining* anything while its peer stayed silent - and
+unreplied UDP is conntrack-NEW on every datagram, which is exactly the shape in
+which an unrevocable mark does the most damage. Benefit and hazard were the
+same case. What is given up in practice is the fast path for QUIC, which was
+getting its first packet through it and nothing more.
+
+**Two guarantees can be weaker than the full ones, and neither is a refusal.**
+The full guarantee is: a grant is cleared by the kernel the moment its process
+exits or execs, with or without a daemon, and a dead daemon is honoured for at
+most sixty seconds. Two kernel facts can weaken it, and the eligibility
+decision - a pure function, `fast_path_decision`, with a test - reduces rather
+than refuses in both cases:
+
+- **The exec/exit tracepoint links could not be pinned** (no
+  `BPF_LINK_TYPE_PERF_EVENT` before 5.15, a read-only bpffs, or no bpffs at
+  all). Those links are what clears grants after the daemon dies; without them
+  an unclean death leaves the connect hooks marking while nothing evicts, and
+  the deadline is all that is left. So the deadline drops to six seconds,
+  refreshed every two.
+- **Process exit is detected by thread-group leader only** - the kernel's
+  `sched_process_exit` record has no readable `group_dead`, which the matrix
+  shows absent on 5.10 and 6.12 and present on 6.18. Then a process whose leader
+  exits first and dies later is never evicted by the kernel, *while the daemon
+  is alive*, so a shorter deadline alone bounds nothing. The daemon therefore
+  sweeps its grants on every heartbeat, dropping any pid whose `/proc` start
+  time no longer matches the one recorded when it was granted. What remains is
+  a pid recycled and connecting within one two-second beat, without an exec in
+  between - an exec clears the grant in the kernel regardless.
+
+`cfc status` names which applies - `live, grants lapse within 6s (exit is
+detected by thread-group leader only, ...)` - because two different weaknesses
+give the same number and the word `live` alone would hide both.
+
+Both were refusals in the first design. Refusing the first withheld the path
+from a bpffs mounted read-only; refusing the second withheld it from every
+kernel RHEL ships, for a risk a per-beat sweep bounds. What still refuses is
+where nothing could ever mark - the basic connect variants carry no mark
+decision - or nothing could ever evict - exit not tracked at all. And
+`Enforcement` is no longer an input: Process mode was refused on the reasoning
+that a stale grant would have "nothing but the deadline", which was backwards -
+there every link and map dies with the daemon, so a stale grant cannot exist
+after it.
+
+**The sendmsg hooks are a caveat, not a requirement.** They used to re-decide a
+UDP socket's mark per datagram and were load-bearing; with no UDP socket ever
+marked, all they can do is strip a mark somebody *forged* onto an unconnected
+UDP socket. Where the kernel's verifier refuses them - 5.10 does - the path
+runs, and the report says what it runs without. On the inherited path the
+previous daemon leaves a directory marker in bpffs once its cookie connect
+variants attached, which is what tells its successor that the pinned programs
+carry the mark decision at all; the pin names do not say.
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately

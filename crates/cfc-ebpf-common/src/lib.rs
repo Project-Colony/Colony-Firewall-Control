@@ -64,22 +64,29 @@ pub use net::UdpPayload;
 /// **Bump both this and [`ABI_VERSION`] whenever an event struct's layout
 /// changes.** The `const` assertions below exist to make forgetting a build
 /// error rather than a field of garbage.
-pub const ABI_SYMBOL: &str = "CFC_EBPF_ABI_V3";
+pub const ABI_SYMBOL: &str = "CFC_EBPF_ABI_V4";
 
 /// Value stored at [`ABI_SYMBOL`]. Present so the two sides disagree loudly if
 /// the name is ever reused without changing the layout.
 ///
-/// **v2** added the `cgroup/connect4|6` programs, `ConnectDeny` and the maps
+/// **v2** added the `cgroup/connect4|6` programs, `ConnectDeny` (since renamed
+/// `ConnectReport`, when the allow ring began carrying it too) and the maps
 /// they use. **v3** added `SOCK_PIDS` (socket cookie -> tgid, written at
 /// `connect()` for O(1) attribution) and the `_basic` program variants for
-/// kernels without `bpf_get_socket_cookie` on sock_addr programs.
+/// kernels without `bpf_get_socket_cookie` on sock_addr programs. **v4**
+/// added the fast-allow path: `FAST_ALLOW`, `FAST_ALLOW_UNTIL`,
+/// `FAST_ALLOW_MARK`, the `ALLOW_EVENTS` ring, the `sendmsg4|6` programs, and
+/// a connect hook that marks an allowed socket so nftables can accept it
+/// ahead of the queue.
 ///
 /// The version is also the bpffs pin path, so bumping it is what makes a
 /// daemon detach the previous version's in-kernel enforcement instead of
-/// inheriting programs whose behaviour it no longer matches - here, v2 pins
-/// would enforce fine but never write a cookie, which would silently cost
-/// every connection the 40 ms walk the map exists to remove.
-pub const ABI_VERSION: u32 = 3;
+/// inheriting programs whose behaviour it no longer matches. v2 pins would
+/// enforce fine but never write a cookie, silently costing every connection
+/// the 40 ms walk the map exists to remove; v3 pins would enforce fine and
+/// never mark a socket, so a daemon reporting fast-allow as live would be
+/// steering programs that cannot honour it. Same shape, same reason.
+pub const ABI_VERSION: u32 = 4;
 
 // The guard behind ABI_SYMBOL. If any of these fires, an event layout moved:
 // bump ABI_VERSION *and* the version suffix in ABI_SYMBOL, and update the
@@ -89,7 +96,7 @@ const _: () = {
     assert!(core::mem::size_of::<ExitEvent>() == 4);
     assert!(core::mem::size_of::<DnsPacket>() == 514);
     assert!(core::mem::size_of::<DnsAnswer>() == 276);
-    assert!(core::mem::size_of::<ConnectDeny>() == 24);
+    assert!(core::mem::size_of::<ConnectReport>() == 24);
 };
 
 // ---------------------------------------------------------------------------
@@ -111,23 +118,34 @@ const _: () = {
 /// The point of this layer is the *opposite* direction: a deny written here
 /// keeps being enforced after the daemon is gone, because the link is pinned.
 pub mod verdict {
-    /// Let `connect()` proceed. Written when a rule allows this executable
-    /// unconditionally, so NFQUEUE would only reach the same answer slower.
-    pub const ALLOW: u32 = 1;
-
     /// Refuse `connect()` in-kernel; the syscall returns `EPERM` before a
     /// packet exists. Written when a rule denies this executable
     /// unconditionally.
+    ///
+    /// The only value. There used to be an `ALLOW = 1` too, matched by the
+    /// kernel and written by nobody, with a doc that said it was written when
+    /// a rule allowed unconditionally - a claim no code ever made true, kept
+    /// for two releases. Allows live in `FAST_ALLOW` now, a separate map with
+    /// separate clearing rules, because an allow that leaks is a bypass and
+    /// a deny that leaks is an inconvenience, and the two must not share a
+    /// sweep. `2` is simply the number it already had; renumbering it to 1
+    /// would buy nothing. Not, as this once claimed, so that a v3 pin still
+    /// reads as a deny - the pin directory carries the ABI version, and pins
+    /// from another version are removed rather than read, so no v4 program
+    /// ever sees a value a v3 daemon wrote.
     pub const DENY: u32 = 2;
 }
 
-/// One `connect()` refused in the kernel.
+/// One `connect()` the kernel decided on its own: refused (`DENY_EVENTS`) or
+/// fast-allowed and marked past the queue (`ALLOW_EVENTS`).
 ///
-/// Exists so an in-kernel deny is not a *silent* deny. Every other deny CFC
-/// makes passes through NFQUEUE, which logs it, counts the rule hit and streams
-/// an event to the UI. A `connect()` refused before a packet exists never
-/// reaches any of that, and a firewall that blocks things without saying so is
-/// a firewall people stop trusting.
+/// Exists so an in-kernel decision is not a *silent* one. Every other verdict
+/// CFC makes passes through NFQUEUE, which logs it, counts the rule hit and
+/// streams an event to the UI. A `connect()` refused before a packet exists
+/// never reaches any of that, and neither does one whose packets the mark
+/// carries past the queue - and a firewall that decides things without saying
+/// so is a firewall people stop trusting. Both rings carry this one record;
+/// the ring says which way the decision went.
 ///
 /// The address is the one the process asked for, taken from `bpf_sock_addr`
 /// before the kernel does anything with it - so this is exactly the destination
@@ -135,7 +153,7 @@ pub mod verdict {
 /// from its own cache anyway.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnectDeny {
+pub struct ConnectReport {
     /// Thread-group id, matching the key in `VERDICTS` and `PROCS`.
     pub pid: u32,
     /// Destination address, network byte order. IPv4 occupies the first four
@@ -149,11 +167,14 @@ pub struct ConnectDeny {
     /// UAPI headers this struct is decoded next to, and 4/6 cannot be
     /// misread.
     pub family: u8,
-    /// Explicit, so the 24-byte size is not an alignment accident.
-    pub _pad: u8,
+    /// IP protocol number (`IPPROTO_TCP` = 6, `IPPROTO_UDP` = 17), from the
+    /// socket the hook ran for. Was padding: the deny log never needed it,
+    /// but the allow feed rebuilds a `Connection` and a connection without a
+    /// protocol is not one. Keeps the 24-byte size.
+    pub protocol: u8,
 }
 
-impl ConnectDeny {
+impl ConnectReport {
     /// All zeroes, for a scratch slot.
     pub const fn zeroed() -> Self {
         Self {
@@ -161,7 +182,7 @@ impl ConnectDeny {
             addr: [0; 16],
             port: 0,
             family: 0,
-            _pad: 0,
+            protocol: 0,
         }
     }
 }
@@ -173,14 +194,125 @@ impl ConnectDeny {
 /// across CPUs for `cfc status`, which is also how the live tests prove the
 /// hook is firing at all.
 pub mod enforce_stat {
-    /// `connect()` allowed because the map said so.
+    /// Fast-allowed: the socket was marked, so its packets skip the queue.
     pub const ALLOWED: u32 = 0;
     /// `connect()` refused in-kernel.
     pub const DENIED: u32 = 1;
-    /// No entry for this pid; fell through to NFQUEUE.
+    /// The fast path did not apply, and the flow went on to NFQUEUE.
+    ///
+    /// Reads as "fell through", not as "something went wrong", and it counts
+    /// more than a missing map entry: no mark armed, a socket whose mark could
+    /// not be read, and - since only TCP is ever marked - *every* non-TCP hook,
+    /// which on a busy host means every UDP datagram that carries a
+    /// destination. Comparing it against `ALLOWED` to judge how much the fast
+    /// path is buying will therefore understate it; the honest comparison is
+    /// against the connect hooks alone.
     pub const UNKNOWN: u32 = 2;
+    /// Granted, but the deadline had passed: the daemon that granted this is
+    /// no longer refreshing. Non-zero here reads "the fast path stopped".
+    pub const STALE: u32 = 3;
+    /// The socket already carried a mark that was not ours - left alone, so
+    /// it takes the queue. Counted separately because "the fast path never
+    /// engages for this program" has a legible cause here (a VPN or proxy
+    /// marking its own sockets) that the ALLOWED counter alone would hide.
+    ///
+    /// Note what this does **not** say: not "granted, but". The kernel bumps
+    /// this before it looks the pid up in `FAST_ALLOW`, deliberately - the
+    /// foreign mark settles the question on its own, and a map lookup that
+    /// cannot change the outcome is not worth paying for on this path. So the
+    /// counter covers every process with a foreign mark, granted or not, and
+    /// reading it as "grants we could not honour" overstates it.
+    pub const FOREIGN_MARK: u32 = 4;
+    /// A `ConnectReport` the ring had no room for.
+    ///
+    /// Both report rings drop silently when full - the decision has already
+    /// been made and taken effect by then, so there is nothing to fail. But
+    /// dropping *unaccounted* makes two different things look identical to
+    /// anyone reading `cfc status`: a fast path that let five connections
+    /// through, and one that let five thousand through and could only tell the
+    /// daemon about five. The counters are what the live tests read to prove
+    /// the hooks fire at all, so a silent drop also reads as a hook that did
+    /// not run.
+    pub const REPORT_DROPPED: u32 = 5;
     /// Number of slots, and the array's `max_entries`.
-    pub const SLOTS: u32 = 3;
+    pub const SLOTS: u32 = 6;
+}
+
+/// The fast-allow path: constants both sides must agree on.
+///
+/// A process the daemon has ruled allowed process-wide still paid an NFQUEUE
+/// round trip per connection, because the connect hook could refuse but not
+/// wave through - `verdict::ALLOW` was matched in the kernel and written by
+/// nobody. This module is what makes an in-kernel allow *buy* something: the
+/// hook marks the socket, and an nftables rule accepts the mark ahead of the
+/// queue.
+///
+/// Every value here is a security boundary, and each has a reason:
+///
+/// * the mark **value** is not a constant. The daemon draws one at random per
+///   start and writes it into `FAST_ALLOW_MARK`; the kernel side reads it
+///   there. Since kernel 5.17 `SO_MARK` needs only `CAP_NET_RAW` - which
+///   docker grants by default, and a `--network=host` container sits in the
+///   host's output chain - so a published value would be a bypass token for
+///   any such process. A random one is guessable only by brute force - about
+///   2^30 candidates once the daemon has excluded the bits well-known fwmark
+///   consumers select on - through a queue that prompts on every miss.
+/// * the **deadline** is a `CLOCK_BOOTTIME` instant, not `CLOCK_MONOTONIC`:
+///   a sixty-second deadline must be sixty wall-clock seconds, not sixty awake
+///   seconds across a laptop suspend. The daemon refreshes it every
+///   [`fast_allow::HEARTBEAT_SECS`] to now + [`fast_allow::DEADLINE_SECS`];
+///   with the daemon dead, every fast-allow goes inert within the deadline
+///   and the machine is fail-closed again. This is what an unpinned map
+///   could not give: the connect programs are pinned and keep their maps
+///   alive, so nothing "dies with the daemon" by itself.
+pub mod fast_allow {
+    /// Value stored in `FAST_ALLOW` for a granted tgid. The map is a set; the
+    /// value exists because a BPF hash map needs one.
+    pub const GRANTED: u32 = 1;
+    /// How far ahead of now the daemon sets `FAST_ALLOW_UNTIL`, in seconds.
+    pub const DEADLINE_SECS: u64 = 60;
+    /// How often the daemon refreshes it. Several beats fit in one deadline so
+    /// a single late tick never lets the fast path lapse on a live daemon.
+    pub const HEARTBEAT_SECS: u64 = 10;
+
+    /// The deadline for a daemon whose guarantees are weaker than the full
+    /// ones - two causes, either of which selects this pair:
+    ///
+    /// * **the exec/exit tracepoint links could not be pinned** to bpffs (no
+    ///   `BPF_LINK_TYPE_PERF_EVENT` before 5.15, a read-only bpffs, or no
+    ///   bpffs at all). Those links are what keeps the kernel clearing grants
+    ///   after the daemon dies; without them an unclean death leaves the
+    ///   connect hooks marking while nothing evicts, and the deadline is the
+    ///   only thing left.
+    /// * **process exit is detected by thread-group leader only** - the
+    ///   kernel's `sched_process_exit` record has no readable `group_dead`,
+    ///   which the matrix shows absent on 5.10 and 6.12 and present on 6.18.
+    ///   Then a process whose leader exits first and dies later is never
+    ///   evicted by the kernel, *while the daemon is alive* - so a shorter
+    ///   deadline alone bounds nothing, and the daemon sweeps its grants on
+    ///   every heartbeat, dropping any pid whose start time no longer matches
+    ///   the one recorded when it was granted. The exposure becomes a pid
+    ///   recycled and connecting within one heartbeat, without an exec.
+    ///
+    /// Both used to be refusals. Refusing was the wrong instrument where
+    /// degrading the parameter - and, for the second, adding a sweep - bounds
+    /// the risk; and refusing the second withheld the fast path from every
+    /// kernel RHEL ships. Ten times shorter costs one eight-byte map write
+    /// every two seconds; the sweep costs one `/proc` read per granted pid per
+    /// beat, and granted pids are the few a lasting rule allows outright.
+    ///
+    /// Both numbers are the daemon's alone: the kernel only ever compares
+    /// `now < until`, so this changes no ABI and no kernel program.
+    pub const DEADLINE_SECS_REDUCED: u64 = 6;
+    /// How often the daemon refreshes [`DEADLINE_SECS_REDUCED`], and how often
+    /// it sweeps stale grants when exit detection is imprecise. Three beats
+    /// per deadline, the same ratio as the full pair.
+    pub const HEARTBEAT_SECS_REDUCED: u64 = 2;
+    /// `FAST_ALLOW_MARK` holds this when no daemon has armed the path. Zero
+    /// is also what a socket with no mark reads, which is why the kernel side
+    /// treats "mark map says 0" as "fast-allow is off" rather than "mark
+    /// sockets with 0".
+    pub const UNARMED: u32 = 0;
 }
 
 /// Length of the kernel's `task_struct::comm` field, including the NUL.
@@ -521,7 +653,7 @@ impl DnsAnswer {
 
 #[cfg(feature = "std")]
 mod std_impls {
-    use super::{ConnectDeny, DnsAnswer, DnsPacket, ExecEvent};
+    use super::{ConnectReport, DnsAnswer, DnsPacket, ExecEvent};
     use std::borrow::Cow;
     use std::fmt;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -538,7 +670,7 @@ mod std_impls {
         }
     }
 
-    impl ConnectDeny {
+    impl ConnectReport {
         /// The address the process asked for.
         ///
         /// `family` decides the width, so a v4 record never reads the 12 zero

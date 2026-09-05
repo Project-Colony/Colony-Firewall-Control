@@ -353,6 +353,7 @@ struct StatusJson {
     uptime_seconds: u64,
     enforcing: bool,
     enforcement: String,
+    fast_allow: String,
     paused: bool,
     resume_at_unix_ms: i64,
     resume_at: Option<String>,
@@ -375,6 +376,7 @@ fn status_json(s: &proto::StatusResponse, now_unix_ms: i64) -> StatusJson {
         uptime_seconds: s.uptime_seconds,
         enforcing: s.enforcing,
         enforcement: s.enforcement.clone(),
+        fast_allow: s.fast_allow.clone(),
         paused: s.paused,
         resume_at_unix_ms: s.resume_at_unix_ms,
         resume_at: output::rfc3339(s.resume_at_unix_ms),
@@ -435,6 +437,19 @@ fn enforcement_cell(level: &str) -> String {
     }
 }
 
+/// The fast-allow cell: the daemon's own sentence, or why there is none.
+///
+/// The daemon already spells this one out (`live`, or `off: ` and the reason
+/// the path is inert), so the CLI only has to name the value the daemon cannot
+/// send: the proto3 default, which is what a daemon without the field answers
+/// and also what a daemon whose startup has not decided yet answers.
+fn fast_allow_cell(level: &str) -> String {
+    match level {
+        "" => "unknown (still starting, or this daemon is too old to say)".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn paused_cell(s: &proto::StatusResponse, now_unix_ms: i64) -> String {
     if !s.paused {
         return "no".to_string();
@@ -468,6 +483,7 @@ async fn cmd_status(client: &mut Client, format: OutputFormat) -> CliResult {
         if s.enforcing { "yes" } else { "no" }
     );
     println!("  in-kernel      {}", enforcement_cell(&s.enforcement));
+    println!("  fast-allow     {}", fast_allow_cell(&s.fast_allow));
     println!("paused           {}", paused_cell(&s, now));
     println!("rules            {}", s.rules_count);
     println!("prompts pending  {}", s.prompts_pending);
@@ -554,6 +570,7 @@ mod tests {
             skipped_rules: 0,
             enforcing: true,
             enforcement: "pinned".to_string(),
+            fast_allow: "live".to_string(),
         }
     }
 
@@ -667,6 +684,36 @@ mod tests {
         assert_eq!(v["no_ui_action"], "allow");
         assert_eq!(v["prompt_timeout_secs"], 15);
         assert_eq!(v["warnings"].as_array().unwrap().len(), 2);
+    }
+
+    /// The daemon's sentence passes through untouched in both output modes;
+    /// only its absence gets words, and those must not read as an answer.
+    #[test]
+    fn fast_allow_passes_through_and_names_its_own_absence() {
+        let now = 1_700_000_000_000;
+        let mut s = status(false, 0);
+        let v = serde_json::to_value(status_json(&s, now)).unwrap();
+        assert_eq!(v["fast_allow"], "live");
+
+        s.fast_allow = "off: [ebpf] fast_allow is not set".to_string();
+        let v = serde_json::to_value(status_json(&s, now)).unwrap();
+        assert_eq!(v["fast_allow"], "off: [ebpf] fast_allow is not set");
+        assert_eq!(fast_allow_cell(&s.fast_allow), s.fast_allow);
+        assert_eq!(fast_allow_cell("live"), "live");
+
+        // The proto3 default is what an older daemon sends, and what a new
+        // one sends before startup has answered. JSON keeps it verbatim so a
+        // script can tell "" from a real value; the text mode says what the
+        // blank means, as the enforcement cell does for its own.
+        s.fast_allow = String::new();
+        let v = serde_json::to_value(status_json(&s, now)).unwrap();
+        assert_eq!(v["fast_allow"], "");
+        let cell = fast_allow_cell("");
+        assert!(cell.starts_with("unknown ("), "{cell}");
+        assert!(
+            enforcement_cell("").starts_with("unknown ("),
+            "the two cells must agree on how an absent answer reads"
+        );
     }
 
     #[test]

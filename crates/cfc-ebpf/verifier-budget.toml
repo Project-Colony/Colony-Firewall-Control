@@ -37,11 +37,20 @@ measured_on = "7.1.8"
 # every execve on the machine. The `EXE_RULES_ON` gate exists for exactly that:
 # the loop is skipped entirely on a host with no exe-scoped deny rule, which is
 # the common case.
-observed = 2355
+# 2355 before the fast path; the FAST_ALLOW delete on the exec path is the
+# difference. 2388 with that delete unconditional, 2408 with it behind a read of
+# the mark: the verifier walks both arms of the branch, so the count goes *up*
+# by twenty for a change that, at runtime, lets every execve on a host with the
+# fast path off - every host by default - skip a hash operation. The two
+# numbers measure different things; do not read this one as a regression.
+observed = 2408
 max = 3000
 
 [cfc_sched_process_exit]
-observed = 25
+# 25 before the fast path; one more map delete (FAST_ALLOW) per exit. 52 with
+# that delete unconditional, 75 with it behind a read of the mark - same shape
+# and same reading as the exec program above.
+observed = 75
 max = 200
 
 [cfc_dns_ingress]
@@ -54,22 +63,79 @@ max = 40000
 
 [cfc_connect4]
 # One cookie read + LRU insert, one hash lookup, one counter increment, and -
-# only on the deny branch - a ring-buffer record. Still small because the
-# decision was already made at exec time and left in a map; anything that grows
-# this number means work moved onto the connect() path, which is the one place
-# in CFC where cost is paid by every process on the machine.
+# only on the deny branch - a ring-buffer record. Then the fast path: a mark
+# map read, a getsockopt, a set lookup, a deadline read and compare, and on a
+# change a setsockopt - with a ring record only when a grant is honoured.
+# Still small because the decision was already made at exec time and left in
+# a map; anything that grows this number means work moved onto the connect()
+# path, which is the one place in CFC where cost is paid by every process on
+# the machine.
 #
 # The cookie recording is what buys back the packet path's ~37 ms /proc walk per
-# new connection: 24 instructions here (106 against the 82 the no-cookie twin
-# costs) for a measured 44.9 -> 4.3 ms median connect. The cheapest millisecond
-# this project will ever purchase.
-observed = 106
-max = 300
+# new connection: 24 instructions (106 against the 82 the no-cookie twin costs)
+# for a measured 44.9 -> 4.3 ms median connect. The fast path - a mark map
+# read, a getsockopt, a set lookup, a deadline compare, a conditional
+# setsockopt and, on a honoured grant, a ring record - took it from 106 to
+# 318 on the first matrix run. Three times the instructions
+# for the whole round trip: still the cheapest millisecond on offer.
+#
+# 318 was the number before the protocol guard - the test that keeps this hook
+# from marking a socket that will never pass a hook again - and how that guard
+# was *written* mattered ten times more than what it tests. Measured on 6.12,
+# where the pre-guard number is 356:
+#
+#   flag at the top of mark_decision, live across the whole body   474  (over)
+#   same flag computed one line before its only use                494  (over)
+#   folded into `granted`, no extra boolean, one fewer tail branch  412
+#   deadline read and clock helper moved inside the `&&`            366
+#
+# The cost was never the context load. It was values alive across the tail -
+# the setsockopt, its error path and three counter arms get walked in twice as
+# many states for each one. Folding the protocol test into `granted` removed a
+# boolean and an arm; moving the deadline read and `bpf_ktime_get_boot_ns`
+# inside the `&&` stopped every ungranted hook paying for a value only a
+# granted one reads. The guard now costs 17 instructions on 7.1 (318 -> 335),
+# which is what "a load and a compare" was supposed to mean all along.
+#
+# `max` was raised to 600 in between, when `observed` stood at 384 and the
+# headroom was 17%. Those two commits made that premise false, so it goes back
+# to 450 - the same 1.3x this program has always had. A ceiling widened on a
+# number that later improved, and left wide, is the thing this file exists to
+# prevent. Worst case across the whole matrix is 366, on 6.12.
+#
+# One inference to distrust next time: the folded build's on-disk section came
+# back to within 8 bytes of the pre-guard one while the verifier still charged
+# +66. Section size is not a proxy for verifier cost; only the matrix knows.
+observed = 335
+max = 450
 
 [cfc_connect6]
-# Three more than v4: the address copy is four words instead of one.
-observed = 109
-max = 300
+# A few more than v4: the address copy is four words instead of one.
+observed = 340
+max = 450
+
+# The mark decision alone: no deny lookup, no cookie, no ring record unless a
+# grant is honoured. Note what the matrix taught on the first run: 5.10
+# refuses these outright - `unknown func bpf_getsockopt` on a sendmsg hook,
+# while the same helper verifies on the connect hooks of that kernel - and
+# 6.12 onward accepts them. Neither fact switches the fast path off any more:
+# a missing sendmsg hook is a caveat in the report (they can only strip a forged
+# mark now), and a missing `group_dead` in the exit record (absent on 5.10 and
+# 6.12, present on 6.18) selects the short deadline plus a per-beat sweep of the
+# granted pids rather than a refusal.
+#
+# These two carry the protocol guard as well, and now pay for a decision they
+# can no longer reach: with only TCP ever marked, nothing here ever sets a mark,
+# and the only thing left to strip is one a process forged. They stay as
+# defence in depth where the kernel verifies them; there is no restriction left
+# for their removal to lift.
+[cfc_sendmsg4]
+observed = 267
+max = 350
+
+[cfc_sendmsg6]
+observed = 269
+max = 350
 
 # The no-cookie twins, for kernels whose verifier does not offer
 # bpf_get_socket_cookie to sock_addr programs. Identical enforcement, no

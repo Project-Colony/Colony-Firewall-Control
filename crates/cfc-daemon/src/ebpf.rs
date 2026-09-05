@@ -87,6 +87,7 @@ pub mod tracefs;
 mod enforce;
 #[cfg(feature = "ebpf")]
 mod loader;
+mod nft_set;
 
 /// Socket-cookie -> pid, answered from the kernel's `SOCK_PIDS` map.
 ///
@@ -372,6 +373,131 @@ pub fn enforcement_level() -> Option<Enforcement> {
     }
 }
 
+/// Whether the fast-allow path - a process-wide allow marking its sockets so
+/// nftables accepts them ahead of the queue - is actually doing anything.
+///
+/// Two-way, with the reason attached. `Off` carries *why*, because the path
+/// has many ways to be silently inert - the config switch, a kernel whose
+/// verifier lacks `bpf_setsockopt` on sock_addr, exit not tracked at all, ring
+/// consumers that did not start, an nftables set the snippet does not declare,
+/// a table that is not loaded yet, a ruleset reload that emptied the set - and
+/// a feature that is off for a reason nobody can read is
+/// a feature nobody can rely on. That lesson was learned once already with the
+/// enforcement level above.
+///
+/// Not "an inherited attach from a build that predates it", which this list
+/// used to open with. The pin directory carries the ABI version and the fast
+/// path arrived with a version bump, so a daemon never inherits pins from a
+/// build that lacks it - it would find no pins at that path at all and attach
+/// fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastAllow {
+    /// Marks are being set and the nftables set holds this daemon's value.
+    ///
+    /// `deadline_secs` is how long a grant outlives a daemon that stops
+    /// refreshing it: the full [`fast_allow::DEADLINE_SECS`] when every
+    /// guarantee holds, the shorter [`fast_allow::DEADLINE_SECS_REDUCED`] when
+    /// one does not. `reduced` says which - the exec/exit links could not be
+    /// pinned, or exit is detected by leader only and grants are swept every
+    /// beat - or is `None` for the full guarantee.
+    ///
+    /// Carried rather than assumed, because a status line that says `live`
+    /// without saying which guarantee is a status line that misleads on
+    /// exactly the kernels where the guarantee is weaker. Two different
+    /// weaknesses give the same six seconds, so the number alone would not do.
+    Live {
+        deadline_secs: u64,
+        reduced: Option<String>,
+    },
+    /// Not doing anything, and this is the one sentence that says why.
+    Off(String),
+}
+
+impl FastAllow {
+    /// One token plus the reason, for `cfc status`: `live` or `off: <why>`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Live {
+                reduced: None,
+                deadline_secs,
+            } if *deadline_secs == cfc_ebpf_common::fast_allow::DEADLINE_SECS => "live".to_string(),
+            Self::Live {
+                deadline_secs,
+                reduced,
+            } => match reduced {
+                Some(why) => format!("live, grants lapse within {deadline_secs}s ({why})"),
+                None => format!("live, grants lapse within {deadline_secs}s"),
+            },
+            Self::Off(why) => format!("off: {why}"),
+        }
+    }
+}
+
+static FAST_ALLOW_LEVEL: std::sync::RwLock<Option<FastAllow>> = std::sync::RwLock::new(None);
+
+/// Records the fast path's current state for `cfc status`.
+///
+/// Not "called once": the loader publishes the startup decision before the
+/// heartbeat exists, the heartbeat publishes every arm and every loss of the
+/// nftables element, the late withdrawal publishes its refusal, and `Drop`
+/// publishes the stop. Last writer wins, which is why the loader must publish
+/// *before* spawning the heartbeat rather than after it returns.
+pub fn set_fast_allow_level(level: FastAllow) {
+    *FAST_ALLOW_LEVEL
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(level);
+}
+
+/// The fast path's state, `None` until startup has answered - the same
+/// "ask again" sentinel `enforcement_level` uses, for the same reason.
+pub fn fast_allow_level() -> Option<FastAllow> {
+    FAST_ALLOW_LEVEL
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// What this kernel's verifier let the fast path have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastPathCapability {
+    /// Cookie connect variants and both sendmsg programs verified.
+    Ready,
+    /// The connect hooks fell back to the `_basic` twins, which carry no
+    /// `mark_decision` at all: nothing would ever mark a socket, so the fast
+    /// path cannot run. In the same era of kernels, no `bpf_setsockopt` on
+    /// sock_addr either.
+    BasicConnect,
+    /// The connect hooks took with the mark decision in them, and a sendmsg
+    /// hook did not load, attach or pin. The path runs; this is a caveat.
+    ///
+    /// The likely cause is the verifier: this kernel allows `bpf_getsockopt` /
+    /// `bpf_setsockopt` on connect programs and not yet on UDP sendmsg ones -
+    /// 5.10 answers `unknown func bpf_getsockopt#57`, 6.12 accepts. It is not
+    /// the only cause, which is why neither this comment nor `caveat` states it
+    /// as fact: `attach_one` also fails at the attach, at taking the link, and
+    /// at pinning. The real error is in the log line beside it.
+    ///
+    /// Why this stopped refusing the path: the sendmsg hooks used to re-decide
+    /// a UDP socket's mark per datagram, and were load-bearing. No UDP socket
+    /// is marked any more, so all they can do is strip a mark somebody
+    /// *forged* onto an unconnected UDP socket - a process that was granted,
+    /// learned the value with `getsockopt`, was revoked, and set it back.
+    /// Defence in depth against a narrow attacker, worth having where the
+    /// kernel allows it and not worth the whole feature where it does not.
+    SendmsgUnavailable,
+}
+
+impl FastPathCapability {
+    /// One grep-able word for the startup log line and the matrix summary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::BasicConnect => "basic-connect",
+            Self::SendmsgUnavailable => "sendmsg-unavailable",
+        }
+    }
+}
+
 /// What actually came up. Reported once at startup and otherwise inert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -409,6 +535,45 @@ pub struct Report {
     /// more expensive" into something visible here, rather than into "it
     /// stopped loading on someone else's kernel".
     pub verified_insns: Vec<(String, u32)>,
+    /// The fast path's state after startup, `None` when the layer never got
+    /// far enough to have an opinion (eBPF off, object not loaded).
+    pub fast_allow: Option<FastAllow>,
+    /// Whether process exit is detected exactly (`group_dead` read from the
+    /// tracepoint record) rather than approximated by leader exit. A deny
+    /// evicted late is an inconvenience; a fast-allow grant evicted late is a
+    /// mark on a recycled pid - so when this is false the fast path runs with
+    /// the reduced deadline and sweeps its grants on every heartbeat, dropping
+    /// any pid whose start time no longer matches the one recorded at grant.
+    /// It used to refuse the path outright, which withheld it from every
+    /// kernel without `group_dead` - 5.10 and 6.12 in the matrix.
+    pub exit_precise: bool,
+    /// Whether *both* lifecycle tracepoint links were pinned to bpffs, rather
+    /// than merely attached.
+    ///
+    /// The two are not the same and the difference is the fast path's whole
+    /// safety argument. `attach_tracepoint` re-attaches unpinned when a link
+    /// cannot be pinned - no `BPF_LINK_TYPE_PERF_EVENT` before 5.15, or a
+    /// read-only bpffs - which keeps eviction working for as long as this
+    /// daemon runs and stops the moment it does not. The connect programs' own
+    /// links are pinned separately and go on marking sockets either way, so
+    /// the difference is whether a grant can outlive this daemon at all - and
+    /// this flag is what tells the two cases apart.
+    ///
+    /// It is one of the two facts that select the reduced deadline rather than
+    /// gating the path - the other is `exit_precise` - and `cfc status` names
+    /// which of the two applies. For a day it was a rung on the eligibility
+    /// ladder instead.
+    pub lifecycle_pinned: bool,
+    /// What this kernel's verifier let the fast path's kernel side have:
+    /// the cookie connect variants with both sendmsg hooks, the variants
+    /// without them, or only the `_basic` twins that mark nothing. The one
+    /// fact of the eligibility ladder that nothing else in this report
+    /// carries, and on a kernel older than 5.16 - which reports no verified
+    /// instruction counts - the only trace of which programs attached. `None`
+    /// where no connect hook attached at all: a layer that is off or could not
+    /// attach has no capability to report, and must not read as having the
+    /// `_basic` twins.
+    pub fast_path_capability: Option<FastPathCapability>,
 }
 
 impl Report {
@@ -539,6 +704,19 @@ impl Report {
             exit_tracking = self.exit_tracking,
             dns_capture = self.dns_capture,
             ppid_from_btf = self.ppid_offsets,
+            fast_path = self
+                .fast_path_capability
+                .map_or("none", FastPathCapability::as_str),
+            // The fast path has five reasons to be off and they used to reach
+            // `cfc status` only. An operator who set `fast_allow = true`,
+            // restarted, and never ran the CLI had no way to learn from the
+            // journal that the kernel had refused a hook - which is the whole
+            // point of degrading loudly.
+            fast_allow = self
+                .fast_allow
+                .as_ref()
+                .map(FastAllow::describe)
+                .unwrap_or_else(|| "not decided".to_string()),
             "attribution sources: sock_diag + /proc{}; hostnames: PTR + FCrDNS{}",
             if self.exec_tracking {
                 " + eBPF exec events"
@@ -584,7 +762,18 @@ pub fn start(
     #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))] engine: Option<
         crate::decision::Engine,
     >,
+    // The fast path's reporting: flows the kernel waved past the queue are
+    // fed back into the same observed stream and the same counters NFQUEUE
+    // feeds, so the live feed and the enforcing heuristic keep telling the
+    // truth about traffic the packet path never sees.
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))]
+    observed: tokio::sync::broadcast::Sender<crate::nfqueue::ObservedConnection>,
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))] stats: crate::stats::Stats,
 ) -> Runtime {
+    // The answer until the layer says otherwise. Every early return below
+    // leaves it standing, which is the truthful default: no layer, no fast
+    // path.
+    set_fast_allow_level(FastAllow::Off("the in-kernel layer is not up".to_string()));
     if !cfg.enabled.wants_load() {
         return Runtime {
             report: Report::inert(
@@ -638,7 +827,19 @@ pub fn start(
                 loader::Trust::Refuse,
             ),
         };
-        match loader::load_and_attach(&path, dns, table.clone(), engine, trust) {
+        match loader::load_and_attach(
+            &path,
+            dns,
+            table.clone(),
+            engine,
+            trust,
+            observed,
+            stats,
+            loader::FastAllowCfg {
+                on: cfg.fast_allow,
+                mark: cfg.fast_allow_mark,
+            },
+        ) {
             Ok((attached, mut report)) => {
                 // The loader builds its report before it knows how it was
                 // asked for; only `start` does. Without this an `auto` host
@@ -646,20 +847,33 @@ pub fn start(
                 // error policy.
                 report.mode = cfg.enabled;
                 table.set_live(report.exec_tracking);
+                // The fast-allow level is NOT published here. The loader
+                // publishes it before it spawns the heartbeat, because that
+                // task publishes too - and this call site runs after both, so
+                // it could only ever overwrite a fresher answer with a staler
+                // one. It did: on a restart the heartbeat arms immediately and
+                // says `Live`, and this line put "waiting for the nftables
+                // table" back on top of it, permanently.
                 Runtime {
                     report,
                     _attached: Some(attached),
                 }
             }
-            Err(e) => Runtime {
-                report: Report::inert_because(
-                    cfg.enabled,
-                    true,
-                    e.degrade,
-                    format!("load failed, continuing without it: {:#}", e.source),
-                ),
-                _attached: None,
-            },
+            Err(e) => {
+                // The loader never got far enough to publish one.
+                set_fast_allow_level(FastAllow::Off(
+                    "the in-kernel layer did not come up".to_string(),
+                ));
+                Runtime {
+                    report: Report::inert_because(
+                        cfg.enabled,
+                        true,
+                        e.degrade,
+                        format!("load failed, continuing without it: {:#}", e.source),
+                    ),
+                    _attached: None,
+                }
+            }
         }
     };
 
@@ -675,12 +889,16 @@ mod tests {
         let cfg = EbpfConfig {
             enabled: EbpfMode::Off,
             object_path: None,
+            fast_allow: false,
+            fast_allow_mark: None,
         };
         let rt = start(
             &cfg,
             DnsCache::new(),
             proc_table::KernelProcTable::new(),
             None,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
         );
         assert!(!rt.report.any_active());
         assert_eq!(rt.report.mode, EbpfMode::Off);
@@ -706,12 +924,21 @@ mod tests {
         let cfg = EbpfConfig {
             enabled: EbpfMode::On,
             object_path: Some(dir.path().join("cfc-ebpf.o")),
+            fast_allow: false,
+            fast_allow_mark: None,
         };
         // An instance, not `proc_table::global()`: the assertion below is about
         // what *this* load did, and against the process-wide table it would be
         // an assertion about every other test in the binary as well.
         let table = proc_table::KernelProcTable::new();
-        let rt = start(&cfg, DnsCache::new(), table.clone(), None);
+        let rt = start(
+            &cfg,
+            DnsCache::new(),
+            table.clone(),
+            None,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+        );
         assert_eq!(rt.report.mode, EbpfMode::On);
         assert!(!rt.report.any_active(), "nothing can have attached");
         assert_eq!(rt.report.ring0(), Ring0::Unavailable);
@@ -765,7 +992,14 @@ mod tests {
         );
 
         let table = proc_table::KernelProcTable::new();
-        let rt = start(&cfg, DnsCache::new(), table.clone(), None);
+        let rt = start(
+            &cfg,
+            DnsCache::new(),
+            table.clone(),
+            None,
+            tokio::sync::broadcast::channel(8).0,
+            crate::stats::Stats::new(),
+        );
         for note in &rt.report.notes {
             println!("note: {note}");
         }

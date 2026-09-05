@@ -214,7 +214,11 @@ MemoryDenyWriteExecute=true
 # else about this unit is compatible with that child - ProtectSystem=strict
 # leaves /var/lib/rpm readable, and rpm needs no writable-executable memory. If
 # it ever is not compatible, the failure is a warning and an empty provenance
-# index, never a failure to filter.
+# index, never a failure to filter. The other child is nft(8), run at start
+# and at stop to put the fast-allow mark into one nftables set and take it
+# out: the same fork/execve, netlink under the CAP_NET_ADMIN already granted,
+# no writable-executable memory - and the same failure shape, the fast path
+# reported off with the reason, never a failure to filter.
 SystemCallFilter=@system-service
 SystemCallFilter=bpf perf_event_open
 SystemCallErrorNumber=EPERM

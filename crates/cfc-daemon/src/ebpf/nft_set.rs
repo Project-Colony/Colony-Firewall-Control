@@ -1,0 +1,695 @@
+//! The one thing the daemon does to nftables: put its fast-allow mark into
+//! the `fast_allow` set the snippet declares empty, and take it out again.
+//!
+//! Until this module existed the daemon never wrote to the ruleset. It sat on
+//! the far end of NFQUEUE 0 and `colony-firewall-nft.service` owned every
+//! rule; that boundary was kept on purpose. It moves for exactly one reason,
+//! given in full in [`cfc_ebpf_common::fast_allow`]: the mark the connect
+//! hooks set must be a per-start random value, so it cannot be a literal in
+//! the snippet, so something at runtime has to tell nftables what it is. This
+//! is that something, and it is kept to two statements: `add element` when
+//! the fast path comes up, `flush set` at every start and at shutdown.
+//!
+//! # Why a child process
+//!
+//! `nft(8)` is run as a child, the way the provenance backend runs `rpm -qa`,
+//! and with the same discipline: a fixed program path, a deadline with a kill
+//! behind it, `LC_ALL=C`, stderr captured into the error and never parsed as
+//! data. The alternative - speaking nf_tables netlink from the daemon - is a
+//! batching protocol with its own cache semantics, for two statements the
+//! package already `Requires: nftables` to make. One fork at start and one at
+//! stop, both off the packet path.
+//!
+//! # What this module refuses to do
+//!
+//! Create the table or the set. Those belong to the snippet and its unit; a
+//! daemon that made them on demand would be a daemon that quietly builds a
+//! ruleset nobody loaded, and on a host without the snippet that ruleset
+//! would be a fail-closed table with the wrong owner. A missing set is
+//! reported as exactly that, with the fix. A missing table is reported as the
+//! ordering it usually is: `colony-firewall-nft.service` is `After=` the
+//! daemon, so at daemon start the table is normally not there *yet*, and at
+//! stop (`PartOf=`) it is normally already gone. [`Absent`] tells the two
+//! apart so the loader can retry the first, and [`disarm`] treats both as
+//! nothing left to flush.
+//!
+//! # The value is a secret
+//!
+//! A forger holding `CAP_NET_RAW` but not `CAP_NET_ADMIN` can read neither the
+//! ruleset nor the BPF map, and that is the whole argument for a random value.
+//! The journal and `cfc status` are readable by more people than the ruleset
+//! is, so the mark never appears in a log line or an error: nft echoes the
+//! failing command back on stderr, and that echo is redacted before it goes
+//! anywhere.
+//!
+//! There is a third read path, and naming two of them made this argument look
+//! stronger than it is: a process the fast path has **granted** can read the
+//! value straight off its own socket with `getsockopt(SO_MARK)`. Nothing
+//! prevents that and nothing should - that process is allowed by a rule, which
+//! is why the kernel marked it. What follows is the scope of the secret: it
+//! holds against processes that have never been granted, and not against one
+//! that has and then, say, execs into something a rule denies. The kernel
+//! clears `FAST_ALLOW` on exec, but it cannot unmark a socket the old program
+//! already passed on. The mark being redrawn at every daemon start is what
+//! bounds that, and it is why [`disarm`] runs unconditionally at start rather
+//! than only on the arming path - a value left accepted in the set that
+//! nothing refreshes is one every past grantee still knows.
+
+// The only caller is the loader, which is behind the `ebpf` feature. The
+// module itself stays in every build so its tests run in the default suite,
+// for the same reason `tracefs` does.
+#![cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+
+use std::fmt;
+use std::io::Read as _;
+use std::path::Path;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail};
+use cfc_ebpf_common::fast_allow;
+use tracing::debug;
+
+/// The family and table the snippet declares, and the set inside it. Named
+/// once here and spelled into every command, so a rename in the snippet fails
+/// the `list set` probe rather than silently arming nothing.
+const FAMILY: &str = "inet";
+const TABLE: &str = "colony_firewall";
+const SET: &str = "fast_allow";
+
+/// Where `nft` is looked for, first hit wins. Fixed paths rather than a
+/// `PATH` search: this child runs as root with `CAP_NET_ADMIN`, and which
+/// binary that is should not depend on an environment variable. `/usr/sbin`
+/// first because on RHEL 9 it is the only spelling; Fedora 42+ and Arch
+/// merged sbin into bin, and there both names resolve to the same file.
+const NFT_CANDIDATES: [&str; 2] = ["/usr/sbin/nft", "/usr/bin/nft"];
+
+/// How long one nft command is given before it is killed.
+///
+/// nft holds the nf_tables transaction lock for the length of its batch, and
+/// waits for it when another process - a large `nft -f`, a container runtime
+/// rewriting its chains - holds it first. A daemon that hangs at start or
+/// stop behind that lock is worse than one whose fast path stays off, and at
+/// shutdown a hang here would run into the unit's stop timeout. Five seconds
+/// is far past any healthy command and far short of that timeout.
+const NFT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the deadline is re-checked while waiting; same value and same
+/// reasoning as the rpm query's.
+const NFT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Adds `mark` to `set fast_allow` in `table inet colony_firewall`.
+///
+/// Errors when the set does not exist (a snippet that predates it), when the
+/// table is not loaded, when `nft` is missing, or when the command fails; the
+/// loader turns any error into `FastAllow::Off(reason)` and never arms the
+/// kernel side without it. The first two are an [`Absent`], reachable through
+/// `downcast_ref`, because one of them is the normal state right after
+/// startup and deserves a retry rather than a reason.
+///
+/// Refuses [`fast_allow::UNARMED`] outright: zero is the mark every socket
+/// carries when nothing has marked it, and a zero element in the set would
+/// accept every unmarked packet on the machine.
+/// Serialises [`arm`] against the shutdown flush, and refuses an arm once that
+/// flush has begun.
+///
+/// Both run `nft`, and the heartbeat's arm runs inside `spawn_blocking`, which
+/// `JoinHandle::abort` cannot cancel: aborting the heartbeat task leaves any
+/// `nft add element` already in flight running to completion on the blocking
+/// pool. So `Drop for Attached` could flush the set and *then* have that add
+/// put the element back - leaving a mark accepted by the ruleset with no
+/// daemon alive to refresh a deadline, honour a revocation, or ever remove it.
+///
+/// The bool inside is "shutdown has started". Holding the lock across the
+/// check and the command is what makes the two orders both end flushed: if the
+/// heartbeat holds it, the shutdown flush waits and runs last; if the shutdown
+/// flush holds it, the heartbeat then sees the flag and does not arm.
+///
+/// It says "has started", not "has happened", so it belongs to one layer's
+/// lifetime and [`disarm_for_start`] clears it. Leaving it set was a real bug
+/// for as long as it existed: this is a process-global, so the first `Attached`
+/// dropped would have refused every arm for the rest of that process - every
+/// later test in one test binary, and any reload of the eBPF layer that did
+/// not also restart the daemon.
+static SHUTDOWN: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Locks [`SHUTDOWN`], ignoring poisoning: the flag is a single bool that no
+/// panic can leave inconsistent, and refusing to shut down cleanly because
+/// some other thread panicked would be the worse failure.
+fn shutdown_gate() -> std::sync::MutexGuard<'static, bool> {
+    SHUTDOWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Puts `mark` in the set, and only `mark`.
+///
+/// Flushes first, so the set is left holding exactly this daemon's value
+/// rather than this one added to whatever a predecessor left. Refuses once
+/// [`disarm_for_shutdown`] has run - see [`SHUTDOWN`].
+pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
+    if mark == fast_allow::UNARMED {
+        bail!(
+            "refusing to arm the fast path with mark {}: that is the mark of every \
+             socket nothing has marked, and accepting it would accept everything",
+            mark_literal(mark)
+        );
+    }
+    let gate = shutdown_gate();
+    if *gate {
+        bail!("not arming the fast-allow set: the daemon is shutting down");
+    }
+    match run(Op::ListSet) {
+        Ok(()) => {}
+        Err(failed) if failed.is_no_such_object() => {
+            // Table or set? nft says "No such file or directory" for both and
+            // only moves the caret. One more probe tells them apart, and it
+            // runs on this path alone.
+            let absent = match run(Op::ListTable) {
+                Ok(()) => Absent::Set,
+                Err(failed) if failed.is_no_such_object() => Absent::Table,
+                Err(failed) => return Err(failed.into_error(Op::ListTable)),
+            };
+            return Err(anyhow::Error::new(absent));
+        }
+        Err(failed) => return Err(failed.into_error(Op::ListSet)),
+    }
+    // Flush before adding, so this leaves the set holding *exactly* this
+    // daemon's mark rather than adding to whatever is already there.
+    //
+    // The startup flush is not enough on its own. It runs once, and on a boot
+    // it runs when the table does not exist yet - `colony-firewall-nft.service`
+    // is ordered after this daemon - so it flushes nothing. The heartbeat then
+    // retries this function on every heartbeat until the table appears, and a
+    // plain `add element` at that point would leave a crashed predecessor's
+    // mark accepted alongside this daemon's, for as long as the ruleset lives.
+    // A mark that is still accepted but that nothing refreshes is the worst
+    // shape this set can be in: every process that ever held it can read it
+    // back with `getsockopt(SO_MARK)` and set it again.
+    if let Err(failed) = run(Op::FlushSet) {
+        // Not fatal: the add below is still the operation that matters. Not
+        // compensated for either, which an earlier version of this comment
+        // claimed - `holds` asks whether *our* mark is in the set, so it
+        // cannot notice a stranger's left beside it. A failed flush here means
+        // a value this daemon did not choose may stay accepted until something
+        // else tears the table down; the log line is the only trace.
+        if !failed.is_no_such_object() {
+            debug!(
+                "could not flush the fast-allow set before arming: {}",
+                failed.into_error(Op::FlushSet)
+            );
+        }
+    }
+    let op = Op::AddElement(mark);
+    run(op).map_err(|failed| failed.into_error(op))?;
+    debug!("fast-allow mark added to set {FAMILY} {TABLE} {SET}");
+    Ok(())
+}
+
+/// Whether the ruleset still accepts `mark`.
+///
+/// Arming is not a fact that stays true. `systemctl restart nftables`, a
+/// `nft -f` that reloads the machine's ruleset, or anything else that
+/// recreates `table inet colony_firewall` leaves the set empty while this
+/// daemon goes on marking sockets and `cfc status` goes on saying `live`. The
+/// heartbeat calls this so that state is noticed and re-armed rather than
+/// reported.
+///
+/// A missing table or set answers `false`, not an error: they are the same
+/// answer for the caller - the mark is not accepted - and the caller's re-arm
+/// path already classifies which of the two it is.
+pub(super) fn holds(mark: u32) -> anyhow::Result<bool> {
+    let op = Op::GetElement(mark);
+    match run(op) {
+        Ok(()) => Ok(true),
+        Err(failed) if failed.is_no_such_object() => Ok(false),
+        Err(failed) => Err(failed.into_error(op)),
+    }
+}
+
+/// Flushes `set fast_allow`, so that no value (this daemon's or a previous
+/// one's) is accepted by the ruleset.
+///
+/// This is the plain flush: the late withdrawal in `load_and_attach` calls it
+/// when the ring consumers failed after arming. The start and shutdown
+/// flushes are [`disarm_for_start`] and [`disarm_for_shutdown`], which also
+/// move the gate - an earlier version of this comment named them as this
+/// function's callers, and they are not.
+///
+/// A missing table or a missing set is success: there is nothing in either
+/// that could accept a mark, and at shutdown the table is usually already
+/// gone - `colony-firewall-nft.service` is `PartOf=` the daemon and stops
+/// first.
+pub(super) fn disarm() -> anyhow::Result<()> {
+    let _gate = shutdown_gate();
+    flush()
+}
+
+/// [`disarm`], beginning a new layer lifetime.
+///
+/// For the one call at the top of `load_and_attach`. Clears the flag a
+/// previous `Attached`'s shutdown set: that flag means "the layer that owned
+/// this set is going away", and by here it has gone.
+pub(super) fn disarm_for_start() -> anyhow::Result<()> {
+    begin_lifetime();
+    flush()
+}
+
+/// The flag half of [`disarm_for_start`], split out so the regression it
+/// exists for can be tested without running `nft`.
+fn begin_lifetime() {
+    *shutdown_gate() = false;
+}
+
+/// [`disarm`], and no [`arm`] after it.
+///
+/// For `Drop for Attached` only. Sets the flag the heartbeat's in-flight arm
+/// will see, under the same lock, so the set cannot be re-armed behind a
+/// daemon that has already stopped.
+pub(super) fn disarm_for_shutdown() -> anyhow::Result<()> {
+    let mut gate = shutdown_gate();
+    *gate = true;
+    flush()
+}
+
+fn flush() -> anyhow::Result<()> {
+    match run(Op::FlushSet) {
+        Ok(()) => {
+            debug!("fast-allow set flushed");
+            Ok(())
+        }
+        Err(failed) if failed.is_no_such_object() => {
+            debug!("fast-allow set not present, nothing to flush");
+            Ok(())
+        }
+        Err(failed) => Err(failed.into_error(Op::FlushSet)),
+    }
+}
+
+/// Why [`arm`] found nothing to arm.
+///
+/// Returned as the error itself rather than as context, so the loader can
+/// `downcast_ref::<Absent>()` and treat the two differently: a missing table
+/// is the expected state right after the daemon starts (the nft unit is
+/// ordered after it) and is worth retrying; a missing set will not fix itself
+/// and names its fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Absent {
+    /// `table inet colony_firewall` is not loaded.
+    Table,
+    /// The table is loaded but carries no `fast_allow` set.
+    Set,
+}
+
+impl fmt::Display for Absent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Absent::Table => write!(
+                f,
+                "table {FAMILY} {TABLE} is not loaded, so there is no {SET} set to arm; \
+                 colony-firewall-nft.service loads it once the daemon is up"
+            ),
+            Absent::Set => write!(
+                f,
+                "the loaded nftables snippet predates {SET}; reinstall \
+                 systemd/nftables-snippet.conf and restart colony-firewall-nft.service"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Absent {}
+
+/// The commands this module issues. Three do the work; `ListTable` exists
+/// only to say which of two things is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// `nft list set inet colony_firewall fast_allow`: does the set exist?
+    /// Its output is discarded; the exit status is the answer.
+    ListSet,
+    /// `nft list table inet colony_firewall`, run only after `ListSet` failed.
+    ListTable,
+    /// `nft add element inet colony_firewall fast_allow { 0x<mark> }`.
+    AddElement(u32),
+    /// `nft flush set inet colony_firewall fast_allow`.
+    FlushSet,
+    /// `nft get element inet colony_firewall fast_allow { 0x<mark> }`: is
+    /// this daemon's mark still accepted? Status-only, like `ListSet`, which
+    /// is why it is a `get` and not a `list` the caller would have to parse.
+    GetElement(u32),
+}
+
+/// The argument vector for `op`, without the program.
+///
+/// Pure, and the part of this module that is tested without nft: what the
+/// tests pin is that every command names the snippet's table and set, and
+/// that the mark is spelled one way.
+fn argv(op: Op) -> Vec<String> {
+    let words: &[&str] = match op {
+        Op::ListSet => &["list", "set", FAMILY, TABLE, SET],
+        Op::ListTable => &["list", "table", FAMILY, TABLE],
+        Op::AddElement(_) => &["add", "element", FAMILY, TABLE, SET],
+        Op::FlushSet => &["flush", "set", FAMILY, TABLE, SET],
+        Op::GetElement(_) => &["get", "element", FAMILY, TABLE, SET],
+    };
+    let mut argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+    if let Op::AddElement(mark) | Op::GetElement(mark) = op {
+        argv.push(format!("{{ {} }}", mark_literal(mark)));
+    }
+    argv
+}
+
+/// The mark as a `type mark` element: `0x` and exactly eight hex digits.
+///
+/// One fixed spelling, because nft echoes the failing command line back on
+/// stderr verbatim and [`redact`] removes the literal by exact match; a
+/// literal that could be spelled two ways could be leaked one of them.
+fn mark_literal(mark: u32) -> String {
+    format!("0x{mark:08x}")
+}
+
+/// One nft command that did not succeed.
+enum Failed {
+    /// nft ran to completion and said no. `stderr` is what it said: an
+    /// `Error:` line, the command echoed back, a caret under the offending
+    /// word.
+    Nft { status: ExitStatus, stderr: String },
+    /// nft could not be found or spawned, or overran [`NFT_TIMEOUT`].
+    Run(anyhow::Error),
+}
+
+impl Failed {
+    /// Whether nft said that the table or the set the command named does not
+    /// exist. Both are `ENOENT`, and nft renders errno as `strerror` text;
+    /// `LC_ALL=C` keeps that text English.
+    fn is_no_such_object(&self) -> bool {
+        matches!(self, Failed::Nft { stderr, .. } if stderr_names_no_such_object(stderr))
+    }
+
+    /// Folds into an error whose text is safe to log: the mark is redacted
+    /// from the command line and from nft's echo of it.
+    fn into_error(self, op: Op) -> anyhow::Error {
+        let command = redact(op, format!("nft {}", argv(op).join(" ")));
+        match self {
+            Failed::Nft { status, stderr } => {
+                anyhow!("{command} failed ({status}): {}", redact(op, stderr).trim())
+            }
+            Failed::Run(e) => e.context(format!("running {command}")),
+        }
+    }
+}
+
+/// The `strerror(ENOENT)` text nft prints for an object that does not exist,
+/// identically for a table and for a set. Observed with nftables 1.1.7 - the
+/// fixtures in the tests are its verbatim output. Deliberately not tied to
+/// the caret line, whose layout is nft's to change.
+fn stderr_names_no_such_object(stderr: &str) -> bool {
+    stderr.contains("No such file or directory")
+}
+
+/// Replaces the mark literal with a placeholder. Only [`Op::AddElement`] and
+/// [`Op::GetElement`] carry the mark; every other command's text is returned
+/// as it is.
+fn redact(op: Op, text: String) -> String {
+    match op {
+        Op::AddElement(mark) | Op::GetElement(mark) => text.replace(&mark_literal(mark), "<mark>"),
+        _ => text,
+    }
+}
+
+/// The first of [`NFT_CANDIDATES`] that exists.
+fn locate_nft() -> anyhow::Result<&'static str> {
+    NFT_CANDIDATES
+        .iter()
+        .copied()
+        .find(|p| Path::new(p).exists())
+        .ok_or_else(|| {
+            anyhow!(
+                "nft not found at {} (the package requires nftables, and without it \
+                 colony-firewall-nft.service could not have loaded the table either)",
+                NFT_CANDIDATES.join(" or ")
+            )
+        })
+}
+
+/// Runs one command to completion under [`NFT_TIMEOUT`].
+///
+/// stdout is discarded - nothing here parses nft's output, and the probe
+/// wants only an exit status. stderr is read on its own thread while the
+/// child runs, so an unexpectedly chatty nft cannot fill the pipe and
+/// deadlock against a parent that waits before it reads.
+fn run(op: Op) -> Result<(), Failed> {
+    let program = locate_nft().map_err(Failed::Run)?;
+    let mut child = Command::new(program)
+        .args(argv(op))
+        // errno text is matched (see `stderr_names_no_such_object`); a
+        // translated "No such file or directory" would defeat that.
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Failed::Run(anyhow::Error::new(e).context(format!("spawning {program}"))))?;
+
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr
+            .read_to_end(&mut buf)
+            .map(|_| String::from_utf8_lossy(&buf).into_owned())
+    });
+
+    let deadline = Instant::now() + NFT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                return Err(Failed::Run(
+                    anyhow::Error::new(e).context("waiting for nft"),
+                ))
+            }
+        }
+        if Instant::now() >= deadline {
+            // Killing closes the pipe, which ends the reader thread on its
+            // own; nothing waits on it because there is nothing it could add.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Failed::Run(anyhow!(
+                "nft did not finish within {NFT_TIMEOUT:?} (another process may be \
+                 holding the nftables transaction lock)"
+            )));
+        }
+        std::thread::sleep(NFT_POLL_INTERVAL);
+    };
+    let stderr = reader
+        .join()
+        .map_err(|_| Failed::Run(anyhow!("nft stderr reader panicked")))?
+        .map_err(|e| Failed::Run(anyhow::Error::new(e).context("reading nft stderr")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Failed::Nft { status, stderr })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// One test, not three: the flag is a process-global, so separate tests
+    /// touching it would race each other under the parallel harness.
+    ///
+    /// Neither half reaches `nft`. `arm` checks the gate before it runs
+    /// anything, and `begin_lifetime` is the flag half of `disarm_for_start`
+    /// split out for exactly this.
+    #[test]
+    fn a_shutdown_refuses_arming_until_a_new_layer_begins() {
+        let mark = 0x0003_3331;
+
+        *shutdown_gate() = true;
+        let e = arm(mark).expect_err("an arm after shutdown must be refused");
+        assert!(
+            e.to_string().contains("shutting down"),
+            "refused for the wrong reason: {e}"
+        );
+
+        // The regression: the flag was set by shutdown and cleared by nothing,
+        // so the first `Attached` dropped refused every arm for the rest of
+        // the process - every later test in one binary, and any reload of the
+        // layer that did not also restart the daemon.
+        begin_lifetime();
+        assert!(
+            !*shutdown_gate(),
+            "a new layer lifetime must clear a previous shutdown's flag"
+        );
+
+        // Deliberately not "and now an arm succeeds": getting past the gate is
+        // the only thing left to check, and checking it means letting `arm`
+        // run nft - which on a machine that *does* have the table loaded would
+        // put a live element in a live ruleset from a unit test. The gate is
+        // two lines and the flag above is the whole of its state.
+    }
+
+    /// The element check is status-only, like the set probe: `get element`
+    /// exits non-zero with ENOENT when the element is absent, so nothing here
+    /// has to parse nft's output.
+    #[test]
+    fn the_element_check_names_the_element_and_carries_the_mark() {
+        assert_eq!(
+            argv(Op::GetElement(0x0012_3456)),
+            vec![
+                "get",
+                "element",
+                "inet",
+                "colony_firewall",
+                "fast_allow",
+                "{ 0x00123456 }",
+            ]
+        );
+    }
+
+    /// Both mark-carrying commands must be redacted, not just the add. nft
+    /// echoes the failing command line back verbatim, so a `get` that fails
+    /// would otherwise put the mark in the journal - where every reader of the
+    /// journal could set it.
+    #[test]
+    fn the_element_check_redacts_the_mark_from_what_nft_echoes() {
+        let mark = 0xdead_0a6c;
+        let echoed = format!("Error: No such file or directory\nget element inet colony_firewall fast_allow {{ {} }}", mark_literal(mark));
+        let safe = redact(Op::GetElement(mark), echoed);
+        assert!(
+            !safe.contains(&mark_literal(mark)),
+            "leaked the mark: {safe}"
+        );
+        assert!(safe.contains("<mark>"));
+    }
+    use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    // Verbatim stderr of nftables 1.1.7, captured in a throwaway network
+    // namespace. The first line is the same in every case; only the caret
+    // moves, from under the table name to under the set name.
+    const NO_TABLE_LIST: &str = "Error: No such file or directory\nlist set inet colony_firewall fast_allow\n              ^^^^^^^^^^^^^^^\n";
+    const NO_SET_FLUSH: &str = "Error: No such file or directory\nflush set inet colony_firewall fast_allow\n                               ^^^^^^^^^^\n";
+    const NO_SET_ADD: &str = "Error: No such file or directory\nadd element inet colony_firewall fast_allow { 0x1234abcd }\n                                 ^^^^^^^^^^\n";
+    const SYNTAX_ERROR: &str = "Error: syntax error, unexpected newline\nexpected any of: <string>, last\nlist set inet colony_firewall\n                             ^\n";
+    const NOT_PERMITTED: &str = "Error: Operation not permitted\nlist set inet colony_firewall fast_allow\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n";
+
+    fn exit_status(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn add_element_spells_the_mark_as_eight_hex_digits() {
+        assert_eq!(
+            argv(Op::AddElement(0x1234_abcd)),
+            [
+                "add",
+                "element",
+                "inet",
+                "colony_firewall",
+                "fast_allow",
+                "{ 0x1234abcd }"
+            ]
+        );
+        // A small value is padded rather than shortened: one spelling only,
+        // which is what makes the redaction an exact match.
+        assert_eq!(argv(Op::AddElement(7)).last().unwrap(), "{ 0x00000007 }");
+        assert_eq!(mark_literal(u32::MAX), "0xffffffff");
+    }
+
+    #[test]
+    fn every_set_command_names_the_snippets_table_and_set() {
+        for op in [Op::ListSet, Op::AddElement(1), Op::FlushSet] {
+            let argv = argv(op);
+            assert_eq!(
+                &argv[2..5],
+                ["inet", "colony_firewall", "fast_allow"],
+                "{op:?} does not address the snippet's set"
+            );
+        }
+        assert_eq!(
+            argv(Op::ListTable),
+            ["list", "table", "inet", "colony_firewall"]
+        );
+    }
+
+    #[test]
+    fn list_and_flush_use_the_verbs_nft_understands() {
+        assert_eq!(
+            argv(Op::ListSet),
+            ["list", "set", "inet", "colony_firewall", "fast_allow"]
+        );
+        assert_eq!(
+            argv(Op::FlushSet),
+            ["flush", "set", "inet", "colony_firewall", "fast_allow"]
+        );
+    }
+
+    #[test]
+    fn a_missing_table_and_a_missing_set_both_read_as_absent() {
+        for stderr in [NO_TABLE_LIST, NO_SET_FLUSH, NO_SET_ADD] {
+            assert!(
+                stderr_names_no_such_object(stderr),
+                "not classified as absent:\n{stderr}"
+            );
+            let failed = Failed::Nft {
+                status: exit_status(1),
+                stderr: stderr.to_string(),
+            };
+            assert!(failed.is_no_such_object());
+        }
+    }
+
+    #[test]
+    fn other_failures_do_not_read_as_absent() {
+        for stderr in [SYNTAX_ERROR, NOT_PERMITTED, ""] {
+            assert!(
+                !stderr_names_no_such_object(stderr),
+                "wrongly classified as absent:\n{stderr}"
+            );
+        }
+        // A spawn failure is not nft saying anything, whatever its text.
+        let failed = Failed::Run(anyhow!("No such file or directory"));
+        assert!(!failed.is_no_such_object());
+    }
+
+    #[test]
+    fn the_unarmed_value_is_refused_before_nft_runs() {
+        // Zero is what every unmarked socket reads; accepting it would accept
+        // everything. This must fail on a machine without nft, which is why
+        // the guard comes before any command is built.
+        let e = arm(fast_allow::UNARMED).expect_err("mark 0 must be refused");
+        assert!(e.to_string().contains("0x00000000"), "{e}");
+    }
+
+    #[test]
+    fn an_add_element_failure_never_names_the_mark() {
+        let mark = 0x1234_abcd;
+        let failed = Failed::Nft {
+            status: exit_status(1),
+            stderr: NO_SET_ADD.to_string(),
+        };
+        let text = format!("{:#}", failed.into_error(Op::AddElement(mark)));
+        assert!(!text.contains("1234abcd"), "leaked: {text}");
+        assert!(text.contains("<mark>"), "{text}");
+        assert!(text.contains("exit status: 1"), "{text}");
+
+        let failed = Failed::Run(anyhow!("spawning /usr/sbin/nft: permission denied"));
+        let text = format!("{:#}", failed.into_error(Op::AddElement(mark)));
+        assert!(!text.contains("1234abcd"), "leaked: {text}");
+        assert!(text.contains("<mark>"), "{text}");
+    }
+
+    #[test]
+    fn absent_names_its_fix_and_survives_the_error_chain() {
+        let set = Absent::Set.to_string();
+        assert!(set.contains("nftables-snippet.conf"), "{set}");
+        assert!(set.contains("colony-firewall-nft.service"), "{set}");
+        let table = Absent::Table.to_string();
+        assert!(table.contains("not loaded"), "{table}");
+        assert!(table.contains("colony-firewall-nft.service"), "{table}");
+
+        // What the loader relies on to tell "retry" from "operator".
+        let e = anyhow::Error::new(Absent::Table);
+        assert_eq!(e.downcast_ref::<Absent>(), Some(&Absent::Table));
+    }
+}
