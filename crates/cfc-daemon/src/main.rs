@@ -323,6 +323,14 @@ async fn run() -> anyhow::Result<()> {
     // sock_diag + /proc alone, which is exactly what the daemon does when the
     // layer is unavailable anyway.
     //
+    // The loader flushes a predecessor's fast-allow mark at the top of every
+    // load. With the layer switched off in the config that flush is never
+    // reached, and the nftables set outlives daemons - so it is done here for
+    // exactly that case. Not under --dry-run, which touches nothing.
+    if !args.dry_run && !cfg.ebpf.enabled.wants_load() {
+        ebpf::flush_stale_fast_allow();
+    }
+
     // Held for the daemon's lifetime: dropping it detaches the programs.
     let _ebpf = ebpf::start(
         // `--dry-run` means "tell me what you would do without touching the

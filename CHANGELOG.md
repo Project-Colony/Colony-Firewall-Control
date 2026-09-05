@@ -111,9 +111,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and written by nobody for two releases, is gone.
 - The daemon now runs `nft` to put its fast-allow value into one set and
   take it out again - the first time it touches nftables; the SELinux policy
-  grants exactly that. The set is flushed unconditionally at every start, so
-  a daemon that crashed while armed and came back with the path off does not
-  leave its predecessor's mark accepted; and once armed the daemon re-checks
+  grants exactly that. The set is flushed at every start of the daemon - with
+  the layer on, switched off in the config, or absent from the build - so a
+  daemon that crashed while armed and came back in any of those states does
+  not leave its predecessor's mark accepted; and once armed the daemon re-checks
   every minute that the element is still there, so an `nft -f` that reloads
   the ruleset is noticed and re-armed rather than reported as live. The
   nftables snippet gains the set and the accept rule; an older snippet leaves
