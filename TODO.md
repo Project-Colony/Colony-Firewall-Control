@@ -126,7 +126,10 @@ RHEL 9's backported 5.14. The fast-allow branch adds 5.15 above it, so the pair
 brackets the RHEL kernel: what both allow, 5.14 allows unless Red Hat took it
 out; what only 5.15 allows, 5.14 has only if they backported it; what both
 refuse, 5.14 may still have through a backport. Where the two disagree is the
-list of things to check on a Rocky host rather than assume.
+list of things to check on a Rocky host rather than assume. The first 5.15 run
+named one such thing: 5.15 already accepts `bpf_getsockopt` on the sendmsg hooks
+that 5.10 refuses, so whether RHEL 9's 5.14 does is exactly what a Rocky host
+has to answer; neither kernel has `group_dead`.
 
 What remains needs a real enforcing machine - except 2b, which turned out to
 be doable from CI after all:

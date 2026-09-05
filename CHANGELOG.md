@@ -71,14 +71,17 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allow, 5.14 allows unless Red Hat took it out; what only 5.15 allows, 5.14
   has only if they backported it; what both refuse, 5.14 may still have
   through a backport. Where the two disagree is the list of things to check
-  on a Rocky host rather than assume.
+  on a Rocky host rather than assume. The first 5.15 run named one: it
+  already takes the sendmsg hooks that 5.10 refuses, and neither has
+  `group_dead`.
 - **The startup report says what the fast path's kernel side is capable
   of** (`fast_path=ready|sendmsg-unavailable|basic-connect` on the log
   line, `none` where no connect hook attached), and the matrix test asserts it per kernel along with `group_dead`
   where a run has already shown the answer: 5.10 takes the connect hooks and
-  refuses the sendmsg ones, 6.12 takes both and still has no `group_dead`,
-  6.18 and 7.1 have everything. A kernel that changes its answer fails in CI
-  rather than degrading quietly on a host; one without a recorded answer is
+  refuses the sendmsg ones, 5.15 and 6.12 take both and still have no
+  `group_dead`, 6.18 and 7.1 have everything. A kernel that changes its
+  answer fails in CI rather than degrading quietly on a host; one without a
+  recorded answer is
   printed, and the matrix summary carries the line.
 
 ### Changed

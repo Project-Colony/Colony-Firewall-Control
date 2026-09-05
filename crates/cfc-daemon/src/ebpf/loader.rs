@@ -2840,12 +2840,16 @@ mod tests {
                     "5.10 takes the connect hooks and refuses bpf_getsockopt on the sendmsg ones"
                 );
             }
-            Some((6, 12)) => {
+            Some((5, 15)) | Some((6, 12)) => {
                 assert!(
                     !report.exit_precise,
-                    "6.12 has no group_dead in sched_process_exit"
+                    "5.15 and 6.12 have no group_dead in sched_process_exit"
                 );
-                assert_eq!(capability, enforce::FastPathCapability::Ready);
+                assert_eq!(
+                    capability,
+                    enforce::FastPathCapability::Ready,
+                    "5.15 already takes the sendmsg hooks 5.10 refuses, and so does 6.12"
+                );
             }
             Some((6, 18)) | Some((7, 1)) => {
                 assert!(
