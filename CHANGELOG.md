@@ -128,8 +128,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Internals
 
-- A test that copied a binary and executed it raced another test's fork
-  (ETXTBSY on CI); it stages the copy where no fork can hold it open.
+- Two integration tests that each copied a binary and spawned it raced each
+  other's fork (ETXTBSY on CI, the window between a fork and its exec, where
+  the child still holds the other test's write descriptor); copy and spawn
+  are now serialised behind one lock instead of retried past the race.
 - Dependency bumps: rusqlite 0.40.2, libc 0.2.189, flate2 1.1.10,
   owo-colors 4.4.0, thiserror 2.0.20; `action-gh-release` 3.0.3.
 
