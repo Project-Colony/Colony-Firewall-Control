@@ -744,6 +744,21 @@ pub struct Runtime {
     _attached: Option<loader::Attached>,
 }
 
+/// Flushes a previous daemon's fast-allow mark out of the nftables set, for
+/// the starts where [`start`] never reaches the loader's own flush: the layer
+/// switched off in the config, or a build without it. The set outlives
+/// daemons and the accept rule reads it whether or not anything still marks,
+/// so a daemon that crashed while armed and came back with the layer off
+/// would otherwise leave a standing bypass token behind it. A table that is
+/// not loaded yet is not an error here - the nft unit is ordered after the
+/// daemon - and `--dry-run` must not call this at all: it touches nothing, and
+/// `main` is the one that knows it is running.
+pub fn flush_stale_fast_allow() {
+    if let Err(e) = nft_set::disarm_for_start() {
+        tracing::warn!("could not flush a previous fast-allow mark from nftables: {e:#}");
+    }
+}
+
 /// Brings the eBPF layer up, as far as it will come up on this host.
 ///
 /// Never returns an error: every failure mode is a note in the [`Report`].
@@ -797,6 +812,9 @@ pub fn start(
         // `dns` and `table` are the loader's inputs; without it they are
         // simply never wired to anything.
         let _ = (dns, table);
+        // And the loader's flush of a predecessor's mark is never reached in
+        // this build, so it happens here.
+        flush_stale_fast_allow();
         Runtime {
             report: Report::inert_because(
                 cfg.enabled,

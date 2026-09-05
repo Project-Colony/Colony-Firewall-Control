@@ -362,8 +362,8 @@ with a single exception: under `[ebpf] fast_allow`, the sockets of a process
 the daemon has already ruled allowed process-wide are marked in the connect
 hook, and the snippet's `meta mark @fast_allow accept` rule takes them ahead
 of the queue. That set is the one thing the daemon ever writes to nftables -
-one element added when the path is armed, flushed unconditionally at every
-start and at shutdown - and it ships empty, so a default install carries no
+one element added when the path is armed, flushed at every daemon start (whether
+or not the layer loads) and at shutdown - and it ships empty, so a default install carries no
 bypass value.
 
 **Where revocation reaches.** A grant is re-decided at every hook that opens a

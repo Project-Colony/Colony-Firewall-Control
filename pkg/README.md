@@ -148,7 +148,7 @@ To reproduce the tarball locally, from the repo root:
 cargo build --workspace --release --locked
 cargo xtask build-ebpf   # cfc-ebpf.o; postInstall fails outright without it
 
-V=0.3.0
+V=0.4.0
 NAME="colony-firewall-control-${V}-linux-x86_64"
 STAGE="$(mktemp -d)/${NAME}"
 mkdir -p "${STAGE}"

@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -239,6 +239,12 @@ fi
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 
 %changelog
+* Sat Sep 05 2026 MotherSphere <linhajahad@gmail.com> - 0.4.0-1
+- Fast-allow path, opt-in: lastingly allowed processes skip the NFQUEUE round trip
+- eBPF ABI v4
+- The daemon arms one nftables set and the SELinux policy grants exactly that
+- Kernel matrix brackets RHEL 9 with 5.10 and 5.15; veth latency bench
+
 * Wed Sep 02 2026 MotherSphere <linhajahad@gmail.com> - 0.3.0-1
 - Hash-bound prompt allows
 - Tray icon fallback

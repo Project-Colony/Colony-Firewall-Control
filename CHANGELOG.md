@@ -6,6 +6,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-05
+
 ### Added
 
 - **Fast allow (opt-in, `[ebpf] fast_allow = true`).** A process a lasting
@@ -75,20 +77,20 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   already takes the sendmsg hooks that 5.10 refuses, and neither has
   `group_dead`.
 - **The startup report says what the fast path's kernel side is capable
-  of** (`fast_path=ready|sendmsg-unavailable|basic-connect` on the log
-  line, `none` where no connect hook attached), and the matrix test asserts it per kernel along with `group_dead`
-  where a run has already shown the answer: 5.10 takes the connect hooks and
-  refuses the sendmsg ones, 5.15 and 6.12 take both and still have no
-  `group_dead`, 6.18 and 7.1 have everything. A kernel that changes its
-  answer fails in CI rather than degrading quietly on a host; one without a
-  recorded answer is
-  printed, and the matrix summary carries the line.
+  of** (`fast_path=ready|sendmsg-unavailable|basic-connect` on the log line,
+  `none` where no connect hook attached), and the matrix test asserts it per
+  kernel, along with `group_dead`, wherever a run has already shown the
+  answer: 5.10 takes the connect hooks and refuses the sendmsg ones, 5.15 and
+  6.12 take both and still have no `group_dead`, 6.18 and 7.1 have
+  everything. A kernel that changes its answer fails in CI rather than
+  degrading quietly on a host; one without a recorded answer is printed, and
+  the matrix summary carries the line.
 
 ### Changed
 
 - Three costs removed from paths every process on the machine takes, none of
-  them measured on a live kernel - this machine cannot run the daemon - and
-  each argued from what the code does rather than from a number. The exec and
+  them measured on a live kernel yet, each argued from what the code does
+  rather than from a number. The exec and
   exit programs deleted a fast-allow grant on every `execve` and every exit,
   unconditionally, on hosts where the feature is off (which is every host by
   default); the delete is now behind one array read of the mark, which is
@@ -109,13 +111,30 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and written by nobody for two releases, is gone.
 - The daemon now runs `nft` to put its fast-allow value into one set and
   take it out again - the first time it touches nftables; the SELinux policy
-  grants exactly that. The set is flushed unconditionally at every start, so
-  a daemon that crashed while armed and came back with the path off does not
-  leave its predecessor's mark accepted; and once armed the daemon re-checks
+  grants exactly that. The set is flushed at every start of the daemon - with
+  the layer on, switched off in the config, or absent from the build - so a
+  daemon that crashed while armed and came back in any of those states does
+  not leave its predecessor's mark accepted; and once armed the daemon re-checks
   every minute that the element is still there, so an `nft -f` that reloads
   the ruleset is noticed and re-armed rather than reported as live. The
   nftables snippet gains the set and the accept rule; an older snippet leaves
   fast-allow off with the reason spelled out.
+
+### Fixed
+
+- The RPM spec still said 0.2.3 in the 0.3.0 tree, and nothing ran to say
+  so: `scripts/check-versions.sh` now holds the spec, the PKGBUILD and the
+  Colony manifest to `Cargo.toml` on every push, not only when a packaging
+  path changes.
+
+### Internals
+
+- Two integration tests that each copied a binary and spawned it raced each
+  other's fork (ETXTBSY on CI, the window between a fork and its exec, where
+  the child still holds the other test's write descriptor); copy and spawn
+  are now serialised behind one lock instead of retried past the race.
+- Dependency bumps: rusqlite 0.40.2, libc 0.2.189, flate2 1.1.10,
+  owo-colors 4.4.0, thiserror 2.0.20; `action-gh-release` 3.0.3.
 
 ## [0.3.0] - 2026-09-02
 

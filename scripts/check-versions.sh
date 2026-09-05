@@ -6,6 +6,14 @@
 #   - pkg/colony.json    every "version" field and every version embedded
 #                        in an "asset" filename
 #   - packaging/rpm/colony-firewall-control.spec   Version:
+#   - crates/cfc-ebpf/Cargo.lock   the `cfc-ebpf-common` entry. The kernel
+#                                  crate is its own workspace with its own
+#                                  committed lock, and nothing builds it with
+#                                  --locked, so a bump that regenerated only
+#                                  the root lock shipped 0.3.0 with this one
+#                                  still saying 0.2.3, and 0.4.0 nearly did
+#                                  the same. `cargo update -p cfc-ebpf-common`
+#                                  from crates/cfc-ebpf moves it.
 #
 # The spec is here because the job that compared it lived in rhel.yml, which
 # only runs when packaging paths change - so a version bump that touched none
@@ -69,6 +77,10 @@ fi
 # packaging/rpm/colony-firewall-control.spec -> Version: X.Y.Z
 spec_ver="$(sed -n 's/^Version:[[:space:]]*//p' "${ROOT}/packaging/rpm/colony-firewall-control.spec" | head -n1)"
 check "packaging/rpm/colony-firewall-control.spec Version" "${spec_ver}"
+
+# crates/cfc-ebpf/Cargo.lock -> the version recorded for cfc-ebpf-common
+ebpf_lock_ver="$(awk '/^name = "cfc-ebpf-common"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' "${ROOT}/crates/cfc-ebpf/Cargo.lock")"
+check "crates/cfc-ebpf/Cargo.lock cfc-ebpf-common" "${ebpf_lock_ver}"
 
 if [[ "${fail}" -ne 0 ]]; then
     echo "version mismatch (canonical: Cargo.toml [workspace.package] = ${cargo_ver}):" >&2
