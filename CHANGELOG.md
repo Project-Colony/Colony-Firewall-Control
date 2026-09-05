@@ -61,6 +61,26 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   restart the previous daemon's cookie-variant marker in bpffs is what tells
   the new one that the pinned connect programs carry the mark decision.
 
+- **`scripts/bench-latency.sh`**, the veth bench the fast path has to be
+  measured on: a network namespace on the other end of a veth pair, a TCP
+  listener on each side, and connect latency in both directions reported as
+  percentiles. It never touches nftables, the daemon or its rules; run it
+  once per state and compare, on a VM where CFC may be armed.
+- **The kernel matrix brackets RHEL 9.** A 5.15 entry joins 5.10: the LTS
+  below and the LTS above the 5.14 that Rocky and RHEL 9 ship. What both
+  allow, 5.14 allows unless Red Hat took it out; what only 5.15 allows, 5.14
+  has only if they backported it; what both refuse, 5.14 may still have
+  through a backport. Where the two disagree is the list of things to check
+  on a Rocky host rather than assume.
+- **The startup report says what the fast path's kernel side is capable
+  of** (`fast_path=ready|sendmsg-unavailable|basic-connect` on the log
+  line, `none` where no connect hook attached), and the matrix test asserts it per kernel along with `group_dead`
+  where a run has already shown the answer: 5.10 takes the connect hooks and
+  refuses the sendmsg ones, 6.12 takes both and still has no `group_dead`,
+  6.18 and 7.1 have everything. A kernel that changes its answer fails in CI
+  rather than degrading quietly on a host; one without a recorded answer is
+  printed, and the matrix summary carries the line.
+
 ### Changed
 
 - Three costs removed from paths every process on the machine takes, none of

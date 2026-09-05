@@ -103,7 +103,11 @@ case** - nothing granted a process that was already running, so every restart
 silently switched the fast path off for every long-lived program while
 `cfc status` said `live`. What is not done: the latency win is not yet
 *measured* on the veth bench - the number that justifies the feature is still
-the pre-feature 0.28 ms per new flow - and 1b below is untouched.
+the pre-feature 0.28 ms per new flow - and 1b below is untouched. The bench
+that produces that number is `scripts/bench-latency.sh`: a veth pair into a
+network namespace, both directions, run once per state (client under a
+lasting Allow rule, under a flow-scoped one, table absent) on a VM where CFC
+may be armed.
 
 **1b. Rules that depend on a destination still cannot be precomputed.**
 `process_wide_action` deliberately answers `None` for them, which is correct and
