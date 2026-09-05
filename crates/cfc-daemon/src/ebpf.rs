@@ -457,6 +457,47 @@ pub fn fast_allow_level() -> Option<FastAllow> {
         .clone()
 }
 
+/// What this kernel's verifier let the fast path have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastPathCapability {
+    /// Cookie connect variants and both sendmsg programs verified.
+    Ready,
+    /// The connect hooks fell back to the `_basic` twins, which carry no
+    /// `mark_decision` at all: nothing would ever mark a socket, so the fast
+    /// path cannot run. In the same era of kernels, no `bpf_setsockopt` on
+    /// sock_addr either.
+    BasicConnect,
+    /// The connect hooks took with the mark decision in them, and a sendmsg
+    /// hook did not load, attach or pin. The path runs; this is a caveat.
+    ///
+    /// The likely cause is the verifier: this kernel allows `bpf_getsockopt` /
+    /// `bpf_setsockopt` on connect programs and not yet on UDP sendmsg ones -
+    /// 5.10 answers `unknown func bpf_getsockopt#57`, 6.12 accepts. It is not
+    /// the only cause, which is why neither this comment nor `caveat` states it
+    /// as fact: `attach_one` also fails at the attach, at taking the link, and
+    /// at pinning. The real error is in the log line beside it.
+    ///
+    /// Why this stopped refusing the path: the sendmsg hooks used to re-decide
+    /// a UDP socket's mark per datagram, and were load-bearing. No UDP socket
+    /// is marked any more, so all they can do is strip a mark somebody
+    /// *forged* onto an unconnected UDP socket - a process that was granted,
+    /// learned the value with `getsockopt`, was revoked, and set it back.
+    /// Defence in depth against a narrow attacker, worth having where the
+    /// kernel allows it and not worth the whole feature where it does not.
+    SendmsgUnavailable,
+}
+
+impl FastPathCapability {
+    /// One grep-able word for the startup log line and the matrix summary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::BasicConnect => "basic-connect",
+            Self::SendmsgUnavailable => "sendmsg-unavailable",
+        }
+    }
+}
+
 /// What actually came up. Reported once at startup and otherwise inert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -523,6 +564,16 @@ pub struct Report {
     /// which of the two applies. For a day it was a rung on the eligibility
     /// ladder instead.
     pub lifecycle_pinned: bool,
+    /// What this kernel's verifier let the fast path's kernel side have:
+    /// the cookie connect variants with both sendmsg hooks, the variants
+    /// without them, or only the `_basic` twins that mark nothing. The one
+    /// fact of the eligibility ladder that nothing else in this report
+    /// carries, and on a kernel older than 5.16 - which reports no verified
+    /// instruction counts - the only trace of which programs attached. `None`
+    /// where no connect hook attached at all: a layer that is off or could not
+    /// attach has no capability to report, and must not read as having the
+    /// `_basic` twins.
+    pub fast_path_capability: Option<FastPathCapability>,
 }
 
 impl Report {
@@ -653,6 +704,9 @@ impl Report {
             exit_tracking = self.exit_tracking,
             dns_capture = self.dns_capture,
             ppid_from_btf = self.ppid_offsets,
+            fast_path = self
+                .fast_path_capability
+                .map_or("none", FastPathCapability::as_str),
             // The fast path has five reasons to be off and they used to reach
             // `cfc status` only. An operator who set `fast_allow = true`,
             // restarted, and never ran the CLI had no way to learn from the

@@ -287,6 +287,12 @@ jobs:
           #         does not report verified instruction counts at all - the
           #         budget assertion simply has nothing to check there, which is
           #         itself worth exercising.
+          #   5.15  the nearest upstream *above* RHEL 9's 5.14. With 5.10
+          #         below, the pair brackets the RHEL kernel: what both allow,
+          #         5.14 allows unless Red Hat took it out; what only 5.15
+          #         allows, 5.14 has only if they backported it. Where the two
+          #         disagree is exactly the list of things to check on a Rocky
+          #         host rather than assume
           #   6.12  the oldest LTS worth supporting today
           #   6.18  the newest LTS
           #   7.1   the kernel every verified-instruction number in
@@ -296,11 +302,17 @@ jobs:
           #
           # Pinned by digest, like every action in this repo: this job pulls a
           # third-party image and executes the kernel binary inside it, in a
-          # job that also has the repo checkout. These are the OCI *index*
-          # digests, so the amd64 child is still selected normally.
+          # job that also has the repo checkout. Each digest is what the
+          # registry served for the tag on the day it was pinned: an OCI index
+          # where the tag is multi-arch, in which case docker still selects the
+          # amd64 child, or the amd64 image manifest itself where the tag is
+          # published single-arch. Both pull the same way.
           - kernel: "5.10"
             role: rhel-floor
             image: "ghcr.io/cilium/ci-kernels@sha256:0bcfd9e526eeb684cd0eb30e1591f9fc2901683ee535ec70a66d109f848bbd2b"
+          - kernel: "5.15"
+            role: rhel-near
+            image: "ghcr.io/cilium/ci-kernels@sha256:ef84b7e71d4f543442736d8b08d4a17b0817da143c88feefbb100960048c369f"
           - kernel: "6.12"
             role: floor-lts
             image: "ghcr.io/cilium/ci-kernels@sha256:2932ba4cae93bd6503b3e5b51873e69ed273ee7ddfa89718c2d21c9951f2ccb4"
@@ -494,6 +506,19 @@ jobs:
             # reporting honestly looks like.
             grep -o 'verified_insns: [^ ]* = [0-9]*' guest.log | while read -r _ p _ n; do
               echo "| \`${p}\` verified insns | ${n} |"
+            done || true
+            # The fast path's facts as this guest observed them and the
+            # decision the eligibility ladder takes on them with the feature
+            # on. Not what `cfc status` would say on a real host of this
+            # kernel: the guest mounts no bpffs, so `lifecycle_pinned` is
+            # false here on every kernel and the deadline shown is the reduced
+            # one wherever a real host would pin. The other two facts -
+            # `exit_precise` and the capability - are the kernel's own.
+            # `tr -d '\r'`: the guest console writes CRLF, and a CR inside a
+            # table cell ends the markdown row early. `|| true` as above: a
+            # guest that died before printing this already failed on the marker.
+            grep -o 'fast path on this kernel: .*' guest.log | tr -d '\r' | tail -1 | while read -r line; do
+              echo "| fast path | ${line#fast path on this kernel: } |"
             done || true
           } >> "${GITHUB_STEP_SUMMARY}"
 

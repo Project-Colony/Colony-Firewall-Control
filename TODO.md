@@ -118,7 +118,11 @@ be resolved to addresses in advance.
 
 Mostly done in `8db949b` and `b05eefc`: the SELinux module, the RPM provenance
 backend, the `.spec`, and a 5.10 entry in the kernel matrix that sits *below*
-RHEL 9's backported 5.14.
+RHEL 9's backported 5.14. The fast-allow branch adds 5.15 above it, so the pair
+brackets the RHEL kernel: what both allow, 5.14 allows unless Red Hat took it
+out; what only 5.15 allows, 5.14 has only if they backported it; what both
+refuse, 5.14 may still have through a backport. Where the two disagree is the
+list of things to check on a Rocky host rather than assume.
 
 What remains needs a real enforcing machine - except 2b, which turned out to
 be doable from CI after all:

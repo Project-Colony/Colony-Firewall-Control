@@ -1650,35 +1650,9 @@ pub(super) struct AttachedPrograms {
     pub fast_path: FastPathCapability,
 }
 
-/// What this kernel's verifier let the fast path have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FastPathCapability {
-    /// Cookie connect variants and both sendmsg programs verified.
-    Ready,
-    /// The connect hooks fell back to the `_basic` twins, which carry no
-    /// `mark_decision` at all: nothing would ever mark a socket, so the fast
-    /// path cannot run. In the same era of kernels, no `bpf_setsockopt` on
-    /// sock_addr either.
-    BasicConnect,
-    /// The connect hooks took with the mark decision in them, and a sendmsg
-    /// hook did not load, attach or pin. The path runs; this is a caveat.
-    ///
-    /// The likely cause is the verifier: this kernel allows `bpf_getsockopt` /
-    /// `bpf_setsockopt` on connect programs and not yet on UDP sendmsg ones -
-    /// 5.10 answers `unknown func bpf_getsockopt#57`, 6.12 accepts. It is not
-    /// the only cause, which is why neither this comment nor `caveat` states it
-    /// as fact: `attach_one` also fails at the attach, at taking the link, and
-    /// at pinning. The real error is in the log line beside it.
-    ///
-    /// Why this stopped refusing the path: the sendmsg hooks used to re-decide
-    /// a UDP socket's mark per datagram, and were load-bearing. No UDP socket
-    /// is marked any more, so all they can do is strip a mark somebody
-    /// *forged* onto an unconnected UDP socket - a process that was granted,
-    /// learned the value with `getsockopt`, was revoked, and set it back.
-    /// Defence in depth against a narrow attacker, worth having where the
-    /// kernel allows it and not worth the whole feature where it does not.
-    SendmsgUnavailable,
-}
+// Defined in `ebpf.rs`, where the `Report` that carries it lives in every
+// build; re-exported so the paths this module's callers use keep resolving.
+pub(super) use super::FastPathCapability;
 
 impl FastPathCapability {
     /// The one reason the fast path cannot run at all, or `None`.

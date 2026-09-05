@@ -986,6 +986,13 @@ pub(super) fn load_and_attach(
         }
     };
 
+    // A fact of the eligibility ladder, recorded whether or not the ladder
+    // runs below: a layer handed no engine still reports what the kernel let
+    // it have, which is what the kernel matrix reads. `None` where nothing
+    // attached - `fast_path` still says BasicConnect then, and that would be
+    // a claim about hooks that do not exist.
+    report.fast_path_capability = report.enforcement.is_live().then_some(fast_path);
+
     // The socket-cookie -> pid map, for O(1) attribution - the pinned one
     // when there is a pin directory, which is what lets an inherited connect
     // program's writes land somewhere this daemon can read. Taken whenever it
@@ -1949,6 +1956,17 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::os::unix::fs::PermissionsExt as _;
 
+    /// `(major, minor)` of the running kernel, from the same file `uname -r`
+    /// reads: "6.12.4-arch1-1" is (6, 12). `None` where the file is missing
+    /// or unparseable, which no assertion here treats as a kernel it knows.
+    fn kernel_major_minor() -> Option<(u32, u32)> {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?;
+        let mut parts = release.trim().split(|c: char| !c.is_ascii_digit());
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some((major, minor))
+    }
+
     // --- the object-trust policy ----------------------------------------
     //
     // Exercised as pure functions rather than through the filesystem: the
@@ -2755,6 +2773,90 @@ mod tests {
                 "fast-allow is off for a reason this setup does not produce: {why}"
             ),
             other => panic!("fast-allow should be off here (no engine), got {other:?}"),
+        }
+        // The eligibility ladder's facts, observed on this kernel. The decision
+        // in this report is `Off` because the test hands the layer no engine,
+        // so the decision a rule set that grants would get is taken here from
+        // the facts the loader gathered - the ladder is a pure function with
+        // its own tests - and printed for the matrix summary. `config_on` and
+        // `has_maps` are this test's inputs, not observations: the object under
+        // test carries the maps, and the question is what the kernel would
+        // allow with the feature switched on. `lifecycle_pinned` is observed
+        // but says as much about the host as about the kernel: the qemu
+        // guests mount no bpffs, so it is false there on every kernel and
+        // the decision printed there carries the reduced deadline where a
+        // real host of the same kernel would pin. `exit_precise` and the
+        // capability are the kernel's own answers.
+        let capability = report
+            .fast_path_capability
+            .expect("enforcement is live, asserted above, so the capability is recorded");
+        let facts = LadderFacts {
+            config_on: true,
+            has_maps: true,
+            exit_tracking: report.exit_tracking,
+            exit_precise: report.exit_precise,
+            lifecycle_pinned: report.lifecycle_pinned,
+            capability,
+        };
+        let decision = fast_path_decision(&facts);
+        let described = match &decision {
+            Ok(reduced) if reduced.is_empty() => "live".to_string(),
+            Ok(reduced) => format!(
+                "live, grants lapse within {}s ({})",
+                deadline_pair(true).0,
+                reduced.join("; ")
+            ),
+            Err(why) => format!("off: {why}"),
+        };
+        println!(
+            "fast path on this kernel: {described} [exit_precise={} lifecycle_pinned={} capability={}]",
+            report.exit_precise,
+            report.lifecycle_pinned,
+            capability.as_str()
+        );
+        // With the config on and the maps present, refusal has two causes left
+        // and neither is a kernel property this matrix has ever shown: exit
+        // tracking is asserted above, and no kernel here falls back to the
+        // `_basic` connect twins. One that did would be a finding to look at,
+        // not a degradation to wave through.
+        assert!(
+            decision.is_ok(),
+            "the fast path should be at least reduced on every matrix kernel: {decision:?}"
+        );
+        // Where the matrix has already shown what a kernel answers, the answer
+        // is asserted, so a kernel that changes its mind is caught here and not
+        // on a host. A kernel without a recorded answer is observed only: the
+        // line printed above is what the first run of a new matrix entry
+        // contributes to this table.
+        match kernel_major_minor() {
+            Some((5, 10)) => {
+                assert!(
+                    !report.exit_precise,
+                    "5.10 has no group_dead in sched_process_exit"
+                );
+                assert_eq!(
+                    capability,
+                    enforce::FastPathCapability::SendmsgUnavailable,
+                    "5.10 takes the connect hooks and refuses bpf_getsockopt on the sendmsg ones"
+                );
+            }
+            Some((6, 12)) => {
+                assert!(
+                    !report.exit_precise,
+                    "6.12 has no group_dead in sched_process_exit"
+                );
+                assert_eq!(capability, enforce::FastPathCapability::Ready);
+            }
+            Some((6, 18)) | Some((7, 1)) => {
+                assert!(
+                    report.exit_precise,
+                    "group_dead is in sched_process_exit from 6.18 on"
+                );
+                assert_eq!(capability, enforce::FastPathCapability::Ready);
+            }
+            other => {
+                println!("kernel {other:?}: no recorded answer for this one, observation only")
+            }
         }
         // Where the sendmsg pair did not verify, the report must say so in the
         // fast-path terms - the note is the only trace a kernel like 5.10
