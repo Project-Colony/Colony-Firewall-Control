@@ -1,6 +1,6 @@
 //! Runtime counters shared across daemon components.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,6 +20,45 @@ struct StatsInner {
     /// auto-unpause timer can be invalidated if the user toggles in the
     /// meantime.
     pause_generation: AtomicU64,
+    /// Last answer from the nftables probe: see [`TablePresence`].
+    ///
+    /// Starts `Unknown` and stays there on any host where `nft` cannot be
+    /// asked, which is what keeps a failed probe from reading as "the
+    /// firewall is gone".
+    nft_table: AtomicU8,
+}
+
+/// What the periodic nftables probe last found.
+///
+/// Three states, not two, and the third is the point: "could not ask" has to
+/// be distinguishable from "asked, and the table is not there". Reporting the
+/// second when the first happened would call a healthy machine unprotected
+/// every time a fork failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablePresence {
+    /// Never probed, or the probe could not run.
+    Unknown,
+    /// `table inet colony_firewall` is loaded.
+    Present,
+    /// It is not. Nothing reaches the queue; nothing is being filtered.
+    Absent,
+}
+
+impl TablePresence {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Present => 1,
+            Self::Absent => 2,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Present,
+            2 => Self::Absent,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 impl Stats {
@@ -33,6 +72,7 @@ impl Stats {
                 prompts_pending: AtomicU64::new(0),
                 paused: AtomicBool::new(false),
                 pause_generation: AtomicU64::new(0),
+                nft_table: AtomicU8::new(TablePresence::Unknown.as_u8()),
             }),
         }
     }
@@ -57,6 +97,18 @@ impl Stats {
 
     pub fn prompts_dec(&self) {
         self.inner.prompts_pending.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Records what the nftables probe found.
+    pub fn set_nft_table(&self, presence: TablePresence) {
+        self.inner
+            .nft_table
+            .store(presence.as_u8(), Ordering::Relaxed);
+    }
+
+    /// The probe's last answer.
+    pub fn nft_table(&self) -> TablePresence {
+        TablePresence::from_u8(self.inner.nft_table.load(Ordering::Relaxed))
     }
 
     pub fn uptime_seconds(&self) -> u64 {

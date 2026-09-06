@@ -39,6 +39,12 @@ const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// See the warmer task in `run`. Not a hot path: the check is one `stat` of
 /// the package database directory, and a rebuild only happens when its mtime
 /// moved.
+/// How often to ask nftables whether the table that feeds NFQUEUE is loaded.
+///
+/// One minute, matching the fast-allow set check: both are a fork and an exec,
+/// and both bound how long `cfc status` may be stale by the same amount.
+const NFT_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 const PROVENANCE_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, Parser)]
@@ -269,6 +275,42 @@ async fn run() -> anyhow::Result<()> {
             }
         }
     });
+
+    // Is the ruleset that feeds us still loaded?
+    //
+    // `cfc status`'s `enforcing` used to be "have we ever seen a packet", and
+    // a counter that only goes up: after the first packet it said yes for the
+    // daemon's whole life, including after `nft flush ruleset` or a firewall
+    // reload took the table away and the machine stopped being filtered. The
+    // README points people at that field, and at `cfc --json status | jq
+    // .enforcing` for scripts, so the one indicator failed in the direction of
+    // false confidence.
+    //
+    // A packet counter cannot tell "nothing is filtered" from "nothing is
+    // happening" - an idle laptop looks identical to an unprotected one. So
+    // ask nftables instead. Once a minute, on the blocking pool because it is
+    // a fork and an exec, which is the same cadence and the same reasoning as
+    // the fast-allow set check that already runs there. An error leaves the
+    // previous answer standing: "could not ask" must never render as "the
+    // firewall is gone".
+    {
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(NFT_PRESENCE_INTERVAL);
+            loop {
+                tick.tick().await;
+                match tokio::task::spawn_blocking(ebpf::nft_table_loaded).await {
+                    Ok(Ok(present)) => stats.set_nft_table(if present {
+                        stats::TablePresence::Present
+                    } else {
+                        stats::TablePresence::Absent
+                    }),
+                    Ok(Err(e)) => tracing::debug!("could not ask nftables for its table: {e:#}"),
+                    Err(e) => tracing::debug!("the nftables probe did not run: {e}"),
+                }
+            }
+        });
+    }
 
     // Watchdog heartbeat. sd_notify::notify() no-ops without
     // $NOTIFY_SOCKET, so this runs harmlessly outside systemd too. The

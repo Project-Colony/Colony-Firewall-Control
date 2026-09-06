@@ -133,6 +133,15 @@ const ENFORCING_GRACE_SECS: u64 = 60;
 const DEFAULT_EVENT_PAGE: u32 = 100;
 const MAX_EVENT_PAGE: u32 = 1000;
 
+/// Largest `offset` a `ListEvents` request may skip to.
+///
+/// `limit` was clamped and `offset` was not, and sqlite pays for a skipped row
+/// much as it pays for a returned one: `OFFSET n` steps and discards n rows,
+/// applying the `instr(exe, ?)` filter to each, with no index to help. The
+/// event table is capped at `[events] max_rows`, so any offset past this can
+/// only ever return nothing - clamping it removes no reachable page.
+const MAX_EVENT_OFFSET: u32 = 1_000_000;
+
 /// Depth of the datapath -> event-writer queue. The writer batches, so this
 /// only needs to absorb a burst, never sustained throughput.
 const EVENT_QUEUE_DEPTH: usize = 4096;
@@ -704,7 +713,12 @@ impl Firewall for FirewallService {
             no_ui_action: convert::action_to_pb(policy.no_ui_action) as i32,
             prompt_timeout_secs: policy.prompt_timeout_secs,
             skipped_rules: self.store.skipped_rules() as u64,
-            enforcing: enforcing_heuristic(self.dry_run, connections_seen, uptime_seconds),
+            enforcing: enforcing_heuristic(
+                self.dry_run,
+                connections_seen,
+                uptime_seconds,
+                self.stats.nft_table(),
+            ),
             enforcement: crate::ebpf::enforcement_level()
                 .map_or("starting", |l| l.as_str())
                 .to_string(),
@@ -831,11 +845,35 @@ fn resolve_pause_secs(duration_secs: u32, default_secs: u64) -> u64 {
 /// nothing is being filtered and saying otherwise would be a lie. Outside
 /// dry-run, seeing no packet at all after the grace period almost always
 /// means the nftables/iptables rule that feeds NFQUEUE is not loaded.
-fn enforcing_heuristic(dry_run: bool, packets_seen: u64, uptime_secs: u64) -> bool {
+fn enforcing_heuristic(
+    dry_run: bool,
+    packets_seen: u64,
+    uptime_secs: u64,
+    table: crate::stats::TablePresence,
+) -> bool {
+    use crate::stats::TablePresence;
     if dry_run {
         return false;
     }
-    packets_seen > 0 || uptime_secs <= ENFORCING_GRACE_SECS
+    let starting = uptime_secs <= ENFORCING_GRACE_SECS;
+    match table {
+        // Evidence, not a guess, so it decides. The packet counter below
+        // never decreases, so on its own it could only ever answer "yes, once
+        // upon a time" - exactly wrong in the case that matters, a ruleset
+        // removed under a running daemon.
+        TablePresence::Present => true,
+        // Also evidence, but only once the machine has had time to load it.
+        // The shipped unit ordering starts this daemon *first* and
+        // `colony-firewall-nft.service` after it, so an absent table is the
+        // expected state for the first moments of every boot - and saying
+        // "not enforcing" then would be a false alarm on every start, in the
+        // field people are told to read.
+        TablePresence::Absent => starting,
+        // The probe has not run yet, or could not run at all - no nft binary,
+        // no permission, the transaction lock held. Fall back to what the
+        // daemon can see for itself.
+        TablePresence::Unknown => packets_seen > 0 || starting,
+    }
 }
 
 /// Maps a `ListEvents` request onto the storage query. Rejects an
@@ -856,7 +894,7 @@ fn event_query_from_pb(req: &ListEventsRequest) -> Result<(u32, u32, EventFilter
         action,
         since_ts_unix_ms: (req.since_unix_ms > 0).then_some(req.since_unix_ms),
     };
-    Ok((limit, req.offset, filter))
+    Ok((limit, req.offset.min(MAX_EVENT_OFFSET), filter))
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1174,7 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats::TablePresence;
 
     // -- authorization ------------------------------------------------------
 
@@ -1224,19 +1263,75 @@ mod tests {
     // -- enforcing heuristic ------------------------------------------------
 
     #[test]
+    fn a_removed_ruleset_stops_reading_as_enforcing() {
+        // The defect this replaces: `packets_seen` only ever goes up, so once
+        // one packet had been seen the answer was "yes" for the life of the
+        // daemon - including after the table was flushed out from under it and
+        // nothing was being filtered at all.
+        assert!(
+            !enforcing_heuristic(false, 1_000_000, 100_000, TablePresence::Absent),
+            "a machine whose table is gone is not enforcing, however many \
+             packets it saw before that"
+        );
+        // And the other way: a table that is loaded settles the question on a
+        // machine so idle it has never seen a packet.
+        assert!(
+            enforcing_heuristic(false, 0, 100_000, TablePresence::Present),
+            "an idle machine with the table loaded is enforcing"
+        );
+        // --dry-run still overrides everything: nothing is bound to the queue,
+        // so a loaded table filters nothing of ours.
+        assert!(!enforcing_heuristic(true, 0, 5, TablePresence::Present));
+    }
+
+    #[test]
+    fn an_absent_table_is_not_alarming_while_the_machine_is_still_starting() {
+        // The shipped units start this daemon before the one that loads the
+        // table, and the probe fires as soon as it is spawned - so on every
+        // single boot the first answer is "absent". Reporting that verbatim
+        // told the user their firewall was off for the first minute of every
+        // start, which is a false alarm in the one field they are pointed at.
+        assert!(
+            enforcing_heuristic(false, 0, 1, TablePresence::Absent),
+            "an absent table inside the grace period is a machine still coming up"
+        );
+        assert!(
+            !enforcing_heuristic(false, 0, ENFORCING_GRACE_SECS + 1, TablePresence::Absent),
+            "past it, absent means absent"
+        );
+        // And the grace period does not extend to a table that is there.
+        assert!(enforcing_heuristic(false, 0, 1, TablePresence::Present));
+    }
+
+    #[test]
     fn enforcing_is_false_only_after_a_silent_grace_period() {
         // Fresh start, nothing seen yet: assume healthy.
-        assert!(enforcing_heuristic(false, 0, 5));
+        assert!(enforcing_heuristic(false, 0, 5, TablePresence::Unknown));
         // Still nothing after the grace period: the nft rule is missing.
-        assert!(!enforcing_heuristic(false, 0, ENFORCING_GRACE_SECS + 1));
+        assert!(!enforcing_heuristic(
+            false,
+            0,
+            ENFORCING_GRACE_SECS + 1,
+            TablePresence::Unknown
+        ));
         // Any traffic at all proves we are in the path.
-        assert!(enforcing_heuristic(false, 1, 100_000));
+        assert!(enforcing_heuristic(
+            false,
+            1,
+            100_000,
+            TablePresence::Unknown
+        ));
     }
 
     #[test]
     fn dry_run_never_claims_to_be_enforcing() {
-        assert!(!enforcing_heuristic(true, 0, 5));
-        assert!(!enforcing_heuristic(true, 999, 100_000));
+        assert!(!enforcing_heuristic(true, 0, 5, TablePresence::Unknown));
+        assert!(!enforcing_heuristic(
+            true,
+            999,
+            100_000,
+            TablePresence::Unknown
+        ));
     }
 
     // -- event query mapping ------------------------------------------------

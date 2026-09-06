@@ -171,6 +171,25 @@ impl DnsCache {
 
     /// The trust level backing the currently cached name for `ip`, if any.
     /// Diagnostics and tests; the packet path does not care.
+    /// The cached name for `ip` and whether it was confirmed against that
+    /// address, in one read.
+    ///
+    /// Confirmed means a reverse lookup that passed forward confirmation: the
+    /// name resolved back to this address, so asserting it takes control of
+    /// that name's forward zone. A name lifted out of an observed response is
+    /// not confirmed - nothing ties such a response to a query this host sent
+    /// - and only decorates the flow. See `Connection::dst_host_verified`.
+    pub fn cached_named(&self, ip: IpAddr) -> Option<(String, bool)> {
+        let now = Instant::now();
+        let cache = self.inner.cache.read();
+        let entry = cache.get(&ip)?;
+        if !entry.is_fresh(now) {
+            return None;
+        }
+        let name = entry.hostname.clone()?;
+        Some((name, entry.trust == Trust::Ptr))
+    }
+
     pub fn cached_trust(&self, ip: IpAddr) -> Option<Trust> {
         let cache = self.inner.cache.read();
         let entry = cache.get(&ip)?;
@@ -293,12 +312,29 @@ impl DnsCache {
 /// live observed one, and it must not be bypassable.
 fn record_ptr_result(inner: &Inner, ip: IpAddr, hostname: Option<String>, now: Instant) {
     let mut cache = inner.cache.write();
+    // Only ever *update* a key `enqueue_lookup` reserved; never create one.
+    //
+    // This is the bound, and it is a branch rather than a call to
+    // `evict_if_full`. Every insert site but this one is paired with a
+    // reservation, so this one adding an eviction would be a third O(n) scan
+    // under the write lock for no gain - and it would still not bound the map,
+    // because eviction removes exactly one entry per insert while a completing
+    // lookup whose placeholder was already evicted adds one. The map ratcheted
+    // upward by one per orphaned completion, without limit, on any workload
+    // touching more distinct destinations than the cache holds.
+    //
+    // A completion whose placeholder is gone has nothing to say: the entry it
+    // would describe was evicted precisely because nothing had asked for it
+    // recently. Dropping the answer costs one hostname, and the next packet to
+    // that address enqueues a fresh lookup.
+    let Some(existing) = cache.get(&ip) else {
+        tracing::trace!(%ip, "PTR result arrived after its reservation was evicted; dropping");
+        return;
+    };
     // An answer observed on the wire while this lookup was in flight is
     // better than the result we just got; do not clobber it.
-    if let Some(existing) = cache.get(&ip) {
-        if !existing.supersedes(Trust::Ptr, now) {
-            return;
-        }
+    if !existing.supersedes(Trust::Ptr, now) {
+        return;
     }
     let ttl = Duration::from_secs(if hostname.is_some() {
         CACHE_TTL_SECS
@@ -418,8 +454,61 @@ mod tests {
 
     /// Files a PTR result exactly as the completed lookup task would, without
     /// needing a resolver.
+    ///
+    /// Including the reservation, because that is half of what the real path
+    /// does: `enqueue_lookup` always inserts an `in_flight` placeholder before
+    /// it spawns, and `record_ptr_result` now only ever *updates* a key that
+    /// placeholder created. A helper that skipped the reservation would test a
+    /// sequence that cannot happen.
     fn insert_ptr(cache: &DnsCache, addr: IpAddr, name: Option<&str>, now: Instant) {
+        reserve(cache, addr, now);
         record_ptr_result(&cache.inner, addr, name.map(str::to_string), now);
+    }
+
+    /// The `in_flight` placeholder `enqueue_lookup` reserves before spawning.
+    ///
+    /// Non-clobbering, exactly as the real one is: `enqueue_lookup` returns
+    /// early when an entry is already there, so a reservation can never throw
+    /// away an observation. A helper that overwrote would have made every
+    /// trust-ordering test below pass for the wrong reason.
+    fn reserve(cache: &DnsCache, addr: IpAddr, now: Instant) {
+        let mut c = cache.inner.cache.write();
+        if c.contains_key(&addr) {
+            return;
+        }
+        c.insert(
+            addr,
+            Entry {
+                hostname: None,
+                inserted: now,
+                in_flight: true,
+                trust: Trust::Ptr,
+                ttl: Duration::from_secs(NEGATIVE_TTL_SECS),
+            },
+        );
+    }
+
+    #[test]
+    fn a_ptr_result_whose_reservation_was_evicted_is_dropped() {
+        // The bound. `evict_if_full` removes one entry per insert, so a
+        // completing lookup that re-created its own evicted key added one back
+        // - the map ratcheted upward for as long as new destinations kept
+        // arriving. A completion with nothing to update has nothing to say.
+        let cache = DnsCache::new();
+        let now = Instant::now();
+        let addr = ip("198.51.100.7");
+        record_ptr_result(&cache.inner, addr, Some("orphan.example".to_string()), now);
+        assert_eq!(
+            cache.lookup_at(addr, now),
+            None,
+            "a result nobody reserved must not create an entry"
+        );
+        assert_eq!(cache.cached_trust(addr), None);
+
+        // With the reservation in place it lands, as it always did.
+        reserve(&cache, addr, now);
+        record_ptr_result(&cache.inner, addr, Some("real.example".to_string()), now);
+        assert_eq!(cache.lookup_at(addr, now).as_deref(), Some("real.example"));
     }
 
     #[test]

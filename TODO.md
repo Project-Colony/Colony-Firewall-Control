@@ -101,13 +101,48 @@ grants written with no liveness guard where the deny side had carried one
 since it was written; and the feature being **inert for its own motivating
 case** - nothing granted a process that was already running, so every restart
 silently switched the fast path off for every long-lived program while
-`cfc status` said `live`. What is not done: the latency win is not yet
-*measured* on the veth bench - the number that justifies the feature is still
-the pre-feature 0.28 ms per new flow - and 1b below is untouched. The bench
-that produces that number is `scripts/bench-latency.sh`: a veth pair into a
-network namespace, both directions, run once per state (client under a
-lasting Allow rule, under a flow-scoped one, table absent) on a VM where CFC
-may be armed.
+`cfc status` said `live`.
+
+**Measured, 2026-09-06.** The number that justifies the feature exists now:
+`scripts/vm-bench` boots a throwaway guest from this machine's own kernel and
+binaries and runs `scripts/bench-latency.sh` there against a real daemon, so
+CFC can be armed without arming it on anybody's workstation. On Linux 7.2.2
+under KVM, per new outbound TCP flow, median:
+
+| | 300 flows | 3000 flows |
+|---|---|---|
+| no firewall at all | 0.0158 ms | 0.0162 ms |
+| the fast path | 0.0268 ms | 0.0269 ms |
+| the NFQUEUE round trip | 5.6745 ms | 7.6083 ms |
+
+So the fast path saves **5.6 ms per new flow at 300 flows and 7.6 ms at
+3000**, and costs 0.011 ms over having no firewall. Its cost does not grow
+with load, because those flows never reach the daemon; the queue's does. The
+0.28 ms this file quoted before was measured on a different bench and is not
+comparable - and it understated the case by two orders of magnitude.
+
+Two findings came out of attributing that cost rather than just recording it,
+both now written where they were wrong:
+
+- **A whole `RECV_POLL_INTERVAL` is paid per queued flow, not half of one.**
+  `nfqueue.rs` predicted "mean: half that", which holds for arrivals
+  independent of the beat and not for a client connecting in series: each
+  connect lands just after the worker committed to a fresh idle wait. Proved
+  by building the same daemon with the constant at 200 us and measuring both
+  in one guest - 4.90 ms of the 5.67 at 300 flows, 5.24 ms of the 7.61 at
+  3000. Not by reading a distribution's shape, which is how this path has been
+  misread before.
+- **`docs/ARCHITECTURE.md` still described the blocking-recv design** that
+  `nfqueue.rs` replaced, claiming "no polling, no added latency" for the
+  common case. Corrected.
+
+What is left here: the remaining queued cost grows with the number of live
+sockets (0.77 ms at 300 flows against 2.36 ms at 3000, with the beat removed)
+and that growth is in the daemon's own per-packet work - the floor moved
+0.0003 ms across the same range. Attribution is the obvious suspect and is not
+yet proven; the cheap next experiment is the same sweep with `[ebpf] enabled`
+off, which forces the `/proc` walk and should separate the socket-cookie path
+from the fallback. 1b below is still untouched.
 
 **1b. Rules that depend on a destination still cannot be precomputed.**
 `process_wide_action` deliberately answers `None` for them, which is correct and

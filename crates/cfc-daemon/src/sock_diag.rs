@@ -56,16 +56,14 @@ pub fn query(
         IpAddr::V6(_) => libc::AF_INET6 as u8,
     };
 
-    let sock = match DiagSocket::open() {
-        Ok(s) => s,
-        Err(e) => {
-            trace!("sock_diag socket unavailable ({e}); falling back to /proc");
-            return None;
-        }
-    };
-
-    let req = build_request(family, proto_num, (src_ip, src_port), (dst_ip, dst_port));
-    if let Some(info) = sock.round_trip(&req) {
+    let req = build_request(
+        family,
+        proto_num,
+        (src_ip, src_port),
+        (dst_ip, dst_port),
+        next_seq(),
+    );
+    if let Some(info) = ask(&req) {
         return Some(info);
     }
 
@@ -75,10 +73,89 @@ pub fn query(
     // for unconnected sockets the kernel may still miss, in which case
     // the /proc scan's zero-remote pass takes over.
     if protocol == Protocol::Udp {
-        let req = build_request(family, proto_num, (dst_ip, dst_port), (src_ip, src_port));
-        return sock.round_trip(&req);
+        let req = build_request(
+            family,
+            proto_num,
+            (dst_ip, dst_port),
+            (src_ip, src_port),
+            next_seq(),
+        );
+        return ask(&req);
     }
     None
+}
+
+thread_local! {
+    /// One netlink socket per thread, for the life of the thread.
+    ///
+    /// This used to be one `socket(2)` + `setsockopt(2)` + `close(2)` per
+    /// queued packet, on the single datapath thread. Measured on the veth
+    /// bench in `scripts/vm-bench`, that churn cost 0.28 ms of every queued
+    /// flow at 3000 flows - small beside the 5 ms idle beat, and pure waste.
+    ///
+    /// Reuse is only safe because the sequence number below is unique per
+    /// request and checked on the way back. Every request used to carry
+    /// `seq = 1`, so a late answer to a request that had already timed out
+    /// would have been indistinguishable from the answer to the next one -
+    /// a *wrong attribution*, which is far worse than a slow one.
+    static DIAG_SOCKET: std::cell::RefCell<Option<DiagSocket>> =
+        const { std::cell::RefCell::new(None) };
+    /// Monotonic per-thread request counter. Starts at 1 because 0 is
+    /// conventionally "not a reply to anything".
+    static DIAG_SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
+/// The next request's sequence number, wrapping past `u32::MAX` back to 1.
+fn next_seq() -> u32 {
+    DIAG_SEQ.with(|c| {
+        let seq = c.get();
+        c.set(seq.checked_add(1).unwrap_or(1));
+        seq
+    })
+}
+
+/// One request on this thread's socket, opening it if needed.
+///
+/// The socket is discarded on anything but a clean, correctly-sequenced
+/// answer. A socket that timed out may still have that answer queued behind
+/// it, and there is no way to tell how much else is queued with it; throwing
+/// the socket away throws the ambiguity away too, at the cost of one
+/// `socket(2)` on the next call.
+fn ask(req: &[u8; REQ_LEN]) -> Option<SockInfo> {
+    let seq = u32::from_ne_bytes(req[8..12].try_into().ok()?);
+    DIAG_SOCKET.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            match DiagSocket::open() {
+                Ok(s) => *slot = Some(s),
+                Err(e) => {
+                    trace!("sock_diag socket unavailable ({e}); falling back to /proc");
+                    return None;
+                }
+            }
+        }
+        match slot.as_ref().map(|s| s.round_trip(req, seq)) {
+            Some(Reply::Found(info)) => Some(info),
+            // A correctly-sequenced "no such socket". The socket is clean, so
+            // it is kept; the caller falls back to /proc as before.
+            Some(Reply::NotFound) => None,
+            _ => {
+                *slot = None;
+                None
+            }
+        }
+    })
+}
+
+/// What one round trip produced, split so the caller knows whether the socket
+/// is still trustworthy.
+enum Reply {
+    Found(SockInfo),
+    /// The kernel answered this request and had nothing to report.
+    NotFound,
+    /// Send failed, receive failed, or the answer was to some other request.
+    /// The socket's state is unknown from here.
+    Desync,
 }
 
 /// Serialize nlmsghdr + inet_diag_req_v2 for an exact (non-dump) query.
@@ -87,6 +164,7 @@ fn build_request(
     protocol: u8,
     local: (IpAddr, u16),
     remote: (IpAddr, u16),
+    seq: u32,
 ) -> [u8; REQ_LEN] {
     let mut buf = [0u8; REQ_LEN];
 
@@ -94,8 +172,8 @@ fn build_request(
     buf[0..4].copy_from_slice(&(REQ_LEN as u32).to_ne_bytes());
     buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
     buf[6..8].copy_from_slice(&(libc::NLM_F_REQUEST as u16).to_ne_bytes());
-    buf[8..12].copy_from_slice(&1u32.to_ne_bytes()); // seq
-                                                     // nlmsg_pid stays 0 (kernel).
+    buf[8..12].copy_from_slice(&seq.to_ne_bytes());
+    // nlmsg_pid stays 0 (kernel).
 
     // struct inet_diag_req_v2.
     buf[16] = family;
@@ -124,6 +202,13 @@ fn write_addr(dst: &mut [u8], ip: IpAddr) {
 }
 
 /// Parse the first netlink message of a reply. Exact (non-dump) queries
+/// The `nlmsg_seq` of a netlink message, or `None` if there is no header.
+fn reply_seq(buf: &[u8]) -> Option<u32> {
+    buf.get(8..12)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_ne_bytes)
+}
+
 /// answer with a single SOCK_DIAG_BY_FAMILY message or an NLMSG_ERROR.
 fn parse_response(buf: &[u8]) -> Option<SockInfo> {
     if buf.len() < NLMSG_HDR_LEN {
@@ -193,7 +278,7 @@ impl DiagSocket {
         Ok(sock)
     }
 
-    fn round_trip(&self, req: &[u8]) -> Option<SockInfo> {
+    fn round_trip(&self, req: &[u8], seq: u32) -> Reply {
         let fd = self.0.as_raw_fd();
 
         // SAFETY: zeroed sockaddr_nl is a valid "to the kernel" address.
@@ -217,7 +302,7 @@ impl DiagSocket {
                 "sock_diag send failed ({}); falling back to /proc",
                 std::io::Error::last_os_error()
             );
-            return None;
+            return Reply::Desync;
         }
 
         let mut buf = [0u8; 8192];
@@ -228,9 +313,20 @@ impl DiagSocket {
                 "sock_diag recv failed ({}); falling back to /proc",
                 std::io::Error::last_os_error()
             );
-            return None;
+            return Reply::Desync;
         }
-        parse_response(&buf[..n as usize])
+        let buf = &buf[..n as usize];
+        // The answer must be to *this* request. Anything else means a previous
+        // request's answer arrived after its timeout, and this socket cannot
+        // be trusted to be at a message boundary any more.
+        if reply_seq(buf) != Some(seq) {
+            trace!("sock_diag answered a different request; discarding the socket");
+            return Reply::Desync;
+        }
+        match parse_response(buf) {
+            Some(info) => Reply::Found(info),
+            None => Reply::NotFound,
+        }
     }
 }
 
@@ -240,10 +336,53 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
     #[test]
+    fn each_request_carries_its_own_sequence_number() {
+        // The whole reason the socket may be reused: two requests must never
+        // be confusable. Before this, every request carried seq 1.
+        let a = next_seq();
+        let b = next_seq();
+        assert_ne!(a, b, "two requests must not share a sequence number");
+        assert_eq!(b, a + 1);
+
+        let local = (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1);
+        let remote = (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 2);
+        let req = build_request(
+            libc::AF_INET as u8,
+            libc::IPPROTO_TCP as u8,
+            local,
+            remote,
+            0xABCD,
+        );
+        assert_eq!(
+            reply_seq(&req),
+            Some(0xABCD),
+            "the seq is where the reply check reads it"
+        );
+    }
+
+    #[test]
+    fn an_answer_to_another_request_is_not_trusted() {
+        // A reply whose sequence does not match is the shape a late answer to
+        // a timed-out request takes. `reply_seq` is what tells them apart, and
+        // a short buffer has no sequence at all.
+        let mut reply = [0u8; 16];
+        reply[8..12].copy_from_slice(&7u32.to_ne_bytes());
+        assert_eq!(reply_seq(&reply), Some(7));
+        assert_ne!(reply_seq(&reply), Some(8));
+        assert_eq!(reply_seq(&[0u8; 4]), None);
+    }
+
+    #[test]
     fn request_serialization_layout() {
         let local = (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let remote = (IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
-        let req = build_request(libc::AF_INET as u8, libc::IPPROTO_TCP as u8, local, remote);
+        let req = build_request(
+            libc::AF_INET as u8,
+            libc::IPPROTO_TCP as u8,
+            local,
+            remote,
+            1,
+        );
 
         // nlmsghdr.
         assert_eq!(u32::from_ne_bytes(req[0..4].try_into().unwrap()), 72);
@@ -276,7 +415,13 @@ mod tests {
     fn request_serialization_v6_addresses() {
         let local = (IpAddr::V6("2001:db8::1".parse().unwrap()), 1);
         let remote = (IpAddr::V6("::1".parse().unwrap()), 2);
-        let req = build_request(libc::AF_INET6 as u8, libc::IPPROTO_UDP as u8, local, remote);
+        let req = build_request(
+            libc::AF_INET6 as u8,
+            libc::IPPROTO_UDP as u8,
+            local,
+            remote,
+            1,
+        );
         assert_eq!(
             &req[28..44],
             &[0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]

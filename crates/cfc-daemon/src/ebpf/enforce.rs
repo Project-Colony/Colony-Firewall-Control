@@ -345,6 +345,14 @@ impl VerdictSink {
 
     /// The grant decision for one process: the shared rule for every writer.
     fn grant_for(&self, proc: &Process) -> Grant {
+        // Abstain wherever a uid-scoped rule could apply. This decider and the
+        // packet path read different uids for a process that dropped
+        // privileges, and a grant is process-wide - see
+        // `Engine::uid_scoped_may_apply`, which explains why the answer is to
+        // step aside rather than to pick a uid.
+        if self.engine.uid_scoped_may_apply(&proc.exe) {
+            return Grant::No;
+        }
         match self.engine.process_wide_verdict(proc) {
             Some(v) if v.fast_allow_eligible() => Grant::Yes(v.rule_id),
             _ => Grant::No,

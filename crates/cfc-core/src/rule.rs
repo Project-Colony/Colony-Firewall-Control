@@ -70,6 +70,13 @@ pub struct RuleScope {
     pub protocol: Option<crate::Protocol>,
 }
 
+/// Longest `exe_path` a rule may carry.
+///
+/// `PATH_MAX` on Linux is 4096 including the terminator, so nothing longer can
+/// name a file that exists. Rules are matched by exact string equality against
+/// `/proc/<pid>/exe`, so a longer one is unmatchable by construction.
+pub const MAX_EXE_PATH_LEN: usize = 4096;
+
 /// Largest executable either side will hash for an `exe_sha256` predicate.
 ///
 /// One constant, two enforcers, and they must agree: the daemon refuses to
@@ -241,6 +248,29 @@ impl RuleScope {
                 exe.display()
             ));
         }
+        // A path no filesystem can hold is a path no process can be running,
+        // so such a rule can never fire - the same test as the two above, for
+        // a value that arrives over the wire.
+        //
+        // The bound is here rather than at the wire because this is the gate
+        // both writers already run. What it stops is not a bad rule: it is the
+        // work of *rejecting* one. `exe_path` is a bare proto string, capped
+        // only by the 4 MiB decode limit, and resolution walks one
+        // `canonicalize(2)` per path component from the leaf upward - about
+        // two million syscalls for a 4 MiB path, on a blocking pool of
+        // sixteen that the prompt router also depends on.
+        //
+        // The message deliberately does not print the path. Every other arm
+        // here formats it into a string that becomes a gRPC status and a log
+        // line, which for this input is the denial-of-service repeated on the
+        // way out.
+        if exe.as_os_str().len() > MAX_EXE_PATH_LEN {
+            return Err(format!(
+                "exe path is {} bytes; the kernel cannot hold a path longer \
+                 than {MAX_EXE_PATH_LEN}, so no process could ever match it",
+                exe.as_os_str().len()
+            ));
+        }
         Ok(())
     }
 
@@ -376,9 +406,21 @@ impl RuleScope {
     }
 
     pub fn matches(&self, conn: &crate::Connection, proc: &crate::Process) -> bool {
-        if !self.matches_process(proc) {
-            return false;
-        }
+        self.matches_process(proc) && self.matches_connection(conn)
+    }
+
+    /// The connection half of [`Self::matches`], on its own.
+    ///
+    /// The mirror of [`Self::matches_process`], and split out for the mirror
+    /// reason: a caller that has a connection needs to ask "could this rule
+    /// be about this flow at all?" *before* asking whether the process half
+    /// can be decided. Without that order, a rule undecidable for the process
+    /// would stop the search for every flow, including the ones its own
+    /// destination predicates exclude - `deny --exe X --sha256 H
+    /// --dst-port 25` would abstain on a connection to port 80, which it can
+    /// never be about. [`Self::matches`] is defined in terms of both halves,
+    /// so none of the three can drift.
+    pub fn matches_connection(&self, conn: &crate::Connection) -> bool {
         // First, because it is the cheapest and the most likely to exclude:
         // an inbound rule must never fire on outbound traffic or the reverse.
         // An unset direction means **outbound**, not "both".
@@ -480,6 +522,29 @@ impl Rule {
     /// True when this rule should no longer match at `now_unix_ms`.
     ///
     /// Only `Duration::Seconds(n)` expires here: the rule stops matching once
+    /// Whether this rule would *admit* a flow on the strength of a hostname
+    /// nothing confirmed.
+    ///
+    /// The asymmetry is the point, and getting it backwards is a hole either
+    /// way. Names reach the daemon two ways. A reverse lookup is
+    /// forward-confirmed, so claiming one means controlling that name's
+    /// forward zone. A name lifted out of an observed DNS response is
+    /// whatever the packet said: nothing ties such a response to a query this
+    /// host sent, so any peer that answers from source port 53 can assert any
+    /// name for any address.
+    ///
+    /// So an unconfirmed name may still *refuse* - an attacker gains nothing
+    /// by naming themselves something the user has denied, and honouring it
+    /// keeps every existing deny rule working exactly as before. It may not
+    /// *permit*: otherwise an attacker wears a name the user trusts and
+    /// inherits its allowance. Refusing the name in both directions is the
+    /// obvious change and it would have quietly disarmed every
+    /// `deny --dst-host` on the machine, which is the failure this codebase
+    /// minds most.
+    pub fn permits_on_an_unverified_name(&self, conn: &crate::Connection) -> bool {
+        self.action == Action::Allow && self.scope.dst_host.is_some() && !conn.dst_host_verified
+    }
+
     /// `created_at + n` seconds have elapsed. `Always` and `UntilRestart`
     /// never expire at lookup time (`UntilRestart` rules are purged from
     /// storage at daemon startup instead). `Once` also returns false: real
@@ -549,16 +614,78 @@ impl RuleSet {
     /// `now_unix_ms` is the current wall-clock time; rules whose
     /// `Duration::Seconds(..)` window has elapsed are skipped (see
     /// [`Rule::is_expired`]).
+    /// A rule that is about this flow but cannot be decided stops the walk,
+    /// rather than being skipped as if it did not match. See [`Match`].
     pub fn lookup(
         &self,
         conn: &crate::Connection,
         proc: &crate::Process,
         now_unix_ms: i64,
-    ) -> Option<&Rule> {
-        self.rules
+    ) -> Match<'_> {
+        for rule in self
+            .rules
             .iter()
             .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .find(|r| r.scope.matches(conn, proc))
+        {
+            // The connection half first, so a rule's own destination
+            // predicates can exclude it before its process half is ever
+            // questioned. Without that order an undecidable rule would abstain
+            // for flows it can never be about.
+            if !rule.scope.matches_connection(conn) {
+                continue;
+            }
+            if rule.scope.undecidable_for(proc) {
+                return Match::Undecidable(rule);
+            }
+            if rule.scope.matches_process(proc) {
+                if rule.permits_on_an_unverified_name(conn) {
+                    // A name nobody confirmed may refuse traffic, never admit
+                    // it. Skip this rule and keep walking: something below it
+                    // may still answer, and anything below an allow is at
+                    // least as restrictive.
+                    continue;
+                }
+                return Match::Rule(rule);
+            }
+        }
+        Match::None
+    }
+}
+
+/// What [`RuleSet::lookup`] found.
+///
+/// Three outcomes, not two, and the third is the whole point. Precedence is
+/// ordered, so a rule that cannot be decided must not be walked past: the
+/// rules beneath it are the ones its author wrote it to override.
+///
+/// The case in the field is a `deny` scoped to `exe_sha256` over a binary the
+/// daemon cannot hash - over 64 MiB, unreadable, or a process whose image is
+/// already gone. `matches_process` collapses "cannot say" into "does not
+/// match", so the walk continued and a lower-precedence `allow --exe X` won.
+/// The deny listed, ranked first, and never fired - indistinguishable from
+/// working. `RuleScope::undecidable_for` was written for exactly this hazard
+/// and its own documentation says so, but it was only ever consulted on the
+/// fast path, where the mirror case (an abstaining *allow* handing the flow to
+/// a lower *deny*) had been noticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Match<'a> {
+    /// This rule answered.
+    Rule(&'a Rule),
+    /// This rule is about this flow and outranks everything below it, but the
+    /// daemon cannot tell whether it matches. Nobody answers; the caller must
+    /// treat it as "no rule decided" and fall back to asking.
+    Undecidable(&'a Rule),
+    /// No rule is about this flow.
+    None,
+}
+
+impl<'a> Match<'a> {
+    /// The rule that answered, if one did. An abstention is not an answer.
+    pub fn rule(self) -> Option<&'a Rule> {
+        match self {
+            Self::Rule(r) => Some(r),
+            _ => None,
+        }
     }
 }
 
@@ -595,12 +722,201 @@ mod tests {
         chrono::Utc::now().timestamp_millis()
     }
 
+    /// The rule set the defect needs: a hash-scoped deny ranking above a
+    /// plain allow for the same program.
+    fn deny_by_hash_over_allow(dst_port: Option<u16>) -> RuleSet {
+        let mut hashed = RuleScope::any();
+        hashed.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        hashed.exe_sha256 = Some("aa".repeat(32));
+        hashed.dst_port = dst_port;
+        let mut plain = RuleScope::any();
+        plain.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let mut set = RuleSet {
+            rules: vec![
+                Rule::new("deny-that-binary".to_string(), Action::Deny, hashed),
+                Rule::new("allow-curl".to_string(), Action::Allow, plain),
+            ],
+        };
+        set.sort_deterministic();
+        set
+    }
+
+    #[test]
+    fn a_deny_that_cannot_be_decided_does_not_hand_the_flow_to_an_allow() {
+        let set = deny_by_hash_over_allow(None);
+        let conn = mk_conn();
+
+        // With the digest in hand the deny answers, as it always did.
+        let mut hashed = mk_proc("/usr/bin/curl");
+        hashed.sha256 = Some("aa".repeat(32));
+        assert_eq!(
+            set.lookup(&conn, &hashed, now()).rule().map(|r| r.action),
+            Some(Action::Deny)
+        );
+
+        // Without it - a binary over the hashing cap, an unreadable image, a
+        // process whose image is already gone - the deny cannot be decided.
+        // It must stop the walk, not be skipped: the allow beneath it is the
+        // rule its author wrote the deny to override.
+        let unhashed = mk_proc("/usr/bin/curl");
+        assert_eq!(unhashed.sha256, None);
+        match set.lookup(&conn, &unhashed, now()) {
+            Match::Undecidable(r) => assert_eq!(r.name, "deny-that-binary"),
+            other => panic!("expected an abstention, got {other:?}"),
+        }
+        assert!(
+            set.lookup(&conn, &unhashed, now()).rule().is_none(),
+            "an abstention is not an answer"
+        );
+    }
+
+    #[test]
+    fn an_undecidable_rule_only_abstains_for_flows_it_could_be_about() {
+        // The trap in the fix: keying the abstention on the process alone
+        // would let `deny --exe X --sha256 H --dst-port 25` stop the walk for
+        // a connection to port 443, which that rule can never be about.
+        let set = deny_by_hash_over_allow(Some(25));
+        let unhashed = mk_proc("/usr/bin/curl");
+
+        // Port 443: the deny's own destination predicate excludes it, so the
+        // allow answers normally.
+        let conn = mk_conn();
+        assert_eq!(conn.dst_port, 443);
+        assert_eq!(
+            set.lookup(&conn, &unhashed, now()).rule().map(|r| r.action),
+            Some(Action::Allow),
+            "a rule excluded by its own destination must not abstain"
+        );
+
+        // Port 25: now it is about this flow, and it abstains.
+        let mut smtp = mk_conn();
+        smtp.dst_port = 25;
+        assert!(matches!(
+            set.lookup(&smtp, &unhashed, now()),
+            Match::Undecidable(_)
+        ));
+    }
+
+    #[test]
+    fn matches_is_still_exactly_its_two_halves() {
+        // The split must not have changed what `matches` means.
+        let conn = mk_conn();
+        let proc = mk_proc("/usr/bin/curl");
+        for scope in [
+            RuleScope::any(),
+            {
+                let mut s = RuleScope::any();
+                s.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+                s
+            },
+            {
+                let mut s = RuleScope::any();
+                s.dst_port = Some(443);
+                s
+            },
+            {
+                let mut s = RuleScope::any();
+                s.dst_port = Some(80);
+                s
+            },
+            {
+                let mut s = RuleScope::any();
+                s.exe_path = Some(PathBuf::from("/usr/bin/wget"));
+                s
+            },
+            {
+                let mut s = RuleScope::any();
+                s.direction = Some(Direction::Inbound);
+                s
+            },
+        ] {
+            assert_eq!(
+                scope.matches(&conn, &proc),
+                scope.matches_process(&proc) && scope.matches_connection(&conn),
+                "the halves must recompose into the whole for {scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_name_admits_nothing_and_still_refuses() {
+        let mut named = RuleScope::any();
+        named.dst_host = Some("example.org".to_string());
+
+        let mut conn = mk_conn();
+        conn.dst_host = Some("example.org".to_string());
+        conn.dst_host_verified = false;
+
+        let allow = Rule::new("a".to_string(), Action::Allow, named.clone());
+        let deny = Rule::new("d".to_string(), Action::Deny, named.clone());
+        assert!(
+            allow.permits_on_an_unverified_name(&conn),
+            "an allow keyed on a name nothing confirmed must stand aside"
+        );
+        assert!(
+            !deny.permits_on_an_unverified_name(&conn),
+            "a deny is not admitting anything, so it still applies"
+        );
+
+        // Confirmed, and the allow is back in play.
+        conn.dst_host_verified = true;
+        assert!(!allow.permits_on_an_unverified_name(&conn));
+
+        // A rule with no name predicate is untouched either way.
+        let plain = Rule::new("p".to_string(), Action::Allow, RuleScope::any());
+        conn.dst_host_verified = false;
+        assert!(!plain.permits_on_an_unverified_name(&conn));
+    }
+
+    #[test]
+    fn an_unverified_name_lets_a_lower_rule_answer() {
+        // The walk must keep going past the abstaining allow, not stop.
+        //
+        // The allow has to genuinely outrank the deny or this proves nothing:
+        // at equal specificity `action_rank` puts Deny first, so the deny
+        // would win either way and the interesting assertion would pass for
+        // the wrong reason. Two predicates against one.
+        let mut named = RuleScope::any();
+        named.dst_host = Some("example.org".to_string());
+        named.dst_port = Some(443);
+        let mut everything = RuleScope::any();
+        everything.dst_port = Some(443);
+        let mut set = RuleSet {
+            rules: vec![
+                Rule::new("allow-by-name".to_string(), Action::Allow, named),
+                Rule::new("deny-that-port".to_string(), Action::Deny, everything),
+            ],
+        };
+        set.sort_deterministic();
+        assert_eq!(
+            set.rules[0].name, "allow-by-name",
+            "the allow must sort first for this test to mean anything"
+        );
+
+        let proc = mk_proc("/usr/bin/curl");
+        let mut conn = mk_conn();
+        conn.dst_host = Some("example.org".to_string());
+
+        conn.dst_host_verified = false;
+        assert_eq!(
+            set.lookup(&conn, &proc, now()).rule().map(|r| r.action),
+            Some(Action::Deny),
+            "with the name unconfirmed the rule below answers"
+        );
+        conn.dst_host_verified = true;
+        assert_eq!(
+            set.lookup(&conn, &proc, now()).rule().map(|r| r.action),
+            Some(Action::Allow),
+            "with it confirmed the more specific allow wins again"
+        );
+    }
+
     #[test]
     fn empty_set_returns_none() {
         let set = RuleSet::default();
         let conn = mk_conn();
         let proc = mk_proc("/usr/bin/curl");
-        assert!(set.lookup(&conn, &proc, now()).is_none());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_none());
     }
 
     #[test]
@@ -616,9 +932,11 @@ mod tests {
 
         assert!(set
             .lookup(&conn, &mk_proc("/usr/bin/curl"), now())
+            .rule()
             .is_some());
         assert!(set
             .lookup(&conn, &mk_proc("/usr/bin/wget"), now())
+            .rule()
             .is_none());
     }
 
@@ -632,9 +950,9 @@ mod tests {
         let proc = mk_proc("/usr/bin/curl");
         let mut conn = mk_conn();
 
-        assert!(set.lookup(&conn, &proc, now()).is_some());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_some());
         conn.dst_port = 80;
-        assert!(set.lookup(&conn, &proc, now()).is_none());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_none());
     }
 
     #[test]
@@ -648,10 +966,10 @@ mod tests {
         let mut conn = mk_conn();
 
         conn.dst_ip = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
-        assert!(set.lookup(&conn, &proc, now()).is_some());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_some());
 
         conn.dst_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        assert!(set.lookup(&conn, &proc, now()).is_none());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_none());
     }
 
     #[test]
@@ -667,21 +985,22 @@ mod tests {
 
         // All three match -> hit.
         let mut conn = mk_conn();
-        assert!(set.lookup(&conn, &proc, now()).is_some());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_some());
 
         // Wrong port -> miss.
         conn.dst_port = 80;
-        assert!(set.lookup(&conn, &proc, now()).is_none());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_none());
 
         // Wrong proto -> miss.
         conn.dst_port = 443;
         conn.protocol = Protocol::Udp;
-        assert!(set.lookup(&conn, &proc, now()).is_none());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_none());
 
         // Wrong exe -> miss.
         conn.protocol = Protocol::Tcp;
         assert!(set
             .lookup(&conn, &mk_proc("/usr/bin/python"), now())
+            .rule()
             .is_none());
     }
 
@@ -695,7 +1014,7 @@ mod tests {
         let set = RuleSet { rules: vec![rule] };
         let conn = mk_conn();
         let proc = mk_proc("/usr/bin/curl");
-        assert!(set.lookup(&conn, &proc, now()).is_none());
+        assert!(set.lookup(&conn, &proc, now()).rule().is_none());
     }
 
     /// Was `first_matching_rule_wins`, which codified whatever Vec order the
@@ -723,7 +1042,10 @@ mod tests {
         let conn = mk_conn();
         let proc = mk_proc("/usr/bin/curl");
 
-        let hit = set.lookup(&conn, &proc, now()).expect("should match");
+        let hit = set
+            .lookup(&conn, &proc, now())
+            .rule()
+            .expect("should match");
         assert_eq!(hit.action, Action::Deny);
         assert_eq!(hit.name, "deny-curl");
     }
@@ -748,7 +1070,10 @@ mod tests {
         let conn = mk_conn();
         let proc = mk_proc("/usr/bin/curl");
 
-        let hit = set.lookup(&conn, &proc, now()).expect("should match");
+        let hit = set
+            .lookup(&conn, &proc, now())
+            .rule()
+            .expect("should match");
         assert_eq!(hit.name, "allow-curl-443");
         assert_eq!(hit.action, Action::Allow);
     }
@@ -776,8 +1101,14 @@ mod tests {
         };
         reverse.sort_deterministic();
 
-        let hit_fwd = forward.lookup(&conn, &proc, at).expect("should match");
-        let hit_rev = reverse.lookup(&conn, &proc, at).expect("should match");
+        let hit_fwd = forward
+            .lookup(&conn, &proc, at)
+            .rule()
+            .expect("should match");
+        let hit_rev = reverse
+            .lookup(&conn, &proc, at)
+            .rule()
+            .expect("should match");
         assert_eq!(hit_fwd.id, hit_rev.id);
         assert_eq!(hit_fwd.name, "deny-curl");
     }
@@ -799,6 +1130,7 @@ mod tests {
 
         let hit = set
             .lookup(&mk_conn(), &mk_proc("/usr/bin/curl"), now())
+            .rule()
             .expect("should match");
         assert_eq!(hit.name, "old-allow");
     }
@@ -812,11 +1144,14 @@ mod tests {
         let set = RuleSet { rules: vec![rule] };
         let conn = mk_conn();
 
-        assert!(set.lookup(&conn, &mk_proc("/anything"), now()).is_some());
+        assert!(set
+            .lookup(&conn, &mk_proc("/anything"), now())
+            .rule()
+            .is_some());
 
         let mut other = mk_proc("/anything");
         other.uid = Some(2000);
-        assert!(set.lookup(&conn, &other, now()).is_none());
+        assert!(set.lookup(&conn, &other, now()).rule().is_none());
     }
 
     #[test]
@@ -831,7 +1166,7 @@ mod tests {
         let conn = mk_conn();
         let unknown = Process::unknown(0);
         assert_eq!(unknown.uid, None);
-        assert!(set.lookup(&conn, &unknown, now()).is_none());
+        assert!(set.lookup(&conn, &unknown, now()).rule().is_none());
     }
 
     #[test]
@@ -850,11 +1185,11 @@ mod tests {
         let expiry = created + 3600 * 1000;
 
         // Still inside the window -> matches.
-        assert!(set.lookup(&conn, &proc, created + 1).is_some());
-        assert!(set.lookup(&conn, &proc, expiry - 1).is_some());
+        assert!(set.lookup(&conn, &proc, created + 1).rule().is_some());
+        assert!(set.lookup(&conn, &proc, expiry - 1).rule().is_some());
         // At and after expiry -> skipped.
-        assert!(set.lookup(&conn, &proc, expiry).is_none());
-        assert!(set.lookup(&conn, &proc, expiry + 1).is_none());
+        assert!(set.lookup(&conn, &proc, expiry).rule().is_none());
+        assert!(set.lookup(&conn, &proc, expiry + 1).rule().is_none());
     }
 
     #[test]

@@ -1582,8 +1582,8 @@ pub(super) fn load_and_attach(
                 dst.ip(),
                 dst.port(),
             );
-            if let Some(host) = dns_hosts.lookup_cached(dst.ip()) {
-                connection = connection.with_host(host);
+            if let Some((host, verified)) = dns_hosts.cached_named(dst.ip()) {
+                connection = connection.with_host_verified(host, verified);
             }
             dns_hosts.enqueue_lookup(dst.ip());
             let process = crate::process_resolve::resolve(ev.pid);

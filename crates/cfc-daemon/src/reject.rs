@@ -49,10 +49,12 @@
 //! lifetime: `Reject` behaves exactly like `Deny`. It never panics and
 //! never logs per packet above trace level.
 
-use cfc_core::{Connection, Protocol};
+use cfc_core::{Connection, Direction, Protocol};
+use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tracing::{debug, trace, warn};
 
 /// IANA protocol numbers we emit.
@@ -112,6 +114,9 @@ pub enum RejectOutcome {
     Unsupported,
     /// The socket existed but the kernel refused the send.
     SendFailed,
+    /// The refusal would have left the machine and the off-box budget was
+    /// spent. Flow is drop-only, which is what `Deny` would have done.
+    RateLimited,
 }
 
 /// Raw sockets used to inject refusals, opened once at daemon start.
@@ -130,6 +135,8 @@ pub struct Rejecter {
     /// Latches after the first send failure so a persistently unroutable
     /// destination logs once at WARN and then only at DEBUG.
     warned_send_failure: AtomicBool,
+    /// Budget for refusals that leave the machine. See [`Rejecter::reject`].
+    inbound_budget: Budget,
 }
 
 impl Rejecter {
@@ -170,6 +177,7 @@ impl Rejecter {
             icmp4,
             icmp6,
             warned_send_failure: AtomicBool::new(false),
+            inbound_budget: Budget::new(INBOUND_REJECTS_PER_SEC, INBOUND_REJECT_BURST),
         }
     }
 
@@ -183,6 +191,7 @@ impl Rejecter {
             icmp4: None,
             icmp6: None,
             warned_send_failure: AtomicBool::new(false),
+            inbound_budget: Budget::new(INBOUND_REJECTS_PER_SEC, INBOUND_REJECT_BURST),
         }
     }
 
@@ -192,6 +201,45 @@ impl Rejecter {
     /// `original` is the exact packet NFQUEUE handed us, needed for the
     /// TCP sequence arithmetic and the ICMP quotation.
     pub fn reject(&self, conn: &Connection, original: &[u8]) -> RejectOutcome {
+        // Both endpoints have to be ordinary unicast addresses before a single
+        // byte is forged. The destination because it is where the refusal
+        // goes; the source because `IP_HDRINCL` means whatever is written
+        // there is what leaves the machine, and the kernel will not correct
+        // it.
+        //
+        // The case this exists for is not exotic. Inbound, `dst_ip` is *us* -
+        // and for mDNS, SSDP, LLMNR or a DHCP offer it is the group or the
+        // broadcast address the datagram was sent to. Refusing those produced
+        // an ICMP error sourced from `224.0.0.251` or `255.255.255.255`, one
+        // per packet, at every neighbour that speaks multicast: a martian
+        // source on the wire, a violation of RFC 1122 3.2.2(a) and RFC 4443
+        // 2.4(e)(3), a free way to enumerate CFC hosts on a segment, and -
+        // because a DHCPOFFER is `ct state new` - an answer to the DHCP
+        // server that breaks the lease.
+        if !unicast_addressable(conn.src_ip) || !unicast_addressable(conn.dst_ip) {
+            trace!(
+                src = %conn.src_ip, dst = %conn.dst_ip,
+                "reject: not a unicast pair; dropping only"
+            );
+            return RejectOutcome::Unsupported;
+        }
+
+        // Off-box refusals are budgeted; on-box ones are not.
+        //
+        // Outbound, the refusal goes to the local application that dialled,
+        // over loopback, and throttling it would turn the immediate refusal
+        // this feature exists for back into the timeout it replaces. Inbound,
+        // the refusal goes to whoever sent the packet - an address taken from
+        // the packet - so an attacker spoofing a victim's source address turns
+        // this daemon into a reflector. `nft reject` cannot be used that way
+        // because the kernel's `icmp_send` is governed by
+        // `net.ipv4.icmp_ratelimit`; a raw socket with `IP_HDRINCL` is not
+        // governed by anything, so the budget has to be here.
+        if conn.direction == Direction::Inbound && !self.inbound_budget.take() {
+            trace!(dst = %conn.src_ip, "reject: inbound refusal budget spent; dropping only");
+            return RejectOutcome::RateLimited;
+        }
+
         match conn.protocol {
             Protocol::Tcp => self.reject_tcp(conn, original),
             Protocol::Udp => self.reject_udp(conn, original),
@@ -592,6 +640,11 @@ fn open_raw_v4(protocol: libc::c_int) -> std::io::Result<OwnedFd> {
     // SAFETY: fd is a freshly created, valid descriptor we own.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     set_flag(&fd, libc::IPPROTO_IP, libc::IP_HDRINCL)?;
+    // Best effort: a kernel that refuses the filter still sends
+    // correctly, it just keeps paying for receives nobody reads.
+    if let Err(e) = drop_all_incoming(&fd) {
+        debug!("could not make the raw socket send-only: {e}");
+    }
     Ok(fd)
 }
 
@@ -615,7 +668,131 @@ fn open_raw_v6(protocol: libc::c_int) -> std::io::Result<OwnedFd> {
     // SAFETY: fd is a freshly created, valid descriptor we own.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     set_flag(&fd, libc::IPPROTO_IPV6, libc::IPV6_HDRINCL)?;
+    // Best effort: a kernel that refuses the filter still sends
+    // correctly, it just keeps paying for receives nobody reads.
+    if let Err(e) = drop_all_incoming(&fd) {
+        debug!("could not make the raw socket send-only: {e}");
+    }
     Ok(fd)
+}
+
+/// Whether an address may appear as either end of a forged refusal.
+///
+/// Deliberately conservative: anything that is not a plain unicast address a
+/// host could hold and answer for is refused. A subnet-directed broadcast
+/// (`192.0.2.255` on a /24) cannot be recognised without knowing the mask and
+/// is not covered; the limited broadcast, every multicast group, the
+/// unspecified address and IPv4-mapped forms of all of those are.
+fn unicast_addressable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => !(a.is_multicast() || a.is_broadcast() || a.is_unspecified()),
+        // `to_canonical` so an IPv4-mapped v6 address is judged by its v4
+        // rules: `::ffff:224.0.0.251` is multicast, and `Ipv6Addr::is_multicast`
+        // alone answers false for it.
+        IpAddr::V6(a) => match a.to_canonical() {
+            IpAddr::V4(v4) => !(v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified()),
+            IpAddr::V6(v6) => !(v6.is_multicast() || v6.is_unspecified()),
+        },
+    }
+}
+
+/// A token bucket, monotonic and lock-light.
+///
+/// One global bucket rather than one per destination: per-destination state is
+/// unbounded and an attacker chooses the destinations. This is the same shape
+/// the kernel uses for `icmp_ratelimit`, and it bounds what this daemon can be
+/// made to emit no matter how the load is spread.
+#[derive(Debug)]
+struct Budget {
+    inner: Mutex<BudgetState>,
+    per_sec: f64,
+    burst: f64,
+}
+
+#[derive(Debug)]
+struct BudgetState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl Budget {
+    fn new(per_sec: u32, burst: u32) -> Self {
+        Self {
+            inner: Mutex::new(BudgetState {
+                tokens: f64::from(burst),
+                last: Instant::now(),
+            }),
+            per_sec: f64::from(per_sec),
+            burst: f64::from(burst),
+        }
+    }
+
+    /// Spends one token if there is one. Refills by elapsed time first, so a
+    /// quiet period is credited without a timer of its own.
+    fn take(&self) -> bool {
+        self.take_at(Instant::now())
+    }
+
+    fn take_at(&self, now: Instant) -> bool {
+        let mut st = self.inner.lock();
+        let elapsed = now.saturating_duration_since(st.last).as_secs_f64();
+        st.last = now;
+        st.tokens = (st.tokens + elapsed * self.per_sec).min(self.burst);
+        if st.tokens >= 1.0 {
+            st.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Refusals per second this daemon will send *off the machine*, and the burst
+/// it will allow. Chosen well above any legitimate inbound load on a desktop
+/// or a small server - a refused scan is one packet, not twenty - and far
+/// below anything worth relaying through.
+const INBOUND_REJECTS_PER_SEC: u32 = 20;
+const INBOUND_REJECT_BURST: u32 = 20;
+
+/// Refuses every packet the kernel would otherwise queue on a raw socket.
+///
+/// A `SOCK_RAW` socket bound to a protocol receives a *copy of every packet of
+/// that protocol delivered to this host*, whether or not anyone reads it -
+/// `IP_HDRINCL` governs sends and nothing else. These four sockets exist only
+/// to send, and are never read, so without this every inbound TCP segment and
+/// every ICMP packet on the machine paid an `skb_clone` and an enqueue into a
+/// buffer that could only ever fill and drop. A one-instruction classic BPF
+/// filter that returns 0 is the standard way to say "send-only": the kernel
+/// drops the packet before the clone. `SO_RCVBUF` would only shrink the waste,
+/// and `shutdown(SHUT_RD)` is not honoured for raw sockets.
+fn drop_all_incoming(fd: &OwnedFd) -> std::io::Result<()> {
+    // BPF_RET | BPF_K with k = 0: "accept 0 bytes of this packet", i.e. drop.
+    let mut insns = [libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    }];
+    let prog = libc::sock_fprog {
+        len: 1,
+        filter: insns.as_mut_ptr(),
+    };
+    // SAFETY: fd is valid and owned; `prog` and the instruction array it
+    // points at both live until setsockopt returns, and the length passed is
+    // the size of the struct the kernel expects.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            (&prog as *const libc::sock_fprog).cast(),
+            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_flag(fd: &OwnedFd, level: libc::c_int, name: libc::c_int) -> std::io::Result<()> {
@@ -778,6 +955,169 @@ mod tests {
 
     fn conn(protocol: Protocol, src: IpAddr, dst: IpAddr) -> Connection {
         Connection::new(protocol, Direction::Outbound, src, APP_PORT, dst, PEER_PORT)
+    }
+
+    fn inbound(protocol: Protocol, peer: IpAddr, us: IpAddr) -> Connection {
+        Connection::new(protocol, Direction::Inbound, peer, PEER_PORT, us, APP_PORT)
+    }
+
+    // ---- who may appear on a forged refusal ----
+
+    #[test]
+    fn only_plain_unicast_addresses_may_carry_a_refusal() {
+        for good in [
+            "192.0.2.10",
+            "127.0.0.1",
+            "10.0.0.1",
+            "2001:db8::1",
+            "::1",
+            "::ffff:192.0.2.10",
+        ] {
+            assert!(
+                unicast_addressable(good.parse().unwrap()),
+                "{good} should be addressable"
+            );
+        }
+        for bad in [
+            // The four shapes that produced a martian source in the field:
+            // mDNS, SSDP, the limited broadcast a DHCP offer carries, and the
+            // v6 multicast mDNS uses.
+            "224.0.0.251",
+            "239.255.255.250",
+            "255.255.255.255",
+            "0.0.0.0",
+            "ff02::fb",
+            "::",
+            // And the mapped form, which `Ipv6Addr::is_multicast` alone
+            // answers `false` for - the reason this helper canonicalises.
+            "::ffff:224.0.0.251",
+            "::ffff:255.255.255.255",
+        ] {
+            assert!(
+                !unicast_addressable(bad.parse().unwrap()),
+                "{bad} must never carry a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_multicast_destined_datagram_is_never_answered() {
+        let r = Rejecter::disabled();
+        // A real datagram, so the ICMP quotation can be built and the guard is
+        // the only thing that can refuse: with an empty buffer this test would
+        // pass for the wrong reason.
+        let udp = ipv4_packet(17, &udp_header(0));
+        // An mDNS query arriving at the group address. Before the guard this
+        // produced an ICMP port-unreachable sourced from 224.0.0.251.
+        let c = inbound(
+            Protocol::Udp,
+            "192.0.2.50".parse().unwrap(),
+            "224.0.0.251".parse().unwrap(),
+        );
+        assert_eq!(r.reject(&c, &udp), RejectOutcome::Unsupported);
+        // The same peer to our real address gets past the guard and stops at
+        // the missing socket, which is the next check along.
+        let c = inbound(
+            Protocol::Udp,
+            "192.0.2.50".parse().unwrap(),
+            "192.0.2.10".parse().unwrap(),
+        );
+        assert_eq!(r.reject(&c, &udp), RejectOutcome::Unavailable);
+    }
+
+    #[test]
+    fn the_send_only_filter_really_drops_what_arrives() {
+        // `drop_all_incoming` is what stops four raw sockets receiving a copy
+        // of every TCP segment and every ICMP packet on the machine for the
+        // daemon's whole life. It cannot be exercised on a raw socket without
+        // CAP_NET_RAW, but `SO_ATTACH_FILTER` is not raw-specific: a UDP
+        // socket answers the same question - is this filter well formed, and
+        // does the kernel really drop on a zero return?
+        use std::net::UdpSocket;
+        use std::os::fd::AsFd;
+
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+
+        // Without the filter the datagram arrives: this half is the control,
+        // and without it a broken filter and a broken test look identical.
+        sender.send_to(b"before", addr).expect("send");
+        let mut buf = [0u8; 16];
+        let n = listener
+            .recv(&mut buf)
+            .expect("the control datagram arrives");
+        assert_eq!(&buf[..n], b"before");
+
+        // SAFETY-adjacent: `drop_all_incoming` takes a borrowed fd and only
+        // calls setsockopt on it.
+        let owned = listener.as_fd().try_clone_to_owned().expect("dup");
+        drop_all_incoming(&owned).expect("the kernel accepts the filter");
+
+        sender.send_to(b"after", addr).expect("send");
+        assert!(
+            listener.recv(&mut buf).is_err(),
+            "with the filter attached nothing may be delivered"
+        );
+    }
+
+    // ---- the off-box budget ----
+
+    #[test]
+    fn the_budget_spends_its_burst_then_refills_with_time() {
+        let b = Budget::new(10, 3);
+        let t0 = Instant::now();
+        assert!(b.take_at(t0), "first of the burst");
+        assert!(b.take_at(t0), "second");
+        assert!(b.take_at(t0), "third");
+        assert!(!b.take_at(t0), "the burst is spent");
+        // 10/s, so 100 ms buys exactly one.
+        assert!(b.take_at(t0 + std::time::Duration::from_millis(100)));
+        assert!(!b.take_at(t0 + std::time::Duration::from_millis(100)));
+        // A long quiet period refills to the burst and no further.
+        let later = t0 + std::time::Duration::from_secs(60);
+        for i in 0..3 {
+            assert!(b.take_at(later), "refilled token {i}");
+        }
+        assert!(!b.take_at(later), "refill is capped at the burst");
+    }
+
+    #[test]
+    fn only_refusals_that_leave_the_machine_are_budgeted() {
+        let peer: IpAddr = "192.0.2.50".parse().unwrap();
+        let us: IpAddr = "192.0.2.10".parse().unwrap();
+        let udp = ipv4_packet(17, &udp_header(0));
+
+        // Outbound refusals go to the local application over loopback and are
+        // never throttled: throttling them would restore the timeout this
+        // feature exists to replace.
+        let r = Rejecter::disabled();
+        for i in 0..(INBOUND_REJECT_BURST * 4) {
+            assert_eq!(
+                r.reject(&conn(Protocol::Udp, us, peer), &udp),
+                RejectOutcome::Unavailable,
+                "outbound refusal {i} must not be budgeted"
+            );
+        }
+
+        // Inbound ones are. The burst goes through (as far as the missing
+        // socket), then the budget answers instead.
+        let r = Rejecter::disabled();
+        for i in 0..INBOUND_REJECT_BURST {
+            assert_eq!(
+                r.reject(&inbound(Protocol::Udp, peer, us), &udp),
+                RejectOutcome::Unavailable,
+                "inbound refusal {i} is within the burst"
+            );
+        }
+        assert_eq!(
+            r.reject(&inbound(Protocol::Udp, peer, us), &udp),
+            RejectOutcome::RateLimited,
+            "past the burst the refusal is dropped, not sent"
+        );
     }
 
     // ---- checksum helper ----

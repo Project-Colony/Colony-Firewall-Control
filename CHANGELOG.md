@@ -6,6 +6,136 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **The fast path could grant what the packet path denies.** The two deciders
+  did not read the same uid: the packet path takes the uid from the kernel's
+  exec record, the grant path resolves it from `/proc` at the time it decides.
+  For a program that drops privileges after `exec` - `named`, `postfix`, a
+  browser entering its sandbox - those differ, so `deny --exe X --uid 0` above
+  `allow --exe X` was answered "deny" by one and "allow" by the other. A grant
+  is process-wide and destination-blind, so the deny was not slower, it never
+  applied. The grant side now abstains wherever a uid-scoped rule could reach
+  the program, exactly as the deny side already did; those flows take the
+  queue, where the uid has one answer. Hosts with no uid-scoped rule are
+  unaffected.
+- **A rule that could not be decided was walked past.** `matches_process`
+  collapses "cannot say" into "does not match", so a `deny` scoped to
+  `exe_sha256` over a binary the daemon cannot hash - over 64 MiB, unreadable,
+  or a process whose image is already gone - handed the flow to a
+  lower-precedence `allow`. The deny listed, ranked first and never fired.
+  `RuleSet::lookup` is now three-valued: a rule that is *about* this flow but
+  undecidable stops the walk, and the default applies instead of a rule its
+  author wrote it to override. The connection half is tested first, so a rule
+  its own destination excludes still abstains for nothing.
+- **Hostnames observed on the wire could admit traffic.** Nothing correlates
+  an observed DNS response to a query this host sent - the kernel gate is
+  `source port == 53` and no more - so any peer answering from that port could
+  assert any name for its own address and inherit whatever a `dst_host` rule
+  allows it. Such a name may now refuse but may not admit; a reverse lookup,
+  which is forward-confirmed, still does both. Deny rules written against a
+  name keep working exactly as before, which is why the check runs one way
+  only.
+- **ICMP refusals were emitted for multicast and broadcast destinations,
+  sourced from the group address.** Inbound, `dst_ip` is this machine - and
+  for mDNS, SSDP, LLMNR or a DHCP offer it is the group the datagram was sent
+  to. Refusing those put a martian source on the wire, one packet per packet
+  received, at every neighbour that speaks multicast: an RFC 1122 and RFC 4443
+  violation, a way to enumerate CFC hosts on a segment, and an answer to the
+  DHCP server that breaks the lease. Both endpoints must now be ordinary
+  unicast addresses before anything is forged.
+- **Refusals that leave the machine are budgeted.** The destination came
+  straight from the packet with no limit of any kind, so a spoofed source
+  address turned the daemon into an unthrottled ICMP reflector - `nft reject`
+  cannot be used that way because the kernel rate-limits `icmp_send`, and a
+  raw socket with `IP_HDRINCL` is governed by nothing. Twenty per second off
+  the machine, with a burst of twenty. Refusals to a local application are not
+  budgeted: throttling those would restore the timeout the feature replaces.
+- **`cfc status` reported `enforcing` forever once it had seen one packet.**
+  The counter only goes up, so after the first connection the answer was "yes"
+  for the daemon's life - including after `nft flush ruleset` or a firewall
+  reload took the table away and the machine stopped being filtered. A packet
+  counter cannot tell "nothing is filtered" from "nothing is happening", so
+  the daemon now asks nftables directly, once a minute, and says what it
+  found. An absent table inside the startup grace period is not alarming: the
+  shipped units start the daemon before the one that loads the table.
+- **An `exe_path` from the wire was unbounded.** A 4 MiB path passed every
+  gate and then drove one `canonicalize(2)` per component - millions of
+  syscalls - on the sixteen-slot blocking pool the prompt router also uses.
+  Rules now refuse a path longer than `PATH_MAX`, which no process could match
+  anyway. The rejection deliberately does not echo the path back.
+- **`docs/HARDENING.md` understated the DNS risk it described.** It framed a
+  forged observed answer as something an attacker must race the resolver for,
+  "the same attacker who could also forge the forward lookup FCrDNS depends
+  on". That is not the shape: nothing correlates an observed response to a
+  query this host sent, so any peer the host sends a datagram to can reply
+  from source port 53, with no spoofing and no guessing, and the application's
+  own resolver never sees it. The section now says so, and says what the
+  daemon does about it.
+- **`ListEvents` skipped an unbounded number of rows.** `limit` was clamped
+  and `offset` was not, so a read-only peer could make sqlite step and discard
+  the whole event table per call, holding the global connection mutex.
+
+### Fixed
+
+- **Four raw sockets received a copy of every TCP segment and every ICMP
+  packet on the machine, for the daemon's whole life.** They exist only to
+  send refusals and are never read, but `IP_HDRINCL` governs sends alone: the
+  kernel clones every matching packet into a buffer that could only fill and
+  drop. They now carry a one-instruction filter that returns zero, the
+  standard way to say send-only. Opened unconditionally at start, so this was
+  a tax on every host running CFC, whether or not any rule ever rejected.
+- **The hostname cache had no upper bound on one of its two insert paths.** A
+  completed reverse lookup re-created its own key even when the reservation
+  had already been evicted, so the map ratcheted upward by one per orphaned
+  completion on any workload touching more distinct destinations than it
+  holds. A completion with nothing to update is now dropped.
+
+### Performance
+
+- **One netlink socket per thread instead of one per queued packet.**
+  Attribution opened, configured and closed an `AF_NETLINK` socket for every
+  packet the queue handed up, on the single datapath thread. Measured on
+  `scripts/vm-bench`: 0.28 ms of every queued flow at 3000 flows. Reuse is
+  only safe because each request now carries its own sequence number and the
+  reply is checked against it - every request used to carry `seq = 1`, so a
+  late answer to a timed-out request would have been indistinguishable from
+  the next one's, which is a wrong attribution rather than a slow one. The
+  socket is discarded on anything but a cleanly-sequenced answer.
+
+### Added
+
+- **`scripts/vm-bench`**, which measures what the firewall costs on a machine
+  it is allowed to arm. It assembles an initramfs from this host's own kernel
+  modules, nftables, iproute2, python3 and the release binaries, boots it under
+  KVM, and runs `scripts/bench-latency.sh` there against a real daemon - queue
+  rule loaded, rules imported, fast path granting. Nothing is downloaded and
+  nothing outside `target/vm-bench` is written. Each state differs from its
+  neighbour in one thing, and two facts are recorded beside every measurement
+  rather than assumed: what `cfc status` says the fast path is, and how many
+  packets the kernel actually handed to userspace.
+
+### Fixed
+
+- **`docs/ARCHITECTURE.md` described a design that had been replaced.** It
+  said the NFQUEUE worker blocks in `recv` while no prompt is outstanding -
+  "no polling, no added latency" - which is the design `nfqueue.rs` replaced,
+  and the opposite of what the shipped daemon does.
+- **`nfqueue.rs` predicted half the idle beat per queued flow; it is a whole
+  one.** "Mean: half that" holds for arrivals independent of the beat, not for
+  a client connecting in series, where every connect lands just after the
+  worker committed to a fresh wait. Measured by building the same daemon with
+  `RECV_POLL_INTERVAL` at 200 us and running both in one guest.
+
+### Measured
+
+- **What the fast path is worth**, per new outbound TCP flow, median, on Linux
+  7.2.2 under KVM: 0.0269 ms against 7.6083 ms through the queue at 3000
+  flows, and 0.0268 against 5.6745 at 300. It costs 0.011 ms over having no
+  firewall at all, and unlike the queue its cost does not grow with load,
+  because those flows never reach the daemon. `TODO.md` 1a carries the whole
+  table and what is still unattributed.
+
 ## [0.4.0] - 2026-09-05
 
 ### Added

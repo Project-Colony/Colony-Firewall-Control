@@ -157,9 +157,25 @@ impl Engine {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rule_match = {
             let rules = self.inner.rules.read();
-            rules
-                .lookup(conn, proc, now_unix_ms)
-                .map(|r| (r.id, r.action))
+            match rules.lookup(conn, proc, now_unix_ms) {
+                cfc_core::rule::Match::Rule(r) => Some((r.id, r.action)),
+                // A rule that is about this flow could not be decided. It
+                // outranks everything below it, so nothing below it may answer
+                // in its place: ask instead. For the case this exists for - a
+                // hash-scoped deny over a binary that cannot be hashed - the
+                // alternative was falling through to a lower allow, which is
+                // the deny silently not existing.
+                cfc_core::rule::Match::Undecidable(r) => {
+                    tracing::debug!(
+                        rule = %r.name,
+                        exe = %proc.exe.display(),
+                        "a rule that outranks the rest cannot be decided for this process; \
+                         no rule answers and the default applies"
+                    );
+                    None
+                }
+                cfc_core::rule::Match::None => None,
+            }
         };
         if let Some((rule_id, action)) = rule_match {
             *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
@@ -412,6 +428,42 @@ impl Engine {
         )
     }
 
+    /// Whether any live rule scoped to a uid could apply to `exe`.
+    ///
+    /// The mirror of [`Self::compilable_exe_paths`], for the grant map rather
+    /// than the deny map, and it exists for the same reason turned around.
+    ///
+    /// The two deciders do not read the same uid. The packet path takes the
+    /// uid from the kernel's exec record when it has one - the uid at
+    /// `execve` - and does not read `/proc/<pid>/status` at all. The grant
+    /// path resolves through `/proc` and gets the uid the process holds
+    /// *now*. For a program that drops privileges after exec - `named`,
+    /// `postfix`, a browser entering its sandbox - those are different, so
+    /// `deny --exe X --uid 0` above `allow --exe X` can be answered "deny" by
+    /// the packet path and "allow" by the grant path. A grant is process-wide
+    /// and destination-blind, so that disagreement is not a slower answer, it
+    /// is the deny never being applied at all.
+    ///
+    /// Rather than decide which uid is the right one - a semantic change to
+    /// what every existing uid-scoped rule means - the fast path simply
+    /// abstains wherever a uid could matter. Those flows take the queue,
+    /// where the uid question has one answer and it is the packet path's.
+    /// Hosts with no uid-scoped rule, which is nearly all of them, pay
+    /// nothing: the walk stops at the first predicate.
+    pub fn uid_scoped_may_apply(&self, exe: &std::path::Path) -> bool {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        self.inner
+            .rules
+            .read()
+            .rules
+            .iter()
+            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
+            .filter(|r| r.scope.uid.is_some())
+            // A uid-scoped rule that names no executable can apply to any
+            // program, exactly as in `compilable_exe_paths`.
+            .any(|r| r.scope.exe_path.as_deref().is_none_or(|p| p == exe))
+    }
+
     /// What an inbound flow gets when no rule matches.
     ///
     /// Separate from `no_ui_action` because it answers a different question.
@@ -603,6 +655,83 @@ mod tests {
 
     fn engine_with(rules: Vec<Rule>) -> Engine {
         Engine::new(RuleSet { rules }, shared(dp_deny()))
+    }
+
+    // --- the uid guard on the grant path --------------------------------
+
+    #[test]
+    fn a_uid_scoped_rule_takes_its_program_off_the_fast_path() {
+        let exe = std::path::Path::new("/usr/sbin/named");
+        let other = std::path::Path::new("/usr/bin/curl");
+
+        // The shape that made the fast path grant what the packet path denies:
+        // the program execs as root and drops to its own uid, so the grant
+        // path reads 53 and the packet path reads 0, and only one of them
+        // sees the deny.
+        let mut denied_as_root = RuleScope::any();
+        denied_as_root.exe_path = Some(PathBuf::from(exe));
+        denied_as_root.uid = Some(0);
+        let mut allowed = RuleScope::any();
+        allowed.exe_path = Some(PathBuf::from(exe));
+        let engine = engine_with(vec![
+            Rule::new("deny-as-root".to_string(), Action::Deny, denied_as_root),
+            Rule::new("allow".to_string(), Action::Allow, allowed),
+        ]);
+        assert!(
+            engine.uid_scoped_may_apply(exe),
+            "a uid-scoped rule names this program, so the fast path must stand aside"
+        );
+        assert!(
+            !engine.uid_scoped_may_apply(other),
+            "a program no uid-scoped rule names is unaffected"
+        );
+
+        // A rule set with no uid predicate at all costs nothing: this is the
+        // common case and it must not be taken off the fast path.
+        let mut plain = RuleScope::any();
+        plain.exe_path = Some(PathBuf::from(exe));
+        let engine = engine_with(vec![Rule::new("a".to_string(), Action::Allow, plain)]);
+        assert!(!engine.uid_scoped_may_apply(exe));
+    }
+
+    #[test]
+    fn a_uid_rule_naming_no_program_takes_everything_off_the_fast_path() {
+        // It could apply to anything, and nothing here can tell whether it
+        // would - the same reasoning `compilable_exe_paths` uses to return
+        // `None` rather than a list.
+        let mut any_program = RuleScope::any();
+        any_program.uid = Some(1000);
+        let engine = engine_with(vec![Rule::new(
+            "per-user".to_string(),
+            Action::Deny,
+            any_program,
+        )]);
+        for exe in ["/usr/bin/curl", "/usr/sbin/named", "/opt/whatever"] {
+            assert!(
+                engine.uid_scoped_may_apply(std::path::Path::new(exe)),
+                "{exe} must not be granted while a uid rule can reach any program"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_or_expired_uid_rule_does_not_hold_the_fast_path_back() {
+        let exe = std::path::Path::new("/usr/sbin/named");
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from(exe));
+        scope.uid = Some(0);
+
+        let mut disabled = Rule::new("off".to_string(), Action::Deny, scope.clone());
+        disabled.enabled = false;
+        assert!(!engine_with(vec![disabled]).uid_scoped_may_apply(exe));
+
+        let mut expired = Rule::new("gone".to_string(), Action::Deny, scope);
+        expired.duration = cfc_core::Duration::Seconds(1);
+        expired.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(
+            !engine_with(vec![expired]).uid_scoped_may_apply(exe),
+            "an expired rule constrains nothing"
+        );
     }
 
     // --- process_wide_action -------------------------------------------
