@@ -64,6 +64,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   syscalls - on the sixteen-slot blocking pool the prompt router also uses.
   Rules now refuse a path longer than `PATH_MAX`, which no process could match
   anyway. The rejection deliberately does not echo the path back.
+- **`docs/HARDENING.md` understated the DNS risk it described.** It framed a
+  forged observed answer as something an attacker must race the resolver for,
+  "the same attacker who could also forge the forward lookup FCrDNS depends
+  on". That is not the shape: nothing correlates an observed response to a
+  query this host sent, so any peer the host sends a datagram to can reply
+  from source port 53, with no spoofing and no guessing, and the application's
+  own resolver never sees it. The section now says so, and says what the
+  daemon does about it.
 - **`ListEvents` skipped an unbounded number of rows.** `limit` was clamped
   and `offset` was not, so a read-only peer could make sqlite step and discard
   the whole event table per call, holding the global connection mutex.

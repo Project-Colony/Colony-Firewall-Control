@@ -131,6 +131,12 @@ lean on a hostname *allow* rule as your only boundary. For allow rules,
 pin `exe` + `dst_port` (+ `dst_net` where destinations are stable)
 instead.
 
+That advice is now enforced rather than only given: a name the daemon
+did not confirm against the address may **refuse** traffic but may not
+**admit** it. A `deny --dst-host` behaves exactly as it
+always did; an `allow --dst-host` stands aside and lets the rules
+beneath it answer.
+
 #### Observed answers, with `[ebpf] enabled`
 
 Turning the eBPF layer on adds a second, better source. The
@@ -147,13 +153,27 @@ was told an address, *before* the connection it explains, by the zone
 that owns the name. The "hostile server names itself `api.github.com`"
 problem does not arise, because the destination no longer gets a vote.
 
-What it does not fix: the program reads packets off the wire, before the
-resolving library's transaction-id and source-port checks. Anything
-arriving from source port 53 that parses as a response is observed,
-including a forgery that the resolver will go on to reject - and that is
-the same attacker who could also forge the forward lookup FCrDNS
-depends on. Observed answers raise the bar; they do not make a hostname
-allow rule a boundary. The advice above is unchanged.
+What it does not fix, stated more plainly than it was: **nothing ties an
+observed response to a query this host sent.** The kernel gate is
+`source port == 53` and no more - the transaction id is parsed and never
+compared, the sender's address is never checked against a configured
+resolver, and the answer's owner name is never compared with the
+question. So this is not a forgery race that an attacker must win
+against the resolver, as this paragraph used to imply. Any peer the host
+sends a UDP datagram to - a game server, a STUN peer, anything - can
+reply from source port 53 and assert any name for any address. No
+spoofing, no guessing, and the application's own resolver never sees the
+packet.
+
+That is why an observed answer decorates a flow but does not admit it:
+it may satisfy a `deny --dst-host` and never an `allow --dst-host`.
+They remain the better source for *naming* a flow in the log, the live
+feed and a prompt, which is what they are for.
+
+The full remedy is to check the sender against the resolvers this host
+actually uses. That needs the source address in the record the kernel
+copies up, and therefore an ABI bump; until then the asymmetry above is
+what stands between an observed name and a decision.
 
 Answers are cached for the record's own TTL, clamped to 60s..1h.
 
