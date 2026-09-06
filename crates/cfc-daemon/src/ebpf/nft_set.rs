@@ -225,6 +225,28 @@ pub(super) fn holds(mark: u32) -> anyhow::Result<bool> {
     }
 }
 
+/// Whether `table inet colony_firewall` is loaded at all.
+///
+/// This is the question `cfc status`'s `enforcing` is really asking. Without
+/// the table nothing reaches NFQUEUE, so nothing is filtered - and that state
+/// is invisible from inside the daemon, which simply sees no packets. An idle
+/// machine also sees no packets, which is why the packet counter alone cannot
+/// tell the two apart and this probe exists.
+///
+/// A missing table answers `false`, not an error; anything else - nft absent,
+/// the transaction lock held, a permission failure - is an error, because
+/// "could not ask" and "asked and it is gone" must not read the same. The
+/// caller keeps its previous answer on an error rather than claiming the
+/// firewall vanished because a fork failed.
+pub(super) fn table_loaded() -> anyhow::Result<bool> {
+    let op = Op::ListTable;
+    match run(op) {
+        Ok(()) => Ok(true),
+        Err(failed) if failed.is_no_such_object() => Ok(false),
+        Err(failed) => Err(failed.into_error(op)),
+    }
+}
+
 /// Flushes `set fast_allow`, so that no value (this daemon's or a previous
 /// one's) is accepted by the ruleset.
 ///

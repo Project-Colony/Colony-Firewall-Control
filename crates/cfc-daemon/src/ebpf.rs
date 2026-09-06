@@ -744,6 +744,15 @@ pub struct Runtime {
     _attached: Option<loader::Attached>,
 }
 
+/// Whether the nftables table that feeds NFQUEUE is loaded.
+///
+/// Available in every build, feature or not: it asks `nft`, not the kernel's
+/// BPF machinery, and the question it answers - "is anything actually being
+/// filtered?" - is not about the eBPF layer at all.
+pub fn nft_table_loaded() -> anyhow::Result<bool> {
+    nft_set::table_loaded()
+}
+
 /// Flushes a previous daemon's fast-allow mark out of the nftables set, for
 /// the starts where [`start`] never reaches the loader's own flush: the layer
 /// switched off in the config, or a build without it. The set outlives

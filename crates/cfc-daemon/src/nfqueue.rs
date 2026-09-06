@@ -911,7 +911,10 @@ impl ProcessResolver for ProcfsResolver {
 /// production.
 trait HostCache {
     fn is_self(&self, pid: u32) -> bool;
-    fn cached_host(&self, ip: IpAddr) -> Option<String>;
+    /// The name for this address, and whether it was confirmed to belong to
+    /// it. Both, because the packet path needs the name for the record and the
+    /// confirmation for the decision, and asking twice would race.
+    fn cached_host(&self, ip: IpAddr) -> Option<(String, bool)>;
     fn enqueue(&self, ip: IpAddr);
 }
 
@@ -920,8 +923,8 @@ impl HostCache for DnsCache {
         DnsCache::is_self(self, pid)
     }
 
-    fn cached_host(&self, ip: IpAddr) -> Option<String> {
-        self.lookup_cached(ip)
+    fn cached_host(&self, ip: IpAddr) -> Option<(String, bool)> {
+        self.cached_named(ip)
     }
 
     fn enqueue(&self, ip: IpAddr) {
@@ -1054,8 +1057,8 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
     }
 
     // Attach cached hostname if any, kick off a fresh lookup for next time.
-    if let Some(host) = deps.dns.cached_host(conn.dst_ip) {
-        conn = conn.with_host(host);
+    if let Some((host, verified)) = deps.dns.cached_host(conn.dst_ip) {
+        conn = conn.with_host_verified(host, verified);
     }
     deps.dns.enqueue(conn.dst_ip);
 
@@ -1235,6 +1238,20 @@ mod tests {
     struct StubDns {
         self_pid: Option<u32>,
         host: Option<String>,
+        /// Whether the stubbed name is confirmed against the address. `true`
+        /// by default so a test that only cares about the name keeps meaning
+        /// what it meant; a test about the trust distinction sets it.
+        host_verified: bool,
+    }
+
+    impl Default for StubDns {
+        fn default() -> Self {
+            Self {
+                self_pid: None,
+                host: None,
+                host_verified: true,
+            }
+        }
     }
 
     impl HostCache for StubDns {
@@ -1242,8 +1259,8 @@ mod tests {
             self.self_pid == Some(pid)
         }
 
-        fn cached_host(&self, _ip: IpAddr) -> Option<String> {
-            self.host.clone()
+        fn cached_host(&self, _ip: IpAddr) -> Option<(String, bool)> {
+            self.host.clone().map(|h| (h, self.host_verified))
         }
 
         fn enqueue(&self, _ip: IpAddr) {}
@@ -1277,6 +1294,7 @@ mod tests {
                 dns: StubDns {
                     self_pid: None,
                     host: None,
+                    ..Default::default()
                 },
                 resolver: StubResolver {
                     pid: Some(4242),
@@ -1841,6 +1859,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_unverified_name_may_refuse_but_may_not_admit() {
+        // A name the daemon lifted off the wire decorates the flow and is
+        // shown to the user. It may still refuse traffic - an attacker gains
+        // nothing by calling themselves something the user denied - but it
+        // must not admit any, because anything answering from source port 53
+        // can assert any name for its own address.
+        let named = |action| {
+            let mut scope = cfc_core::RuleScope::any();
+            scope.dst_host = Some("example.org".to_string());
+            Rule::new("by-name".to_string(), action, scope)
+        };
+
+        // Allow + unverified: the rule does not answer, so the default does.
+        let mut env = TestEnv::new(vec![named(Action::Allow)], dp_deny());
+        env.dns.host = Some("example.org".into());
+        env.dns.host_verified = false;
+        match env.handle(&tcp_packet(443), &NO_META) {
+            PacketOutcome::Prompt { connection, .. } => {
+                assert_eq!(
+                    connection.dst_host.as_deref(),
+                    Some("example.org"),
+                    "the name is still attached, for the log and the live feed"
+                );
+                assert!(!connection.dst_host_verified);
+            }
+            other => panic!("an unverified name must not admit, got {other:?}"),
+        }
+
+        // Deny + unverified: it answers, exactly as it did before. Refusing
+        // the name in both directions would have disarmed every deny rule
+        // written against a name on a host running the DNS observer.
+        let mut env = TestEnv::new(vec![named(Action::Deny)], dp_allow());
+        env.dns.host = Some("example.org".into());
+        env.dns.host_verified = false;
+        match env.handle(&tcp_packet(443), &NO_META) {
+            PacketOutcome::Deliver { verdict, .. } => {
+                assert_eq!(verdict.action, Action::Deny, "a deny by name still fires");
+            }
+            other => panic!("an unverified name must still refuse, got {other:?}"),
+        }
+
+        // Allow + confirmed against the address: the rule answers.
+        let mut env = TestEnv::new(vec![named(Action::Allow)], dp_deny());
+        env.dns.host = Some("example.org".into());
+        env.dns.host_verified = true;
+        match env.handle(&tcp_packet(443), &NO_META) {
+            PacketOutcome::Deliver {
+                connection,
+                verdict,
+                ..
+            } => {
+                assert!(connection.dst_host_verified);
+                assert_eq!(verdict.action, Action::Allow);
+            }
+            other => panic!("a confirmed name should have matched, got {other:?}"),
+        }
+    }
+
     // ---- FlowKey dedup ----
 
     fn conn_to(dst_port: u16, src_port: u16) -> Connection {
@@ -2047,6 +2124,7 @@ mod tests {
                 dns: Box::new(StubDns {
                     self_pid: None,
                     host: None,
+                    ..Default::default()
                 }),
                 resolver: Box::new(StubResolver {
                     pid: Some(4242),
