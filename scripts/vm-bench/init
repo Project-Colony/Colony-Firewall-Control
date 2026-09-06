@@ -1,0 +1,60 @@
+#!/bin/bash
+# PID 1. Nothing else will mount anything, so everything the daemon and the
+# bench touch is mounted here.
+#
+# /dev first, then take the console: a cpio rootfs has no device nodes, so
+# until devtmpfs is up this script has no stdout at all and a failure before
+# that line is invisible.
+mount -t devtmpfs devtmpfs /dev
+exec > /dev/console 2>&1
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
+# bpffs, unlike the CI guests: with it the exec/exit links pin, which is what
+# lets the fast path run with its full sixty-second deadline rather than the
+# shortened one. The measurement should see the feature as a host sees it.
+mount -t bpf bpf /sys/fs/bpf
+mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+
+mkdir -p /run/colony-firewall /run/netns /var/lib/colony-firewall /var/log/colony-firewall
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+export HOME=/root
+
+echo "guest kernel: $(uname -r)"
+
+# Two passes: the dependency order in the list is per-module, so a module
+# whose dependency comes later in the list fails the first time and takes on
+# the second. Silent by design - "already loaded" is the common failure.
+for pass in 1 2 3; do
+    while read -r ko; do
+        err="$(insmod "$ko" 2>&1)"
+        # Third pass only: by then a real failure is not an ordering problem,
+        # and "already loaded" is the expected answer for everything that took.
+        if [ "$pass" = 3 ] && [ -n "$err" ] && [[ "$err" != *"File exists"* ]]; then
+            echo "  module $(basename "$ko"): $err"
+        fi
+    done < /modlist
+done
+echo "modules loaded: $(awk '{printf "%s ", $1}' /proc/modules)"
+
+ip link set lo up
+
+# How many samples per direction, from the kernel command line, so a smoke run
+# and a real run are the same guest booted differently.
+# The plan's knobs come down the kernel command line, so a quick check and a
+# real run are the same guest booted differently.
+cmdline() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+DRAIN_SECS="$(cmdline cfc_drain)"
+SWEEP="$(cmdline cfc_sweep | tr ',' ' ')"
+export DRAIN_SECS SWEEP
+echo "sweep: ${SWEEP:-default}  drain: ${DRAIN_SECS:-default}s"
+
+/bench/plan.sh
+echo "CFC_DONE=$?"
+
+# Exiting is the shutdown: panic=1 turns a dead init into a reboot, and
+# qemu's -no-reboot turns that reboot into an exit.
+exit 0
