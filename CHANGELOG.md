@@ -6,6 +6,39 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/vm-bench`**, which measures what the firewall costs on a machine
+  it is allowed to arm. It assembles an initramfs from this host's own kernel
+  modules, nftables, iproute2, python3 and the release binaries, boots it under
+  KVM, and runs `scripts/bench-latency.sh` there against a real daemon - queue
+  rule loaded, rules imported, fast path granting. Nothing is downloaded and
+  nothing outside `target/vm-bench` is written. Each state differs from its
+  neighbour in one thing, and two facts are recorded beside every measurement
+  rather than assumed: what `cfc status` says the fast path is, and how many
+  packets the kernel actually handed to userspace.
+
+### Fixed
+
+- **`docs/ARCHITECTURE.md` described a design that had been replaced.** It
+  said the NFQUEUE worker blocks in `recv` while no prompt is outstanding -
+  "no polling, no added latency" - which is the design `nfqueue.rs` replaced,
+  and the opposite of what the shipped daemon does.
+- **`nfqueue.rs` predicted half the idle beat per queued flow; it is a whole
+  one.** "Mean: half that" holds for arrivals independent of the beat, not for
+  a client connecting in series, where every connect lands just after the
+  worker committed to a fresh wait. Measured by building the same daemon with
+  `RECV_POLL_INTERVAL` at 200 us and running both in one guest.
+
+### Measured
+
+- **What the fast path is worth**, per new outbound TCP flow, median, on Linux
+  7.2.2 under KVM: 0.0269 ms against 7.6083 ms through the queue at 3000
+  flows, and 0.0268 against 5.6745 at 300. It costs 0.011 ms over having no
+  firewall at all, and unlike the queue its cost does not grow with load,
+  because those flows never reach the daemon. `TODO.md` 1a carries the whole
+  table and what is still unattributed.
+
 ## [0.4.0] - 2026-09-05
 
 ### Added

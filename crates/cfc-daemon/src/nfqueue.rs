@@ -42,13 +42,24 @@
 //!   that this replaces.
 //!
 //! The price is that while the worker is idle the first packet of an
-//! intercepted flow can wait up to one [`RECV_POLL_INTERVAL`] (mean: half
-//! that) in the kernel queue, and that the idle worker wakes at that
-//! cadence. It is the same cadence the loop already paid whenever a prompt
-//! was outstanding, and single-digit milliseconds on connection setup is a
-//! far better trade than a minute and a half on every restart. If `nfq`
-//! ever exposes the netlink fd, move the idle wait to a `poll()` on it:
-//! that buys back the zero added latency *and* keeps the bounded stop.
+//! intercepted flow waits in the kernel queue for the rest of the current
+//! beat, and that the idle worker wakes at that cadence.
+//!
+//! "Mean: half of one interval" is what this comment used to claim, and it
+//! is only true of arrivals that are independent of the beat. A client that
+//! connects in series is not: each connect lands just after the worker
+//! observed an empty queue and committed to a fresh wait, so it pays close
+//! to a whole interval, every time. Measured in `scripts/vm-bench` by
+//! building this file with the constant at 200 us and running both daemons
+//! in one guest - 4.90 ms of 5.67 at 300 flows, 5.24 ms of 7.61 at 3000 -
+//! rather than inferred from the shape of a distribution, which is how this
+//! path has been misread before.
+//!
+//! It remains a far better trade than a minute and a half on every restart,
+//! and the fast path takes the whole round trip away for a process a lasting
+//! rule allows. If `nfq` ever exposes the netlink fd, move the idle wait to
+//! a `poll()` on it: that buys back the added latency *and* keeps the
+//! bounded stop.
 
 use crate::config::NfqConfig;
 use crate::decision::{Decision, Engine};

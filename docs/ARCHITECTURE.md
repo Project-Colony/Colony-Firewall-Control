@@ -103,11 +103,23 @@ The worker keeps two maps that are created and destroyed together:
 Verdicts arrive asynchronously on a separate channel and are applied out of
 order, so a slow prompt only delays its own flow.
 
-**Recv mode follows the outstanding count.** With no prompt outstanding the
-worker blocks in `recv`, which is both the common case and the cheapest one:
-no polling, no added latency. The moment a prompt is outstanding it switches
-the queue socket to non-blocking and interleaves `recv` with 5ms waits on the
-verdict channel. It switches back once the last prompt resolves.
+**The queue socket is non-blocking for the worker's whole life**, and every
+idle turn of the loop waits up to `RECV_POLL_INTERVAL` (5 ms) on the verdict
+channel. This paragraph used to describe the opposite - a blocking `recv` with
+"no polling, no added latency" whenever no prompt was outstanding - which was
+true of an earlier design and had not been true for some time. A thread parked
+in a blocking `recv` cannot be woken to see a stop flag, and that was ninety
+seconds of hang on every daemon stop; `crates/cfc-daemon/src/nfqueue.rs` has
+the full argument.
+
+The price is real and is now measured rather than estimated: a queued flow
+pays a whole idle beat, about 5 ms, because a client connecting in series
+lands just after the worker committed to a fresh wait. `scripts/vm-bench`
+attributes it - 4.90 ms of 5.67 at 300 flows, 5.24 ms of 7.61 at 3000, by
+building the same daemon with the constant at 200 us and measuring both in one
+boot. The fast path below removes the round trip entirely for a process a
+lasting rule allows, which is what makes that cost bearable rather than
+something to redesign around today.
 
 **Prompt deduplication** is keyed on `(exe-or-pid, dst_ip, dst_port,
 protocol)`. Source address and port are deliberately excluded, so a SYN
