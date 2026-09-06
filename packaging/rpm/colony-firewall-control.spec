@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -239,6 +239,13 @@ fi
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 
 %changelog
+* Sun Sep 06 2026 MotherSphere <linhajahad@gmail.com> - 0.5.0-1
+- Security: the fast path could grant what the packet path denies (uid divergence)
+- Security: a rule that could not be decided was walked past into a lower allow
+- Security: an unconfirmed hostname may now refuse but not admit
+- Security: ICMP refusals no longer forged with a multicast source, and are budgeted off-box
+- The measured cost of the fast path, and scripts/vm-bench that measures it
+
 * Sat Sep 05 2026 MotherSphere <linhajahad@gmail.com> - 0.4.0-1
 - Fast-allow path, opt-in: lastingly allowed processes skip the NFQUEUE round trip
 - eBPF ABI v4
