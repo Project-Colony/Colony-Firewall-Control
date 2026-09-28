@@ -18,7 +18,7 @@
 name = "cfc-ebpf"
 version = "0.2.0"
 edition = "2024"
-# Matches aya-ebpf 0.2's own MSRV. Irrelevant to the workspace MSRV of 1.88:
+# Matches aya-ebpf 0.2's own MSRV. Irrelevant to the workspace MSRV of 1.89:
 # this crate is only ever built by the pinned nightly.
 rust-version = "1.87"
 license = "GPL-3.0-or-later"

@@ -12,7 +12,7 @@
 #      actually has.
 #   2. the spec parses and produces a source RPM, with `rpmlint` on top.
 #   3. the package builds, installs and verifies end to end - in a Fedora
-#      container, not on Rocky 9, because the workspace's MSRV is 1.88 and
+#      container, not on Rocky 9, because the workspace's MSRV is 1.89 and
 #      Rocky 9's default repos do not reach it. The Rocky-native path
 #      (`rust-toolset`) remains untried; TODO.md 2b says so rather than
 #      letting a green Fedora build imply the deployment target can build it.

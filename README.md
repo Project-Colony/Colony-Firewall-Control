@@ -377,7 +377,7 @@ A profile is a base, not a lock: any field you set under
 
 ## Development
 
-Requires Rust stable (MSRV 1.88, gated in CI) and `protobuf-compiler`.
+Requires Rust stable (MSRV 1.89, gated in CI) and `protobuf-compiler`.
 On Debian/Ubuntu:
 
 ```sh

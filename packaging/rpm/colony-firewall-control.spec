@@ -22,7 +22,7 @@ Source0:        %{forgeurl}/archive/v%{version}/%{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64
 
 BuildRequires:  cargo
-BuildRequires:  rust >= 1.88
+BuildRequires:  rust >= 1.89
 BuildRequires:  protobuf-compiler
 BuildRequires:  pkgconf
 BuildRequires:  gcc
