@@ -6,6 +6,16 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-28
+
+### Changed
+
+- The minimum supported Rust version increased from 1.88 to 1.89. Source
+  builds and package builders now require Rust 1.89 or newer.
+- Updated `notify-rust` to 4.18.0, `dns-lookup` to 4.0.1, `futures` to
+  0.3.34, `chrono` to 0.4.45, and `ipnet` to 2.12.2.
+- Updated the pinned Rust toolchain GitHub Action.
+
 ## [0.5.0] - 2026-09-06
 
 ### Security

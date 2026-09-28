@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
-Version:        0.5.0
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -239,6 +239,11 @@ fi
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 
 %changelog
+* Mon Sep 28 2026 MotherSphere <linhajahad@gmail.com> - 0.6.0-1
+- Raise the minimum supported Rust version to 1.89
+- Update notify-rust, dns-lookup, futures, chrono, and ipnet
+- Update the pinned Rust toolchain GitHub Action
+
 * Sun Sep 06 2026 MotherSphere <linhajahad@gmail.com> - 0.5.0-1
 - Security: the fast path could grant what the packet path denies (uid divergence)
 - Security: a rule that could not be decided was walked past into a lower allow
