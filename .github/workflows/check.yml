@@ -126,10 +126,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --profile release --locked
 
-  # Verify the declared MSRV (rust-version in Cargo.toml). 1.88 is the
-  # floor imposed by the current lockfile (wgpu 27 needs 1.88; zvariant
-  # needs 1.87; edition-2024 crates need 1.85) — verified by compiling the
-  # whole workspace with each candidate toolchain.
+  # Verify the declared MSRV (rust-version in Cargo.toml). notify-rust 4.18
+  # requires 1.89; compile the whole workspace with that toolchain.
   #
   # RUSTUP_TOOLCHAIN is what actually pins this job. dtolnay/rust-toolchain
   # only runs `rustup default <toolchain>`, and the repo's root
@@ -140,12 +138,12 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: "1.88"
+      RUSTUP_TOOLCHAIN: "1.89"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
       - name: Assert the toolchain in use really is the MSRV
         run: |
           # Keep in sync with rust-version in [workspace.package].

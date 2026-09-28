@@ -454,7 +454,7 @@ This crate is **not** a member of the root workspace: it is listed under
 `Cargo.lock`. Consequences, all intentional:
 
 * `cargo build --workspace`, `cargo test --workspace`,
-  `cargo clippy --workspace --all-targets` and the MSRV 1.88 check never see
+  `cargo clippy --workspace --all-targets` and the MSRV 1.89 check never see
   this crate and are completely unaffected by it;
 * `aya-ebpf` never enters the root lockfile, so it never widens the `cargo deny`
   surface of the shipped userspace binaries;

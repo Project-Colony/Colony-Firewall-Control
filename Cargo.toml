@@ -19,7 +19,7 @@ exclude = ["crates/cfc-ebpf"]
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Project-Colony/Colony-Firewall-Control"
 authors = ["MotherSphere <linhajahad@gmail.com>"]
@@ -37,7 +37,7 @@ cfc-ebpf-common = { path = "crates/cfc-ebpf-common" }
 # and nothing at build time beyond aya itself: aya is pure Rust and needs no
 # bpf-linker, no nightly and no BPF-capable kernel to compile. aya 0.14 pairs
 # with the aya-ebpf 0.2.x the kernel-side crate uses, and declares
-# rust-version 1.87, comfortably inside this workspace's 1.88 MSRV. The exact
+# rust-version 1.87, comfortably inside this workspace's 1.89 MSRV. The exact
 # build is pinned by Cargo.lock plus `--locked` in CI, not by an `=` requirement
 # (cargo expands `=0.14` to the same range as `0.14` for a 0.x version, so an
 # `=` here would be a no-op that reads like a guarantee).
