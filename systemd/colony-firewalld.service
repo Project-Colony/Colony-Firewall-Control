@@ -1,14 +1,10 @@
 [Unit]
 Description=Colony Firewall Control daemon
 Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
-# Ordered BEFORE network-pre.target, the systemd convention for firewalls:
-# every network-configuration service (NetworkManager, systemd-networkd,
-# dhcpcd, ...) is After=network-pre.target, so this daemon is up and
-# listening on the queue before any interface gets configured. There is
-# no window at boot where the network exists but filtering does not.
-# (During early boot no UI is connected yet, so unmatched flows resolve
-# via no_ui_action; `cfc rules bootstrap-defaults` covers DHCP, DNS and
-# NTP so a strict profile still boots.)
+# Filtering is installed independently before daemon initialization. A failed
+# daemon leaves the fail-closed table loaded; a failed nft load blocks startup.
+Requires=colony-firewall-nft.service
+After=colony-firewall-nft.service
 Before=network-pre.target
 Wants=network-pre.target
 
@@ -215,10 +211,9 @@ MemoryDenyWriteExecute=true
 # leaves /var/lib/rpm readable, and rpm needs no writable-executable memory. If
 # it ever is not compatible, the failure is a warning and an empty provenance
 # index, never a failure to filter. The other child is nft(8), run at start
-# and at stop to put the fast-allow mark into one nftables set and take it
-# out: the same fork/execve, netlink under the CAP_NET_ADMIN already granted,
-# no writable-executable memory - and the same failure shape, the fast path
-# reported off with the reason, never a failure to filter.
+# and at stop to flush legacy Fast Allow state. The same fork/execve and
+# CAP_NET_ADMIN netlink operations are needed. Failed cleanup is reported
+# explicitly because an older installed ruleset may still accept old marks.
 SystemCallFilter=@system-service
 SystemCallFilter=bpf perf_event_open
 SystemCallErrorNumber=EPERM
@@ -232,3 +227,4 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 
 [Install]
 WantedBy=multi-user.target
+Also=colony-firewall-nft.service

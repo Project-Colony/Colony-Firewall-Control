@@ -262,61 +262,29 @@ struct LadderFacts {
     capability: enforce::FastPathCapability,
 }
 
-/// The reduced guarantee when exit is detected by leader only.
-const REDUCED_IMPRECISE_EXIT: &str =
-    "exit is detected by thread-group leader only, so stale grants are swept every beat";
-/// The reduced guarantee when the lifecycle links are not pinned.
-const REDUCED_UNPINNED_LINKS: &str =
-    "the exec/exit tracepoint links are not pinned, so their clears die with this daemon";
+/// Legacy status rendering remains readable for older clients.
+#[cfg(test)]
+const REDUCED_IMPRECISE_EXIT: &str = "exit is detected by thread-group leader only";
 
-/// Off, with the one sentence for `cfc status` - or on, with the list of
-/// guarantees that are weaker than the full ones (empty means all hold).
-///
-/// What refuses and what merely reduces is the whole policy of the fast path,
-/// so it is worth reading as a list:
-///
-/// * **refuse** when nothing could ever mark (config off, no maps, basic
-///   connect variants) or nothing could ever evict (exit not tracked at all).
-/// * **reduce** when eviction is weaker but boundable: exit detected by leader
-///   only (the daemon sweeps its grants every beat), or lifecycle links that
-///   die with the daemon (the deadline is all that is left after it does).
-///   Both select the short deadline pair.
-/// * **note, and run** when the sendmsg hooks are missing: they can only strip
-///   a forged mark from an unconnected UDP socket now, and that is not worth
-///   the whole feature.
-///
-/// `Enforcement` is deliberately not an input. It used to be - Process mode
-/// was refused on the reasoning that a stale grant would have "nothing but the
-/// deadline" - and that reasoning was backwards: in Process mode every link
-/// and every map dies with the daemon, so a stale grant cannot exist after it,
-/// which is the safest case there is. The unpinned-links reduction covers what
-/// is genuinely weaker about it while the daemon is up.
+/// Legacy capability checks remain conservative, but runtime grants are disabled
+/// for every configuration: a socket mark does not identify its current sender.
+const FAST_ALLOW_DISABLED: &str =
+    "Fast Allow is disabled: socket marks cannot verify the current sender; use normal NFQUEUE filtering";
+
 fn fast_path_decision(f: &LadderFacts) -> Result<Vec<&'static str>, &'static str> {
     if !f.config_on {
         return Err("[ebpf] fast_allow is not set");
     }
     if !f.has_maps {
-        // Not reachable by an *old* object: the loader requires the v4 ABI
-        // symbol with must_exist, and the fast path arrived with that bump.
-        // What is left is an object built from a tree with the maps taken out.
         return Err("the loaded object has no fast-allow maps");
     }
-    if !f.exit_tracking {
-        // Without exit events nothing evicts while the daemon is alive, and no
-        // sweep cadence makes up for a kernel that never says a process died.
-        return Err("process exit is not tracked on this kernel");
+    if !f.exit_tracking || !f.exit_precise || !f.lifecycle_pinned {
+        return Err("fast-allow requires precise, pinned exec/exit hooks");
     }
     if let Some(why) = f.capability.refusal() {
         return Err(why);
     }
-    let mut reduced = Vec::new();
-    if !f.exit_precise {
-        reduced.push(REDUCED_IMPRECISE_EXIT);
-    }
-    if !f.lifecycle_pinned {
-        reduced.push(REDUCED_UNPINNED_LINKS);
-    }
-    Ok(reduced)
+    Err(FAST_ALLOW_DISABLED)
 }
 
 /// One attempt at the nftables side, at startup, reported as the state it
@@ -334,13 +302,12 @@ fn nft_arm_state(mark: u32, deadline_secs: u64, reduced: Option<String>) -> Fast
 }
 
 /// The reported state for a failed nftables arm. A missing *table* is the
-/// normal boot order (the nft unit starts after this daemon) and reads as
-/// waiting; a missing *set* is an operator-visible fact - a snippet that
+/// ruleset unavailable and reads as waiting; a missing *set* is an operator-visible fact - a snippet that
 /// predates the feature - and carries the fix; anything else is quoted.
 fn nft_arm_state_from_error(e: &anyhow::Error) -> FastAllow {
     match e.downcast_ref::<super::nft_set::Absent>() {
         Some(super::nft_set::Absent::Table) => FastAllow::Off(
-            "waiting for the nftables table (colony-firewall-nft.service starts after the daemon)"
+            "waiting for the nftables table (colony-firewall-nft.service has not installed filtering)"
                 .to_string(),
         ),
         Some(super::nft_set::Absent::Set) => FastAllow::Off(format!("{e}")),
@@ -512,9 +479,9 @@ pub(super) fn load_and_attach(
         // `LoadError` and drops this `Report` on the floor, and a failed flush
         // followed by a failed load is exactly the shape that leaves a
         // predecessor's mark accepted with no daemon to explain it.
-        warn!("could not flush a previous fast-allow mark from nftables: {e:#}");
+        tracing::error!("could not disable previous Fast Allow state: {e:#}; old marks may still bypass filtering; run systemctl reload colony-firewall-nft and inspect the journal before relying on filtering");
         report.notes.push(format!(
-            "could not flush a previous fast-allow mark from nftables: {e:#}"
+            "could not disable previous Fast Allow state: {e:#}; old marks may still bypass filtering; reload colony-firewall-nft before relying on filtering"
         ));
     }
 
@@ -895,8 +862,12 @@ pub(super) fn load_and_attach(
     // --- attach, each independently ------------------------------------
 
     let exec_pin = pin_dir.as_deref().map(|d| d.join(enforce::LINK_EXEC));
-    if let Some(p) = exec_pin.as_deref() {
-        drop_stale_link_pin(p);
+    let exit_pin = pin_dir.as_deref().map(|d| d.join(enforce::LINK_EXIT));
+    for p in [exec_pin.as_deref(), exit_pin.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        drop_stale_link_pin(p).map_err(|e| LoadError::new(Degrade::Other, e))?;
     }
     let mut exec_pinned = false;
     let r = attach_tracepoint(
@@ -912,10 +883,6 @@ pub(super) fn load_and_attach(
     // Both tracepoints are pinned, for different reasons: exec so a process
     // that starts without a daemon still gets a verdict, exit so the map it
     // writes cannot rot. Both are replaced rather than inherited on restart.
-    let exit_pin = pin_dir.as_deref().map(|d| d.join(enforce::LINK_EXIT));
-    if let Some(p) = exit_pin.as_deref() {
-        drop_stale_link_pin(p);
-    }
     let mut exit_pinned = false;
     let r = attach_tracepoint(
         &mut bpf,
@@ -1174,6 +1141,10 @@ pub(super) fn load_and_attach(
 
                     let (state, mark_opt) = match off {
                         Some(why) => {
+                            if fast_allow.on {
+                                warn!("{FAST_ALLOW_DISABLED}");
+                                report.notes.push(FAST_ALLOW_DISABLED.to_string());
+                            }
                             sink.withdraw_fast_path();
                             (FastAllow::Off(why.to_string()), None)
                         }
@@ -1307,6 +1278,9 @@ pub(super) fn load_and_attach(
         let sink_exit = sink.clone();
         match spawn_ring(&mut bpf, MAP_EXIT, move |bytes| {
             if let Some(event) = decode::<ExitEvent>(bytes) {
+                if !process_group_is_gone(event.pid) {
+                    return;
+                }
                 t.observe_exit(event.pid);
                 // The verdict map is pinned, so an entry the daemon forgets
                 // outlives the daemon. Evicting here is what stops a recycled
@@ -1784,15 +1758,23 @@ fn attach_tracepoint(
 /// daemons, not to be inherited across it. The program behind it references the
 /// previous run's `PROCS` and `EXIT_EVENTS`, both rebuilt on every start, so
 /// adopting it would leave the new daemon's tables uncleaned.
-fn drop_stale_link_pin(path: &Path) {
+fn drop_stale_link_pin(path: &Path) -> anyhow::Result<()> {
     match std::fs::remove_file(path) {
-        Ok(()) => debug!(path = %path.display(), "removed a previous run's tracepoint pin"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!(
-            path = %path.display(),
-            "could not remove the previous tracepoint pin ({e}); the old program \
-             stays attached alongside the new one"
-        ),
+        Ok(()) => {
+            debug!(path = %path.display(), "removed a previous run's tracepoint pin");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                "could not replace the previous lifecycle program: {e}; old code remains active; repair bpffs permissions and restart colony-firewalld before relying on the new kernel fixes"
+            );
+            Err(anyhow::Error::new(e).context(format!(
+                "removing previous lifecycle pin {}; old code remains active, repair bpffs permissions and restart colony-firewalld",
+                path.display()
+            )))
+        }
     }
 }
 
@@ -1882,9 +1864,16 @@ fn exec_process(event: &ExecEvent) -> Process {
         ppid: (event.ppid != 0).then_some(event.ppid),
         uid: Some(event.uid),
         gid: Some(event.gid),
-        exe: PathBuf::from(event.filename_str().into_owned()),
+        // The tracepoint filename is the argument to execve, not an attested
+        // mapped image. on_exec resolves /proc before applying an exe rule.
         ..Process::unknown(event.pid)
     }
+}
+
+/// A leader exit event is only a candidate on compatibility kernels. Any
+/// readable task directory or permission failure preserves identity and deny.
+fn process_group_is_gone(pid: u32) -> bool {
+    matches!(std::fs::read_dir(format!("/proc/{pid}/task")), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Takes a ring-buffer map out of the object and starts a task that drains it.
@@ -1953,6 +1942,25 @@ fn decode<T: Copy>(bytes: &[u8]) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_thread_group_is_not_evicted() {
+        assert!(!process_group_is_gone(std::process::id()));
+        assert!(process_group_is_gone(u32::MAX));
+    }
+
+    #[test]
+    fn fast_allow_is_refused_even_with_every_hook_available() {
+        let facts = LadderFacts {
+            config_on: true,
+            has_maps: true,
+            exit_tracking: true,
+            exit_precise: true,
+            lifecycle_pinned: true,
+            capability: enforce::FastPathCapability::Ready,
+        };
+        assert!(fast_path_decision(&facts).is_err());
+    }
     use std::net::Ipv4Addr;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -2058,83 +2066,25 @@ mod tests {
     /// reduces; a missing sendmsg hook is a note. `Enforcement` is not an
     /// input at all, which is itself the assertion.
     #[test]
-    fn the_ladder_refuses_only_where_nothing_could_mark_or_evict() {
+    fn the_ladder_never_arms_socket_mark_authorization() {
         use enforce::FastPathCapability as Cap;
-        let full = LadderFacts {
-            config_on: true,
-            has_maps: true,
-            exit_tracking: true,
-            exit_precise: true,
-            lifecycle_pinned: true,
-            capability: Cap::Ready,
-        };
-        assert_eq!(
-            fast_path_decision(&full),
-            Ok(vec![]),
-            "everything in place: full guarantee"
-        );
-
-        // Refusals.
-        assert!(fast_path_decision(&LadderFacts {
-            config_on: false,
-            ..full
-        })
-        .is_err());
-        assert!(fast_path_decision(&LadderFacts {
-            has_maps: false,
-            ..full
-        })
-        .is_err());
-        assert!(fast_path_decision(&LadderFacts {
-            exit_tracking: false,
-            ..full
-        })
-        .is_err());
-        assert!(
-            fast_path_decision(&LadderFacts {
-                capability: Cap::BasicConnect,
-                ..full
-            })
-            .is_err(),
-            "basic connect variants carry no mark decision: nothing would ever mark"
-        );
-
-        // Reductions - the two that used to refuse.
-        assert_eq!(
-            fast_path_decision(&LadderFacts {
-                exit_precise: false,
-                ..full
-            }),
-            Ok(vec![REDUCED_IMPRECISE_EXIT]),
-            "no group_dead is a swept, short-deadline path - not a refusal"
-        );
-        assert_eq!(
-            fast_path_decision(&LadderFacts {
-                lifecycle_pinned: false,
-                ..full
-            }),
-            Ok(vec![REDUCED_UNPINNED_LINKS])
-        );
-        assert_eq!(
-            fast_path_decision(&LadderFacts {
-                exit_precise: false,
-                lifecycle_pinned: false,
-                ..full
-            }),
-            Ok(vec![REDUCED_IMPRECISE_EXIT, REDUCED_UNPINNED_LINKS]),
-            "both reductions are reported, not just the first"
-        );
-
-        // A missing sendmsg hook is a caveat: the path runs with the full
-        // guarantee, and the caveat is a separate note.
-        let no_sendmsg = LadderFacts {
-            capability: Cap::SendmsgUnavailable,
-            ..full
-        };
-        assert_eq!(fast_path_decision(&no_sendmsg), Ok(vec![]));
-        assert!(Cap::SendmsgUnavailable.caveat().is_some());
-        assert!(Cap::Ready.caveat().is_none());
-        assert!(Cap::BasicConnect.refusal().is_some());
+        for config_on in [false, true] {
+            for capability in [Cap::Ready, Cap::SendmsgUnavailable, Cap::BasicConnect] {
+                for lifecycle_pinned in [false, true] {
+                    for exit_precise in [false, true] {
+                        assert!(fast_path_decision(&LadderFacts {
+                            config_on,
+                            has_maps: true,
+                            exit_tracking: true,
+                            exit_precise,
+                            lifecycle_pinned,
+                            capability,
+                        })
+                        .is_err());
+                    }
+                }
+            }
+        }
     }
 
     /// `cfc status` must not say plain `live` on a kernel where the guarantee
@@ -2355,6 +2305,24 @@ mod tests {
         p.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
         p.extend_from_slice(&ip.octets());
         p
+    }
+
+    #[test]
+    fn stale_lifecycle_pin_removal_errors_are_not_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        // remove_file cannot unlink a directory. No BPF or kernel state is used.
+        assert!(drop_stale_link_pin(temp.path()).is_err());
+        assert!(drop_stale_link_pin(&temp.path().join("absent")).is_ok());
+    }
+
+    #[test]
+    fn exec_event_filename_does_not_attest_a_policy_image() {
+        let mut event = ExecEvent::zeroed();
+        event.pid = u32::MAX;
+        event.uid = 1000;
+        event.filename[..4].copy_from_slice(b"/bin");
+        event.filename_len = 4;
+        assert!(!exec_process(&event).exe_is_known());
     }
 
     #[test]
@@ -2814,14 +2782,12 @@ mod tests {
             report.lifecycle_pinned,
             capability.as_str()
         );
-        // With the config on and the maps present, refusal has two causes left
-        // and neither is a kernel property this matrix has ever shown: exit
-        // tracking is asserted above, and no kernel here falls back to the
-        // `_basic` connect twins. One that did would be a finding to look at,
-        // not a degradation to wave through.
+        // Runtime grants remain disabled regardless of the capabilities this
+        // kernel verifies. The matrix still records those facts for Deny and
+        // attribution compatibility; it must never claim Fast Allow is live.
         assert!(
-            decision.is_ok(),
-            "the fast path should be at least reduced on every matrix kernel: {decision:?}"
+            decision.is_err(),
+            "Fast Allow must be disabled on every matrix kernel: {decision:?}"
         );
         // Where the matrix has already shown what a kernel answers, the answer
         // is asserted, so a kernel that changes its mind is caught here and not

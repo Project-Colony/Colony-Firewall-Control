@@ -34,7 +34,17 @@ pub fn duration_label(d: i32) -> &'static str {
         pb::Duration::Once => "once",
         pb::Duration::UntilRestart => "until-restart",
         pb::Duration::Always => "always",
+        pb::Duration::Seconds => "seconds",
         pb::Duration::Unspecified => "?",
+    }
+}
+
+/// Human-readable duration including a timed rule's exact lifetime.
+pub fn rule_duration_label(rule: &pb::RuleInfo) -> String {
+    if rule.duration == pb::Duration::Seconds as i32 {
+        format!("{}s", rule.duration_seconds)
+    } else {
+        duration_label(rule.duration).to_string()
     }
 }
 
@@ -139,7 +149,7 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
     let target = scope
         .and_then(|s| {
             if !s.dst_host.is_empty() {
-                Some(s.dst_host.clone())
+                Some(format!("{} [legacy hostname; uncertain]", s.dst_host))
             } else if !s.dst_net.is_empty() {
                 Some(s.dst_net.clone())
             } else {
@@ -298,7 +308,10 @@ mod tests {
             has_dst_port: true,
             ..Default::default()
         }));
-        assert_eq!(s, "allow   /usr/bin/curl -> example.com:443");
+        assert_eq!(
+            s,
+            "allow   /usr/bin/curl -> example.com [legacy hostname; uncertain]:443"
+        );
     }
 
     #[test]

@@ -20,129 +20,17 @@ longer lifts anything; `nft delete table` no longer lifts the denies it holds.
 Two pieces of it are deliberately not done, and both are real work rather than
 oversights:
 
-**1a. An in-kernel *allow* now buys the round trip - opt-in.** Done, along
-the line sketched here (`bpf_setsockopt(SO_MARK)` on the connect path, an nft
-rule ahead of the queue), and then reshaped by an adversarial review of the
-design that stood 59 objections before a line was written. The three that
-could not be patched, and what replaced them:
+**1a. Fast Allow is disabled.** Socket marks do not attest the current sender,
+and grants can outlive their intended executable or rule. Every configuration,
+including `fast_allow = true`, uses NFQUEUE for allowed flows. The nft snippet
+no longer accepts the legacy set, startup clears old state, and upgrades reload
+active nft units atomically. Reintroducing an in-kernel Allow requires a design
+that verifies current socket ownership and revocation; the old mark protocol is
+not a supported security boundary.
 
-- *The mark lives on the socket, not in the map.* Revoking a grant left every
-  already-marked socket marked, and an fd inherited across `execve` carried
-  the bypass to a binary that earned nothing. So the mark is re-decided - set
-  or stripped - at every flow start, `connect()` and `sendmsg()` alike, and
-  sockets already carrying someone else's mark (a VPN, a proxy) are left
-  alone in both directions. Exactly which hooks that is, is what the
-  *implementation* review pinned down: `cgroup/sendmsg` runs for a send that
-  carries a destination, not for `send()` on a connected socket. So **only TCP
-  is ever marked** - an allowlist, after two narrower rules leaked in a row
-  (refusing UDP at `connect()` alone left the sendmsg hooks marking sockets
-  that were already connected; naming UDP at all missed UDP-Lite, DCCP and
-  SCTP). The cost is nil in the case that matters: a UDP peer that answers
-  makes the flow conntrack-established, and only `ct state new` is queued. What
-  is given up is the fast path for QUIC, which was getting its first packet
-  through it and nothing more.
-
-  **Resolved on this branch.** With no UDP socket ever marked, the two
-  `cgroup/sendmsg` programs can only strip a mark somebody forged onto an
-  unconnected UDP socket, so their absence no longer refuses the fast path - it
-  is a caveat in the report. The inherited path stopped using their pins as
-  evidence of which connect variant runs; `attach` now leaves a directory
-  marker in bpffs once the cookie variants took, and that is what a restart
-  reads. The programs themselves stay: where the kernel verifies them they are
-  worth their ~270 instructions as defence in depth, and removing them is an
-  ABI change for another day.
-- *`CAP_NET_RAW` can set `SO_MARK` since 5.17*, which docker grants by
-  default. A published mark value is a bypass token. The value is drawn at
-  random per start and lives in a pinned map and an nftables set, never in a
-  package. Two things the implementation review added: the draw is sieved
-  against the fwmark selectors other software uses - kube-proxy's masks are a
-  single bit each, so an unsieved word collided half the time on a Kubernetes
-  node - and the set is flushed unconditionally at start, because a value left
-  accepted that nothing refreshes is one every past grantee can still read off
-  its own socket with `getsockopt(SO_MARK)`.
-- *A static accept rule is a token on every install.* The snippet ships the
-  set empty; the daemon fills it only when the path is armed - the one thing
-  the daemon does to nftables.
-
-Grants are cleared in the kernel on exec and exit, so no daemon is needed for
-the hand-over to fail safe; a `CLOCK_BOOTTIME` deadline the daemon refreshes
-makes a dead daemon fail-closed within one deadline (60 s refreshed every 10 s,
-or 6 s refreshed every 2 s where the lifecycle links cannot be pinned); and the
-path stays off - with
-the reason in `cfc status` - unless enforcement is pinned, exit is detected
-exactly (`group_dead`), their ring consumers running, the cookie connect
-variants *and* the sendmsg hooks verified, the nftables set present and holding
-this daemon's mark, and `[ebpf] fast_allow` is set. Whether the exec/exit links
-could be *pinned* is not on that list any more, and neither is whether exit is
-detected *exactly* (`group_dead`) or whether enforcement is *pinned*: each of
-those used to refuse the path, and each was the wrong instrument. Now the
-decision is a pure function (`fast_path_decision`, with a test) that **refuses**
-only where nothing could ever mark (config off, no maps, basic connect variants)
-or nothing could ever evict (exit not tracked), and **reduces** otherwise:
-unpinned lifecycle links or leader-only exit detection both drop the deadline to
-six seconds refreshed every two, and leader-only exit also makes every beat
-sweep the granted pids against the start time recorded at grant - because there
-the kernel can miss a death while the daemon is alive, and no deadline bounds a
-grant the heartbeat keeps refreshing. `Enforcement` is not an input at all:
-refusing Process mode was backwards, since there everything dies with the
-daemon. The matrix shows `group_dead` absent on 5.10 and 6.12 and present on
-6.18, so this is what puts the fast path within reach of the kernels RHEL
-ships; nothing in CI has yet run it there with a rule engine attached, so that
-reach is reasoned from the ladder and the guest logs, not observed.
-**Off by default** for this release: the blast radius named above has not
-changed, only its edges.
-
-An adversarial review of the *implementation* then found 23 confirmed defects
-on top of the design's 59, all fixed on this branch. The ones worth
-remembering as classes: a second decider that read the execve string and the
-exec-time uid where every other decider reads `/proc` (which skipped
-relative-exec processes entirely, so a grant survived its rule's deletion);
-grants written with no liveness guard where the deny side had carried one
-since it was written; and the feature being **inert for its own motivating
-case** - nothing granted a process that was already running, so every restart
-silently switched the fast path off for every long-lived program while
-`cfc status` said `live`.
-
-**Measured, 2026-09-06.** The number that justifies the feature exists now:
-`scripts/vm-bench` boots a throwaway guest from this machine's own kernel and
-binaries and runs `scripts/bench-latency.sh` there against a real daemon, so
-CFC can be armed without arming it on anybody's workstation. On Linux 7.2.2
-under KVM, per new outbound TCP flow, median:
-
-| | 300 flows | 3000 flows |
-|---|---|---|
-| no firewall at all | 0.0158 ms | 0.0162 ms |
-| the fast path | 0.0268 ms | 0.0269 ms |
-| the NFQUEUE round trip | 5.6745 ms | 7.6083 ms |
-
-So the fast path saves **5.6 ms per new flow at 300 flows and 7.6 ms at
-3000**, and costs 0.011 ms over having no firewall. Its cost does not grow
-with load, because those flows never reach the daemon; the queue's does. The
-0.28 ms this file quoted before was measured on a different bench and is not
-comparable - and it understated the case by two orders of magnitude.
-
-Two findings came out of attributing that cost rather than just recording it,
-both now written where they were wrong:
-
-- **A whole `RECV_POLL_INTERVAL` is paid per queued flow, not half of one.**
-  `nfqueue.rs` predicted "mean: half that", which holds for arrivals
-  independent of the beat and not for a client connecting in series: each
-  connect lands just after the worker committed to a fresh idle wait. Proved
-  by building the same daemon with the constant at 200 us and measuring both
-  in one guest - 4.90 ms of the 5.67 at 300 flows, 5.24 ms of the 7.61 at
-  3000. Not by reading a distribution's shape, which is how this path has been
-  misread before.
-- **`docs/ARCHITECTURE.md` still described the blocking-recv design** that
-  `nfqueue.rs` replaced, claiming "no polling, no added latency" for the
-  common case. Corrected.
-
-What is left here: the remaining queued cost grows with the number of live
-sockets (0.77 ms at 300 flows against 2.36 ms at 3000, with the beat removed)
-and that growth is in the daemon's own per-packet work - the floor moved
-0.0003 ms across the same range. Attribution is the obvious suspect and is not
-yet proven; the cheap next experiment is the same sweep with `[ebpf] enabled`
-off, which forces the `/proc` walk and should separate the socket-cookie path
-from the fallback. 1b below is still untouched.
+The previous latency measurements describe the disabled implementation. The
+remaining NFQUEUE cost still warrants measurement and optimization, with the
+same application-policy semantics.
 
 **1b. Rules that depend on a destination still cannot be precomputed.**
 `process_wide_action` deliberately answers `None` for them, which is correct and
@@ -225,6 +113,14 @@ are worth stating rather than discovering:
 - **It follows symlinks the path's owner controls.** A rule for
   `/home/bob/tool` pointing at `/usr/bin/curl` becomes a rule about curl. The
   CLI prints what it stored and the daemon warns; nothing pins the inode.
+
+Process resolution now rereads policy identity for every packet lookup; pid
+and start time do not identify an executable across exec. Its path and digest
+come from one opened mapped image, with metadata and link consistency checks.
+Mutable images bypass the digest cache. A raw exec-event filename is retained
+for diagnostics only; once `/proc` is gone, the policy executable is unknown.
+Shared or passed socket descriptors remain outside sender attribution, and
+the mapped image is still a read-time snapshot rather than packet-time proof.
 
 ---
 
@@ -336,10 +232,10 @@ believing they are protected when they are not.
 **CFC is a detection and consent layer. It is not a containment boundary.**
 SELinux is a containment boundary. The two are not substitutes.
 
-What CFC actually guarantees: against an unprivileged adversary running as its
-own executable and not injecting into anything, an outbound connection is
-noticed and requires a decision. That is the dropper-calls-its-C2 case, and it
-is a large share of real malware. It is a genuinely useful guarantee.
+CFC decides new tracked outbound flows when its table is loaded. This scope
+excludes established/related traffic, local relays, inherited or passed sockets,
+and packet-layer traffic. It is application consent, not domain or process
+containment.
 
 What defeats it completely:
 
@@ -349,7 +245,8 @@ What defeats it completely:
 | **Code inside an allowed process** | a browser extension, a script under an allowed interpreter, `ptrace`/`LD_PRELOAD` injection. Structural to every application firewall. Making Allow persistent (`72964b5`) improved usability and widened this. |
 | **Loopback** | `oifname "lo" accept`, deliberately - filtering it stalls the systemd-resolved stub. Anything that can reach a local service which egresses is attributed to that service. |
 | **DNS tunnelling** | the resolver must be allowed for anything to work. CFC *observes* answers; it does not inspect or block queries. |
-| **Passed socket descriptors** | NFQUEUE gives a socket, not a pid. `SCM_RIGHTS` breaks the association; ring-0 exec tracking does not help here. |
+| **Inherited or passed socket descriptors** | Existing connection authorization is not rechecked for each sending executable; socket attribution is ambiguous when ownership is shared. |
+| **CAP_NET_RAW packet sockets** | Packet-layer egress can bypass the IP OUTPUT hook. Layer-2 confinement is outside the shipped rules. |
 | **Prompt fatigue** | demonstrated on this machine: ten Firefox prompts in a row, all denied, browser lost. A malicious installer generating thirty prompts trains the user to click Allow. |
 
 And one tradeoff worth stating plainly: the ruleset is **fail-closed** (`ct

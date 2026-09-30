@@ -5,6 +5,35 @@ breaks, *the network* breaks, and the tool you'd use to debug it may be on
 the other side of the connection it just dropped. Read the first section
 before enabling enforcement on any machine you reach over SSH.
 
+## Daemon restarts and rule upgrades
+
+Once loaded, both nft tables survive daemon stops and restarts. With no queue
+listener, new tracked flows drop; established and related traffic retains its
+authorization. To intentionally remove filtering, stop the corresponding nft
+unit. An active network manager that requires this unit also stops; disabling
+enforcement removes its requirement for subsequent starts. Uninstall removes
+both tables and Colony's pinned BPF directory.
+
+Package upgrades reload active nft units atomically. After a manual upgrade,
+run `systemctl daemon-reload`, then `systemctl reenable colony-firewalld
+colony-firewall-nft` (and the inbound unit only if already enabled), and
+`systemctl reload colony-firewall-nft` (and the inbound unit if active) before
+relying on the new rules. Reenable installs the native network-manager
+requirements on existing deployments. A startup error saying
+previous Fast Allow state could not be disabled means old acceptance may still
+exist; resolve that error and inspect the loaded table. The nft units load
+before the daemon. Failed daemon initialization leaves filtering installed;
+a failed nft load blocks the daemon and the enabled NetworkManager or
+systemd-networkd requirements. This covers those managers' startup after
+enforcement is enabled, not initramfs networking or already configured
+interfaces. Later external ruleset flushes also need operator coordination.
+
+The inbound lockout guard reads persisted rules directly and never needs live
+IPC. With an established remote session, unreadable saved rules prevent
+activation. It uses Python's SQLite and TOML standard libraries; Python older
+than 3.11 needs `CFC_RULES_DB` set to the actual configured database path for
+this check. `CFC_INBOUND_FORCE=1` remains the explicit console override.
+
 ## Testing over SSH without locking yourself out
 
 The shipped nftables snippet is **fail-closed**: `queue num 0` without the

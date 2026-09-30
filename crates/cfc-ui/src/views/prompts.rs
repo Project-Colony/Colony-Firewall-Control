@@ -144,7 +144,11 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         if ev.binds_to_hash {
             rows.push(DetailRow {
                 label: "Rule binding",
-                value: "Allow always will pin to this binary".to_string(),
+                value: if p.sha256.is_empty() {
+                    "Image hash unavailable; persistent allow cannot be saved".to_string()
+                } else {
+                    "Allow always will pin to this binary".to_string()
+                },
                 note: "(user-writable path)",
                 copy: None,
             });
@@ -578,6 +582,7 @@ mod tests {
             dst_ip: "93.184.216.34".into(),
             dst_port: 443,
             dst_host: "example.com".into(),
+            dst_host_verified: false,
         }
     }
 

@@ -41,6 +41,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check release assets against pkg/colony.json
         run: ./scripts/check-release-assets.sh
+      - name: Check startup protection without touching host services
+        run: python3 scripts/check-startup-protection.py
 
   clippy:
     runs-on: ubuntu-latest

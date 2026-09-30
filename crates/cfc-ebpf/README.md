@@ -117,20 +117,16 @@ the offset to matter to.
 
 ### 2. `tracepoint/sched/sched_process_exit` → `cfc_sched_process_exit`
 
-Removes the pid from `PROCS` and pushes an `ExitEvent` to `EXIT_EVENTS`, so the
-userspace cache can never serve a stale entry for a **recycled** pid.
+Evicts process identity and deny state only when the tracepoint's `group_dead`
+field confirms that the final thread has exited. The loader discovers that
+field's offset from the live tracefs format.
 
-Two details:
-
-* This tracepoint fires for every *thread*. The program compares
-  `bpf_get_current_pid_tgid()`'s two halves and only acts when `tgid == tid`,
-  i.e. when the thread-group leader dies and the process is genuinely gone.
-  Evicting on any thread exit would blind the daemon to a still-running
-  multithreaded process.
-* It reads nothing from the tracepoint record. `/sys/kernel/tracing` is
-  root-only on the build host, so the `sched_process_exit` field layout could
-  not be verified; the helper is layout-independent and therefore strictly
-  safer.
+On kernels without a readable `group_dead`, thread and leader exits preserve
+identity and denials. Leader events are candidates for userspace cleanup only
+after `/proc/<pid>/task` disappears. A leader can exit while workers remain, so
+leader exit cannot justify eviction. This conservative fallback can retain stale
+denials until exec or reconciliation; immediate final-thread cleanup is not
+guaranteed on those kernels.
 
 ### 3. `cgroup_skb/ingress` → `cfc_dns_ingress`
 

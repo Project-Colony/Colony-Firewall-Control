@@ -205,7 +205,7 @@ pub struct NfqConfig {
     /// Kernel queue length before packets overflow.
     pub queue_max_len: u32,
     /// What happens to packets when the queue overflows or the daemon cannot
-    /// keep up: `false` drops them (fail-closed), `true` lets them through.
+    /// keep up. Must be false so overflow cannot bypass the verdict audit.
     pub fail_open: bool,
 }
 
@@ -317,32 +317,9 @@ pub struct EbpfConfig {
     /// Where the BPF object built by `cargo xtask build-ebpf` was installed.
     /// `None` means `crate::ebpf::DEFAULT_OBJECT_PATH`.
     pub object_path: Option<PathBuf>,
-    /// Let a process-wide allow skip the queue.
-    ///
-    /// Off by default, and opt-in on purpose. What it buys: a process whose
-    /// connections a rule allows outright, for the life of the rule, stops
-    /// paying the NFQUEUE round trip - the kernel marks its sockets at
-    /// `connect()`, nftables accepts the mark ahead of the queue, and no
-    /// packet of that process reaches the daemon. What it costs: those
-    /// decisions move off the one path every other guarantee here is built
-    /// on. The mark is a value drawn at random at each start and matched
-    /// exactly, so a process holding CAP_NET_RAW - enough for `SO_MARK`
-    /// since 5.17 - cannot forge it without first learning it; and the flows
-    /// it lets through are reported back over a ring buffer rather than seen
-    /// on the packet path, so the counters and the live feed for them are only
-    /// as timely as that consumer.
-    ///
-    /// Inert unless all of: enforcement pinned or inherited, exit tracking up
-    /// and exact, the exec/exit links actually pinned, the cookie connect
-    /// variants and *both* sendmsg hooks verified, the ring consumers started,
-    /// and the nftables set declared by the snippet and holding this daemon's
-    /// mark.
-    ///
-    /// The last two are the ones that fail in the field and the ones this list
-    /// used to omit: 5.10 verifies `bpf_setsockopt` on connect hooks and
-    /// refuses it on sendmsg ones, and the nft unit starts *after* the daemon,
-    /// so a fresh boot reports "waiting for the nftables table" until it does.
-    /// `cfc status` and the startup log line name whichever it was.
+    /// Compatibility setting, currently ignored: Fast Allow is disabled for
+    /// every configuration because socket marks cannot attest the sender.
+    /// Ordinary traffic uses NFQUEUE; the startup report explains the refusal.
     pub fast_allow: bool,
     /// The `SO_MARK` value the fast path uses, when the machine needs a
     /// specific one.
@@ -526,6 +503,10 @@ impl Config {
     /// profile / `[default_policy]` precedence rules).
     pub fn from_toml_str(txt: &str) -> anyhow::Result<Self> {
         let raw: ConfigToml = toml::from_str(txt)?;
+        anyhow::ensure!(
+            !raw.nfqueue.fail_open,
+            "[nfqueue] fail_open = true bypasses mandatory verdict auditing and is unsupported"
+        );
         Ok(raw.resolve())
     }
 }
@@ -533,6 +514,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_overflow_cannot_bypass_the_verdict_audit_gate() {
+        assert!(Config::from_toml_str("[nfqueue]\nfail_open = true\n").is_err());
+        assert!(
+            !Config::from_toml_str("[nfqueue]\nfail_open = false\n")
+                .unwrap()
+                .nfqueue
+                .fail_open
+        );
+    }
 
     #[test]
     fn empty_file_yields_balanced_defaults() {
@@ -854,7 +846,7 @@ enabled = " Auto ""#
             [nfqueue]
             queue_num = 3
             queue_max_len = 8192
-            fail_open = true
+            fail_open = false
 
             [pause]
             default_secs = 120
@@ -870,7 +862,7 @@ enabled = " Auto ""#
         .unwrap();
         assert_eq!(cfg.nfqueue.queue_num, 3);
         assert_eq!(cfg.nfqueue.queue_max_len, 8192);
-        assert!(cfg.nfqueue.fail_open);
+        assert!(!cfg.nfqueue.fail_open);
         assert_eq!(cfg.pause.default_secs, 120);
         assert_eq!(cfg.events.max_rows, 5000);
         assert_eq!(cfg.ipc.group, "wheel");

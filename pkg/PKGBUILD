@@ -31,6 +31,8 @@ makedepends=('cargo' 'protobuf' 'pkgconf')
 # in a clean chroot on 2026-08-21.
 options=('!lto')
 optdepends=(
+    'bubblewrap>=0.13.0: explicit headless application confinement'
+    'libbpf: mandatory interface filters for application confinement'
     'libnotify: desktop notifications on new prompts'
     'libx11: run the GUI in X11/XWayland sessions'
 )
@@ -45,6 +47,10 @@ sha256sums=('SKIP')
 _srcname=Colony-Firewall-Control-$pkgver
 
 prepare() {
+    if [[ "${sha256sums[0]}" == 'SKIP' ]]; then
+        printf '%s\n' 'Release template has no source checksum. Run updpkgsums before building.' >&2
+        return 1
+    fi
     cd "$srcdir/$_srcname"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"

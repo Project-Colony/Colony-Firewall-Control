@@ -50,11 +50,9 @@ headless machine gets a say.
 ```
 kernel (nftables OUTPUT hook)
    |
-   |  meta mark @fast_allow accept   (opt-in fast path: a socket the connect
-   |                                  hook marked for an already-allowed
-   |                                  process skips the queue; the set holds
-   |                                  one element while armed, none otherwise)
+   |  loopback / established,related / daemon refusal packets accepted
    |  ct state new   queue num 0
+   |  all other traffic dropped
    v
 NFQUEUE 0
    |
@@ -94,10 +92,9 @@ every new connection on the machine. It no longer does.
 
 The worker keeps two maps that are created and destroyed together:
 
-- `waiters: HashMap<prompt_id, PendingPrompt>` - each `PendingPrompt` holds
-  the connection, the process, the fallback verdict, and **every packet
-  parked on it**. When the prompt resolves, all of them get the same
-  verdict.
+- `waiters: HashMap<prompt_id, PendingPrompt>` holds the fallback and each
+  parked packet's connection and process snapshot. A prompt answer is
+  checked against current policy for every packet; a new refusal takes precedence.
 - `pending_flows: HashMap<FlowKey, prompt_id>` - the deduplication index.
 
 Verdicts arrive asynchronously on a separate channel and are applied out of
@@ -117,15 +114,15 @@ pays a whole idle beat, about 5 ms, because a client connecting in series
 lands just after the worker committed to a fresh wait. `scripts/vm-bench`
 attributes it - 4.90 ms of 5.67 at 300 flows, 5.24 ms of 7.61 at 3000, by
 building the same daemon with the constant at 200 us and measuring both in one
-boot. The fast path below removes the round trip entirely for a process a
-lasting rule allows, which is what makes that cost bearable rather than
-something to redesign around today.
+boot. These are historical measurements, not a current performance guarantee.
+Fast Allow is disabled, so allowed flows also pay the queue round trip.
 
-**Prompt deduplication** is keyed on `(exe-or-pid, dst_ip, dst_port,
-protocol)`. Source address and port are deliberately excluded, so a SYN
-retransmit or a second parallel connection from the same program to the same
-destination joins the existing prompt instead of raising another one. A
-process the daemon could not attribute keys on its pid instead of its path.
+**Prompt deduplication** requires the same UID, executable path, image digest,
+destination IP, destination port and protocol. Source address and port are
+excluded, so equivalent parallel connections may share a prompt. An incomplete
+identity never shares authorization. Persistent prompt Allows use the queued
+image digest; they never rehash a later image at a reused PID. A retargeted
+pathname cannot suppress the required hash binding.
 
 **Exactly-once resolution.** Four paths can resolve a prompt: the user
 answers, the timeout fires, there was no subscriber to begin with, or the
@@ -152,35 +149,43 @@ packet it cannot parse gets the default policy applied silently.
 Given a 5-tuple, the daemon has to name the program behind it, in the few
 hundred microseconds before the packet's latency becomes visible.
 
-1. **`sock_diag` fast path.** A netlink `INET_DIAG_REQ_V2` exact-tuple query
+1. **TCP `sock_diag` fast path.** A netlink `INET_DIAG_REQ_V2` exact-tuple query
    returns the socket inode directly. It works unprivileged and avoids
-   reading the whole `/proc/net` table. UDP gets one retry with the local and
-   remote ends swapped, because `udp_diag` interprets the request that way.
+   reading the whole `/proc/net` table.
 2. **`/proc/net/{tcp,udp}{,6}` fallback**, silently, whenever the fast path
-   misses. Three passes over the table, in order: exact local + exact remote;
-   then, for UDP only, exact local with a zero remote (an unconnected socket
-   doing `sendto` - mDNS, NTP, syslog, QUIC stacks); then a wildcard-bound
-   local address. All comparisons run on canonical form, so `::ffff:a.b.c.d`
+   misses. UDP always reads all relevant tables first and requires one unique
+   compatible inode: exact or wildcard local address, with exact or zero
+   remote address. Missing tables, an exhausted lookup budget or several
+   compatible inodes leave attribution unknown. The packet's socket UID,
+   when present, filters candidates. All comparisons run on canonical form,
+   so `::ffff:a.b.c.d`
    rows in the v6 tables match plain IPv4 flows - which is what dual-stack
    Java, Go and node runtimes produce. Rows with inode 0 (TIME_WAIT,
    orphans) are dropped first so they cannot shadow a live socket.
-3. **inode -> pid** by walking `/proc/*/fd` for a `socket:[inode]` link.
+3. **inode -> pid** via the diagnostic cookie when available, otherwise by
+   walking `/proc/*/fd` for a `socket:[inode]` link. A shared or passed socket
+   descriptor still does not identify which holder sent a packet.
 
-Three bounded TTL caches keep the walk off the hot path:
+Two bounded caches avoid repeated socket walks and sealed-image hashing:
 
-| Cache          | Key                          | TTL   |
-|----------------|------------------------------|-------|
-| inode -> pid   | socket inode                 | 2s    |
-| pid -> process | (pid, process start time)    | 5s    |
-| exe digest     | (dev, inode, mtime)          | 1h    |
+| Cache          | Key                                         | Lifetime |
+|----------------|---------------------------------------------|----------|
+| inode -> pid   | socket inode                                | 2s       |
+| sealed exe digest | dev, inode, length, mtime and ctime with nanoseconds | key change or eviction |
 
-Keying the process cache on start time makes it safe against pid reuse; a
-cache hit on the inode cache is re-verified by reading the `/proc/<pid>/fd`
-link back before it is trusted. The whole resolution is under a 50ms budget.
+A complete process record is read on every resolution: exec changes policy
+identity without changing pid or start time. A cache hit on the inode cache
+is re-verified by reading the `/proc/<pid>/fd` link back before it is trusted.
+The socket lookup has a 50ms budget.
 
 The binary's SHA-256 is read through `/proc/<pid>/exe`, so it hashes the
 image actually running even if the file on disk was replaced or deleted.
-Files over 64 MiB are skipped.
+The same opened file supplies metadata and bytes. Content changes during
+hashing are rejected; the mapped link, metadata and process start time must
+still agree before publishing executable identity. Mutable images are never
+served from the digest cache. Files over 64 MiB retain their path but have no
+digest. This remains a read-time snapshot: an exec after the final check can
+change the process before the queued packet receives its verdict.
 
 The kernel also reports the originating uid and gid with each queued packet
 (`NFQA_UID` / `NFQA_GID`). Those are authoritative and override whatever
@@ -196,13 +201,12 @@ A table fed by the exec/exit tracepoints is consulted *before* `/proc`:
 |---|---|---|
 | `ppid` | `/proc/<pid>/stat` field 4 | exec event |
 | `uid`, `gid` | `/proc/<pid>/status` | exec event, i.e. the values at `execve()` |
-| `exe` | `/proc/<pid>/exe` | only as a fallback, when `/proc` is gone |
+| `exe` | `/proc/<pid>/exe` | unchanged; raw exec arguments cannot attest the mapped path |
 | `cmdline`, `cwd`, digest, package | `/proc` | unchanged |
 
-Two `/proc` file parses disappear per uncached resolve, but the real win is the
-last row of the first column: a process that exited between the packet and the
-`/proc` read used to resolve to `unknown`, and now resolves to a name. That is
-the common case for exactly the short-lived processes worth prompting about.
+Two `/proc` file parses disappear per resolve. When the process has already
+exited, the record can preserve uid/gid/ppid. Its executable and digest stay
+unknown without a readable, consistent mapped image.
 
 It does **not** remove the socket -> pid step - NFQUEUE gives the daemon a
 packet, not a pid - and it does not override a readable `/proc/<pid>/exe`,
@@ -216,6 +220,20 @@ after the event arrives, and a lookup presenting a different start time drops
 the record and falls back to `/proc`.
 
 ## Rule evaluation
+
+Executable policies name the canonical mapped target explicitly. New CLI,
+GUI, native import, OpenSnitch import and daemon writes refuse paths that
+resolve through an alias instead of silently saving its current target.
+Shipped system-service bundles intentionally select a current fixed target
+from their candidate list. They do not track later alias changes.
+
+Missing absolute targets remain valid before installation when their existing
+ancestors need no rewriting and no unresolved symlink is present. An alias
+installed there later needs operator review. Existing stored paths remain
+fixed targets: older rules lost the original alias spelling, so an automatic
+migration cannot recover that intent. This is a policy-entry contract; it
+does not pin an inode, follow aliases at exec time, or attest future pathname
+changes. Legacy alias intent loss is not repaired by this validation.
 
 `RuleSet` is kept sorted so that lookup is a linear scan that returns the
 first match, and the order does not depend on what SQLite happened to
@@ -256,18 +274,23 @@ merged at the very last step, when the kernel is told to DROP.
 
 ## Event log
 
-Every observed connection and its verdict is persisted, off the packet path:
+Parsed NFQUEUE policy refusals commit to SQLite with WAL/FULL before verdict
+delivery, the journald message and live publication. Commit failure drops the
+current packet and ends the worker, so later queued packets cannot be allowed
+by that worker after an unaudited refusal.
 
 ```
-worker --> broadcast feed --> feeder --> bounded mpsc (4096) --> writer
-                                |                                  |
-                                |                                  v
-                          journald audit                   events table
-                          (Deny/Reject only)         (batched: 256 rows or 1s)
+parsed Deny/Reject --> durable events commit --> verdict --> journal/live feed
+Allow             --> verdict --> live feed --> bounded queue --> async writer
 ```
 
-The feeder uses `try_send` and counts what it drops. Persistence can never
-block a verdict; if the queue fills, rows are lost and the loss is logged.
+The live feed and async Allow history can lose observations under load. The
+feeder uses `try_send` and logs lag or drops; it skips already committed refusals.
+Refusal commits can delay delivery. Database mutex and SQLite busy waits are
+each limited to 250 ms; filesystem I/O and fsync are not bounded by these limits.
+This gate does not audit malformed packets, nftables drops or kernel-ring
+refusals. It is not a universal lossless audit or protection against root
+rewriting the database.
 The table is pruned to `[events] max_rows` every 60 seconds. `ListEvents`
 queries it with executable-substring, action and since filters; `cfc log` is
 the front end.
@@ -315,9 +338,14 @@ with the calling uid and pid. See [HARDENING.md](HARDENING.md).
   Prompts go out on a broadcast channel; verdicts come back on a dedicated
   channel the worker polls.
 - **ipc server** - tonic gRPC over the Unix socket.
-- **event writer** - batches rows into SQLite and prunes on a timer.
+- **event writer** - batches Allow observations into SQLite and prunes on a timer.
+  Parsed NFQUEUE Deny/Reject decisions commit synchronously before their verdict
+  and live publication. Audit failure drops the packet and ends the worker.
 - **storage** - sqlite behind a mutex. Reads are served from the in-memory
-  `RuleSet`; writes are kept off the hot path.
+  `RuleSet`. Production startup requires WAL with synchronous=FULL. Refusal
+  commits are on the packet path; lock and SQLite busy waits are each limited
+  to 250 ms. These limits do not bound filesystem I/O or fsync. Kernel/nftables
+  drops and malformed packets are not covered by this durable delivery gate.
 
 ## Lifecycle and systemd integration
 
@@ -350,10 +378,10 @@ Signals:
 
 ## The eBPF layer
 
-Three kernel-side programs (`crates/cfc-ebpf`, built separately by
+The kernel-side programs (`crates/cfc-ebpf`, built separately by
 `cargo xtask build-ebpf`) and their userspace loader (`cfc-daemon/src/ebpf/`).
 The loader is compiled in by default (the `ebpf` cargo feature, which is what
-pulls `aya` in); the layer stays off at runtime until `[ebpf] enabled` is set.
+pulls `aya` in); the runtime defaults to automatic loading when the host supports it.
 Compiling it in is not the same as running it: while the config switch is off,
 `start` returns before any `bpf(2)` call, so a default build is exactly as
 inert as one built with `--no-default-features`.
@@ -361,104 +389,29 @@ inert as one built with `--no-default-features`.
 | program | attach | what the daemon does with it |
 |---|---|---|
 | `tracepoint/sched/sched_process_exec` | `sched:sched_process_exec` | fills a pid -> (exe, comm, uid, gid, ppid) table |
-| `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts from that table |
-| `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads out; the daemon parses them and lifts the `A`/`AAAA` records |
-| `cgroup/connect4`, `cgroup/connect6` | cgroup v2 root, link **pinned** | refuse `connect()` for pids the daemon has denied outright, before a packet exists - and, under `[ebpf] fast_allow`, mark the sockets of pids a lasting rule allows outright |
-| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | the same mark decision for a UDP send that carries a destination; no refusal |
+| `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts only on confirmed thread-group death |
+| `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads for diagnostics, never policy identity |
+| `cgroup/connect4`, `cgroup/connect6` | cgroup v2 root, link **pinned** | refuse `connect()` for pids the daemon has denied outright, before a packet exists |
+| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | legacy mark-clearing support; Fast Allow stays disabled |
 
-**Two decisions happen in the kernel; everything else is enrichment.** The
-connect hooks refuse a denied program's `connect()` with `EPERM` - pinned, so
-the refusal outlives the daemon - and, with one opt-in fast path, wave an
-allowed one past the queue. Every other verdict comes from NFQUEUE,
-with a single exception: under `[ebpf] fast_allow`, the sockets of a process
-the daemon has already ruled allowed process-wide are marked in the connect
-hook, and the snippet's `meta mark @fast_allow accept` rule takes them ahead
-of the queue. That set is the one thing the daemon ever writes to nftables -
-one element added when the path is armed, flushed at every daemon start (whether
-or not the layer loads) and at shutdown - and it ships empty, so a default install carries no
-bypass value.
+**In-kernel denials.** The connect hooks refuse an executable denied
+process-wide with `EPERM`. Pinned denials outlive the daemon. Conditional rules,
+prompts and Allow decisions remain on the normal NFQUEUE path.
 
-**Where revocation reaches.** A grant is re-decided at every hook that opens a
-flow: `connect()`, and a `sendmsg` that carries a destination. Deleting the
-rule, replacing it with a Block, the process exec'ing, the process exiting, and
-the daemon going away for more than one deadline all take effect at the next
-such hook, which is what makes the mark safe to hand out at all.
+**Fast Allow is disabled in every runtime configuration.** A socket mark cannot
+prove the current sender's identity, and lifecycle checks do not repair that
+property. `fast_allow = true` produces a warning and no grants or heartbeat.
+The nft snippet has no mark-set accept rule. Startup flushes legacy accepted
+marks, and package upgrades reload active nft units with one atomic transaction
+to remove old acceptance rules. A failed cleanup emits an error and requires
+operator action before filtering can be relied upon.
 
-**Only a TCP socket is ever marked.** The property that decides this is not
-the protocol but whether a socket passes one of our hooks *again* after it is
-set up - because the mark lives on the socket and only a hook can take it back.
-TCP does: it passes the connect hook for every connection it opens. A UDP
-socket that has called `connect()` sends with `send()`, which carries no
-destination and so passes neither hook; the mark it holds then is the mark it
-keeps until it is closed, past a revocation, past the deadline, and past the
-daemon's death - the one case where "a dead daemon fails closed within sixty
-seconds" would not hold.
-
-Two narrower rules were tried first and both leaked, which is why this is an
-allowlist rather than a list of protocols to exclude. Refusing UDP only at
-`connect()` left the sendmsg hooks free to mark a socket that was *already*
-connected: `sendto` with an explicit address is legal on a connected UDP
-socket, and the hook runs whenever a destination is supplied. And naming UDP at
-all covers only what someone thought to name - UDP-Lite, DCCP and SCTP connect
-the same way and have no sendmsg hook here either.
-
-Refusing is never a bare early return: a socket that already carries our mark
-is still stripped of it. Never set, always strip.
-
-The cost lands where it does least harm. The ruleset queues `ct state new`; a
-UDP peer that answers makes the flow conntrack-established after one exchange,
-and established traffic is not queued with or without a mark. A marked UDP
-socket only kept *gaining* anything while its peer stayed silent - and
-unreplied UDP is conntrack-NEW on every datagram, which is exactly the shape in
-which an unrevocable mark does the most damage. Benefit and hazard were the
-same case. What is given up in practice is the fast path for QUIC, which was
-getting its first packet through it and nothing more.
-
-**Two guarantees can be weaker than the full ones, and neither is a refusal.**
-The full guarantee is: a grant is cleared by the kernel the moment its process
-exits or execs, with or without a daemon, and a dead daemon is honoured for at
-most sixty seconds. Two kernel facts can weaken it, and the eligibility
-decision - a pure function, `fast_path_decision`, with a test - reduces rather
-than refuses in both cases:
-
-- **The exec/exit tracepoint links could not be pinned** (no
-  `BPF_LINK_TYPE_PERF_EVENT` before 5.15, a read-only bpffs, or no bpffs at
-  all). Those links are what clears grants after the daemon dies; without them
-  an unclean death leaves the connect hooks marking while nothing evicts, and
-  the deadline is all that is left. So the deadline drops to six seconds,
-  refreshed every two.
-- **Process exit is detected by thread-group leader only** - the kernel's
-  `sched_process_exit` record has no readable `group_dead`, which the matrix
-  shows absent on 5.10 and 6.12 and present on 6.18. Then a process whose leader
-  exits first and dies later is never evicted by the kernel, *while the daemon
-  is alive*, so a shorter deadline alone bounds nothing. The daemon therefore
-  sweeps its grants on every heartbeat, dropping any pid whose `/proc` start
-  time no longer matches the one recorded when it was granted. What remains is
-  a pid recycled and connecting within one two-second beat, without an exec in
-  between - an exec clears the grant in the kernel regardless.
-
-`cfc status` names which applies - `live, grants lapse within 6s (exit is
-detected by thread-group leader only, ...)` - because two different weaknesses
-give the same number and the word `live` alone would hide both.
-
-Both were refusals in the first design. Refusing the first withheld the path
-from a bpffs mounted read-only; refusing the second withheld it from every
-kernel RHEL ships, for a risk a per-beat sweep bounds. What still refuses is
-where nothing could ever mark - the basic connect variants carry no mark
-decision - or nothing could ever evict - exit not tracked at all. And
-`Enforcement` is no longer an input: Process mode was refused on the reasoning
-that a stale grant would have "nothing but the deadline", which was backwards -
-there every link and map dies with the daemon, so a stale grant cannot exist
-after it.
-
-**The sendmsg hooks are a caveat, not a requirement.** They used to re-decide a
-UDP socket's mark per datagram and were load-bearing; with no UDP socket ever
-marked, all they can do is strip a mark somebody *forged* onto an unconnected
-UDP socket. Where the kernel's verifier refuses them - 5.10 does - the path
-runs, and the report says what it runs without. On the inherited path the
-previous daemon leaves a directory marker in bpffs once its cookie connect
-variants attached, which is what tells its successor that the pinned programs
-carry the mark decision at all; the pin names do not say.
+**Compatibility exit handling.** When `sched_process_exit` exposes `group_dead`,
+the kernel evicts only on confirmed process death. Without that field, it
+preserves identity and deny entries on thread or leader exit. The daemon can
+remove a candidate only after `/proc/<pid>/task` is absent. A leader may exit
+before its workers, so this conservative fallback can leave stale denials until
+exec or reconciliation; it cannot guarantee immediate cleanup after group death.
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately

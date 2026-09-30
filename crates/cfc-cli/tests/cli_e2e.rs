@@ -59,6 +59,7 @@ impl Firewall for FakeDaemon {
             let ev = pb::PromptEvent {
                 prompt_id: "42".into(),
                 connection: Some(pb::ConnectionInfo {
+                    dst_host_verified: false,
                     id: "c1".into(),
                     timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
                     protocol: pb::Protocol::Tcp as i32,
@@ -187,6 +188,40 @@ impl Firewall for FakeDaemon {
         }))
     }
 
+    async fn apply_rules(
+        &self,
+        req: Request<pb::ApplyRulesRequest>,
+    ) -> Result<Response<pb::ApplyRulesResponse>, Status> {
+        let req = req.into_inner();
+        for rule in &req.rules {
+            if self.upsert_fails_for.lock().unwrap().contains(&rule.name) {
+                return Err(Status::invalid_argument(format!(
+                    "rule `{}` refused by this test daemon",
+                    rule.name
+                )));
+            }
+        }
+        let mut ids = Vec::new();
+        for rule in req.rules {
+            ids.push(
+                self.upsert_rule(Request::new(pb::UpsertRuleRequest { rule: Some(rule) }))
+                    .await?
+                    .into_inner()
+                    .id,
+            );
+        }
+        let mut removed = 0;
+        if req.replace {
+            let old = self.existing.lock().unwrap().clone();
+            for rule in old.into_iter().filter(|rule| !ids.contains(&rule.id)) {
+                self.delete_rule(Request::new(pb::DeleteRuleRequest { id: rule.id }))
+                    .await?;
+                removed += 1;
+            }
+        }
+        Ok(Response::new(pb::ApplyRulesResponse { ids, removed }))
+    }
+
     async fn delete_rule(
         &self,
         req: Request<pb::DeleteRuleRequest>,
@@ -207,6 +242,7 @@ impl Firewall for FakeDaemon {
             let _ = tx
                 .send(Ok(pb::ConnectionEvent {
                     connection: Some(pb::ConnectionInfo {
+                        dst_host_verified: false,
                         id: "c1".into(),
                         timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
                         protocol: pb::Protocol::Tcp as i32,
@@ -710,6 +746,7 @@ async fn import_fixture_failing(
 
 fn stub_rule(id: &str, name: &str) -> pb::RuleInfo {
     pb::RuleInfo {
+        duration_seconds: 0,
         id: id.into(),
         name: name.into(),
         enabled: true,
@@ -765,10 +802,9 @@ async fn import_with_an_unknown_action_changes_nothing_at_all() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn import_replace_upserts_before_it_deletes() {
-    // There is no server-side transaction, so something has to be the failure
-    // window. Making it "old rules linger" rather than "no rules at all" is the
-    // only ordering that cannot take the machine's network down.
+async fn import_replace_requests_the_complete_new_policy() {
+    // The fake expands an atomic batch into recorded changes; the real daemon
+    // transaction and rollback are covered by ipc_integration and storage tests.
     let existing = vec![stub_rule("11111111-1111-4111-8111-111111111111", "old")];
     let (path, calls, server) = import_fixture("import-order", existing).await;
 
@@ -800,7 +836,7 @@ async fn import_replace_upserts_before_it_deletes() {
             Call::Upsert("22222222-2222-4222-8222-222222222222".into()),
             Call::Delete("11111111-1111-4111-8111-111111111111".into()),
         ],
-        "the new rule must exist before the old one is removed"
+        "replacement includes the new rule and removes the old rule"
     );
     server.abort();
 }
@@ -917,14 +953,18 @@ async fn an_upsert_that_fails_midway_leaves_the_old_rules_in_place() {
         !calls.iter().any(|c| matches!(c, Call::Delete(_))),
         "nothing may be deleted once the apply phase has failed: {calls:?}"
     );
+    assert!(
+        calls.is_empty(),
+        "a refused batch must mutate nothing: {calls:?}"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("boom"),
         "the message must name the rule that failed: {err}"
     );
     assert!(
-        err.contains("1 rules were already applied"),
-        "and say how far it got, because the state is now partial: {err}"
+        err.contains("no rules were changed"),
+        "a failed batch must preserve the prior state: {err}"
     );
     server.abort();
 }
@@ -995,4 +1035,84 @@ async fn two_rules_sharing_an_id_are_refused_before_anything_is_applied() {
         "a file describing a state it cannot produce must change nothing"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn removing_a_bundle_preserves_a_manual_rule_with_the_same_name() {
+    let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let socket = dir.join("cli.sock");
+    let id = "22222222-2222-4222-8222-222222222222";
+    let mut manual = stub_rule(id, "inbound-ssh-lan");
+    manual.action = pb::Action::Deny as i32;
+    let fake = FakeDaemon::default();
+    fake.existing.lock().unwrap().push(manual);
+    let calls = fake.calls.clone();
+    let existing = fake.existing.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &[
+                "--socket",
+                &socket_arg,
+                "rules",
+                "bundle",
+                "remove",
+                "inbound",
+            ],
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(existing.lock().unwrap()[0].id, id);
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_partial_opensnitch_replace_changes_nothing() {
+    let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let source = dir.join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("valid.json"), r#"{"name":"scoped","action":"allow","duration":"always","operator":{"type":"simple","operand":"dest.port","data":"443"}}"#).unwrap();
+    std::fs::write(source.join("unsupported.json"), r#"{"name":"unsupported","action":"deny","duration":"always","operator":{"type":"simple","operand":"unsupported","data":"value"}}"#).unwrap();
+    let socket = dir.join("cli.sock");
+    let fake = FakeDaemon::default();
+    fake.existing.lock().unwrap().push(stub_rule(
+        "22222222-2222-4222-8222-222222222222",
+        "old-deny",
+    ));
+    let calls = fake.calls.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let source_arg = source.to_string_lossy().into_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &[
+                "--socket",
+                &socket_arg,
+                "rules",
+                "import-opensnitch",
+                &source_arg,
+                "--replace",
+            ],
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was changed"));
+    assert!(calls.lock().unwrap().is_empty());
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
 }

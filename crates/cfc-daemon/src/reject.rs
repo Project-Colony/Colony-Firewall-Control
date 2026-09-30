@@ -29,17 +29,12 @@
 //! makes packet construction a set of pure functions unit-testable without
 //! root; only [`send_raw`] touches a socket.
 //!
-//! # Why this does not feed back into our own queue
+//! # Output filtering
 //!
-//! The injected packet leaves through `NF_INET_LOCAL_OUT`, the same hook
-//! the shipped nft snippet queues from - but that rule matches
-//! `ct state new`, and neither response qualifies: conntrack classifies an
-//! unsolicited RST as INVALID (`tcp_conntracks[sNONE][rst] == sIV`) and an
-//! ICMP error whose inner tuple has no conntrack entry as untracked. A
-//! deployment that queues *all* outbound packets instead would see the
-//! response come back around; it would then be unattributable rather than
-//! looping, since the sending socket is a raw socket and never appears in
-//! /proc/net/tcp.
+//! Dedicated raw sockets carry [`REJECT_MARK`]. The nftables exception requires
+//! this mark, socket UID 0, and a TCP RST or ICMP port-unreachable response.
+//! Other INVALID and UNTRACKED outbound packets drop. Outbound refusals route
+//! to the local application over loopback; inbound refusals may leave the host.
 //!
 //! # Degradation
 //!
@@ -56,6 +51,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, trace, warn};
+
+/// Public packet marker, constrained by socket UID and refusal type in nftables.
+const REJECT_MARK: u32 = 0xcfc0_0001;
 
 /// IANA protocol numbers we emit.
 const IPPROTO_ICMP: u8 = 1;
@@ -640,6 +638,12 @@ fn open_raw_v4(protocol: libc::c_int) -> std::io::Result<OwnedFd> {
     // SAFETY: fd is a freshly created, valid descriptor we own.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     set_flag(&fd, libc::IPPROTO_IP, libc::IP_HDRINCL)?;
+    set_socket_option(
+        &fd,
+        libc::SOL_SOCKET,
+        libc::SO_MARK,
+        REJECT_MARK as libc::c_int,
+    )?;
     // Best effort: a kernel that refuses the filter still sends
     // correctly, it just keeps paying for receives nobody reads.
     if let Err(e) = drop_all_incoming(&fd) {
@@ -668,6 +672,12 @@ fn open_raw_v6(protocol: libc::c_int) -> std::io::Result<OwnedFd> {
     // SAFETY: fd is a freshly created, valid descriptor we own.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     set_flag(&fd, libc::IPPROTO_IPV6, libc::IPV6_HDRINCL)?;
+    set_socket_option(
+        &fd,
+        libc::SOL_SOCKET,
+        libc::SO_MARK,
+        REJECT_MARK as libc::c_int,
+    )?;
     // Best effort: a kernel that refuses the filter still sends
     // correctly, it just keeps paying for receives nobody reads.
     if let Err(e) = drop_all_incoming(&fd) {
@@ -796,7 +806,15 @@ fn drop_all_incoming(fd: &OwnedFd) -> std::io::Result<()> {
 }
 
 fn set_flag(fd: &OwnedFd, level: libc::c_int, name: libc::c_int) -> std::io::Result<()> {
-    let enable: libc::c_int = 1;
+    set_socket_option(fd, level, name, 1)
+}
+
+fn set_socket_option(
+    fd: &OwnedFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
     // SAFETY: fd is valid and owned; the option value points at a properly
     // sized c_int that outlives the call.
     let rc = unsafe {
@@ -804,7 +822,7 @@ fn set_flag(fd: &OwnedFd, level: libc::c_int, name: libc::c_int) -> std::io::Res
             fd.as_raw_fd(),
             level,
             name,
-            (&enable as *const libc::c_int).cast(),
+            (&value as *const libc::c_int).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };

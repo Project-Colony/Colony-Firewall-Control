@@ -40,10 +40,9 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 - opensnitch JSON import for one-shot migration
 - Named profiles: relaxed / balanced / strict (in `daemon.toml`)
 - Shell completions and man pages, generated from the binary
-- **Optional eBPF backend**: exec tracking and observed DNS answers read
-  from inside the kernel, so attribution does not race `/proc` and
-  hostnames come from the resolver's own replies rather than the
-  destination's PTR record
+- **Optional eBPF backend**: exec tracking and DNS response diagnostics
+  from inside the kernel supplement `/proc` attribution; uncorrelated DNS
+  observations never supply policy identity
 - Memory-safe Rust top to bottom for a root daemon parsing untrusted packets
 
 ## Architecture
@@ -125,17 +124,23 @@ sudo install -Dm755 target/release/colony-firewall  /usr/bin/colony-firewall
 sudo install -Dm755 target/release/cfc              /usr/bin/cfc
 sudo install -Dm755 target/release/colony-firewall-tray /usr/bin/colony-firewall-tray
 
-# Both units. colony-firewall-nft.service is what First run step 1
+# All units. colony-firewall-nft.service is what First run step 1
 # enables; without it that step fails with "Unit ... not found".
 sudo install -Dm644 systemd/colony-firewalld.service \
      /usr/lib/systemd/system/colony-firewalld.service
 sudo install -Dm644 systemd/colony-firewall-nft.service \
      /usr/lib/systemd/system/colony-firewall-nft.service
+sudo install -Dm644 systemd/colony-firewall-nft-inbound.service \
+     /usr/lib/systemd/system/colony-firewall-nft-inbound.service
 
 # The ruleset colony-firewall-nft.service loads. The unit hardcodes this
 # path, so it is not optional either.
 sudo install -Dm644 systemd/nftables-snippet.conf \
      /usr/share/colony-firewall/nftables-snippet.conf
+sudo install -Dm644 systemd/nftables-inbound.conf \
+     /usr/share/colony-firewall/nftables-inbound.conf
+sudo install -Dm755 scripts/inbound-lockout-guard.sh \
+     /usr/lib/colony-firewall/inbound-lockout-guard.sh
 
 # Config, and the group that gates the control socket
 sudo install -Dm644 systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
@@ -155,15 +160,13 @@ sudo install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
      /etc/xdg/autostart/colony-firewall-tray.desktop
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now colony-firewalld
 
 # The control socket is root:colony-firewall 0660. Join the group, then
 # log out and back in, or the GUI and cfc get "permission denied".
 sudo usermod -aG colony-firewall "$USER"
 ```
 
-Installing only puts the binaries and daemon in place - no traffic is
-filtered until you enable enforcement. See First run below.
+Enable the installed daemon and enforcement in First run below.
 
 ## First run
 
@@ -175,12 +178,10 @@ these three things, in order:
 nftables ruleset at boot and removes it on stop:
 
 ```sh
-sudo systemctl enable --now colony-firewall-nft.service
+sudo systemctl enable --now colony-firewalld.service colony-firewall-nft.service
 ```
 
-Alternatively, apply the snippet by hand - but note this does **not**
-survive a reboot; after restarting, the daemon runs while enforcing
-nothing:
+Applying the snippet by hand does **not** create the boot dependencies:
 
 ```sh
 sudo nft -f /usr/share/colony-firewall/nftables-snippet.conf   # installed
@@ -250,16 +251,29 @@ This cannot lock you out of a remote machine: the ruleset hooks `output`
 on `ct state new` only, so an inbound SSH session's replies are
 `ct state established` and are never queued.
 
-**Boot behaviour.** Both units are ordered `Before=network-pre.target`,
-the systemd convention for firewalls: every network-configuration
-service (NetworkManager, systemd-networkd, dhcpcd) is
-`After=network-pre.target`, so the daemon and its nftables ruleset are
-in place before any interface is configured. There is no window at boot
-where the network is up but filtering is not - the same guarantee
-Windows' built-in firewall provides with its boot-time filters. During
-that early phase no UI is connected, so unmatched flows resolve via
-`no_ui_action` - a denial - and the bootstrap DHCP/DNS/NTP rules are
-what keep the machine bootable.
+**Boot behaviour.** The nft units load independently before the daemon,
+`network-pre.target`, NetworkManager and systemd-networkd, after the
+distribution's `nftables.service` when it is in the same boot transaction.
+Enabling enforcement creates native requirements from those two network
+managers: a failed nft load blocks their startup. A failed daemon start leaves
+the loaded tables dropping new flows. The daemon also requires the outbound
+table before initialization. Tables survive daemon stops and restarts; stop
+the nft unit explicitly to remove its table. Inbound stays opt-in. Its lockout
+guard reads saved SQLite rules without a running daemon.
+
+This contract covers systemd-managed NetworkManager and systemd-networkd
+after enforcement is enabled. It does not cover networking configured in an
+initramfs, interfaces already configured before these units, other network
+managers, or a later external ruleset flush. Early unmatched flows use
+`no_ui_action`; bootstrap DHCP/DNS/NTP rules keep strict configurations usable.
+
+**Scope.** Rules decide new tracked flows; established and related traffic
+retains its connection-wide authorization. Passed or inherited sockets and
+local DNS/proxy relays are not confined to their original executable.
+Loopback is exempt, and packet-layer traffic from applications with
+`CAP_NET_RAW` is outside these IP hooks. Use OS containment for those cases.
+Fast Allow is disabled even when `fast_allow = true` is configured; allowed
+flows use the normal NFQUEUE path.
 
 Then confirm it is really filtering:
 
@@ -274,6 +288,61 @@ cfc status     # "enforcing yes", and it warns on stderr when it is not
 > [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - specifically the
 > SSH exemption and dead-man's-switch patterns - *before* enabling
 > enforcement remotely.
+
+### Explicit application confinement
+
+`cfc applications run` starts a separate, headless application tree with an
+empty network permission list. Administrators may approve exact numeric peer
+addresses with `--allow IP`. Permissions apply to the entire tree across
+TCP/UDP ports; ordinary CFC rules can additionally restrict new connections.
+Changing permissions requires stopping the complete tree and launching a fresh
+one. This first interface does not provide live grant changes or GUI prompts
+for the native tree filter.
+
+The initial supported platform is x86_64 Linux with cgroup v2, systemd 262 or
+newer, a working system D-Bus, Bubblewrap 0.13.0 or newer, and libbpf-backed
+interface filtering. CFC verifies actual IP/interface BPF attachments, their
+policy maps and synthetic decisions before starting the application. Missing
+support or failed verification refuses the launch. Local routes through `lo`
+remain blocked even when an approved address later belongs to the host.
+
+Prepare an administrator-owned runtime containing the executable and all its
+dependencies as regular files and directories. Every entry must be owned by
+root and must not be writable by another account. Symlinks, special files and
+nested mounts are rejected. The runtime must contain empty `dev`, `proc`,
+`sys`, `tmp`, `run` and `home` directories. For a statically linked program:
+
+```sh
+sudo install -d -m755 /var/lib/colony-firewall/runtimes/example/{app,dev,proc,sys,tmp,run,home}
+sudo install -m755 /path/to/static-program /var/lib/colony-firewall/runtimes/example/app/program
+sudo cfc applications run --runtime /var/lib/colony-firewall/runtimes/example -- /app/program
+```
+
+Covering mounts must use a supported local filesystem: ext2/3/4, XFS, Btrfs,
+F2FS, tmpfs, ramfs/rootfs, SquashFS or EROFS. FUSE, network filesystems and
+overlay mounts are rejected because ownership metadata alone cannot exclude
+an external filesystem broker or concealed lower storage.
+
+To approve a peer, repeat the launch with `--allow IP` before `--`; repeat the
+flag for additional peers. The launcher prints the tree identity. Use
+`sudo cfc applications stop ID` to terminate it from another terminal, or
+Ctrl-C in the launching terminal.
+
+Each active tree receives a reserved host UID and private PID, mount, user,
+IPC, UTS and cgroup namespaces. Its writable state is private and its runtime
+is read-only. The application runs as PID 1 in its private PID namespace and
+must reap its own children; CFC stops the entire tree on revocation. Inherited
+descriptors and environment are removed; all three
+standard streams are `/dev/null`. There are no host desktop, D-Bus, audio,
+shared-home or output brokers. This mode therefore suits unattended local
+workloads; programs requiring those services need an explicitly designed
+broker before they can use it.
+
+This mode protects explicitly launched trees. It does not change normal-mode
+socket attribution or revoke established flows when an ordinary rule is
+edited. Stop the tree to revoke its permissions. Approving a peer approves
+that endpoint, including any remote relay it provides. Trusted host root,
+the operating system and kernel vulnerabilities are outside this boundary.
 
 ## Quick start
 
@@ -318,6 +387,14 @@ cfc rules export --out rules.json
 # Migrate from an existing opensnitch install
 cfc rules import-opensnitch /etc/opensnitchd/rules
 ```
+
+Executable rules require the canonical mapped target explicitly. An alias
+such as `/bin/tool` on a system where `/bin` links to `/usr/bin` is refused;
+review and name `/usr/bin/tool` instead. Rules remain attached to that fixed
+target and do not follow later alias changes. Missing canonical paths can be
+prepared before installation, but installing an alias there requires review.
+Legacy rules retain their stored targets; lost original alias intent cannot
+be migrated automatically.
 
 ### Scripting
 

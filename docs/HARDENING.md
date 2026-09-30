@@ -54,11 +54,12 @@ You can still set either to `"Allow"` explicitly under `[default_policy]`
 — see below. The change is that nothing does it on your behalf.
 
 The danger with `strict` is bootstrap: the units are ordered
-`Before=network-pre.target`, so filtering is live before any interface
-is configured and long before your UI session exists — under `strict`,
-every outbound flow with no matching rule is denied from the first
-instant of boot. That ordering is the point (there is no unfiltered
-window at boot), but it means DHCP, DNS and NTP need standing rules or
+before the daemon and `network-pre.target`. Enabled enforcement is required
+by NetworkManager and systemd-networkd, so an nft load failure blocks their
+startup. Initial daemon failure leaves the table loaded and drops new flows.
+This does not cover initramfs networking, already configured interfaces, or
+other network managers. Once loaded, strict
+filtering denies unmatched flows, so DHCP, DNS and NTP need standing rules or
 the machine cannot even get a lease. Network managers retrying DNS will
 look like total network failure. **Only flip to strict after you have
 rules for every always-on system service**.
@@ -93,89 +94,35 @@ This is idempotent: it skips rules already present by name.
 
 ## What to *deny* first
 
-A short blocklist that pays off on most workstations:
+Start with executable rules for unwanted telemetry or resolver clients, and
+numeric `dst_net` scopes for endpoints whose addresses you manage. An IP scope
+matches addresses, not a website: shared hosting and address changes require
+an explicit policy review.
 
-- Any DNS-over-TLS or DoH client you didn't install on purpose
-- Adobe / Microsoft / Google telemetry endpoints (use `dst_host` rules)
-- Crashpad processes in browsers that you don't want phoning home
+### DNS names are diagnostic only
 
-Example with the CLI:
+New rules and imports cannot use `dst_host`. Neither observed DNS answers nor
+forward-confirmed PTR records establish the hostname an application intended
+to contact, or enumerate all names associated with an address.
 
-```sh
-cfc rules add --action deny --dst-host 'incoming.telemetry.mozilla.org' \
-              --name 'block-firefox-telemetry'
-```
+Legacy hostname rules keep their scope and priority. When their other known
+predicates are compatible, their uncertainty refuses the flow before a lower
+Allow, pause or prompt can admit it. Replace these rules explicitly with
+executable or numeric scopes; a legacy hostname Allow no longer grants access.
+The editor requires the old hostname to be removed before saving a replacement.
 
-### A warning about `dst_host`
-
-Hostname matching is based on reverse DNS: the daemon does a PTR lookup
-on the destination IP and matches `dst_host` against whatever comes
-back. **PTR records are published by whoever controls the destination
-IP** - which, for outbound filtering, is exactly the party you may be
-trying to keep the user away from. Taken at face value, a hostile server
-could name itself `api.github.com` and satisfy an allow rule.
-
-The daemon mitigates this with forward confirmation (FCrDNS): every PTR
-answer is resolved back to its A/AAAA set, and the name is kept only if
-that set contains the IP we started from. Names that fail confirmation
-are discarded, so a rule never matches on one. That makes a hostname as
-trustworthy as the *forward* zone of the claimed domain rather than the
-reverse zone of an arbitrary IP.
-
-It is a mitigation, not a guarantee. Names are still resolved after the
-fact and cached (300s positive, 60s negative), and an attacker who
-controls both zones can still name themselves self-consistently. Treat
-`dst_host` as best-effort metadata and a convenience for *deny* rules (a
-telemetry endpoint has no incentive to hide its own PTR). Do **not**
-lean on a hostname *allow* rule as your only boundary. For allow rules,
-pin `exe` + `dst_port` (+ `dst_net` where destinations are stable)
-instead.
-
-That advice is now enforced rather than only given: a name the daemon
-did not confirm against the address may **refuse** traffic but may not
-**admit** it. A `deny --dst-host` behaves exactly as it
-always did; an `allow --dst-host` stands aside and lets the rules
-beneath it answer.
+CLI and GUI destination presets use the observed numeric endpoint, as `/32`
+for IPv4 or `/128` for IPv6, and label it as an IP. They do not turn a domain
+into a permanent IP rule. DNS enrichment starts only after an Allow; explicit
+Deny/Reject decisions start no lookup. Eight permits bound resolver jobs.
 
 #### Observed answers, with `[ebpf] enabled`
 
-Turning the eBPF layer on adds a second, better source. The
-`cgroup_skb/ingress` program copies the DNS *responses* this machine
-receives off the wire, and the daemon lifts the `A`/`AAAA` records
-straight out of them. Those mappings win over anything the PTR path
-produces.
-
-The difference is who is being asked. A PTR answer is the destination
-address's owner saying what it would like to be called - second-hand,
-after the fact, from the party you may be trying to block. An observed
-answer is first-hand: this host asked a resolver for `example.com` and
-was told an address, *before* the connection it explains, by the zone
-that owns the name. The "hostile server names itself `api.github.com`"
-problem does not arise, because the destination no longer gets a vote.
-
-What it does not fix, stated more plainly than it was: **nothing ties an
-observed response to a query this host sent.** The kernel gate is
-`source port == 53` and no more - the transaction id is parsed and never
-compared, the sender's address is never checked against a configured
-resolver, and the answer's owner name is never compared with the
-question. So this is not a forgery race that an attacker must win
-against the resolver, as this paragraph used to imply. Any peer the host
-sends a UDP datagram to - a game server, a STUN peer, anything - can
-reply from source port 53 and assert any name for any address. No
-spoofing, no guessing, and the application's own resolver never sees the
-packet.
-
-That is why an observed answer decorates a flow but does not admit it:
-it may satisfy a `deny --dst-host` and never an `allow --dst-host`.
-They remain the better source for *naming* a flow in the log, the live
-feed and a prompt, which is what they are for.
-
-The full remedy is to check the sender against the resolvers this host
-actually uses. That needs the source address in the record the kernel
-copies up, and therefore an ABI bump; until then the asymmetry above is
-what stands between an observed name and a decision.
-
-Answers are cached for the record's own TTL, clamped to 60s..1h.
+The ingress hook copies DNS-shaped UDP responses received from source port 53.
+It does not validate a resolver transaction, sender or question. These records
+remain untrusted diagnostics in a separate cache. They cannot satisfy a
+policy rule. Observations and forward-confirmed PTR diagnostics use separate caches. Diagnostic entries
+retain the record TTL, clamped to 60s..1h; the policy cache remains separate.
 
 ## Deny or Reject?
 
@@ -232,9 +179,17 @@ real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
   instead of, traditional access controls.
 - **eBPF / unprivileged user namespaces**: a sufficiently privileged user
   can bypass NFQUEUE entirely with `unshare -rn` and a custom net namespace.
-- **DNS-over-HTTPS embedded in browsers**: if the browser resolves names
-  inside its own HTTPS connection, the firewall sees only the outer
-  443/tcp flow. Block at the `dst_host` layer or disable DoH per-app.
+- **Local relays and DNS**: loopback is exempt. A denied application can use
+  an allowed local resolver or proxy; outbound traffic is attributed to that
+  service. Hostname rules and observed answers do not isolate DNS queries.
+- **Inherited or passed sockets**: established/related traffic keeps its
+  connection-wide authorization. An inherited or passed descriptor is not
+  reauthorized for each sending executable.
+- **Packet-layer privileges**: applications with `CAP_NET_RAW` can use packet
+  sockets outside the shipped IP OUTPUT hooks. These rules do not provide
+  layer-2 containment.
+- **DNS-over-HTTPS embedded in browsers**: the firewall sees the outer HTTPS
+  flow. Domain isolation requires an application-aware proxy or separate containment.
 - **Container traffic**: Docker / Podman / LXC route through their own
   bridges. You need to enqueue their veth interfaces explicitly in nftables.
 
@@ -349,17 +304,18 @@ journalctl -u colony-firewalld -g 'rule upserted|rule delete|verdict submitted|p
 so "who deleted the rule blocking that telemetry endpoint" is answerable
 after the fact.
 
-**2. journald, for every blocked connection.** Deny and Reject verdicts
+**2. journald, for parsed NFQUEUE refusals.** Deny and Reject verdicts
 log the action, its source, the executable, pid, uid and destination:
 
 ```sh
 journalctl -u colony-firewalld -g 'connection blocked'
 ```
 
-This line is emitted whether or not the row makes it to disk.
+This line is emitted after the refusal row commits and verdict delivery succeeds.
+A failed commit drops the packet and ends the worker before live publication.
 
-**3. The events table, for everything.** Every observed connection and
-its verdict is persisted in the rules database and queried with `cfc log`:
+**3. The events table.** Parsed NFQUEUE refusals commit synchronously;
+Allow observations use best-effort asynchronous persistence. Query with `cfc log`:
 
 ```sh
 cfc log --since 24h --action deny
@@ -367,9 +323,11 @@ cfc log --exe firefox --limit 200
 cfc log --json --since 1h | jq -r '.[] | .dst_host // .dst_ip' | sort | uniq -c
 ```
 
-Persistence happens off the packet path through a bounded queue, so a
-slow disk can never delay a verdict; if the queue fills, rows are dropped
-and the loss is logged. Retention is a row cap, not a time window:
+Refusal commits can delay a verdict. WAL and synchronous=FULL are required at
+startup. Mutex and SQLite busy waits each have a 250 ms limit, which does not
+bound filesystem I/O or fsync. Allow rows can be dropped when their queue fills;
+that loss is logged. Malformed packets, nftables drops and in-kernel refusals
+are not covered by this durable NFQUEUE gate. Retention is a row cap, not a time window:
 `[events] max_rows` (default 100000), pruned every 60 seconds. Raise it
 if you want a longer history, and remember the table lives in
 `/var/lib/colony-firewall/rules.db` - back it up or ship it off the host
@@ -387,7 +345,7 @@ to shrink what a code-execution bug could reach:
 
 | Directive                          | Why                             |
 |------------------------------------|---------------------------------|
-| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE and for the one nftables set element the fast-allow path adds and flushes, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer, `CAP_CHOWN` for the control socket's group, and `CAP_DAC_READ_SEARCH` for the `/proc/*/fd` walk attribution falls back to. The count and the list have to agree: this said seven and named five, and the two it left out are exactly the pair the SELinux policy was once missing - with the fail-closed ruleset, a daemon that cannot read `/proc` attributes nothing and the machine loses outbound traffic |
+| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE and for flushing legacy Fast Allow state, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer, `CAP_CHOWN` for the control socket's group, and `CAP_DAC_READ_SEARCH` for the `/proc/*/fd` walk attribution falls back to. The count and the list have to agree: this said seven and named five, and the two it left out are exactly the pair the SELinux policy was once missing - with the fail-closed ruleset, a daemon that cannot read `/proc` attributes nothing and the machine loses outbound traffic |
 | `NoNewPrivileges`                  | No regaining privileges via setuid binaries |
 | `SystemCallFilter=@system-service` | seccomp; the biggest blast-radius reduction available |
 | `SystemCallFilter=bpf perf_event_open` | The two syscalls the eBPF layer needs, named individually |
@@ -457,10 +415,9 @@ without `bypass` - is in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#fail-open-vs-fail-closed-matrix).
 Read it before enabling enforcement on a machine you only reach over SSH.
 
-Note that `[nfqueue] fail_open` is a *different* knob: it governs what
-the kernel does when the queue overflows while the daemon is running
-(default `false`, drop). The `bypass` keyword governs what happens when
-no daemon is attached at all.
+`[nfqueue] fail_open` must be `false`; `true` is rejected. Queue overflow
+must drop traffic instead of bypassing policy and durable refusal auditing.
+The nftables `bypass` keyword governs missing listeners and is not shipped.
 
 ## When something stops working
 

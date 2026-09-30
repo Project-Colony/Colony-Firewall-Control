@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +14,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -96,10 +98,16 @@ jobs:
           echo "pinned nightly uses LLVM ${LLVM_MAJOR}; building bpf-linker against it"
 
           sudo apt-get update
-          sudo apt-get install -y lsb-release wget software-properties-common gnupg
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh "${LLVM_MAJOR}"
+          sudo apt-get install -y lsb-release wget gnupg
+          # apt.llvm.org documents this primary key fingerprint. Trust only
+          # this key for this repository; never execute a downloaded installer.
+          wget -qO /tmp/llvm.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+          FINGERPRINT="$(gpg --batch --show-keys --with-colons /tmp/llvm.asc | awk -F: '$1 == "pub" { primary = 1; next } primary && $1 == "fpr" { print $10; primary = 0 }')"
+          test "${FINGERPRINT}" = "6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          sudo install -m 0644 /tmp/llvm.asc /usr/share/keyrings/llvm.asc
+          CODENAME="$(lsb_release -cs)"
+          printf 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/%s/ llvm-toolchain-%s-%s main\n' "${CODENAME}" "${CODENAME}" "${LLVM_MAJOR}" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
           sudo apt-get install -y "llvm-${LLVM_MAJOR}-dev" "libpolly-${LLVM_MAJOR}-dev"
 
           export "LLVM_SYS_${LLVM_MAJOR}1_PREFIX=/usr/lib/llvm-${LLVM_MAJOR}"
@@ -218,16 +226,15 @@ jobs:
             cp CHANGELOG.md RELEASE_BODY.md
           fi
 
-      - name: Create draft release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          draft: true
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.version) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.version) }}
-          body_path: RELEASE_BODY.md
-          files: |
+          name: release-assets
+          if-no-files-found: error
+          path: |
             ${{ steps.assemble.outputs.tarball }}
             SHA256SUMS
+            RELEASE_BODY.md
 
   # Build pkg/PKGBUILD for real against the freshly pushed tag, and produce
   # the AUR-submittable artifacts (PKGBUILD with real checksums + .SRCINFO).
@@ -238,9 +245,8 @@ jobs:
   # there is no tag for the source array to point at.
   pkgbuild:
     if: github.ref_type == 'tag'
-    # Sequenced after `build` so the draft release already exists when the
-    # AUR artifacts are attached to it, and so a broken build does not
-    # spend half an hour compiling twice.
+    # Package only after the main build succeeds. Publishing runs separately
+    # with write permission after both builds complete.
     needs: build
     runs-on: ubuntu-latest
     container: archlinux:base-devel
@@ -353,11 +359,47 @@ jobs:
             exit 1
           fi
 
-      - name: Attach AUR artifacts to the release
+      - name: Upload AUR artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aur-assets
+          if-no-files-found: error
+          path: |
+            pkg/PKGBUILD
+            pkg/SRCINFO
+
+  publish:
+    needs: [build, pkgbuild]
+    if: always() && needs.build.result == 'success' && (needs.pkgbuild.result == 'success' || needs.pkgbuild.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release-assets
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: github.ref_type == 'tag'
+        with:
+          name: aur-assets
+          path: aur-assets
+      - name: Create draft release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.build.outputs.version) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.build.outputs.version) }}
+          body_path: release-assets/RELEASE_BODY.md
+          files: |
+            release-assets/colony-firewall-control-*.tar.zst
+            release-assets/SHA256SUMS
+      - name: Attach AUR artifacts
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
           tag_name: ${{ github.ref_name }}
           files: |
-            pkg/PKGBUILD
-            pkg/SRCINFO
+            aur-assets/PKGBUILD
+            aur-assets/SRCINFO

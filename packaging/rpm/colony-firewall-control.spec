@@ -57,11 +57,9 @@ not belong in a distro build root.
 
 Install one - `cargo xtask build-ebpf`, dropped at
 /usr/lib/colony-firewall/cfc-ebpf.o, in the directory this package creates for
-it - and the daemon additionally attaches seven small programs: three that
-improve attribution and hostname resolution, two that refuse connect(2) in the
-kernel for programs already denied (pinned to bpffs, so those denials survive
-the daemon being killed), and two that mark the sockets of programs a lasting
-rule allows, which the opt-in fast path then accepts ahead of the queue.
+it - and the daemon adds process attribution, DNS display enrichment, and
+in-kernel connect(2) denial. Pinned denials survive a daemon crash. Fast Allow
+is disabled; allowed connections continue through NFQUEUE.
 
 The ruleset is fail-closed. If the daemon is not running, new outbound
 connections are dropped rather than allowed.
@@ -81,8 +79,7 @@ SELinux policy module for Colony Firewall Control.
 Confines the daemon to what it actually needs: netlink_netfilter and raw
 sockets, bpf() and perf_event_open(), the bpffs pin directory, other domains'
 /proc entries for attribution, a read-only rpm query for package provenance,
-and running nft(8) to add and remove the one nftables set element the opt-in
-fast path uses. CAP_SYS_ADMIN is deliberately not granted; that it is
+and running nft(8) to clear Fast Allow state left by older installations. CAP_SYS_ADMIN is deliberately not granted; that it is
 unnecessary is covered by a test rather than assumed.
 
 %prep
@@ -172,6 +169,19 @@ cargo test --workspace --locked --no-fail-fast
 %post
 %systemd_post colony-firewalld.service colony-firewall-nft.service
 %sysusers_create_compat %{_sysusersdir}/colony-firewall.conf
+if [ $1 -gt 1 ]; then
+    # Reload active nft units atomically before the daemon restart in postun.
+    systemctl daemon-reload
+    for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do
+        if systemctl is-enabled --quiet "$unit"; then
+            systemctl reenable "$unit" || exit 1
+        fi
+    done
+    systemctl try-reload-or-restart colony-firewall-nft.service colony-firewall-nft-inbound.service || {
+        echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
+        exit 1
+    }
+fi
 
 %preun
 %systemd_preun colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service

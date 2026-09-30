@@ -1,58 +1,25 @@
-//! Resolving an executable path to the form the kernel will report it in.
+//! Executable path diagnostics and explicit policy targets.
 //!
-//! # Why this exists
+//! Rule matching compares the stored path with the canonical mapped image
+//! reported by `/proc/<pid>/exe`. New policy writes use [`resolve_policy`]:
+//! the operator must name that target explicitly. An alias is refused instead
+//! of silently storing its current target, because retargeting an alias could
+//! otherwise leave a plausible Deny attached to an obsolete version.
 //!
-//! Rule matching is exact `PathBuf` equality (`RuleScope::matches_process`),
-//! and the process side of that comparison comes from `/proc/<pid>/exe` — which
-//! the kernel resolves for us: symlinks followed, `.`/`..` gone, the real
-//! inode's path. So the two sides can only disagree because of what a *human*
-//! typed on the rule side.
+//! [`resolve`] remains a diagnostic helper for callers that intentionally
+//! snapshot a current target, such as the shipped system-service bundles.
+//! Its best-effort classification is not sufficient to validate user policy.
 //!
-//! That disagreement is silent and total. A rule for `/bin/curl` on a
-//! usr-merged host, where `/bin` is a symlink to `usr/bin`, shows up in
-//! `cfc rules list`, ranks by specificity above less specific rules, and never
-//! fires — because every real curl reports `/usr/bin/curl`. The rule looks
-//! present and does nothing, which is the worst failure a firewall rule can
-//! have: it is indistinguishable from working.
+//! A missing absolute target is accepted only when its existing ancestry does
+//! not require rewriting and no unresolved symlink is present. This supports
+//! policies prepared before installation. If that path later becomes an
+//! alias, the operator must review it and select the mapped target explicitly.
 //!
-//! # What this does not do
-//!
-//! It does not run on the packet path. Canonicalising at match time would put
-//! filesystem I/O in front of every unmatched connection, to fix a problem that
-//! only exists where a path is *entered*. Rules are canonicalised once, when
-//! they are created.
-//!
-//! It also does not turn a path that cannot be resolved into an error. A rule
-//! for a program that is not installed yet is a legitimate thing to write, and
-//! refusing it would be worse than storing it verbatim. Callers that can say
-//! something useful about that case — the CLI can, the daemon cannot — are
-//! expected to warn.
-//!
-//! # Three properties worth knowing before relying on this
-//!
-//! **A versioned symlink resolves to a version.** `/usr/bin/python ->
-//! python3.13` stores `/usr/bin/python3.13`, which stops applying the next time
-//! that symlink moves — silently, with the rule still listed and still
-//! plausible. Matching-wise this is not a regression (the unresolved rule never
-//! matched either), but it is a *new, time-dependent* failure and it is the one
-//! a reader should expect. It matters most for a Deny: an allow that stops
-//! applying prompts, a deny that stops applying does not.
-//!
-//! **Resolution follows symlinks whoever owns the path controls.** A rule
-//! written for `/home/bob/tool`, where Bob has pointed that at `/usr/bin/curl`,
-//! is stored as a rule about curl — and for an Allow that widens the policy to
-//! every user's curl. The CLI prints what it stored for exactly this reason;
-//! the daemon logs it at warn. Nothing pins the inode, so this is a plain
-//! time-of-check/time-of-use gap and always was.
-//!
-//! **It is forward-only.** Rules already on disk are never re-resolved: the
-//! daemon loads them as written, so an install that wrote `/bin/curl` before
-//! this existed keeps an inert rule after upgrading. The repair is one round
-//! trip, because import re-upserts every rule and upsert resolves:
-//!
-//! ```sh
-//! cfc rules export > rules.json && cfc rules import --replace rules.json
-//! ```
+//! Stored paths remain fixed targets. Older rules did not preserve the
+//! originally typed alias, so that intent cannot be reconstructed or migrated
+//! automatically. Nothing here follows a retargeted alias at exec time, pins
+//! an inode, or attests a future installation. Validation runs at policy entry,
+//! never on the packet path.
 
 use std::path::{Path, PathBuf};
 
@@ -61,7 +28,7 @@ use std::path::{Path, PathBuf};
 pub enum Resolved {
     /// The path was already the one the kernel will report.
     Unchanged(PathBuf),
-    /// Resolved to a different path; the rule should store this one.
+    /// Resolved to a different path; a diagnostic caller may select this target.
     ///
     /// Carries the original so a caller can tell the user what changed —
     /// silently rewriting what someone typed is its own kind of surprise.
@@ -196,6 +163,66 @@ pub fn resolve(path: &Path) -> Resolved {
     }
 }
 
+/// Validate an explicitly selected executable policy target.
+///
+/// Refuses aliases, unresolved symlinks and filesystem errors. An absent
+/// target with unchanged, resolvable ancestry remains valid for preinstallation.
+pub fn resolve_policy(path: &Path) -> Result<Resolved, String> {
+    let outcome = resolve(path);
+    match &outcome {
+        Resolved::Rewritten { from, to } | Resolved::RewrittenButMissing { from, to } => {
+            return Err(format!(
+                "executable policy must name the canonical target explicitly: {} \
+                 resolves to {}; review that target and submit it instead. \
+                 Rules do not follow retargeted aliases",
+                from.display(),
+                to.display()
+            ));
+        }
+        Resolved::Relative(path) => {
+            return Err(format!(
+                "executable policy path {} must be absolute",
+                path.display()
+            ));
+        }
+        Resolved::Missing(path) => {
+            if path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+            {
+                return Err(
+                    "a missing executable policy target cannot contain unresolved `..`".into(),
+                );
+            }
+            // canonicalize() cannot distinguish an absent future file from a
+            // dangling alias. Inspect the nearest existing component without
+            // following it; only a real directory can vouch for the missing tail.
+            for ancestor in path.ancestors() {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.is_dir() && ancestor != path => break,
+                    Ok(_) => {
+                        return Err(format!(
+                            "executable policy target {} cannot be resolved; {} is not \
+                         an unchanged directory ancestor",
+                            path.display(),
+                            ancestor.display()
+                        ))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot resolve executable policy target {}: {error}",
+                            path.display()
+                        ))
+                    }
+                }
+            }
+        }
+        Resolved::Unchanged(_) => {}
+    }
+    Ok(outcome)
+}
+
 /// Canonicalises the longest existing prefix of `path` and re-appends the rest.
 ///
 /// Returns `None` when no ancestor resolves, or when the components that would
@@ -230,8 +257,8 @@ fn resolve_via_ancestor(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Resolves in place, returning what happened. `None` when the scope names no
-/// executable.
+/// Diagnostic resolution in place. Policy writes must use [`resolve_policy`].
+/// Returns `None` when the scope names no executable.
 pub fn resolve_scope(scope: &mut crate::RuleScope) -> Option<Resolved> {
     let current = scope.exe_path.as_deref()?;
     let outcome = resolve(current);
@@ -266,8 +293,9 @@ pub fn file_is_sealed(uid: u32, mode: u32) -> bool {
 ///
 /// True only when the file *and every ancestor directory* pass the sealed
 /// tests above: a root-owned file under a directory someone else can rename
-/// is not a sealed file. Symlinks are resolved first - judging the link and
-/// trusting the target would check the wrong file.
+/// is not a sealed file. Callers must supply an absolute resolved path.
+/// Symlinks do not qualify: following a replacement link could judge a
+/// different image while granting trust to the original pathname.
 ///
 /// Two callers, two consequences:
 /// * the daemon binds a prompt-created **allow** to the binary's hash when
@@ -281,14 +309,16 @@ pub fn file_is_sealed(uid: u32, mode: u32) -> bool {
 pub fn is_root_sealed(path: &std::path::Path) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let real = std::fs::canonicalize(path)?;
-    let meta = std::fs::metadata(&real)?;
+    if !path.is_absolute() {
+        return Ok(false);
+    }
+    let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_file() || !file_is_sealed(meta.uid(), meta.mode()) {
         return Ok(false);
     }
-    for dir in real.ancestors().skip(1) {
-        let m = std::fs::metadata(dir)?;
-        if !dir_is_sealed(m.uid(), m.mode()) {
+    for dir in path.ancestors().skip(1) {
+        let m = std::fs::symlink_metadata(dir)?;
+        if !m.is_dir() || !dir_is_sealed(m.uid(), m.mode()) {
             return Ok(false);
         }
     }
@@ -299,6 +329,49 @@ pub fn is_root_sealed(path: &std::path::Path) -> std::io::Result<bool> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn policy_paths_require_explicit_fixed_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(directory.path()).unwrap();
+        let target = base.join("target");
+        let replacement = base.join("replacement");
+        std::fs::write(&target, b"local test data").unwrap();
+        std::fs::write(&replacement, b"local replacement data").unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(
+            resolve_policy(&alias).is_err(),
+            "New policy must refuse an alias"
+        );
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        assert!(
+            resolve_policy(&alias).is_err(),
+            "Retargeting cannot silently select a new policy target"
+        );
+
+        let directory_alias = base.join("directory-alias");
+        std::os::unix::fs::symlink(&base, &directory_alias).unwrap();
+        assert!(resolve_policy(&directory_alias.join("not-installed")).is_err());
+        let dangling = base.join("dangling");
+        std::os::unix::fs::symlink(base.join("absent"), &dangling).unwrap();
+        assert!(resolve_policy(&dangling).is_err());
+        assert!(resolve_policy(&dangling.join("child")).is_err());
+        assert!(resolve_policy(&target.join("not-a-directory")).is_err());
+        assert!(resolve_policy(Path::new("relative")).is_err());
+        assert!(resolve_policy(&base.join("absent/../target")).is_err());
+
+        assert_eq!(
+            resolve_policy(&target).unwrap(),
+            Resolved::Unchanged(target)
+        );
+        let missing = base.join("future-directory/future-program");
+        assert_eq!(
+            resolve_policy(&missing).unwrap(),
+            Resolved::Missing(missing)
+        );
+    }
 
     #[test]
     fn a_symlinked_path_is_rewritten_to_its_target() {

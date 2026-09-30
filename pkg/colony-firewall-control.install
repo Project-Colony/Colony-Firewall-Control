@@ -7,8 +7,8 @@ post_install() {
     1. Enable the daemon and the persistent nftables rules:
            systemctl enable --now colony-firewalld colony-firewall-nft
        (colony-firewall-nft loads 'table inet colony_firewall'; it is
-        fail-closed while loaded, and PartOf= the daemon, so stopping
-        the daemon also removes the table cleanly.)
+        fail-closed while loaded and survives daemon restarts/stops.
+        Stop colony-firewall-nft explicitly to remove filtering.)
 
     2. Let your desktop user talk to the daemon socket:
            usermod -aG colony-firewall <your-user>
@@ -27,6 +27,19 @@ EOF
 }
 
 post_upgrade() {
+    # Refresh active units only; inbound remains opt-in. ExecReload applies
+    # the new snippet atomically and removes old Fast Allow acceptance.
+    systemctl daemon-reload
+    # Recreate native network-manager dependencies for enabled deployments.
+    for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do
+        if systemctl is-enabled --quiet "$unit"; then
+            systemctl reenable "$unit" || return 1
+        fi
+    done
+    systemctl try-reload-or-restart colony-firewall-nft.service colony-firewall-nft-inbound.service || {
+        echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
+        return 1
+    }
     cat <<'EOF'
 ==> colony-firewall-control upgraded.
     Changes: /usr/share/doc/colony-firewall-control/README.md and

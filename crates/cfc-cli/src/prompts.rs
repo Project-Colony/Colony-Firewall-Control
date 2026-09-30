@@ -62,7 +62,7 @@ pub enum Scope {
     ExeAndPort,
     /// This executable, anywhere.
     Exe,
-    /// This destination, from any executable.
+    /// This numeric endpoint IP, from any executable.
     Destination,
 }
 
@@ -99,17 +99,8 @@ pub fn build_scope(
         }
         Scope::Destination => {
             let c = conn?;
-            if !c.dst_host.is_empty() {
-                out.dst_host = c.dst_host.clone();
-            } else if !c.dst_ip.is_empty() {
-                out.dst_net = if c.dst_ip.contains(':') {
-                    format!("{}/128", c.dst_ip)
-                } else {
-                    format!("{}/32", c.dst_ip)
-                };
-            } else {
-                return None;
-            }
+            let ip = c.dst_ip.parse::<std::net::IpAddr>().ok()?;
+            out.dst_net = ipnet::IpNet::from(ip).to_string();
         }
     }
     Some(out)
@@ -189,9 +180,23 @@ pub fn describe_destination(conn: Option<&proto::ConnectionInfo>) -> String {
     };
     let proto_label = convert::protocol_label(c.protocol);
     if c.dst_host.is_empty() {
-        format!("{proto_label} {}:{}", c.dst_ip, c.dst_port)
+        format!(
+            "{proto_label} {}:{}",
+            output::terminal_safe(&c.dst_ip),
+            c.dst_port
+        )
     } else {
-        format!("{proto_label} {}:{} ({})", c.dst_host, c.dst_port, c.dst_ip)
+        format!(
+            "{proto_label} {}:{} ({}; {} hostname)",
+            output::terminal_safe(&c.dst_host),
+            c.dst_port,
+            output::terminal_safe(&c.dst_ip),
+            if c.dst_host_verified {
+                "verified"
+            } else {
+                "unverified"
+            }
+        )
     }
 }
 
@@ -206,7 +211,12 @@ pub fn describe_process(proc: Option<&proto::ProcessInfo>) -> String {
             } else {
                 p.exe.as_str()
             };
-            format!("{exe} (pid {}, uid {})", p.pid, convert::uid_label(p.uid))
+            format!(
+                "{} (pid {}, uid {})",
+                output::terminal_safe(exe),
+                p.pid,
+                convert::uid_label(p.uid)
+            )
         }
     }
 }
@@ -562,7 +572,8 @@ async fn handle_prompt(
     let (duration, scope) = match duration {
         None => (proto::Duration::Once, None),
         Some(duration) => {
-            let scope_label = "scope: [1] this app + port [2] this app [3] this destination";
+            let scope_label =
+                "scope: [1] this app + port [2] this app [3] this endpoint IP (/32 or /128)";
             term.announce(scope_label);
             let picked = match term
                 .choose(
@@ -658,7 +669,7 @@ fn print_prompt(ev: &proto::PromptEvent) {
     println!("  process  {}", describe_process(proc));
     if let Some(p) = proc {
         if !p.cmdline.is_empty() {
-            println!("  cmdline  {}", p.cmdline.join(" "));
+            println!("  cmdline  {}", output::terminal_safe(&p.cmdline.join(" ")));
         }
         if let Some(sha) = short_sha(&p.sha256) {
             println!("  sha256   {sha}");
@@ -672,10 +683,10 @@ fn print_prompt(ev: &proto::PromptEvent) {
                 // package is a genuine red flag, not a footnote.
                 println!(
                     "  package  {}",
-                    label.if_supports_color(Stdout, |s| s.red())
+                    output::terminal_safe(&label).if_supports_color(Stdout, |s| s.red())
                 );
             } else {
-                println!("  package  {label}");
+                println!("  package  {}", output::terminal_safe(&label));
             }
         }
     }
@@ -688,7 +699,11 @@ fn print_prompt(ev: &proto::PromptEvent) {
     // an allow-always will bind to the binary's current hash rather than
     // follow whatever bytes sit at the path next.
     if ev.binds_to_hash {
-        println!("  binding  allow-always will pin to this binary's sha256");
+        if ev.process.as_ref().is_some_and(|p| !p.sha256.is_empty()) {
+            println!("  binding  allow-always will pin to this binary's sha256");
+        } else {
+            println!("  binding  image hash unavailable; persistent allow cannot be saved");
+        }
     }
 }
 
@@ -722,6 +737,7 @@ mod tests {
             dst_ip: "93.184.216.34".into(),
             dst_port: 443,
             dst_host: "example.com".into(),
+            dst_host_verified: false,
         }
     }
 
@@ -747,11 +763,11 @@ mod tests {
     }
 
     #[test]
-    fn destination_scope_prefers_the_hostname() {
+    fn destination_scope_pins_the_numeric_endpoint_even_with_a_hostname() {
         let s = build_scope(Scope::Destination, Some(&process()), Some(&conn())).unwrap();
-        assert_eq!(s.dst_host, "example.com");
+        assert!(s.dst_host.is_empty());
         assert!(s.exe_path.is_empty());
-        assert!(s.dst_net.is_empty());
+        assert_eq!(s.dst_net, "93.184.216.34/32");
     }
 
     #[test]
@@ -806,7 +822,8 @@ mod tests {
         // unattributed flow - that is the rule shape such prompts should use.
         p.exe = convert::UNKNOWN_EXE.to_string();
         let s = build_scope(Scope::Destination, Some(&p), Some(&conn())).unwrap();
-        assert_eq!(s.dst_host, "example.com");
+        assert!(s.dst_host.is_empty());
+        assert_eq!(s.dst_net, "93.184.216.34/32");
         assert!(s.exe_path.is_empty());
     }
 
@@ -823,7 +840,7 @@ mod tests {
     fn destination_description_includes_protocol_and_host() {
         assert_eq!(
             describe_destination(Some(&conn())),
-            "tcp example.com:443 (93.184.216.34)"
+            "tcp example.com:443 (93.184.216.34; unverified hostname)"
         );
         let mut c = conn();
         c.dst_host = String::new();
@@ -871,6 +888,17 @@ mod tests {
             count: 0,
         };
         assert_eq!(interactive.auto(), None);
+    }
+
+    #[test]
+    fn json_keeps_command_arguments_for_machine_consumers() {
+        let mut event = proto::PromptEvent {
+            process: Some(process()),
+            ..Default::default()
+        };
+        event.process.as_mut().unwrap().cmdline = vec!["line\nnext".into()];
+        let value = serde_json::to_value(to_json(&event, None, None)).unwrap();
+        assert_eq!(value["cmdline"], "line\nnext");
     }
 
     #[test]
