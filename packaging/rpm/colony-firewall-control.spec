@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
-Version:        0.6.0
+Version:        0.7.0
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -249,6 +249,12 @@ fi
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 
 %changelog
+* Wed Sep 30 2026 MotherSphere <mothersphere.colony@gmail.com> - 0.7.0-1
+- Add opt-in headless application confinement with explicit numeric IP permissions
+- Disable Fast Allow and new hostname policies; require explicit canonical targets
+- Commit parsed refusals before verdicts and require filtering before network managers
+- Harden control credentials, prompt bindings, packet attribution and build permissions
+
 * Mon Sep 28 2026 MotherSphere <linhajahad@gmail.com> - 0.6.0-1
 - Raise the minimum supported Rust version to 1.89
 - Update notify-rust, dns-lookup, futures, chrono, and ipnet
