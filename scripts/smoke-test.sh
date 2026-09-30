@@ -193,26 +193,27 @@ say "cfc rules list (post-roundtrip)"
 
 # Pick the first rule id. The list prints a short id in column 1, which
 # must be enough to act on: everything below resolves by prefix.
+# Drain CLI output so early matches do not close the pipe under pipefail.
 if [[ "${HAVE_JQ}" -eq 1 ]]; then
     FULL_ID="$("${CFC}" --socket "${SOCKET}" rules list --json | jq -r '.[0].id')"
 else
     FULL_ID=""
 fi
 SHORT_ID="$("${CFC}" --socket "${SOCKET}" rules list \
-    | awk 'NR>1 && NF>0 {print $1; exit}')"
+    | awk 'NR>1 && NF>0 && !seen {print $1; seen=1}')"
 
 if [[ -n "${SHORT_ID}" ]]; then
     say "cfc rules show ${SHORT_ID} (id prefix)"
     "${CFC}" --socket "${SOCKET}" rules show "${SHORT_ID}"
 
     say "cfc rules disable/enable ${SHORT_ID} (idempotent)"
-    "${CFC}" --socket "${SOCKET}" rules disable "${SHORT_ID}" | grep -q 'disabled' \
+    "${CFC}" --socket "${SOCKET}" rules disable "${SHORT_ID}" | grep 'disabled' >/dev/null \
         || { echo "expected disable to report the new state"; exit 1; }
-    "${CFC}" --socket "${SOCKET}" rules disable "${SHORT_ID}" | grep -q 'already disabled' \
+    "${CFC}" --socket "${SOCKET}" rules disable "${SHORT_ID}" | grep 'already disabled' >/dev/null \
         || { echo "expected the second disable to be a no-op"; exit 1; }
-    "${CFC}" --socket "${SOCKET}" rules enable "${SHORT_ID}" | grep -q 'enabled' \
+    "${CFC}" --socket "${SOCKET}" rules enable "${SHORT_ID}" | grep 'enabled' >/dev/null \
         || { echo "expected enable to report the new state"; exit 1; }
-    "${CFC}" --socket "${SOCKET}" rules enable "${SHORT_ID}" | grep -q 'already enabled' \
+    "${CFC}" --socket "${SOCKET}" rules enable "${SHORT_ID}" | grep 'already enabled' >/dev/null \
         || { echo "expected the second enable to be a no-op"; exit 1; }
 
     say "cfc rules toggle ${SHORT_ID}"
