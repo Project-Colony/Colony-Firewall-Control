@@ -289,6 +289,61 @@ cfc status     # "enforcing yes", and it warns on stderr when it is not
 > SSH exemption and dead-man's-switch patterns - *before* enabling
 > enforcement remotely.
 
+### Explicit application confinement
+
+`cfc applications run` starts a separate, headless application tree with an
+empty network permission list. Administrators may approve exact numeric peer
+addresses with `--allow IP`. Permissions apply to the entire tree across
+TCP/UDP ports; ordinary CFC rules can additionally restrict new connections.
+Changing permissions requires stopping the complete tree and launching a fresh
+one. This first interface does not provide live grant changes or GUI prompts
+for the native tree filter.
+
+The initial supported platform is x86_64 Linux with cgroup v2, systemd 262 or
+newer, a working system D-Bus, Bubblewrap 0.13.0 or newer, and libbpf-backed
+interface filtering. CFC verifies actual IP/interface BPF attachments, their
+policy maps and synthetic decisions before starting the application. Missing
+support or failed verification refuses the launch. Local routes through `lo`
+remain blocked even when an approved address later belongs to the host.
+
+Prepare an administrator-owned runtime containing the executable and all its
+dependencies as regular files and directories. Every entry must be owned by
+root and must not be writable by another account. Symlinks, special files and
+nested mounts are rejected. The runtime must contain empty `dev`, `proc`,
+`sys`, `tmp`, `run` and `home` directories. For a statically linked program:
+
+```sh
+sudo install -d -m755 /var/lib/colony-firewall/runtimes/example/{app,dev,proc,sys,tmp,run,home}
+sudo install -m755 /path/to/static-program /var/lib/colony-firewall/runtimes/example/app/program
+sudo cfc applications run --runtime /var/lib/colony-firewall/runtimes/example -- /app/program
+```
+
+Covering mounts must use a supported local filesystem: ext2/3/4, XFS, Btrfs,
+F2FS, tmpfs, ramfs/rootfs, SquashFS or EROFS. FUSE, network filesystems and
+overlay mounts are rejected because ownership metadata alone cannot exclude
+an external filesystem broker or concealed lower storage.
+
+To approve a peer, repeat the launch with `--allow IP` before `--`; repeat the
+flag for additional peers. The launcher prints the tree identity. Use
+`sudo cfc applications stop ID` to terminate it from another terminal, or
+Ctrl-C in the launching terminal.
+
+Each active tree receives a reserved host UID and private PID, mount, user,
+IPC, UTS and cgroup namespaces. Its writable state is private and its runtime
+is read-only. The application runs as PID 1 in its private PID namespace and
+must reap its own children; CFC stops the entire tree on revocation. Inherited
+descriptors and environment are removed; all three
+standard streams are `/dev/null`. There are no host desktop, D-Bus, audio,
+shared-home or output brokers. This mode therefore suits unattended local
+workloads; programs requiring those services need an explicitly designed
+broker before they can use it.
+
+This mode protects explicitly launched trees. It does not change normal-mode
+socket attribution or revoke established flows when an ordinary rule is
+edited. Stop the tree to revoke its permissions. Approving a peer approves
+that endpoint, including any remote relay it provides. Trusted host root,
+the operating system and kernel vulnerabilities are outside this boundary.
+
 ## Quick start
 
 Open the GUI:

@@ -1,5 +1,6 @@
 //! Colony Firewall Control - CLI control tool.
 
+mod confinement;
 mod error;
 mod events;
 mod humantime;
@@ -72,6 +73,11 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Launch or stop an explicitly confined application tree (administrator only).
+    Applications {
+        #[command(subcommand)]
+        cmd: ApplicationsCmd,
+    },
     /// Show daemon status.
     Status,
     /// Rules CRUD.
@@ -224,8 +230,43 @@ enum BundleCmd {
     },
 }
 
+fn main() {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("__cfc_application_gate")) {
+        let id = args.next();
+        let result = match (id.as_deref().and_then(std::ffi::OsStr::to_str), args.next()) {
+            (Some(id), None) => confinement::gate(id),
+            _ => Err(anyhow::anyhow!("invalid application gate invocation")),
+        };
+        if let Err(error) = result {
+            eprintln!("cfc: {}", output::terminal_safe(&error.to_string()));
+        }
+        std::process::exit(error::EXIT_RUNTIME);
+    }
+    cli_main();
+}
+
+#[derive(Debug, Subcommand)]
+enum ApplicationsCmd {
+    /// Start a fresh headless application with no network permission by default.
+    Run {
+        /// Administrator-owned runtime containing only sealed directories and regular files.
+        #[arg(long)]
+        runtime: PathBuf,
+        /// Authorize an exact numeric peer IP across TCP/UDP ports for the whole tree.
+        /// Ordinary CFC rules remain an additional restriction on new flows.
+        #[arg(long = "allow", value_name = "IP")]
+        allow: Vec<std::net::IpAddr>,
+        /// Absolute executable inside the runtime, followed by its arguments.
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Stop every process in a confined tree before releasing its permissions.
+    Stop { id: String },
+}
+
 #[tokio::main]
-async fn main() {
+async fn cli_main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -262,6 +303,7 @@ async fn run(cli: Cli) -> CliResult {
     let socket = cli.socket();
 
     match cli.cmd {
+        Command::Applications { cmd } => confinement::run(cmd, format).await.map_err(Into::into),
         // Commands that must work with no daemon at all (packaging, docs).
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -339,7 +381,9 @@ async fn dispatch(
         Command::Log(args) => events::run(client, args, format).await,
         Command::Pause { duration } => cmd_pause(client, duration, format).await,
         Command::Resume => cmd_resume(client, format).await,
-        Command::Completions { .. } | Command::Man { .. } => unreachable!("handled by run()"),
+        Command::Applications { .. } | Command::Completions { .. } | Command::Man { .. } => {
+            unreachable!("handled by run()")
+        }
     }
 }
 
@@ -597,6 +641,48 @@ mod tests {
         let cli = Cli::parse_from(["cfc", "rules", "list", "--json", "--socket", "/tmp/x.sock"]);
         assert!(cli.format().is_json());
         assert_eq!(cli.socket(), PathBuf::from("/tmp/x.sock"));
+    }
+
+    #[test]
+    fn confined_payload_arguments_cannot_become_launcher_permissions() {
+        let cli = Cli::try_parse_from([
+            "cfc",
+            "applications",
+            "run",
+            "--runtime",
+            "/sealed/runtime",
+            "--",
+            "/app/program",
+            "--allow",
+            "203.0.113.7",
+            "--json",
+        ])
+        .unwrap();
+        assert!(!cli.format().is_json());
+        match cli.cmd {
+            Command::Applications {
+                cmd: ApplicationsCmd::Run { allow, command, .. },
+            } => {
+                assert!(allow.is_empty());
+                assert_eq!(
+                    command,
+                    ["/app/program", "--allow", "203.0.113.7", "--json"]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(Cli::try_parse_from([
+            "cfc",
+            "applications",
+            "run",
+            "--runtime",
+            "/sealed/runtime",
+            "--allow",
+            "example.com",
+            "--",
+            "/app/program",
+        ])
+        .is_err());
     }
 
     #[test]
