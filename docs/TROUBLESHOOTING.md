@@ -5,6 +5,21 @@ breaks, *the network* breaks, and the tool you'd use to debug it may be on
 the other side of the connection it just dropped. Read the first section
 before enabling enforcement on any machine you reach over SSH.
 
+## Daemon restarts and rule upgrades
+
+Once loaded, both nft tables survive daemon stops and restarts. With no queue
+listener, new tracked flows drop; established and related traffic retains its
+authorization. To intentionally remove filtering, stop the corresponding nft
+unit. Uninstall removes both tables and Colony's pinned BPF directory.
+
+Package upgrades reload active nft units atomically. After a manual upgrade,
+run `systemctl daemon-reload` and `systemctl reload colony-firewall-nft` (and the
+inbound unit if active) before relying on the new rules. A startup error saying
+previous Fast Allow state could not be disabled means old acceptance may still
+exist; resolve that error and inspect the loaded table. The first nft-unit
+start requires a ready daemon, so an initial launch failure can leave boot
+traffic unfiltered.
+
 ## Testing over SSH without locking yourself out
 
 The shipped nftables snippet is **fail-closed**: `queue num 0` without the

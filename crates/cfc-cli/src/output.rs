@@ -66,9 +66,27 @@ pub fn rfc3339(unix_ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(unix_ms).map(|t| t.to_rfc3339())
 }
 
+/// Render untrusted values as one terminal-safe line. JSON keeps raw values.
+pub fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if character.is_control()
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
 /// Clips a cell to `width` characters, marking the cut with `~` so a
 /// truncated path is never mistaken for a real one.
 pub fn truncate(s: &str, width: usize) -> String {
+    let escaped = terminal_safe(s);
+    let s = escaped.as_str();
     if s.chars().count() <= width || width == 0 {
         return s.to_string();
     }
@@ -80,6 +98,12 @@ pub fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_controls_are_rendered_without_affecting_the_terminal() {
+        assert_eq!(terminal_safe("line\nnext\tcell"), "line\\nnext\\tcell");
+        assert!(terminal_safe("\u{202e}").is_ascii());
+    }
 
     #[test]
     fn truncation_marks_the_cut() {

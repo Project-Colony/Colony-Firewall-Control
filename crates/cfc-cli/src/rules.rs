@@ -97,7 +97,7 @@ async fn resolve_via_daemon(
         Err(ResolveError::Ambiguous(candidates)) => {
             let list = candidates
                 .iter()
-                .map(|(id, name)| format!("\n  {id}  {name}"))
+                .map(|(id, name)| format!("\n  {id}  {}", output::terminal_safe(name)))
                 .collect::<String>();
             Err(CliError::runtime(format!(
                 "{needle:?} matches {} rules:{list}",
@@ -136,10 +136,10 @@ pub async fn list(client: &mut Client, format: OutputFormat) -> CliResult {
             "{:<8}  {:<3}  {:<13}  {:>5}  {:<name_w$}  {}",
             short_id(&r.id),
             if r.enabled { "yes" } else { "no" },
-            convert::duration_label(r.duration),
+            convert::rule_duration_label(r),
             r.hit_count,
             output::truncate(&r.name, name_w),
-            convert::rule_summary(r)
+            output::terminal_safe(&convert::rule_summary(r))
         );
     }
     Ok(())
@@ -155,14 +155,14 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
         if s.is_empty() {
             "-".to_string()
         } else {
-            s.to_string()
+            output::terminal_safe(s)
         }
     };
     println!("id           {}", rule.id);
-    println!("name         {}", rule.name);
+    println!("name         {}", output::terminal_safe(&rule.name));
     println!("enabled      {}", if rule.enabled { "yes" } else { "no" });
     println!("action       {}", convert::action_label(rule.action));
-    println!("duration     {}", convert::duration_label(rule.duration));
+    println!("duration     {}", convert::rule_duration_label(&rule));
     println!(
         "created      {}",
         if rule.created_at_unix_ms > 0 {
@@ -172,7 +172,10 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
         }
     );
     println!("hits         {}", rule.hit_count);
-    println!("summary      {}", convert::rule_summary(&rule));
+    println!(
+        "summary      {}",
+        output::terminal_safe(&convert::rule_summary(&rule))
+    );
     println!("scope:");
     // Not dashed when unset: an absent direction is not "unconstrained", it
     // means outbound (the matcher's contract - unset kept the meaning every
@@ -244,7 +247,11 @@ pub async fn remove(client: &mut Client, needle: &str, format: OutputFormat) -> 
             "deleted": true, "id": rule.id, "name": rule.name,
         }));
     }
-    println!("deleted {} ({})", rule.id, rule.name);
+    println!(
+        "deleted {} ({})",
+        rule.id,
+        output::terminal_safe(&rule.name)
+    );
     Ok(())
 }
 
@@ -276,12 +283,17 @@ pub async fn set_enabled(
     }
     let label = |b: bool| if b { "enabled" } else { "disabled" };
     if want == was {
-        println!("{} ({}): already {}", rule.id, rule.name, label(was));
+        println!(
+            "{} ({}): already {}",
+            rule.id,
+            output::terminal_safe(&rule.name),
+            label(was)
+        );
     } else {
         println!(
             "{} ({}): {} -> {}",
             rule.id,
-            rule.name,
+            output::terminal_safe(&rule.name),
             label(was),
             label(want)
         );
@@ -498,9 +510,9 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
             let outcome = cfc_core::exe_path::resolve(p);
             if let Some(note) = outcome.note() {
                 if outcome.is_inert() {
-                    eprintln!("warning: {note}");
+                    eprintln!("warning: {}", output::terminal_safe(&note));
                 } else {
-                    eprintln!("note: {note}");
+                    eprintln!("note: {}", output::terminal_safe(&note));
                 }
             }
             outcome.into_path().to_string_lossy().into_owned()
@@ -553,6 +565,7 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
 
     let name = args.name.unwrap_or_else(|| "cli-added".into());
     let rule = proto::RuleInfo {
+        duration_seconds: 0,
         id: String::new(),
         name: name.clone(),
         enabled: true,
@@ -606,14 +619,7 @@ pub async fn import(
 
     let rules: Vec<ExportedRule> = serde_json::from_str(&json).context("parsing JSON")?;
 
-    // --- 1. validate everything before touching anything --------------------
-    //
-    // The old order was: delete every existing rule, then upsert one at a time
-    // and abort on the first failure. A single unrecognised field therefore
-    // left the daemon with an **emptied** rule set and a partial import - and
-    // because the nftables ruleset is fail-closed, an emptied rule set is not a
-    // degraded firewall, it is a machine with no outbound network. Validating
-    // first turns that class of failure into "nothing happened, here is why".
+    // Parse and validate the complete file before the atomic server-side batch.
     let mut pending = Vec::with_capacity(rules.len());
     let mut problems = Vec::new();
     let mut seen_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -654,7 +660,7 @@ pub async fn import(
         // Every problem, not just the first: an operator fixing an export by
         // hand should learn about all of them in one pass.
         for p in &problems {
-            eprintln!("  {p}");
+            eprintln!("  {}", output::terminal_safe(p));
         }
         return Err(anyhow::anyhow!(
             "{} of {} rules could not be read; nothing was changed",
@@ -677,63 +683,12 @@ pub async fn import(
         .into());
     }
 
-    // --- 2. apply, in the order that has no empty window --------------------
-    //
-    // Upserts first, deletions last. There is no server-side transaction, so
-    // something has to be the failure window; making it "old rules linger"
-    // rather than "no rules at all" is the only choice that cannot take the
-    // machine's network down. Lingering rules are the status quo of a second
-    // ago, not a new grant.
-    let existing = if replace {
-        client.list_rules().await?
-    } else {
-        Vec::new()
-    };
-
-    let mut imported = 0u32;
-    let mut imported_ids = std::collections::HashSet::new();
-    for pb in pending {
-        let name = pb.name.clone();
-        // The id the *daemon* returns, not the one the file carried. `parse_str`
-        // accepts uppercase, braced and 32-char forms; the daemon stores the
-        // canonical lowercase-hyphenated one and lists it back that way. Keying
-        // this set on the file's spelling meant an id that differed only in
-        // case upserted onto an existing rule and was then deleted by the
-        // cleanup below as "absent from the import" - the exact bug the e2e
-        // test was written to pin, invisible to it because the fake daemon
-        // echoed the id back verbatim.
-        //
-        // Using the response also covers the mint-a-new-one case, where the
-        // file has no id at all and only the daemon knows what it became.
-        let assigned = client.upsert_rule(pb).await.with_context(|| {
-            format!("importing rule `{name}`; {imported} rules were already applied")
-        })?;
-        imported_ids.insert(assigned);
-        imported += 1;
-    }
-
-    // Only now, and only for rules the import did not already carry: an
-    // imported rule that shares an id with an existing one was *updated* by the
-    // upsert above, so deleting it here would throw away the thing just
-    // imported. That is the bug this set exists to prevent.
-    let mut removed = 0u32;
-    if replace {
-        for r in &existing {
-            if imported_ids.contains(r.id.as_str()) {
-                continue;
-            }
-            // `delete_rule` answers whether a rule was actually there; another
-            // client may have removed it between the listing above and now.
-            // Counting it anyway would report a removal that did not happen.
-            if client
-                .delete_rule(&r.id)
-                .await
-                .with_context(|| format!("removing rule `{}`, absent from the import", r.id))?
-            {
-                removed += 1;
-            }
-        }
-    }
+    let response = client
+        .apply_rules(pending, replace)
+        .await
+        .context("import refused; no rules were changed")?;
+    let imported = response.ids.len();
+    let removed = response.removed;
 
     if format.is_json() {
         return output::print_json(&serde_json::json!({
@@ -757,6 +712,7 @@ pub async fn import(
 /// Wire-compatible with the in-process Rule type but stable across daemon
 /// versions.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportedRule {
     #[serde(default)]
     pub id: String,
@@ -767,10 +723,13 @@ pub struct ExportedRule {
     #[serde(default = "default_duration")]
     pub duration: String,
     #[serde(default)]
+    pub duration_seconds: u32,
+    #[serde(default)]
     pub scope: ExportedScope,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportedScope {
     #[serde(default)]
     pub exe_path: Option<String>,
@@ -788,9 +747,7 @@ pub struct ExportedScope {
     pub dst_port: Option<u16>,
     #[serde(default)]
     pub protocol: Option<String>,
-    /// "in" or "out". Absent means the rule applies to both, which is what
-    /// every rule exported before inbound filtering existed means - so old
-    /// files keep importing unchanged.
+    /// "in" or "out". Absent retains the historical outbound meaning.
     #[serde(default)]
     pub direction: Option<String>,
     #[serde(default)]
@@ -857,12 +814,30 @@ impl ExportedRule {
             "reject" => proto::Action::Reject,
             other => return Err(bad("action", other, "allow, deny, reject")),
         };
+        for (field, value) in [
+            ("exe_path", self.scope.exe_path.as_deref()),
+            ("exe_sha256", self.scope.exe_sha256.as_deref()),
+            ("parent_exe", self.scope.parent_exe.as_deref()),
+            ("dst_host", self.scope.dst_host.as_deref()),
+            ("dst_net", self.scope.dst_net.as_deref()),
+            ("src_net", self.scope.src_net.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(format!("rule `{name}`: {field} is present but empty"));
+            }
+        }
         let duration = match self.duration.to_ascii_lowercase().as_str() {
             "always" => proto::Duration::Always,
+            "seconds" if self.duration_seconds > 0 => proto::Duration::Seconds,
             "once" => proto::Duration::Once,
             "until-restart" | "until_restart" => proto::Duration::UntilRestart,
             other => return Err(bad("duration", other, "always, once, until-restart")),
         };
+        if duration != proto::Duration::Seconds && self.duration_seconds != 0 {
+            return Err(format!(
+                "rule `{name}`: duration_seconds requires duration `seconds`"
+            ));
+        }
         let direction_idx = match self.scope.direction.as_deref() {
             None => None,
             Some(d) => Some(match d.to_ascii_lowercase().as_str() {
@@ -919,6 +894,9 @@ impl ExportedRule {
                      every unattributable flow"
                 ));
             }
+            if exe.len() > cfc_core::rule::MAX_EXE_PATH_LEN {
+                return Err(format!("rule `{name}`: executable path is too long"));
+            }
             if !std::path::Path::new(exe).is_absolute() {
                 return Err(format!(
                     "rule `{name}`: exe_path `{exe}` is not absolute; rules \
@@ -944,17 +922,13 @@ impl ExportedRule {
                 other => return Err(bad("protocol", other, "tcp, udp, icmp")),
             }),
         };
-        // Checked here as well as in the daemon so the message can say which
-        // rule in the file is at fault; the daemon only ever sees one rule at a
-        // time and cannot.
+        // Local validation names the failing rule before sending the batch.
         if let Some(net) = self.scope.dst_net.as_deref() {
             net.parse::<ipnet::IpNet>()
                 .map_err(|e| format!("rule `{name}`: bad dst_net `{net}`: {e}"))?;
         }
-        // Everything below is refused by the daemon on upsert. Checking it here
-        // too is not belt and braces - it is the difference between "nothing was
-        // changed" and a 200-rule file that applies 149 and then stops, which is
-        // the outcome the whole validate-first pass exists to prevent.
+        // Give import errors local names; the daemon independently validates
+        // the complete batch before its transaction.
         if duration == proto::Duration::Once {
             return Err(format!(
                 "rule `{name}`: duration `once` answers a single prompt and cannot be \
@@ -968,6 +942,8 @@ impl ExportedRule {
             || self.scope.dst_host.is_some()
             || self.scope.dst_net.is_some()
             || self.scope.dst_port.is_some()
+            || self.scope.src_net.is_some()
+            || self.scope.src_port.is_some()
             || protocol_idx.is_some();
         if !constrains_something {
             return Err(format!(
@@ -1011,6 +987,7 @@ impl ExportedRule {
             enabled: self.enabled,
             action: action as i32,
             duration: duration as i32,
+            duration_seconds: self.duration_seconds,
             scope: Some(scope),
             created_at_unix_ms: 0,
             hit_count: 0,
@@ -1033,6 +1010,7 @@ pub fn exported_rule(r: &proto::RuleInfo) -> ExportedRule {
         enabled: r.enabled,
         action: convert::action_label(r.action).to_string(),
         duration: convert::duration_label(r.duration).to_string(),
+        duration_seconds: r.duration_seconds,
         scope: ExportedScope {
             exe_path: scope.and_then(|s| opt_string(&s.exe_path)),
             exe_sha256: scope.and_then(|s| opt_string(&s.exe_sha256)),
@@ -1071,7 +1049,6 @@ struct OsnRule {
     name: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
-    #[serde(default = "default_allow_str")]
     action: String,
     #[serde(default = "default_duration")]
     duration: String,
@@ -1091,7 +1068,6 @@ enum OsnOperator {
 #[derive(Debug, serde::Deserialize)]
 struct OsnSimple {
     operand: String,
-    #[serde(default)]
     data: String,
 }
 
@@ -1104,27 +1080,26 @@ struct OsnList {
     list: Vec<OsnOperator>,
 }
 
-fn default_allow_str() -> String {
-    "allow".into()
-}
-
 pub async fn import_opensnitch(
     client: &mut Client,
     path: PathBuf,
     replace: bool,
     format: OutputFormat,
 ) -> CliResult {
-    let files: Vec<PathBuf> = if path.is_dir() {
+    let mut files: Vec<PathBuf> = if path.is_dir() {
         std::fs::read_dir(&path)
             .with_context(|| format!("reading dir {}", path.display()))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .context("reading OpenSnitch directory entries")?
+            .into_iter()
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
             .collect()
     } else {
         vec![path.clone()]
     };
 
+    files.sort();
     if files.is_empty() {
         return Err(CliError::runtime(format!(
             "no .json files found under {}",
@@ -1132,17 +1107,7 @@ pub async fn import_opensnitch(
         )));
     }
 
-    // Same shape as `import`, and for the same reason: this used to delete every
-    // existing rule *first*, then upsert one at a time and abort with `?` on the
-    // first daemon rejection. That was already a way to end up with an emptied
-    // rule set against a fail-closed table; making `scope_from_pb` strict about
-    // CIDRs turned it from unlikely into ordinary, because opensnitch rule files
-    // carry destination data this converter passes through untouched.
-    //
-    // Convert everything first. A file that will not convert is skipped and
-    // counted, as before - opensnitch exports routinely contain rules with no
-    // CFC equivalent - but a *daemon* rejection now cannot happen after the
-    // deletions, because the deletions happen last.
+    // Unsupported rules may be skipped only for additive imports.
     let mut pending = Vec::new();
     let mut skipped = 0u32;
     for file in &files {
@@ -1151,7 +1116,10 @@ pub async fn import_opensnitch(
         let osn: OsnRule = match serde_json::from_str(&json) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("skip {}: parse error: {e}", file.display());
+                eprintln!(
+                    "{}",
+                    output::terminal_safe(&format!("skip {}: parse error: {e}", file.display()))
+                );
                 skipped += 1;
                 continue;
             }
@@ -1159,10 +1127,16 @@ pub async fn import_opensnitch(
         match convert_opensnitch(file, osn) {
             Ok(rule) => pending.push(rule),
             Err(e) => {
-                eprintln!("skip {}: {e}", file.display());
+                eprintln!(
+                    "{}",
+                    output::terminal_safe(&format!("skip {}: {e}", file.display()))
+                );
                 skipped += 1;
             }
         }
+    }
+    if replace && skipped > 0 {
+        return Err(anyhow::anyhow!("refusing --replace: {skipped} source rules could not be converted; nothing was changed").into());
     }
     if replace && pending.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1173,39 +1147,12 @@ pub async fn import_opensnitch(
         .into());
     }
 
-    // Upserts first, deletions last - see `import`.
-    let existing = if replace {
-        client.list_rules().await?
-    } else {
-        Vec::new()
-    };
-
-    let mut imported = 0u32;
-    let mut imported_ids = std::collections::HashSet::new();
-    for rule in pending {
-        let name = rule.name.clone();
-        let assigned = client.upsert_rule(rule).await.with_context(|| {
-            format!("importing `{name}`; {imported} rules were already applied")
-        })?;
-        imported_ids.insert(assigned);
-        imported += 1;
-    }
-
-    let mut removed = 0u32;
-    if replace {
-        for r in &existing {
-            if imported_ids.contains(r.id.as_str()) {
-                continue;
-            }
-            if client
-                .delete_rule(&r.id)
-                .await
-                .with_context(|| format!("removing rule `{}`, absent from the import", r.id))?
-            {
-                removed += 1;
-            }
-        }
-    }
+    let response = client
+        .apply_rules(pending, replace)
+        .await
+        .context("OpenSnitch import refused; no rules were changed")?;
+    let imported = response.ids.len();
+    let removed = response.removed;
 
     if format.is_json() {
         return output::print_json(&serde_json::json!({
@@ -1233,7 +1180,7 @@ fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<pr
     };
     let duration = match osn.duration.to_ascii_lowercase().as_str() {
         "always" => proto::Duration::Always,
-        "once" => proto::Duration::Once,
+        "once" => anyhow::bail!("Once rules cannot be persisted"),
         "until restart" | "until-restart" | "restart" => proto::Duration::UntilRestart,
         other => {
             anyhow::bail!("unknown duration `{other}` (expected always, once or until restart)")
@@ -1245,7 +1192,8 @@ fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<pr
         apply_operator(&op, &mut scope)?;
     }
 
-    let scope_empty = scope.exe_path.is_empty()
+    let scope_empty = scope.exe_sha256.is_empty()
+        && scope.exe_path.is_empty()
         && scope.dst_host.is_empty()
         && scope.dst_net.is_empty()
         && !scope.has_dst_port
@@ -1262,6 +1210,7 @@ fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<pr
     });
 
     Ok(proto::RuleInfo {
+        duration_seconds: 0,
         id: String::new(),
         name,
         enabled: osn.enabled,
@@ -1294,6 +1243,9 @@ fn apply_operator(op: &OsnOperator, scope: &mut proto::RuleScope) -> anyhow::Res
             s.data
         ),
         OsnOperator::List(l) => {
+            if l.list.is_empty() {
+                anyhow::bail!("empty predicate list");
+            }
             for sub in &l.list {
                 apply_operator(sub, scope)?;
             }
@@ -1303,6 +1255,9 @@ fn apply_operator(op: &OsnOperator, scope: &mut proto::RuleScope) -> anyhow::Res
 }
 
 fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<()> {
+    if s.data.trim().is_empty() {
+        anyhow::bail!("operand `{}` has empty data", s.operand);
+    }
     // A list with two `dest.ip` entries means "either of these" in
     // opensnitch; overwriting would keep only the last and silently drop the
     // rest of the disjunction. One value per predicate, or the rule fails.
@@ -1955,6 +1910,14 @@ fn proto_for(spec: &BundleRule, exe: &str) -> proto::RuleInfo {
     )
 }
 
+fn bundle_rule_id(bundle: &str, name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("colony-firewall-bundle\0{bundle}\0{name}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
 /// `direction`/`src_net` are what an inbound bundle entry needs; every
 /// outbound one leaves them unset.
 fn allow_rule(
@@ -1966,6 +1929,7 @@ fn allow_rule(
     src_net: Option<&str>,
 ) -> proto::RuleInfo {
     proto::RuleInfo {
+        duration_seconds: 0,
         id: String::new(),
         name: name.to_string(),
         enabled: true,
@@ -2000,7 +1964,7 @@ pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult
         .list_rules()
         .await?
         .into_iter()
-        .map(|r| r.name)
+        .map(|r| r.id)
         .collect();
 
     let all = bundles();
@@ -2014,7 +1978,7 @@ pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult
                     "summary": b.summary,
                     "entries": b.rules.len(),
                     "available_here": p.present.len(),
-                    "installed": p.present.iter().filter(|(n, _)| existing.contains(*n)).count(),
+                    "installed": p.present.iter().filter(|(n, _)| existing.contains(&bundle_rule_id(b.name, n))).count(),
                 })
             })
             .collect();
@@ -2030,7 +1994,7 @@ pub async fn bundle_list(client: &mut Client, format: OutputFormat) -> CliResult
         let installed = p
             .present
             .iter()
-            .filter(|(n, _)| existing.contains(*n))
+            .filter(|(n, _)| existing.contains(&bundle_rule_id(b.name, n)))
             .count();
         println!(
             "{:<10}  {:>9}  {:>9}  {}",
@@ -2118,33 +2082,38 @@ pub async fn bundle_add(
     let by_name: std::collections::HashMap<&str, &BundleRule> =
         bundle.rules.iter().map(|r| (r.name, r)).collect();
 
-    let existing: std::collections::HashSet<String> = client
-        .list_rules()
-        .await?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
+    let existing = client.list_rules().await?;
 
     let planned = plan(&bundle);
     let mut added = Vec::new();
     let mut skipped_present = 0u32;
+    for (rule_name, _) in &planned.present {
+        let id = bundle_rule_id(bundle.name, rule_name);
+        if existing
+            .iter()
+            .any(|rule| rule.name == *rule_name && rule.id != id)
+        {
+            return Err(CliError::runtime(format!("bundle rule `{rule_name}` collides with a rule outside this bundle; nothing was changed")));
+        }
+    }
 
     for (rule_name, exe) in &planned.present {
-        if existing.contains(*rule_name) {
+        let id = bundle_rule_id(bundle.name, rule_name);
+        if existing.iter().any(|rule| rule.id == id) {
             skipped_present += 1;
             continue;
         }
         let spec = &by_name[*rule_name];
         if !dry_run {
-            client
-                .upsert_rule(proto_for(spec, &exe.to_string_lossy()))
-                .await?;
+            let mut rule = proto_for(spec, &exe.to_string_lossy());
+            rule.id = id;
+            client.upsert_rule(rule).await?;
         }
         if !format.is_json() {
             println!(
                 "{}: {rule_name}  ({}{})",
                 if dry_run { "would add" } else { "added" },
-                exe.display(),
+                output::terminal_safe(&exe.to_string_lossy()),
                 spec.dst_port
                     .map(|p| format!(" -> :{p}"))
                     .unwrap_or_default()
@@ -2188,9 +2157,8 @@ pub async fn bundle_add(
 
 /// `cfc rules bundle remove <name>`
 ///
-/// Matches on the exact rule names the bundle defines, never on a prefix: a
-/// prefix would also delete a rule someone hand-wrote and happened to name
-/// `web-something`.
+/// Removes only deterministic IDs created by this bundle. Existing rules
+/// imported by older versions lack this ownership evidence and are preserved.
 pub async fn bundle_remove(
     client: &mut Client,
     name: &str,
@@ -2198,11 +2166,15 @@ pub async fn bundle_remove(
     format: OutputFormat,
 ) -> CliResult {
     let bundle = find_bundle(name)?;
-    let owned: std::collections::HashSet<&str> = bundle.rules.iter().map(|r| r.name).collect();
+    let owned: std::collections::HashSet<String> = bundle
+        .rules
+        .iter()
+        .map(|r| bundle_rule_id(bundle.name, r.name))
+        .collect();
 
     let existing = client.list_rules().await?;
     let mut removed = Vec::new();
-    for r in existing.iter().filter(|r| owned.contains(r.name.as_str())) {
+    for r in existing.iter().filter(|r| owned.contains(&r.id)) {
         if !dry_run {
             client.delete_rule(&r.id).await?;
         }
@@ -2211,7 +2183,7 @@ pub async fn bundle_remove(
                 "{}: {} ({})",
                 if dry_run { "would remove" } else { "removed" },
                 short_id(&r.id),
-                r.name
+                output::terminal_safe(&r.name)
             );
         }
         removed.push(r.name.clone());
@@ -2274,6 +2246,7 @@ mod resolve_tests {
 
     fn rule(id: &str, name: &str) -> proto::RuleInfo {
         proto::RuleInfo {
+            duration_seconds: 0,
             id: id.to_string(),
             name: name.to_string(),
             enabled: true,
@@ -2377,6 +2350,15 @@ mod resolve_tests {
 mod json_tests {
     use super::*;
 
+    #[test]
+    fn native_import_rejects_unknown_and_empty_predicates() {
+        let unknown = r#"[{"name":"t","action":"allow","scope":{"exe_path":"/usr/bin/curl","dst_hostname":"example.com"}}]"#;
+        assert!(serde_json::from_str::<Vec<ExportedRule>>(unknown).is_err());
+        let mut rule = exported("allow");
+        rule.scope.dst_host = Some(String::new());
+        assert!(rule.try_into_proto().is_err());
+    }
+
     fn exported(action: &str) -> ExportedRule {
         ExportedRule {
             id: String::new(),
@@ -2384,6 +2366,7 @@ mod json_tests {
             enabled: true,
             action: action.into(),
             duration: "always".into(),
+            duration_seconds: 0,
             scope: ExportedScope {
                 exe_path: Some("/usr/bin/curl".into()),
                 exe_sha256: None,
@@ -2496,6 +2479,7 @@ mod json_tests {
             has_src_port: false,
         };
         let original = proto::RuleInfo {
+            duration_seconds: 0,
             id: "3f1b8a0e-5c4d-4e2a-9b7f-1a2b3c4d5e6f".into(),
             name: "curl-https".into(),
             enabled: false,
@@ -2533,6 +2517,7 @@ mod json_tests {
     #[test]
     fn unset_scope_fields_serialise_as_null() {
         let pb = proto::RuleInfo {
+            duration_seconds: 0,
             id: "id-2".into(),
             name: "bare".into(),
             enabled: true,
@@ -2553,6 +2538,7 @@ mod json_tests {
     #[test]
     fn rule_detail_carries_bookkeeping_fields_flattened() {
         let pb = proto::RuleInfo {
+            duration_seconds: 0,
             id: "id-3".into(),
             name: "detail".into(),
             enabled: true,
@@ -2926,6 +2912,16 @@ mod bundle_tests {
 #[cfg(test)]
 mod opensnitch_tests {
     use super::*;
+
+    #[test]
+    fn opensnitch_requires_action_and_nonempty_predicates() {
+        assert!(parse(
+            r#"{"operator":{"type":"simple","operand":"process.path","data":"/usr/bin/curl"}}"#
+        )
+        .is_err());
+        assert!(parse(r#"{"action":"allow","operator":{"type":"list","operand":"list","list":[{"type":"simple","operand":"process.path","data":""},{"type":"simple","operand":"dest.port","data":"443"}]}}"#).is_err());
+    }
+
     use std::path::Path;
 
     fn parse(json: &str) -> anyhow::Result<proto::RuleInfo> {
@@ -2989,7 +2985,7 @@ mod opensnitch_tests {
             r#"{
               "name": "block-evil",
               "action": "deny",
-              "duration": "once",
+              "duration": "always",
               "operator": {
                 "type": "simple",
                 "operand": "dest.host",
@@ -2999,7 +2995,7 @@ mod opensnitch_tests {
         )
         .unwrap();
         assert_eq!(r.action, proto::Action::Deny as i32);
-        assert_eq!(r.duration, proto::Duration::Once as i32);
+        assert_eq!(r.duration, proto::Duration::Always as i32);
         assert_eq!(r.scope.unwrap().dst_host, "evil.example");
     }
 

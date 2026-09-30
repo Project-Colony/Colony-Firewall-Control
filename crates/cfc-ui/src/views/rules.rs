@@ -256,7 +256,7 @@ fn rule_row<'a>(
         text(convert::action_label(r.action))
             .size(12)
             .width(Length::Fixed(56.0)),
-        text(convert::duration_label(r.duration))
+        text(convert::rule_duration_label(r))
             .size(12)
             .width(Length::Fixed(84.0)),
         column![
@@ -332,7 +332,11 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     // Once is intentionally absent: the daemon rejects a persisted Once
     // rule, so offering it here would only produce an error.
     let duration_pick = pick_list(
-        [DurationOption::UntilRestart, DurationOption::Always],
+        if ed.duration == proto::Duration::Seconds {
+            vec![DurationOption::Seconds, DurationOption::UntilRestart]
+        } else {
+            vec![DurationOption::UntilRestart, DurationOption::Always]
+        },
         Some(DurationOption::from(ed.duration)),
         |d| Message::EditorDuration(d.into()),
     );
@@ -537,6 +541,7 @@ impl std::fmt::Display for ActionOption {
 /// Shared with the prompt cards, which offer the same three choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurationOption {
+    Seconds,
     Once,
     UntilRestart,
     Always,
@@ -545,6 +550,7 @@ pub enum DurationOption {
 impl From<proto::Duration> for DurationOption {
     fn from(v: proto::Duration) -> Self {
         match v {
+            proto::Duration::Seconds => DurationOption::Seconds,
             proto::Duration::Once => DurationOption::Once,
             proto::Duration::UntilRestart => DurationOption::UntilRestart,
             _ => DurationOption::Always,
@@ -555,6 +561,7 @@ impl From<proto::Duration> for DurationOption {
 impl From<DurationOption> for proto::Duration {
     fn from(v: DurationOption) -> Self {
         match v {
+            DurationOption::Seconds => proto::Duration::Seconds,
             DurationOption::Once => proto::Duration::Once,
             DurationOption::UntilRestart => proto::Duration::UntilRestart,
             DurationOption::Always => proto::Duration::Always,
@@ -565,6 +572,7 @@ impl From<DurationOption> for proto::Duration {
 impl std::fmt::Display for DurationOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            DurationOption::Seconds => "Timed (preserve lifetime)",
             DurationOption::Once => "Once",
             DurationOption::UntilRestart => "Until restart",
             DurationOption::Always => "Always",
@@ -578,6 +586,7 @@ mod tests {
 
     fn rule(id: &str, name: &str, hits: u64, created: i64) -> proto::RuleInfo {
         proto::RuleInfo {
+            duration_seconds: 0,
             id: id.into(),
             name: name.into(),
             enabled: true,

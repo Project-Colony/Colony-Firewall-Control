@@ -54,11 +54,10 @@ You can still set either to `"Allow"` explicitly under `[default_policy]`
 — see below. The change is that nothing does it on your behalf.
 
 The danger with `strict` is bootstrap: the units are ordered
-`Before=network-pre.target`, so filtering is live before any interface
-is configured and long before your UI session exists — under `strict`,
-every outbound flow with no matching rule is denied from the first
-instant of boot. That ordering is the point (there is no unfiltered
-window at boot), but it means DHCP, DNS and NTP need standing rules or
+`Before=network-pre.target`, to load filtering before cooperating network
+services configure interfaces. Initial daemon failure prevents the nft unit
+from loading and may leave boot traffic unfiltered. Once loaded, strict
+filtering denies unmatched flows, so DHCP, DNS and NTP need standing rules or
 the machine cannot even get a lease. Network managers retrying DNS will
 look like total network failure. **Only flip to strict after you have
 rules for every always-on system service**.
@@ -131,51 +130,20 @@ lean on a hostname *allow* rule as your only boundary. For allow rules,
 pin `exe` + `dst_port` (+ `dst_net` where destinations are stable)
 instead.
 
-That advice is now enforced rather than only given: a name the daemon
-did not confirm against the address may **refuse** traffic but may not
-**admit** it. A `deny --dst-host` behaves exactly as it
-always did; an `allow --dst-host` stands aside and lets the rules
-beneath it answer.
+Only forward-confirmed PTR names enter policy identity. DNS enrichment starts
+after Allow or an unresolved decision; an explicit Deny/Reject starts no new
+lookup. Eight permits bound active and queued resolver jobs, and a full pool
+skips enrichment. A lookup may finish only after the first flow was decided,
+so hostname Deny rules cannot guarantee domain isolation. Use stable IP scopes
+or separate containment when that property is required.
 
 #### Observed answers, with `[ebpf] enabled`
 
-Turning the eBPF layer on adds a second, better source. The
-`cgroup_skb/ingress` program copies the DNS *responses* this machine
-receives off the wire, and the daemon lifts the `A`/`AAAA` records
-straight out of them. Those mappings win over anything the PTR path
-produces.
-
-The difference is who is being asked. A PTR answer is the destination
-address's owner saying what it would like to be called - second-hand,
-after the fact, from the party you may be trying to block. An observed
-answer is first-hand: this host asked a resolver for `example.com` and
-was told an address, *before* the connection it explains, by the zone
-that owns the name. The "hostile server names itself `api.github.com`"
-problem does not arise, because the destination no longer gets a vote.
-
-What it does not fix, stated more plainly than it was: **nothing ties an
-observed response to a query this host sent.** The kernel gate is
-`source port == 53` and no more - the transaction id is parsed and never
-compared, the sender's address is never checked against a configured
-resolver, and the answer's owner name is never compared with the
-question. So this is not a forgery race that an attacker must win
-against the resolver, as this paragraph used to imply. Any peer the host
-sends a UDP datagram to - a game server, a STUN peer, anything - can
-reply from source port 53 and assert any name for any address. No
-spoofing, no guessing, and the application's own resolver never sees the
-packet.
-
-That is why an observed answer decorates a flow but does not admit it:
-it may satisfy a `deny --dst-host` and never an `allow --dst-host`.
-They remain the better source for *naming* a flow in the log, the live
-feed and a prompt, which is what they are for.
-
-The full remedy is to check the sender against the resolvers this host
-actually uses. That needs the source address in the record the kernel
-copies up, and therefore an ABI bump; until then the asymmetry above is
-what stands between an observed name and a decision.
-
-Answers are cached for the record's own TTL, clamped to 60s..1h.
+The ingress hook copies DNS-shaped UDP responses received from source port 53.
+It does not validate a resolver transaction, sender or question. These records
+remain untrusted diagnostics in a separate cache. They cannot satisfy a
+policy rule or replace a forward-confirmed PTR policy name. Diagnostic entries
+retain the record TTL, clamped to 60s..1h; the policy cache remains separate.
 
 ## Deny or Reject?
 
@@ -232,9 +200,17 @@ real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
   instead of, traditional access controls.
 - **eBPF / unprivileged user namespaces**: a sufficiently privileged user
   can bypass NFQUEUE entirely with `unshare -rn` and a custom net namespace.
-- **DNS-over-HTTPS embedded in browsers**: if the browser resolves names
-  inside its own HTTPS connection, the firewall sees only the outer
-  443/tcp flow. Block at the `dst_host` layer or disable DoH per-app.
+- **Local relays and DNS**: loopback is exempt. A denied application can use
+  an allowed local resolver or proxy; outbound traffic is attributed to that
+  service. Hostname rules and observed answers do not isolate DNS queries.
+- **Inherited or passed sockets**: established/related traffic keeps its
+  connection-wide authorization. An inherited or passed descriptor is not
+  reauthorized for each sending executable.
+- **Packet-layer privileges**: applications with `CAP_NET_RAW` can use packet
+  sockets outside the shipped IP OUTPUT hooks. These rules do not provide
+  layer-2 containment.
+- **DNS-over-HTTPS embedded in browsers**: the firewall sees the outer HTTPS
+  flow. A best-effort hostname rule cannot enforce domain isolation.
 - **Container traffic**: Docker / Podman / LXC route through their own
   bridges. You need to enqueue their veth interfaces explicitly in nftables.
 
@@ -387,7 +363,7 @@ to shrink what a code-execution bug could reach:
 
 | Directive                          | Why                             |
 |------------------------------------|---------------------------------|
-| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE and for the one nftables set element the fast-allow path adds and flushes, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer, `CAP_CHOWN` for the control socket's group, and `CAP_DAC_READ_SEARCH` for the `/proc/*/fd` walk attribution falls back to. The count and the list have to agree: this said seven and named five, and the two it left out are exactly the pair the SELinux policy was once missing - with the fail-closed ruleset, a daemon that cannot read `/proc` attributes nothing and the machine loses outbound traffic |
+| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE and for flushing legacy Fast Allow state, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer, `CAP_CHOWN` for the control socket's group, and `CAP_DAC_READ_SEARCH` for the `/proc/*/fd` walk attribution falls back to. The count and the list have to agree: this said seven and named five, and the two it left out are exactly the pair the SELinux policy was once missing - with the fail-closed ruleset, a daemon that cannot read `/proc` attributes nothing and the machine loses outbound traffic |
 | `NoNewPrivileges`                  | No regaining privileges via setuid binaries |
 | `SystemCallFilter=@system-service` | seccomp; the biggest blast-radius reduction available |
 | `SystemCallFilter=bpf perf_event_open` | The two syscalls the eBPF layer needs, named individually |

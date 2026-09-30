@@ -235,14 +235,18 @@ impl PromptRouter {
             return;
         }
 
+        let mut process = convert::process_to_pb(&req.process);
+        if let Some(sha256) = &binding.sha256 {
+            process.sha256 = sha256.clone();
+        }
         let event = pb::PromptEvent {
             prompt_id: prompt_id.to_string(),
             connection: Some(convert::connection_to_pb(&req.connection)),
-            process: Some(convert::process_to_pb(&req.process)),
+            process: Some(process),
             deadline_unix_ms: chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64,
             // Said before the user answers, because "your allow will follow
             // the hash, not the path" changes what clicking Allow means.
-            binds_to_hash: binding.sha256.is_some(),
+            binds_to_hash: binding.hash_expected,
         };
 
         self.inner.pending.lock().insert(prompt_id, binding);
@@ -310,11 +314,8 @@ impl Drop for PromptSubscription {
 /// Pumps `PromptRequest`s from the NFQUEUE worker into the router.
 pub async fn run_router_task(mut prompt_rx: mpsc::Receiver<PromptRequest>, router: PromptRouter) {
     while let Some(req) = prompt_rx.recv().await {
-        // Off the async threads: the sealed check is a handful of stats, but
-        // the hash behind it reads up to the shared size cap. Prompts are
-        // sequential through this channel anyway, and the packet the prompt
-        // is about is parked waiting on a *human* - milliseconds of hashing
-        // are free here and would not be on the NFQUEUE worker.
+        // Filesystem ownership checks stay off the async threads. The digest
+        // belongs to the queued process snapshot, not a later image at its PID.
         let process = req.process.clone();
         let binding = tokio::task::spawn_blocking(move || compute_binding(&process))
             .await
@@ -324,35 +325,23 @@ pub async fn run_router_task(mut prompt_rx: mpsc::Receiver<PromptRequest>, route
     warn!("prompt router channel closed");
 }
 
-/// What to remember about this prompt's process, judged now, while it runs.
+/// Preserve the identity snapshot recorded for the queued packet.
 ///
-/// The digest is taken from `/proc/<pid>/exe` - the running image - only when
-/// the executable's own path is not root-sealed. A sealed path (root-owned,
+/// The resolver's digest binds an unsealed path to that snapshot. A sealed path (root-owned,
 /// unwritable ancestors all the way up) keeps path-keyed rules meaningful; an
 /// unsealed one means anyone who can write the file inherits every allow its
 /// path has earned, which is what binding exists to stop. Denies never bind
 /// (see the persist path): a hash-bound deny is one file swap away from not
 /// applying, while the path-bound one covers whatever bytes sit there next.
 fn compute_binding(process: &cfc_core::Process) -> PromptBinding {
-    compute_binding_from(
-        process,
-        std::path::Path::new(&format!("/proc/{}/exe", process.pid)),
-    )
-}
-
-/// The image path is a parameter so tests can point it at a file of their
-/// own making: the real one is `/proc/<pid>/exe`, whose size and ownership
-/// are whatever the machine running the tests happens to be - the first
-/// version asserted against the test binary itself and learned that a debug
-/// build is over the hashing cap.
-fn compute_binding_from(process: &cfc_core::Process, image: &std::path::Path) -> PromptBinding {
     if !process.exe_is_known() || !process.exe.is_absolute() {
         return PromptBinding::default();
     }
     let exe = process.exe.clone();
     // Stat failure reads as unsealed: a path that cannot even be examined is
-    // certainly not root-sealed, and the hash below answers from /proc
-    // regardless of what the on-disk path is doing.
+    // certainly not root-sealed. Never re-read a PID here: it may have exec'd
+    // or been recycled since the worker recorded this process.
+    // The sealed check rejects symlinks instead of re-resolving this snapshot.
     if cfc_core::exe_path::is_root_sealed(&exe).unwrap_or(false) {
         return PromptBinding {
             exe: Some(exe),
@@ -360,13 +349,13 @@ fn compute_binding_from(process: &cfc_core::Process, image: &std::path::Path) ->
             sha256: None,
         };
     }
-    let sha256 = crate::process_resolve::sha256_file(image, cfc_core::rule::SHA256_MAX_LEN);
+    let sha256 = process.sha256.clone();
     if sha256.is_none() {
         debug!(
             pid = process.pid,
             exe = %exe.display(),
             "user-writable executable could not be hashed; a persisted allow \
-             will follow the path"
+             cannot be persisted without its image hash"
         );
     }
     PromptBinding {
@@ -382,6 +371,44 @@ mod tests {
     use cfc_core::Action;
     use cfc_core::{Connection, Direction, Process, Protocol, VerdictSource};
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn a_queued_prompt_keeps_its_original_image_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, b"original image").unwrap();
+        let original =
+            crate::process_resolve::sha256_file(&exe, cfc_core::rule::SHA256_MAX_LEN).unwrap();
+        let process = Process {
+            exe: exe.clone(),
+            sha256: Some(original.clone()),
+            ..Process::unknown(4242)
+        };
+        std::fs::write(&exe, b"later image").unwrap();
+        let binding = compute_binding(&process);
+        assert_eq!(binding.exe.as_ref(), Some(&exe));
+        assert_eq!(binding.sha256.as_ref(), Some(&original));
+    }
+
+    #[test]
+    fn a_retargeted_prompt_path_keeps_its_hash_binding() {
+        let sealed = std::path::Path::new("/usr/bin/env");
+        if !cfc_core::exe_path::is_root_sealed(sealed).unwrap_or(false) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("tool");
+        std::os::unix::fs::symlink(sealed, &exe).unwrap();
+        let process = Process {
+            exe: exe.clone(),
+            sha256: Some("ab".repeat(32)),
+            ..Process::unknown(4242)
+        };
+        let binding = compute_binding(&process);
+        assert!(binding.hash_expected);
+        assert_eq!(binding.exe.as_ref(), Some(&exe));
+        assert_eq!(binding.sha256, process.sha256);
+    }
 
     fn dp(prompt_timeout_secs: u32) -> DefaultPolicy {
         DefaultPolicy {
@@ -648,9 +675,10 @@ mod tests {
         let proc = Process {
             pid: 4242,
             exe: exe.clone(),
+            sha256: crate::process_resolve::sha256_file(&exe, cfc_core::rule::SHA256_MAX_LEN),
             ..Process::unknown(4242)
         };
-        let binding = compute_binding_from(&proc, &exe);
+        let binding = compute_binding(&proc);
         assert!(
             binding.hash_expected,
             "a user-writable path must expect a hash"
@@ -664,12 +692,11 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_image_expects_a_hash_it_cannot_have() {
+    fn an_unavailable_snapshot_digest_cannot_be_recovered_from_a_later_file() {
         // The over-the-cap path: hash_expected stays true - the persist
         // side turns that into a spoken note instead of a silent
-        // path-keyed allow - but no digest is produced. Exercised with the
-        // real cap by pointing the image at a file that does not exist,
-        // which takes the same None path without writing 64 MiB in a test.
+        // path-keyed allow - but no digest is produced. A readable later file
+        // must not fill in the snapshot's missing identity.
         let dir = tempfile::tempdir().expect("tempdir");
         let exe = dir.path().join("tool");
         std::fs::write(&exe, b"x").expect("write");
@@ -681,7 +708,7 @@ mod tests {
             exe: exe.clone(),
             ..Process::unknown(4242)
         };
-        let binding = compute_binding_from(&proc, &dir.path().join("gone"));
+        let binding = compute_binding(&proc);
         assert!(binding.hash_expected);
         assert!(binding.sha256.is_none());
     }

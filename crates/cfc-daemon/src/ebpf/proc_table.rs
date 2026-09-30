@@ -9,17 +9,17 @@
 //!
 //! It buys three things:
 //!
-//! * **Identity for processes that are already gone.** NFQUEUE hands the
+//! * **Credentials for processes that are already gone.** NFQUEUE hands the
 //!   daemon a packet some microseconds after the socket wrote it; a
 //!   short-lived process (`curl`, a shell one-liner, an installer hook) can
-//!   easily be reaped before `/proc/<pid>` is opened. Today that resolves to
-//!   `Process::unknown`. With an exec record it resolves to a name.
+//!   easily be reaped before `/proc/<pid>` is opened. An exec record retains
+//!   uid/gid/ppid, but its filename cannot attest the mapped executable path.
 //! * **Exec-time uid/gid/ppid instead of read-time.** `/proc/<pid>/status`
 //!   reports whatever the process is *now*; the exec event reports what it was
 //!   when it was launched, which is the thing a rule is really about.
-//! * **Explicit eviction.** The exit tracepoint fires for the thread-group
-//!   leader, so an entry disappears when the process does, rather than ageing
-//!   out on a timer.
+//! * **Explicit eviction.** A confirmed thread-group death evicts the entry.
+//!   On kernels without `group_dead`, the exit consumer checks that the group
+//!   is gone before treating a thread exit as process death.
 //!
 //! It does **not** remove:
 //!
@@ -30,8 +30,8 @@
 //! * the `/proc/<pid>/exe` read. The exec event carries the path as passed to
 //!   `execve()`, which may be relative, may be a symlink, and is not what the
 //!   digest and package provenance describe - those hash the image the kernel
-//!   actually mapped. So the exec path is used as a *fallback* when `/proc` is
-//!   gone, never as an override of a readable `/proc/<pid>/exe`. See
+//!   actually mapped. When `/proc` is gone, the policy executable is unknown;
+//!   the raw exec argument remains available only in the kernel record. See
 //!   `crate::process_resolve::resolve_inner`.
 //! * `cmdline` and `cwd`, which have no kernel-side source here.
 //!
@@ -89,13 +89,12 @@ pub struct KernelProc {
 }
 
 impl KernelProc {
-    /// The exec path, but only when it is absolute.
+    /// The raw exec argument, but only when it is absolute.
     ///
     /// `execve()` takes whatever string the caller passed, so a process
     /// launched as `./configure` records a path that means nothing outside the
-    /// launcher's cwd - and rules match on absolute paths. Relative records
-    /// are kept (they still name the binary in a prompt) but never fed to rule
-    /// evaluation as an `exe`.
+    /// launcher's cwd. Even an absolute argument may be an unresolved alias;
+    /// callers must not use it as the mapped path for executable rules.
     pub fn absolute_exe(&self) -> Option<&Path> {
         self.exe.is_absolute().then_some(self.exe.as_path())
     }
@@ -118,11 +117,8 @@ impl From<&ExecEvent> for KernelProc {
             // memset does not lower on the BPF backend), so its tail is stale
             // by design and only `filename_len` says how much of it is real.
             //
-            // `absolute_exe()` already drops an empty path from rule
-            // evaluation, so this is belt-and-braces at this layer. It is
-            // worth having anyway because a *garbage but absolute* path could
-            // not be detected here at all, which is why the real defence is
-            // suppressing the read at the source.
+            // Keep diagnostic records accurate even though policy resolution
+            // requires the mapped image through /proc, not this raw argument.
             exe: if e.filename_len == 0 {
                 PathBuf::new()
             } else {
@@ -266,9 +262,9 @@ impl KernelProcTable {
         entries.into_iter().map(|(pid, _)| pid).collect()
     }
 
-    /// Records an exit. The kernel side only publishes these for thread-group
-    /// leaders, so this really is "the process is gone", not "a thread of it
-    /// finished".
+    /// Records a confirmed thread-group death. A leader exit alone is not
+    /// sufficient: the exit consumer must verify whole-group death when the
+    /// kernel cannot report `group_dead` directly.
     pub fn observe_exit(&self, pid: u32) {
         self.inner.map.write().remove(&pid);
     }

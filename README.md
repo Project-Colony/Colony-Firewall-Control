@@ -40,10 +40,9 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 - opensnitch JSON import for one-shot migration
 - Named profiles: relaxed / balanced / strict (in `daemon.toml`)
 - Shell completions and man pages, generated from the binary
-- **Optional eBPF backend**: exec tracking and observed DNS answers read
-  from inside the kernel, so attribution does not race `/proc` and
-  hostnames come from the resolver's own replies rather than the
-  destination's PTR record
+- **Optional eBPF backend**: exec tracking and DNS response diagnostics
+  from inside the kernel supplement `/proc` attribution; uncorrelated DNS
+  observations never supply policy identity
 - Memory-safe Rust top to bottom for a root daemon parsing untrusted packets
 
 ## Architecture
@@ -250,16 +249,22 @@ This cannot lock you out of a remote machine: the ruleset hooks `output`
 on `ct state new` only, so an inbound SSH session's replies are
 `ct state established` and are never queued.
 
-**Boot behaviour.** Both units are ordered `Before=network-pre.target`,
-the systemd convention for firewalls: every network-configuration
-service (NetworkManager, systemd-networkd, dhcpcd) is
-`After=network-pre.target`, so the daemon and its nftables ruleset are
-in place before any interface is configured. There is no window at boot
-where the network is up but filtering is not - the same guarantee
-Windows' built-in firewall provides with its boot-time filters. During
-that early phase no UI is connected, so unmatched flows resolve via
-`no_ui_action` - a denial - and the bootstrap DHCP/DNS/NTP rules are
-what keep the machine bootable.
+**Boot behaviour.** The units are ordered `Before=network-pre.target`
+to load filtering before cooperating network services configure interfaces.
+The nft unit requires a ready daemon before its first load. If that initial
+launch fails, it leaves networking available and filtering may be absent;
+this is not a boot-time isolation guarantee. Once loaded, the fail-closed
+tables survive daemon stops and restarts. Stop the nft unit explicitly to
+remove its table. Early unmatched flows use `no_ui_action`, and bootstrap
+DHCP/DNS/NTP rules keep strict configurations usable.
+
+**Scope.** Rules decide new tracked flows; established and related traffic
+retains its connection-wide authorization. Passed or inherited sockets and
+local DNS/proxy relays are not confined to their original executable.
+Loopback is exempt, and packet-layer traffic from applications with
+`CAP_NET_RAW` is outside these IP hooks. Use OS containment for those cases.
+Fast Allow is disabled even when `fast_allow = true` is configured; allowed
+flows use the normal NFQUEUE path.
 
 Then confirm it is really filtering:
 

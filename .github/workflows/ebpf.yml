@@ -108,10 +108,16 @@ jobs:
           echo "pinned nightly uses LLVM ${LLVM_MAJOR}; building bpf-linker against it"
 
           sudo apt-get update
-          sudo apt-get install -y lsb-release wget software-properties-common gnupg
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh "${LLVM_MAJOR}"
+          sudo apt-get install -y lsb-release wget gnupg
+          # apt.llvm.org documents this primary key fingerprint. Trust only
+          # this key for this repository; never execute a downloaded installer.
+          wget -qO /tmp/llvm.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+          FINGERPRINT="$(gpg --batch --show-keys --with-colons /tmp/llvm.asc | awk -F: '$1 == "pub" { primary = 1; next } primary && $1 == "fpr" { print $10; primary = 0 }')"
+          test "${FINGERPRINT}" = "6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          sudo install -m 0644 /tmp/llvm.asc /usr/share/keyrings/llvm.asc
+          CODENAME="$(lsb_release -cs)"
+          printf 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/%s/ llvm-toolchain-%s-%s main\n' "${CODENAME}" "${CODENAME}" "${LLVM_MAJOR}" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
           sudo apt-get install -y "llvm-${LLVM_MAJOR}-dev" "libpolly-${LLVM_MAJOR}-dev"
 
           # llvm-sys keys its prefix variable on the version it wraps: LLVM 22

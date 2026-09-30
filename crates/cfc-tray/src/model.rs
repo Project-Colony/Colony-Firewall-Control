@@ -21,6 +21,7 @@ pub const MIN_PROMPT_TIMEOUT_MS: u32 = 1_000;
 /// Notification action keys. `default` is the freedesktop key invoked by
 /// clicking the notification body itself.
 pub const KEY_DEFAULT: &str = "default";
+pub const KEY_ALLOW_ONCE: &str = "allow-once";
 pub const KEY_ALLOW: &str = "allow";
 pub const KEY_DENY: &str = "deny";
 pub const KEY_BLOCK: &str = "block";
@@ -245,16 +246,28 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
         None => "An unknown process".to_string(),
     };
     let summary = format!("{name} wants to connect");
-    // "93.184.216.34:443" is not something anyone can make a decision
-    // about; prefer the resolved hostname whenever the daemon has one.
     let target = match ev.connection.as_ref() {
         Some(c) => {
-            let host = [c.dst_host.as_str(), c.dst_ip.as_str(), "unknown"]
-                .into_iter()
-                .find(|s| !s.is_empty())
-                .expect("literal fallback");
+            let ip = if c.dst_ip.is_empty() {
+                "unknown"
+            } else {
+                &c.dst_ip
+            };
+            let destination = if c.dst_host.is_empty() {
+                ip.to_string()
+            } else {
+                format!(
+                    "{} ({ip}; {} hostname)",
+                    c.dst_host,
+                    if c.dst_host_verified {
+                        "verified"
+                    } else {
+                        "unverified"
+                    }
+                )
+            };
             format!(
-                "{host}:{} ({})",
+                "{destination}:{} ({})",
                 c.dst_port,
                 cfc_client::convert::protocol_label(c.protocol)
             )
@@ -266,13 +279,22 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
         body.push('\n');
         body.push_str(exe);
     }
+    if cfc_client::convert::exe_is_rule_scopable(exe) {
+        body.push_str("\nAlways allow app covers all destinations until the rule is removed.");
+    }
     // Said before the buttons, because it changes what Allow means: the
     // daemon judged this path rewritable by a non-root user, so an Allow
     // will bind to the binary's current hash - a replaced file prompts
     // again instead of inheriting the access.
     if ev.binds_to_hash {
         body.push('\n');
-        body.push_str("Allow will pin to this binary (user-writable path)");
+        body.push_str(
+            if ev.process.as_ref().is_some_and(|p| !p.sha256.is_empty()) {
+                "Allow will pin to this binary (user-writable path)"
+            } else {
+                "Image hash unavailable; persistent allow cannot be saved"
+            },
+        );
     }
     let remaining = ev.deadline_unix_ms.saturating_sub(now_unix_ms);
     let timeout_ms = remaining.clamp(i64::from(MIN_PROMPT_TIMEOUT_MS), i64::from(u32::MAX)) as u32;
@@ -286,28 +308,11 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
 
 /// What a notification button click means.
 ///
-/// # Why Allow persists and Deny does not
-///
-/// The two permanent choices are the two that answer the question the user is
-/// actually being asked: *may this program use the network?* That is a
-/// property of the program, not of one TCP connection, and it is how a person
-/// thinks about it - the same shape Windows Firewall Control uses, where you
-/// authorise the executable once and never see it again.
-///
-/// Allow used to be one-shot, and it made the product unusable on the
-/// applications people use most. A browser opens dozens of connections to
-/// render one page: every one of them was a separate bubble, and answering
-/// "yes" to each was not a thing anyone would do. Observed live - a user
-/// denied ten prompts in a row to make them stop and lost their browser
-/// entirely, while Steam and a chat client, which hold a few long-lived
-/// connections, worked fine. The flaw only bit the applications that matter.
-///
-/// Deny stays one-shot on purpose. "Not right now" and "never" are genuinely
-/// different answers, and the permanent form of no already has its own button.
-/// Keeping the transient option on the refusing side, where a mistake costs a
-/// retry rather than access, is the right way round.
+/// Allow once and Deny answer the current connection. The explicit
+/// permanent choices create an executable-scoped rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptChoice {
+    AllowOnce,
     /// "Allow": this program may use the network, from now on. Persists a
     /// rule scoped to the exe, mirroring [`Self::BlockAlways`].
     AllowAlways,
@@ -323,6 +328,7 @@ pub enum PromptChoice {
 pub fn choice_from_key(key: &str) -> Option<PromptChoice> {
     match key {
         KEY_ALLOW => Some(PromptChoice::AllowAlways),
+        KEY_ALLOW_ONCE => Some(PromptChoice::AllowOnce),
         KEY_DENY => Some(PromptChoice::DenyOnce),
         KEY_BLOCK => Some(PromptChoice::BlockAlways),
         _ => None,
@@ -361,6 +367,7 @@ pub fn verdict_for(
         PromptChoice::AllowAlways => for_this_exe(proto::Action::Allow),
         PromptChoice::BlockAlways => for_this_exe(proto::Action::Deny),
         PromptChoice::DenyOnce => (proto::Action::Deny, proto::Duration::Once, None),
+        PromptChoice::AllowOnce => (proto::Action::Allow, proto::Duration::Once, None),
     }
 }
 
@@ -403,7 +410,7 @@ pub fn allow_confirmation(exe: &str) -> String {
 /// even identify. The next prompt from it then looks like the firewall forgot.
 pub fn one_shot_fallback(choice: PromptChoice, exe: &str) -> String {
     let applied = match choice {
-        PromptChoice::AllowAlways => "Allowed this time",
+        PromptChoice::AllowAlways | PromptChoice::AllowOnce => "Allowed this time",
         PromptChoice::BlockAlways | PromptChoice::DenyOnce => "Denied this time",
     };
     format!(
@@ -729,12 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn prompt_notification_prefers_host_over_ip() {
+    fn prompt_notification_keeps_ip_and_hostname_trust() {
         let n = prompt_notification(
             &prompt_event("/usr/bin/curl", "example.com", "93.184.216.34", 0),
             0,
         );
-        assert!(n.body.starts_with("example.com:443 (tcp)"), "{}", n.body);
+        assert!(n.body.contains("93.184.216.34"), "{}", n.body);
     }
 
     #[test]
@@ -754,7 +761,7 @@ mod tests {
     #[test]
     fn prompt_notification_body_carries_the_full_exe_on_a_second_line() {
         let n = prompt_notification(&prompt_event("/usr/bin/curl", "example.com", "", 0), 0);
-        assert_eq!(n.body, "example.com:443 (tcp)\n/usr/bin/curl");
+        assert_eq!(n.body, "example.com (unknown; unverified hostname):443 (tcp)\n/usr/bin/curl\nAlways allow app covers all destinations until the rule is removed.");
     }
 
     #[test]

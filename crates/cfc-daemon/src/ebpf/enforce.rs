@@ -1061,18 +1061,10 @@ impl VerdictSink {
         // and re-decided by the next resync, whose live loop reads /proc for
         // both. Mixing a live path with an event-time uid is worth naming
         // rather than leaving for a reader to find.
-        // When /proc is unreadable, the process already exec'd again or
-        // exited; the event's own path is the only witness left, and a wrong
-        // decision for a dead pid is cleaned by the exit program or the next
-        // sweep.
-        //
-        // That sentence justifies a *refusal*, and it used to be made to carry
-        // the grant at the end of this function too. It cannot: a refusal
-        // written for a pid that has already gone is the safe direction and is
-        // swept away, while a grant written for one is a grant for whoever
-        // owns that pid next - a marked socket past the queue, for a process
-        // that may match no rule at all. So the deny below still falls back to
-        // the event's own path; the grant does not happen at all.
+        // When /proc is unreadable, retain the unknown executable supplied by
+        // the event consumer. The execve argument cannot attest a mapped image.
+        // Missing identity keeps grants absent and leaves packet policy to
+        // NFQUEUE; it must not satisfy an executable-scoped rule.
         let readable = resolved.is_some();
         let corrected = match resolved {
             Some(exe) if exe != proc.exe => Some(Process {
@@ -1671,7 +1663,8 @@ impl FastPathCapability {
                  decision (usually no bpf_get_socket_cookie / bpf_setsockopt on sock_addr \
                  programs; the log line beside this one has the kernel's actual answer)",
             ),
-            Self::Ready | Self::SendmsgUnavailable => None,
+            Self::SendmsgUnavailable => Some("fast-allow requires both UDP sendmsg hooks"),
+            Self::Ready => None,
         }
     }
 

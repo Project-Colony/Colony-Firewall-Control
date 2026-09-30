@@ -562,8 +562,11 @@ impl PromptNotifier {
                 // for, and long labels wrap the button row onto a second
                 // line. "Details" is the freedesktop `default` action, so
                 // clicking the bubble body opens the GUI too.
-                .action(model::KEY_ALLOW, "Allow")
-                .action(model::KEY_DENY, "Deny");
+                .action(model::KEY_ALLOW_ONCE, "Allow once");
+            if n.offer_block {
+                notification.action(model::KEY_ALLOW, "Always allow app");
+            }
+            notification.action(model::KEY_DENY, "Deny");
             if n.offer_block {
                 notification.action(model::KEY_BLOCK, "Block app");
             }
@@ -732,7 +735,7 @@ async fn submit_prompt_verdict(
             // and the None arm read "Rule created: allow <unknown> always"
             // for a verdict that created nothing.
             match (choice, o.rule_persisted) {
-                (PromptChoice::DenyOnce, _) => {}
+                (PromptChoice::DenyOnce | PromptChoice::AllowOnce, _) => {}
                 // A persisted choice that fell back to answering once: no
                 // rule was requested, so no rule may be announced - and
                 // silence would read as success to the user who clicked
@@ -988,11 +991,13 @@ async fn run() -> anyhow::Result<()> {
                 Some(Cmd::PromptResult { prompt_id, exe, key }) => {
                     // Slot freed regardless of outcome. After a stream
                     // drop the id is already gone; remove is a no-op.
-                    notifier.active.remove(&prompt_id);
+                    let current = notifier.active.remove(&prompt_id);
                     if key == model::KEY_DEFAULT {
                         open_gui();
-                    } else if let Some(choice) = model::choice_from_key(&key) {
+                    } else if current {
+                        if let Some(choice) = model::choice_from_key(&key) {
                         submit_prompt_verdict(&mut client, &socket, &prompt_id, choice, &exe).await;
+                        }
                     }
                     // KEY_CLOSED / anything else: dismissed or expired -
                     // the daemon's timeout_action covers it.

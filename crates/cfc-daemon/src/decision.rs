@@ -159,20 +159,15 @@ impl Engine {
             let rules = self.inner.rules.read();
             match rules.lookup(conn, proc, now_unix_ms) {
                 cfc_core::rule::Match::Rule(r) => Some((r.id, r.action)),
-                // A rule that is about this flow could not be decided. It
-                // outranks everything below it, so nothing below it may answer
-                // in its place: ask instead. For the case this exists for - a
-                // hash-scoped deny over a binary that cannot be hashed - the
-                // alternative was falling through to a lower allow, which is
-                // the deny silently not existing.
+                // Missing identity cannot authorize traffic or be overridden
+                // by pause, a permissive fallback, or a prompt response.
                 cfc_core::rule::Match::Undecidable(r) => {
                     tracing::debug!(
                         rule = %r.name,
                         exe = %proc.exe.display(),
-                        "a rule that outranks the rest cannot be decided for this process; \
-                         no rule answers and the default applies"
+                        "policy identity is incomplete; refusing this flow"
                     );
-                    None
+                    return Decision::Resolved(Verdict::from_policy(cfc_core::Action::Deny));
                 }
                 cfc_core::rule::Match::None => None,
             }
@@ -388,18 +383,9 @@ impl Engine {
     /// rule can apply to any program, and nothing here can tell whether it
     /// would.
     ///
-    /// The uid is the whole reason this is not just "every exe a rule names".
-    /// `process_wide_action` is asked about a synthetic process that has an
-    /// executable and no uid, and a uid-scoped rule simply does not match such
-    /// a process - `undecidable_for` abstains on `exe_sha256` and on nothing
-    /// else. So a higher-precedence `allow --exe X --uid 1000` is *skipped*,
-    /// and the `deny --exe X` beneath it is what would be compiled - a kernel
-    /// refusal for the very uid the allow exempted, which is exactly the
-    /// "refuses what the daemon would have allowed" this table must never do.
-    ///
-    /// So an executable any uid-scoped rule could touch is left out entirely.
-    /// It then has no kernel entry, which means "ask the packet path" - where
-    /// the uid is known and the answer is right.
+    /// A synthetic process with no uid cannot decide a uid-scoped rule.
+    /// Excluding every executable such a rule could touch preserves the
+    /// per-user decision in the packet path, where the uid is available.
     pub fn compilable_exe_paths(&self) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
@@ -521,6 +507,28 @@ impl Engine {
             rule.hit_count = existing.hit_count;
             rule.created_at = existing.created_at;
         }
+    }
+
+    /// Publish an already committed batch with one policy transition.
+    pub fn replace_rules(&self, rules: Vec<Rule>) {
+        let mut replacement = RuleSet { rules };
+        replacement.sort_deterministic();
+        {
+            let mut current = self.inner.rules.write();
+            let existing: HashMap<_, _> = current.rules.iter().map(|r| (r.id, r)).collect();
+            for rule in &mut replacement.rules {
+                if let Some(old) = existing.get(&rule.id) {
+                    rule.hit_count = old.hit_count;
+                    rule.created_at = old.created_at;
+                }
+            }
+            self.inner
+                .hits
+                .lock()
+                .retain(|id, _| replacement.rules.iter().any(|r| r.id == *id));
+            *current = replacement;
+        }
+        self.notify_changed();
     }
 
     pub fn upsert_rule(&self, rule: Rule) {
@@ -858,7 +866,7 @@ mod tests {
             ..Process::unknown(1)
         };
         assert_eq!(engine.process_wide_action(&with_uid), Some(Action::Allow));
-        assert_eq!(engine.process_wide_action(&without), Some(Action::Deny));
+        assert_eq!(engine.process_wide_action(&without), None);
     }
 
     /// The eligibility predicate, reached the way the daemon reaches it: through
@@ -1120,12 +1128,8 @@ mod tests {
 
     #[test]
     fn an_exe_a_uid_rule_could_touch_is_not_compilable() {
-        // The shape that broke the safety claim. `process_wide_action` is asked
-        // about a synthetic process with an exe and no uid, and a uid-scoped
-        // rule simply does not match one - `undecidable_for` abstains on
-        // exe_sha256 and on nothing else. So the allow is skipped and the deny
-        // beneath it would be compiled into the kernel, refusing the very uid
-        // the allow exempted.
+        // Missing uid must preserve the uncertainty of a preceding uid rule;
+        // it cannot authorize a process-wide kernel decision.
         let mut allow = RuleScope::any();
         allow.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         allow.uid = Some(1000);
@@ -1145,8 +1149,8 @@ mod tests {
         };
         assert_eq!(
             engine.process_wide_action(&uidless),
-            Some(Action::Deny),
-            "precondition: with no uid, the allow does not match and is skipped"
+            None,
+            "with no uid, the preceding allow cannot be decided"
         );
         // ...so the exe must be excluded from the kernel table entirely.
         let compilable = engine.compilable_exe_paths().expect("some are compilable");
@@ -1511,6 +1515,38 @@ mod tests {
         // Mutating the snapshot must not affect the engine.
         drop(snap);
         assert_eq!(engine.snapshot().rules.len(), 2);
+    }
+
+    #[test]
+    fn batch_publication_cannot_double_pending_hits() {
+        let original = allow_port_rule(80);
+        let id = original.id;
+        let engine = engine_with(vec![original]);
+        engine.record_hit(id);
+        let mut batch = engine.snapshot().rules;
+        batch.push(allow_port_rule(443));
+        engine.replace_rules(batch);
+        assert_eq!(
+            engine
+                .snapshot()
+                .rules
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .hit_count,
+            1
+        );
+        assert_eq!(engine.drain_hits().get(&id), Some(&1));
+        assert_eq!(
+            engine
+                .snapshot()
+                .rules
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .hit_count,
+            1
+        );
     }
 
     #[test]

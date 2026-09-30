@@ -18,6 +18,8 @@ service Firewall {
   rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
   rpc UpsertRule(UpsertRuleRequest) returns (UpsertRuleResponse);
   rpc DeleteRule(DeleteRuleRequest) returns (DeleteRuleResponse);
+  // Validate and apply a complete import atomically.
+  rpc ApplyRules(ApplyRulesRequest) returns (ApplyRulesResponse);
 
   // Live observed connections (for the live view, no verdict requested).
   rpc StreamConnections(SubscribeRequest) returns (stream ConnectionEvent);
@@ -99,6 +101,7 @@ message ConnectionInfo {
   string dst_ip = 7;
   uint32 dst_port = 8;
   string dst_host = 9;
+  bool dst_host_verified = 10;
 }
 
 message ProcessInfo {
@@ -164,6 +167,8 @@ message RuleInfo {
   RuleScope scope = 6;
   int64 created_at_unix_ms = 7;
   uint64 hit_count = 8;
+  // Exact lifetime when duration is DURATION_SECONDS.
+  uint32 duration_seconds = 9;
 }
 
 message ListRulesRequest {}
@@ -177,6 +182,15 @@ message UpsertRuleRequest {
 message UpsertRuleResponse {
   string id = 1;
   string error = 2;
+}
+
+message ApplyRulesRequest {
+  repeated RuleInfo rules = 1;
+  bool replace = 2;
+}
+message ApplyRulesResponse {
+  repeated string ids = 1;
+  uint32 removed = 2;
 }
 
 message DeleteRuleRequest {
@@ -309,6 +323,7 @@ enum Duration {
   DURATION_ONCE = 1;
   DURATION_UNTIL_RESTART = 2;
   DURATION_ALWAYS = 3;
+  DURATION_SECONDS = 4;
 }
 
 enum Protocol {

@@ -293,6 +293,7 @@ mod tests {
                 dst_ip: ip.into(),
                 dst_port: port,
                 dst_host: host.into(),
+                dst_host_verified: false,
             }),
             process: Some(proto::ProcessInfo {
                 pid: 42,

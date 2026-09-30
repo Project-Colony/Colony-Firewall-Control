@@ -7,15 +7,13 @@
 #
 #     systemctl enable --now colony-firewall-nft-inbound
 #
-# Stopping it removes the table and the machine accepts inbound traffic again,
-# which is the pre-CFC behaviour. PartOf= the daemon for the same reason the
-# outbound unit is: stopping the daemon should not leave a fail-closed chain
-# with nothing on the queue.
+# Stopping this unit explicitly removes inbound filtering. Its table remains
+# loaded across daemon restarts and stops; a missing queue listener drops new
+# inbound flows until the daemon returns.
 
 [Unit]
 Description=Colony Firewall inbound nftables rules
 Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
-PartOf=colony-firewalld.service
 Wants=colony-firewalld.service
 After=colony-firewalld.service
 Before=network-pre.target
@@ -39,6 +37,7 @@ ExecStartPre=/usr/bin/systemctl is-active --quiet colony-firewalld.service
 ExecStartPre=/usr/lib/colony-firewall/inbound-lockout-guard.sh
 
 ExecStart=/usr/bin/nft -f /usr/share/colony-firewall/nftables-inbound.conf
+ExecReload=/usr/bin/nft -f /usr/share/colony-firewall/nftables-inbound.conf
 ExecStop=/usr/bin/nft delete table inet colony_firewall_inbound
 
 [Install]

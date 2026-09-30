@@ -325,8 +325,8 @@ const EXEC_FILENAME_DATA_LOC_MAX: u32 = cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET
 ///
 /// Overridden by the loader from the live format file. Defaulting to "absent"
 /// is the safe direction: an object loaded by something that does not set it
-/// keeps the old leader-only behaviour rather than reading a byte at a guessed
-/// offset and evicting on garbage.
+/// preserves identity and denials until group death can be confirmed, rather
+/// than evicting a live process on leader exit or reading a guessed offset.
 #[unsafe(no_mangle)]
 static EXIT_GROUP_DEAD_OFF: Global<u32> = Global::new(EXIT_GROUP_DEAD_ABSENT);
 
@@ -583,14 +583,16 @@ fn current_ppid() -> u32 {
 
 /// Whether this exit is the last one for its thread group.
 ///
-/// Prefers the kernel's own `group_dead`. Falls back to "the exiting task is
-/// the thread-group leader" only when the offset was never resolved, which is
-/// the pre-existing behaviour and no worse than it was.
+/// Only the kernel's readable `group_dead` confirms death. Leader exit alone
+/// never authorizes eviction of process identity or a standing denial.
 #[inline(always)]
-fn process_is_gone(ctx: &TracePointContext, tgid: u32, tid: u32) -> bool {
+fn process_is_gone(ctx: &TracePointContext) -> bool {
     let off = EXIT_GROUP_DEAD_OFF.load();
     if off == EXIT_GROUP_DEAD_ABSENT || off > EXIT_GROUP_DEAD_MAX {
-        return tgid == tid;
+        // Leader exit does not prove that its workers are dead. Keep the
+        // identity and deny on compatibility kernels; userspace reconciles
+        // candidates after verifying that the thread group no longer exists.
+        return false;
     }
     match unsafe { ctx.read_at::<u8>(off as usize) } {
         Ok(v) => v != 0,
@@ -617,7 +619,19 @@ pub fn cfc_sched_process_exit(ctx: TracePointContext) -> u32 {
     // the fallback: a leader that calls `pthread_exit()` leaves its workers
     // running under the same tgid (evicting there is a fail-open), and a worker
     // that exits last never satisfies it at all (so nothing is ever evicted).
-    if !process_is_gone(&ctx, tgid, tid) {
+    if !process_is_gone(&ctx) {
+        // Removing an allow is safe even when the remaining workers live.
+        if fast_path_armed() {
+            let _ = FAST_ALLOW.remove(&tgid);
+        }
+        // A candidate is not a kernel-confirmed death. The daemon verifies
+        // /proc before dropping its identity or pinned denial.
+        if tgid == tid {
+            if let Some(mut entry) = EXIT_EVENTS.reserve::<ExitEvent>(0) {
+                entry.write(ExitEvent { pid: tgid });
+                entry.submit(0);
+            }
+        }
         return 0;
     }
 
@@ -1051,8 +1065,7 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
         // SAFETY: `as_ptr` hands the program's own context to a helper the
         // kernel defines for exactly this program type; the kernel assigns the
         // cookie if the socket does not have one yet.
-        let cookie =
-            unsafe { aya_ebpf::helpers::generated::bpf_get_socket_cookie(ctx.as_ptr()) };
+        let cookie = unsafe { aya_ebpf::helpers::generated::bpf_get_socket_cookie(ctx.as_ptr()) };
         if cookie != 0 {
             // Failure means the LRU is momentarily unable to evict; the cost is
             // one fallback walk in userspace, never a wrong answer.

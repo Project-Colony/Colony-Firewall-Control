@@ -137,6 +137,7 @@ mod tests {
                 dst_ip: ip.into(),
                 dst_port: 443,
                 dst_host: host.into(),
+                dst_host_verified: false,
             }),
             process: Some(proto::ProcessInfo {
                 pid: 1,

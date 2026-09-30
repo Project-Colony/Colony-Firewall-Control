@@ -216,6 +216,18 @@ impl Client {
         Ok(resp.into_inner().id)
     }
 
+    pub async fn apply_rules(
+        &mut self,
+        rules: Vec<proto::RuleInfo>,
+        replace: bool,
+    ) -> Result<proto::ApplyRulesResponse, ClientError> {
+        Ok(self
+            .inner
+            .apply_rules(proto::ApplyRulesRequest { rules, replace })
+            .await?
+            .into_inner())
+    }
+
     pub async fn delete_rule(&mut self, id: &str) -> Result<bool, ClientError> {
         let resp = self
             .inner

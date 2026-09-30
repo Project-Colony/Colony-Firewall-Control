@@ -14,16 +14,12 @@
 //!    the daemon logs a prominent warning, leaves the socket `0600`
 //!    (root-only) and keeps running, so a root CLI still works.
 //!
-//! 2. **Per-RPC peer credentials.** Every connection carries `SO_PEERCRED`
-//!    (tonic's [`UdsConnectInfo`]). Mutating RPCs - `UpsertRule`,
-//!    `DeleteRule`, `SetPaused`, `SubmitVerdict` - require either uid 0 or
-//!    a socket that is genuinely group-gated (layer 1 succeeded). If the
-//!    chown/chmod failed and an admin loosened the mode by hand, non-root
-//!    mutations are refused rather than silently trusted. `require_group =
-//!    false` opts out of that second check for sites gating the socket some
-//!    other way (filesystem ACLs). Read-only RPCs - `ListRules`,
-//!    `GetStatus`, `StreamConnections`, `StreamPrompts`, `ListEvents` - are
-//!    allowed for any peer that got through layer 1.
+//! 2. **Per-RPC peer credentials.** Mutations require uid 0 or actual
+//!    membership of the configured group. The kernel peer gid proves primary
+//!    membership. Supplementary membership requires `/proc/<peer pid>/status`
+//!    with the same effective uid and process starttime captured at accept.
+//!    Missing evidence is refused. `require_group = false` explicitly opts
+//!    out for deployments authorizing their control socket another way.
 //!
 //! Consequence worth stating plainly: **every member of the configured
 //! group is fully trusted.** Group membership grants the ability to allow
@@ -56,15 +52,19 @@ use crate::prompts::{should_deliver, PromptRouter};
 use crate::stats::Stats;
 use crate::storage::{EventFilter, EventRow, RuleStore};
 use anyhow::Context;
+use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tonic::transport::server::UdsConnectInfo;
+use tonic::transport::server::{Connected, UdsConnectInfo};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
@@ -113,12 +113,40 @@ async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) {
     scope.exe_path = Some(outcome.into_path());
 }
 
+fn bind_prompt_allow(
+    rule: &mut cfc_core::Rule,
+    binding: &crate::prompts::PromptBinding,
+) -> Result<(), String> {
+    if rule.action != cfc_core::Action::Allow || !binding.hash_expected {
+        return Ok(());
+    }
+    if rule.scope.exe_path != binding.exe || binding.exe.is_none() {
+        return Err(
+            "the persisted Allow must name the prompted image; its executable path changed".into(),
+        );
+    }
+    let hash = binding
+        .sha256
+        .as_ref()
+        .ok_or("the prompted executable requires a hash, but its image could not be hashed")?;
+    if rule
+        .scope
+        .exe_sha256
+        .as_ref()
+        .is_some_and(|existing| existing != hash)
+    {
+        return Err("the persisted Allow hash differs from the prompted image".into());
+    }
+    rule.scope.exe_sha256 = Some(hash.clone());
+    Ok(())
+}
+
 use cfc_proto::v1::{
     firewall_server::{Firewall, FirewallServer},
-    ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse, ListEventsRequest, ListEventsResponse,
-    ListRulesRequest, ListRulesResponse, PromptEvent, RuleInfo, SetPausedRequest,
-    SetPausedResponse, StatusRequest, StatusResponse, SubscribeRequest, UpsertRuleRequest,
-    UpsertRuleResponse, VerdictRequest, VerdictResponse,
+    ApplyRulesRequest, ApplyRulesResponse, ConnectionEvent, DeleteRuleRequest, DeleteRuleResponse,
+    ListEventsRequest, ListEventsResponse, ListRulesRequest, ListRulesResponse, PromptEvent,
+    RuleInfo, SetPausedRequest, SetPausedResponse, StatusRequest, StatusResponse, SubscribeRequest,
+    UpsertRuleRequest, UpsertRuleResponse, VerdictRequest, VerdictResponse,
 };
 
 /// Hard ceiling on a pause, regardless of what a client asks for. A pause
@@ -166,7 +194,9 @@ const AUDIENCE_CAP: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerId {
     pub uid: u32,
+    pub gid: u32,
     pub pid: Option<i32>,
+    pub starttime: Option<u64>,
 }
 
 /// Privilege an RPC requires.
@@ -183,24 +213,27 @@ enum Access {
 #[derive(Debug, Clone)]
 struct SocketAuth {
     group: String,
+    group_gid: Option<u32>,
     /// True only when the socket really is `root:<group>` mode 0660, i.e.
     /// the kernel is enforcing group membership on `connect(2)`.
     group_gated: bool,
     require_group: bool,
 }
 
-/// Pure authorization policy, split out from the request plumbing so it can
-/// be exercised without a live socket.
-fn authorize_uid(uid: u32, level: Access, group_gated: bool, require_group: bool) -> bool {
+/// Pure policy over membership proved from the individual peer credentials.
+fn authorize_uid(uid: u32, level: Access, group_member: bool, require_group: bool) -> bool {
     match level {
         // Layer 1 (socket mode) already decided who may connect at all.
         Access::ReadOnly => true,
-        Access::Mutate => uid == 0 || !require_group || group_gated,
+        Access::Mutate => uid == 0 || !require_group || group_member,
     }
 }
 
 /// Extracts kernel-reported peer credentials from a request.
 fn peer_of<T>(req: &Request<T>) -> Result<PeerId, Status> {
+    if let Some(peer) = req.extensions().get::<PeerId>() {
+        return Ok(*peer);
+    }
     let info = req
         .extensions()
         .get::<UdsConnectInfo>()
@@ -210,8 +243,112 @@ fn peer_of<T>(req: &Request<T>) -> Result<PeerId, Status> {
         .ok_or_else(|| Status::permission_denied("peer credentials unavailable"))?;
     Ok(PeerId {
         uid: cred.uid(),
+        gid: cred.gid(),
         pid: cred.pid(),
+        starttime: cred
+            .pid()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .and_then(crate::process_resolve::read_starttime),
     })
+}
+
+struct PeerStream {
+    stream: tokio::net::UnixStream,
+    peer: PeerId,
+}
+
+impl PeerStream {
+    fn new(stream: tokio::net::UnixStream) -> std::io::Result<Self> {
+        let credentials = stream.peer_cred()?;
+        let pid = credentials.pid();
+        let starttime = pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .and_then(crate::process_resolve::read_starttime);
+        Ok(Self {
+            stream,
+            peer: PeerId {
+                uid: credentials.uid(),
+                gid: credentials.gid(),
+                pid,
+                starttime,
+            },
+        })
+    }
+}
+impl Connected for PeerStream {
+    type ConnectInfo = PeerId;
+    fn connect_info(&self) -> PeerId {
+        self.peer
+    }
+}
+impl AsyncRead for PeerStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+impl AsyncWrite for PeerStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(context, bytes)
+    }
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
+}
+
+fn peer_is_group_member(peer: PeerId, gid: Option<u32>) -> bool {
+    let Some(gid) = gid else {
+        return false;
+    };
+    if peer.gid == gid {
+        return true;
+    }
+    let Some(pid) = peer.pid.filter(|pid| *pid > 0) else {
+        return false;
+    };
+    if peer.starttime.is_none()
+        || crate::process_resolve::read_starttime(pid as u32) != peer.starttime
+    {
+        return false;
+    }
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status_proves_group(&status, peer.uid, gid)
+        && crate::process_resolve::read_starttime(pid as u32) == peer.starttime
+}
+
+fn status_proves_group(status: &str, uid: u32, gid: u32) -> bool {
+    let effective_uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|values| values.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u32>().ok());
+    effective_uid == Some(uid)
+        && status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .is_some_and(|groups| {
+                groups
+                    .split_whitespace()
+                    .any(|value| value.parse::<u32>().ok() == Some(gid))
+            })
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +421,7 @@ struct FirewallService {
     resume_at_ms: Arc<AtomicI64>,
     pause_default_secs: u64,
     dry_run: bool,
+    mutations: Mutex<()>,
 }
 
 impl FirewallService {
@@ -293,7 +431,7 @@ impl FirewallService {
         if authorize_uid(
             peer.uid,
             level,
-            self.auth.group_gated,
+            peer_is_group_member(peer, self.auth.group_gid),
             self.auth.require_group,
         ) {
             return Ok(peer);
@@ -302,10 +440,10 @@ impl FirewallService {
             peer_uid = peer.uid,
             peer_pid = ?peer.pid,
             group = %self.auth.group,
-            "refusing mutating RPC: socket is not group-gated and caller is not root"
+            "refusing mutating RPC: caller is not a member of the configured group"
         );
         Err(Status::permission_denied(format!(
-            "mutating RPCs require uid 0 or a socket owned by group '{}'",
+            "mutating RPCs require uid 0 or membership of group '{}'",
             self.auth.group
         )))
     }
@@ -442,6 +580,7 @@ impl Firewall for FirewallService {
                 scope: Some(scope_pb),
                 created_at_unix_ms: 0,
                 hit_count: 0,
+                duration_seconds: 0,
             };
             match convert::rule_from_pb(&rule_pb).and_then(|rule| {
                 convert::reject_unpersistable_duration(rule.duration)?;
@@ -453,51 +592,23 @@ impl Firewall for FirewallService {
                     // attribution fell back to the exec event's path, which is
                     // whatever string was passed to execve() and may well be
                     // `/bin/curl`.
-                    resolve_exe_off_thread(&mut rule.scope).await;
-                    // Bind a persisted ALLOW to the running image's digest
-                    // when the prompt promised it would (the executable lives
-                    // somewhere a non-root user could rewrite - see
-                    // `compute_binding`). A path-keyed allow on such a path
-                    // outlives its binary: whoever writes the file next
-                    // inherits the network access the previous bytes earned.
-                    // Only when the scope still names the prompt's executable
-                    // - a user who edited the scope gets exactly what they
-                    // wrote - and never for a deny, which path-keyed covers
-                    // whatever bytes sit there next while hash-keyed is one
-                    // file swap from covering nothing.
-                    if rule.action == cfc_core::Action::Allow
-                        && rule.scope.exe_sha256.is_none()
-                        && rule.scope.exe_path.is_some()
-                        && rule.scope.exe_path == binding.exe
-                    {
-                        match &binding.sha256 {
-                            Some(sha) => {
-                                rule.scope.exe_sha256 = Some(sha.clone());
-                                persist_note = format!(
-                                    "the allow is bound to the binary's \
-                                     current sha256 ({}…): a changed file at \
-                                     that path will prompt again",
-                                    &sha[..12]
-                                );
-                            }
-                            // The prompt said it would bind and could not
-                            // (unreadable or oversized image). Persisting a
-                            // silent path-only allow here would be the exact
-                            // hole binding exists to close - with a promise
-                            // attached. Say it instead. The judgment is the
-                            // one made at prompt time, carried in the
-                            // binding - re-statting now would judge whatever
-                            // file sits at the path today, which is exactly
-                            // the thing that cannot be trusted.
-                            None if binding.hash_expected => {
-                                persist_note = "the executable is under a \
-                                     user-writable path but its hash could \
-                                     not be read; the rule follows the path"
-                                    .to_string();
-                            }
-                            None => {}
-                        }
+                    if let Err(error) = bind_prompt_allow(&mut rule, &binding) {
+                        persist_error = format!("the verdict was applied, but the standing rule could not be saved: {error}");
+                        return Ok(Response::new(VerdictResponse {
+                            accepted,
+                            persisted_rule_id: String::new(),
+                            persist_error,
+                            persist_note,
+                            error: String::new(),
+                        }));
                     }
+                    if rule.scope.exe_path != binding.exe {
+                        resolve_exe_off_thread(&mut rule.scope).await;
+                    }
+                    if rule.action == cfc_core::Action::Allow && binding.hash_expected {
+                        persist_note = "the allow is bound to the prompted binary's sha256; a changed file will prompt again".into();
+                    }
+                    let _mutation = self.mutations.lock();
                     match self.store.upsert(&rule) {
                         Ok(()) => {
                             persisted_rule = Some(rule.id);
@@ -597,6 +708,14 @@ impl Firewall for FirewallService {
         // rule must not be able to rewrite its history, deliberately or (as
         // every read-modify-write client did) by echoing back a count that
         // already included an unflushed delta.
+        let _mutation = self.mutations.lock();
+        if rule.duration == cfc_core::Duration::Always
+            && self.engine.snapshot().rules.iter().any(|old| {
+                old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
+            })
+        {
+            return Err(Status::invalid_argument("a timed rule cannot be changed to Always by an older read-modify-write client; delete and recreate it explicitly"));
+        }
         self.engine.preserve_server_owned(&mut rule);
         self.store
             .upsert(&rule)
@@ -620,6 +739,60 @@ impl Firewall for FirewallService {
         }))
     }
 
+    async fn apply_rules(
+        &self,
+        req: Request<ApplyRulesRequest>,
+    ) -> Result<Response<ApplyRulesResponse>, Status> {
+        self.authorize(&req, Access::Mutate)?;
+        let req = req.into_inner();
+        if req.replace && req.rules.is_empty() {
+            return Err(Status::invalid_argument("refusing an empty replacement"));
+        }
+        let mut pending = Vec::with_capacity(req.rules.len());
+        let mut ids = HashSet::new();
+        for proto in req.rules {
+            let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
+            convert::reject_unpersistable_duration(rule.duration)
+                .map_err(Status::invalid_argument)?;
+            if !ids.insert(rule.id) {
+                return Err(Status::invalid_argument("duplicate rule id"));
+            }
+            resolve_exe_off_thread(&mut rule.scope).await;
+            pending.push(rule);
+        }
+        let _mutation = self.mutations.lock();
+        let existing = self.engine.snapshot();
+        for rule in &mut pending {
+            if rule.duration == cfc_core::Duration::Always
+                && existing.rules.iter().any(|old| {
+                    old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
+                })
+            {
+                return Err(Status::invalid_argument(
+                    "a timed rule cannot become Always in place; delete it and create a new rule",
+                ));
+            }
+            self.engine.preserve_server_owned(rule);
+        }
+        let removed = self
+            .store
+            .apply_rules(&pending, req.replace)
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        let assigned = pending.iter().map(|rule| rule.id.to_string()).collect();
+        let mut final_rules = if req.replace {
+            Vec::new()
+        } else {
+            self.engine.snapshot().rules
+        };
+        final_rules.retain(|rule| !ids.contains(&rule.id));
+        final_rules.extend(pending);
+        self.engine.replace_rules(final_rules);
+        Ok(Response::new(ApplyRulesResponse {
+            ids: assigned,
+            removed: u32::try_from(removed).unwrap_or(u32::MAX),
+        }))
+    }
+
     async fn delete_rule(
         &self,
         req: Request<DeleteRuleRequest>,
@@ -628,6 +801,7 @@ impl Firewall for FirewallService {
         let id_str = req.into_inner().id;
         let id = uuid::Uuid::parse_str(&id_str)
             .map_err(|e| Status::invalid_argument(format!("bad uuid: {e}")))?;
+        let _mutation = self.mutations.lock();
         let deleted = self
             .store
             .delete(id)
@@ -915,12 +1089,12 @@ fn resolve_group_gid(name: &str) -> Result<Option<u32>, String> {
 /// Chowns the freshly-bound socket to `root:<group>` and chmods it 0660.
 ///
 /// Never fails startup: if the group is missing or the daemon is not root,
-/// it warns loudly, leaves the socket root-only (0600) and reports
-/// `group_gated = false`, which in turn makes non-root mutating RPCs fail
-/// the second authorization layer.
+/// it warns loudly and retains owner-only socket access (0600). RPC
+/// authorization independently verifies the individual peer's group credentials.
 fn secure_socket(path: &Path, ipc: &IpcConfig) -> SocketAuth {
     let mut auth = SocketAuth {
         group: ipc.group.clone(),
+        group_gid: None,
         group_gated: false,
         require_group: ipc.require_group,
     };
@@ -950,6 +1124,7 @@ fn secure_socket(path: &Path, ipc: &IpcConfig) -> SocketAuth {
         }
     };
 
+    auth.group_gid = gid;
     if let Some(gid) = gid {
         match std::os::unix::fs::chown(path, Some(0), Some(gid)) {
             Ok(()) => auth.group_gated = true,
@@ -1016,22 +1191,6 @@ pub fn spawn_event_pipeline(
                         &obs.process,
                         &obs.verdict,
                     );
-                    // Audit trail for every blocked flow, independent of
-                    // whether the row makes it to disk.
-                    if matches!(
-                        obs.verdict.action,
-                        cfc_core::Action::Deny | cfc_core::Action::Reject
-                    ) {
-                        info!(
-                            action = ?obs.verdict.action,
-                            source = convert::verdict_source_db_str(&obs.verdict.source),
-                            exe = %obs.process.exe.display(),
-                            pid = obs.process.pid,
-                            uid = ?obs.process.uid,
-                            dst = %format_args!("{}:{}", obs.connection.dst_ip, obs.connection.dst_port),
-                            "connection blocked"
-                        );
-                    }
                     if tx.try_send(row).is_err() {
                         let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
                         if n == 1 || n.is_multiple_of(EVENT_DROP_LOG_EVERY) {
@@ -1136,11 +1295,16 @@ pub async fn spawn(
         crate::prompts::run_router_task(prompt_rx, router_for_pump).await;
     });
 
+    // Establish restrictive creation permissions before the listening inode exists.
+    unsafe {
+        libc::umask(0o077);
+    }
     let uds = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
     // Tighten ownership/mode before the first client can connect.
     let auth = secure_socket(&socket_path, &opts.ipc);
-    let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds);
+    let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds)
+        .map(|stream| stream.and_then(PeerStream::new));
 
     let service = FirewallService {
         engine,
@@ -1154,6 +1318,7 @@ pub async fn spawn(
         resume_at_ms: Arc::new(AtomicI64::new(0)),
         pause_default_secs: opts.pause_default_secs,
         dry_run: opts.dry_run,
+        mutations: Mutex::new(()),
     };
 
     info!(socket = %socket_path.display(), "IPC listening");
@@ -1196,14 +1361,46 @@ mod tests {
     }
 
     #[test]
-    fn non_root_mutation_requires_a_group_gated_socket() {
-        // Socket really is root:group 0660 -> connecting proved membership.
+    fn non_root_mutation_requires_proved_peer_group_membership() {
+        // Only proved peer membership authorizes a non-root mutation.
         assert!(authorize_uid(1000, Access::Mutate, true, true));
-        // Group missing / chown failed -> the socket is not proof of
-        // anything, so refuse non-root mutation.
+        // A socket mode is not membership evidence for an individual peer.
         assert!(!authorize_uid(1000, Access::Mutate, false, true));
         // Explicit opt-out: the admin gates the socket some other way.
         assert!(authorize_uid(1000, Access::Mutate, false, false));
+    }
+
+    #[test]
+    fn supplementary_group_evidence_must_match_the_kernel_peer_uid() {
+        let status = "Uid:\t1000 1000 1000 1000\nGroups:\t10 20 30\n";
+        assert!(status_proves_group(status, 1000, 20));
+        assert!(!status_proves_group(status, 1001, 20));
+        assert!(!status_proves_group(status, 1000, 40));
+        assert!(!status_proves_group("Groups: 20", 1000, 20));
+    }
+
+    #[test]
+    fn promised_binding_never_degrades_to_path_only() {
+        use cfc_core::{Action, Rule, RuleScope};
+        let mut rule = Rule::new(
+            "test",
+            Action::Allow,
+            RuleScope {
+                exe_path: Some("/tmp/tool".into()),
+                ..RuleScope::any()
+            },
+        );
+        let mut binding = crate::prompts::PromptBinding {
+            exe: rule.scope.exe_path.clone(),
+            hash_expected: true,
+            sha256: None,
+        };
+        assert!(bind_prompt_allow(&mut rule, &binding).is_err());
+        binding.sha256 = Some("a".repeat(64));
+        assert!(bind_prompt_allow(&mut rule, &binding).is_ok());
+        assert_eq!(rule.scope.exe_sha256, binding.sha256);
+        rule.scope.exe_path = Some("/tmp/other".into());
+        assert!(bind_prompt_allow(&mut rule, &binding).is_err());
     }
 
     // -- group resolution ---------------------------------------------------

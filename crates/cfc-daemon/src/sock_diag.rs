@@ -22,7 +22,8 @@ const REQ_LEN: usize = NLMSG_HDR_LEN + INET_DIAG_REQ_V2_LEN;
 /// Fixed part of struct inet_diag_msg (before any attributes).
 const INET_DIAG_MSG_LEN: usize = 72;
 
-/// Answer to an exact-tuple query.
+/// Answer to an exact-tuple query. For UDP this identifies one compatible
+/// socket, not the sender; callers must independently establish uniqueness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SockInfo {
     pub inode: u64,
@@ -31,7 +32,6 @@ pub struct SockInfo {
     /// `sock_gen_cookie`, which assigns it lazily to whoever asks first.
     /// `None` when the kernel reported the unassigned sentinel.
     pub cookie: Option<u64>,
-    #[allow(dead_code)]
     pub uid: u32,
 }
 

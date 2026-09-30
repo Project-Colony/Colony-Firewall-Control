@@ -30,12 +30,14 @@
         "install -D -m 0644 colony-firewall.svg /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
         "install -D -m 0644 cfc-ebpf.o /usr/lib/colony-firewall/cfc-ebpf.o",
         "systemd-sysusers",
-        "systemctl daemon-reload"
+        "systemctl daemon-reload",
+        "systemctl try-reload-or-restart colony-firewall-nft.service colony-firewall-nft-inbound.service || { echo \"Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering.\" >&2; exit 1; }"
       ],
       "preRemove": [
         "systemctl disable --now colony-firewall-nft-inbound.service colony-firewall-nft.service colony-firewalld.service || true",
         "nft delete table inet colony_firewall || true",
         "nft delete table inet colony_firewall_inbound || true",
+        "rm -rf /sys/fs/bpf/colony-firewall",
         "rm -f /usr/lib/systemd/system/colony-firewall-nft.service /usr/lib/systemd/system/colony-firewall-nft-inbound.service /usr/lib/systemd/system/colony-firewalld.service",
         "rm -f /usr/lib/sysusers.d/colony-firewall.conf",
         "rm -f /usr/share/colony-firewall/nftables-snippet.conf",

@@ -290,6 +290,7 @@ mod tests {
                 dst_ip: "93.184.216.34".into(),
                 dst_port,
                 dst_host: "example.com".into(),
+                dst_host_verified: false,
             }),
             process: Some(proto::ProcessInfo {
                 pid,

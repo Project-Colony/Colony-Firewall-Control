@@ -427,6 +427,7 @@ fn scope_port(port: u32) -> pb::RuleScope {
 
 fn rule_pb(name: &str, action: pb::Action, scope: pb::RuleScope) -> pb::RuleInfo {
     pb::RuleInfo {
+        duration_seconds: 0,
         id: String::new(),
         name: name.to_string(),
         enabled: true,
@@ -951,6 +952,75 @@ async fn rules_crud_round_trip_and_deterministic_order() {
     assert_eq!(reopened.snapshot().expect("snapshot").rules.len(), 2);
 }
 
+#[tokio::test]
+async fn a_rejected_batch_preserves_the_complete_policy() {
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let old = client
+        .upsert_rule(rule_pb("old-deny", pb::Action::Deny, scope_port(443)))
+        .await
+        .unwrap();
+    let valid = rule_pb("new-allow", pb::Action::Allow, scope_port(80));
+    let mut invalid = rule_pb("invalid", pb::Action::Allow, scope_port(22));
+    invalid.action = pb::Action::Unspecified as i32;
+    for replace in [false, true] {
+        let err = client
+            .apply_rules(vec![valid.clone(), invalid.clone()], replace)
+            .await
+            .unwrap_err();
+        assert_eq!(status_of(err).code(), tonic::Code::InvalidArgument);
+        let rules = client.list_rules().await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, old);
+        assert_eq!(d.store.snapshot().unwrap().rules.len(), 1);
+    }
+    let response = client.apply_rules(vec![valid], true).await.unwrap();
+    assert_eq!(response.removed, 1);
+    let rules = client.list_rules().await.unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].name, "new-allow");
+    assert_eq!(d.store.snapshot().unwrap().rules[0].name, "new-allow");
+}
+
+#[tokio::test]
+async fn a_timed_rule_keeps_its_lifetime_across_toggle_and_batch_import() {
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let mut timed = rule_pb("temporary-allow", pb::Action::Allow, scope_port(443));
+    timed.duration = pb::Duration::Seconds as i32;
+    timed.duration_seconds = 90;
+    let id = client.upsert_rule(timed).await.unwrap();
+    let mut read_back = client.list_rules().await.unwrap().remove(0);
+    assert_eq!(read_back.duration, pb::Duration::Seconds as i32);
+    assert_eq!(read_back.duration_seconds, 90);
+    let created_at = read_back.created_at_unix_ms;
+    read_back.enabled = false;
+    client.upsert_rule(read_back.clone()).await.unwrap();
+    read_back.enabled = true;
+    client
+        .apply_rules(vec![read_back.clone()], true)
+        .await
+        .unwrap();
+    let saved = client.list_rules().await.unwrap().remove(0);
+    assert_eq!(saved.id, id);
+    assert_eq!(saved.duration_seconds, 90);
+    assert_eq!(saved.created_at_unix_ms, created_at);
+    read_back.duration = pb::Duration::Always as i32;
+    read_back.duration_seconds = 0;
+    assert_eq!(
+        status_of(client.upsert_rule(read_back.clone()).await.unwrap_err()).code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        status_of(client.apply_rules(vec![read_back], true).await.unwrap_err()).code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        client.list_rules().await.unwrap()[0].duration,
+        pb::Duration::Seconds as i32
+    );
+}
+
 /// Wave-3 fail-closed conversions: nothing a default-initialized or
 /// version-skewed client can send may be silently interpreted.
 #[tokio::test]
@@ -1413,6 +1483,43 @@ fn spawn_user_writable_copy() -> Option<(tempfile::TempDir, std::path::PathBuf, 
 }
 
 #[tokio::test]
+async fn a_required_hash_failure_refuses_a_standing_allow() {
+    let d = TestDaemon::build().await;
+    let mut client = d.client().await;
+    let mut prompts = client.stream_prompts("test".into()).await.unwrap();
+    let tool = d._dir.path().join("unavailable-image");
+    let process = Process {
+        pid: 0,
+        exe: tool.clone(),
+        uid: Some(self_uid()),
+        ..Process::unknown(0)
+    };
+    d.push_prompt_for(63, process).await;
+    let event = next_message(&mut prompts).await;
+    assert!(event.binds_to_hash);
+    assert!(event.process.unwrap().sha256.is_empty());
+    let scope = pb::RuleScope {
+        exe_path: tool.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let outcome = client
+        .submit_verdict("63", pb::Action::Allow, pb::Duration::Always, Some(scope))
+        .await
+        .unwrap();
+    assert!(
+        outcome.accepted,
+        "the explicit verdict is still a one-time answer"
+    );
+    assert_eq!(outcome.rule_persisted, Some(false));
+    assert!(outcome
+        .persist_error
+        .unwrap()
+        .contains("could not be hashed"));
+    assert!(client.list_rules().await.unwrap().is_empty());
+    assert!(d.store.snapshot().unwrap().rules.is_empty());
+}
+
+#[tokio::test]
 async fn a_user_writable_binary_gets_its_allow_hash_bound() {
     // End to end, with a real process: a copy of /usr/bin/sleep in a
     // tempdir is exactly the ~/.local/bin shape - user-owned, small, alive
@@ -1431,11 +1538,12 @@ async fn a_user_writable_binary_gets_its_allow_hash_bound() {
         .await
         .expect("subscribing to prompts");
 
-    let process = Process {
-        pid: child.id(),
-        exe: std::fs::canonicalize(&tool).expect("canonical tool path"),
-        ..Process::unknown(child.id())
-    };
+    let process = cfc_daemon::process_resolve::resolve(child.id());
+    assert_eq!(process.exe, std::fs::canonicalize(&tool).unwrap());
+    assert!(
+        process.sha256.is_some(),
+        "the queued image snapshot is hashed"
+    );
     d.push_prompt_for(61, process.clone()).await;
     let ev = next_message(&mut prompts).await;
     assert_eq!(ev.prompt_id, "61");
@@ -1461,6 +1569,7 @@ async fn a_user_writable_binary_gets_its_allow_hash_bound() {
     assert_eq!(rules.len(), 1);
     let stored = rules[0].scope.as_ref().expect("scope");
     assert_eq!(stored.exe_sha256.len(), 64, "the allow is hash-bound");
+    assert_eq!(Some(stored.exe_sha256.as_str()), process.sha256.as_deref());
     assert!(stored.exe_sha256.bytes().all(|b| b.is_ascii_hexdigit()));
 
     let _ = child.kill();

@@ -3,16 +3,16 @@
 //!
 //! Resolution strategy, fastest first:
 //!   1. netlink sock_diag exact-tuple query ([`crate::sock_diag`]): one
-//!      round-trip per connection instead of a full-table parse. Falls
-//!      back silently on any error (EPERM in containers, old kernels).
+//!      round-trip per TCP connection instead of a full-table parse. UDP first
+//!      verifies that the complete socket tables contain one compatible inode.
 //!   2. Parse /proc/net/{tcp,udp}{,6} with layered match passes (exact,
 //!      unconnected-UDP, wildcard-bind, v4-mapped-in-v6).
 //!   3. inode -> pid via a verified TTL cache, else a /proc/*/fd walk.
 //!
 //! TOCTOU note: the resolved pid may have exited by the time we describe it.
-//! The process cache is keyed by (pid, starttime) so pid reuse invalidates
-//! naturally, and the inode cache re-verifies its answer with a single
-//! readlink before trusting it.
+//! Process identity is read on every resolve: exec preserves pid and starttime.
+//! The inode cache re-verifies its answer with a single readlink before
+//! trusting it.
 //!
 //! # Where the kernel exec table fits
 //!
@@ -24,14 +24,13 @@
 //! |---|---|---|
 //! | `ppid` | `/proc/<pid>/stat` field 4 | exec event (or `None` if BTF offsets were unresolved) |
 //! | `uid`/`gid` | `/proc/<pid>/status` `Ruid`/`Rgid` | exec event, i.e. the values at `execve()` |
-//! | `exe` | `/proc/<pid>/exe` | `/proc/<pid>/exe`, falling back to the exec event's path when `/proc` is gone |
+//! | `exe` | `/proc/<pid>/exe` | unchanged; an exec argument cannot attest the mapped path |
 //! | `cmdline`, `cwd` | `/proc/<pid>/{cmdline,cwd}` | unchanged - no kernel source |
 //! | `sha256`, package | `/proc/<pid>/exe` | unchanged - the digest must be of the mapped image |
 //!
-//! So it removes two `/proc` file parses per uncached resolve and, more
-//! importantly, produces a *named* process where the pre-eBPF path could only
-//! return [`Process::unknown`] - the short-lived-process case that a
-//! packet-triggered `/proc` read loses by construction.
+//! So it removes two `/proc` file parses per resolve and preserves credentials
+//! when a short-lived process is already gone. Its executable stays unknown
+//! unless a consistent mapped image is readable through `/proc`.
 //!
 //! It does **not** remove the socket -> pid step: NFQUEUE hands the daemon a
 //! packet, not a pid, so `sock_diag` (or the table walk, or the `/proc/*/fd`
@@ -65,32 +64,8 @@ const RESOLVE_BUDGET: Duration = Duration::from_millis(50);
 /// produces (SYN, first payload, retransmits).
 const INODE_CACHE_TTL: Duration = Duration::from_secs(2);
 
-/// (pid, starttime) -> Process. starttime makes pid reuse self-invalidating,
-/// so this TTL only bounds staleness of mutable fields (cwd, cmdline).
-const PROCESS_CACHE_TTL: Duration = Duration::from_secs(5);
-
-/// Executable digests are keyed by (dev, inode, mtime) which is already
-/// content-addressed for our purposes; the TTL is just a memory backstop.
-/// The digest cache does not expire, and that is the point.
-///
-/// Its key is `(dev, inode, mtime, mtime_nsec)`, which is content-addressed:
-/// a file whose bytes change gets a new mtime and therefore a new key, so a
-/// stale entry cannot be returned for changed content. An hour's expiry
-/// bought nothing and cost a re-hash of the whole binary on the packet
-/// worker - a single thread - every hour, per executable:
-///
-/// ```text
-/// /usr/bin/node        59.9 MB  ->  ~34 ms
-/// /usr/bin/gh          38.8 MB  ->  ~22 ms
-/// /usr/bin/tailscaled  28.5 MB  ->  ~16 ms
-/// ```
-///
-/// The 64 MiB size cap barely helps: it excludes almost nothing that is
-/// actually installed. The 1024-entry bound still evicts, so this is a cache
-/// with a size limit and no clock, not an unbounded one.
-///
-/// The digest cannot simply be skipped instead: `RuleScope::exe_sha256` is a
-/// rule predicate, and a hash-scoped rule abstains when the hash is unknown.
+/// Only root-sealed images reuse digests. Mutable images are read afresh:
+/// filesystem timestamps are change hints, not a content identity.
 const SHA_CACHE_TTL: Duration = Duration::from_secs(u64::MAX / 2);
 
 /// Don't hash executables larger than this. Shared with the CLI's
@@ -103,36 +78,22 @@ const CACHE_CAP: usize = 1024;
 static INODE_PID_CACHE: LazyLock<Mutex<TtlCache<u64, (u32, i32)>>> =
     LazyLock::new(|| Mutex::new(TtlCache::new(INODE_CACHE_TTL, CACHE_CAP)));
 
-static PROCESS_CACHE: LazyLock<Mutex<TtlCache<(u32, u64), Process>>> =
-    LazyLock::new(|| Mutex::new(TtlCache::new(PROCESS_CACHE_TTL, CACHE_CAP)));
+type ImageKey = (u64, u64, u64, i64, i64, i64, i64);
 
-#[allow(clippy::type_complexity)]
-static SHA_CACHE: LazyLock<Mutex<TtlCache<(u64, u64, i64, i64), Option<String>>>> =
+static SHA_CACHE: LazyLock<Mutex<TtlCache<ImageKey, String>>> =
     LazyLock::new(|| Mutex::new(TtlCache::new(SHA_CACHE_TTL, CACHE_CAP)));
 
 /// Build a full Process record for `pid`, from the kernel exec table where
 /// one is available and from /proc/{pid} for everything else.
 ///
-/// Cached by (pid, starttime from /proc/{pid}/stat field 22): a recycled
-/// pid has a different starttime, so it can never hit a stale entry. That
-/// same start time is what the exec table is verified against.
+/// Start time verifies the kernel exec table against pid reuse. It cannot
+/// validate a cached Process: exec replaces the image without changing it.
 pub fn resolve(pid: u32) -> Process {
     let now = Instant::now();
     let starttime = read_starttime(pid);
 
-    if let Some(st) = starttime {
-        if let Some(p) = PROCESS_CACHE.lock().get(&(pid, st), now) {
-            return p;
-        }
-    }
-
     match resolve_inner(pid, starttime, now, crate::ebpf::proc_table::global()) {
-        Ok(p) => {
-            if let Some(st) = starttime {
-                PROCESS_CACHE.lock().insert((pid, st), p.clone(), now);
-            }
-            p
-        }
+        Ok(p) => p,
         Err(_) => Process::unknown(pid),
     }
 }
@@ -160,12 +121,15 @@ fn resolve_inner(
         anyhow::bail!("pid {pid} has neither a /proc entry nor a kernel exec record");
     }
 
-    let proc_exe = p.as_ref().and_then(|p| p.exe().ok());
-    let cmdline = p
+    // Hold the mapped image across the other reads so a concurrent exec
+    // cannot pair an old path with a new digest.
+    let proc_exe_path = PathBuf::from(format!("/proc/{pid}/exe"));
+    let image = MappedImage::open(&proc_exe_path);
+    let mut cmdline = p
         .as_ref()
         .and_then(|p| p.cmdline().ok())
         .unwrap_or_default();
-    let cwd = p.as_ref().and_then(|p| p.cwd().ok());
+    let mut cwd = p.as_ref().and_then(|p| p.cwd().ok());
 
     let (ppid, uid, gid) = match &kern {
         // The exec event already carries all three, so /proc/{pid}/stat and
@@ -182,17 +146,19 @@ fn resolve_inner(
         }
     };
 
-    // /proc/{pid}/exe wins whenever it is readable: it is the canonical path
-    // of the image the kernel mapped, which is what rules match and what the
-    // digest below describes. The exec event's path is the fallback for a
-    // process that is already gone, and only when it is absolute (see
-    // `KernelProc::absolute_exe`).
-    let exe = proc_exe
-        .or_else(|| {
-            kern.as_ref()
-                .and_then(|k| k.absolute_exe().map(Path::to_path_buf))
-        })
-        .unwrap_or_else(|| PathBuf::from("<deleted>"));
+    let image = image.and_then(|image| image.finish(&proc_exe_path));
+    let image = image.filter(|_| read_starttime(pid) == starttime);
+    let (exe, sha256) = match image {
+        Some(identity) => identity,
+        None => {
+            // The event filename is an exec argument, including aliases.
+            // It cannot substitute for the mapped path when /proc is gone
+            // or changed during resolution. Kernel credentials remain useful.
+            cmdline.clear();
+            cwd = None;
+            (PathBuf::from(cfc_core::UNKNOWN_EXE), None)
+        }
+    };
 
     // The kernel appends " (deleted)" to /proc/<pid>/exe once the file has been
     // replaced or removed underneath a running process. On a rolling
@@ -236,12 +202,13 @@ fn resolve_inner(
     // This is deliberately NOT taken from the exec event: an exec-time path
     // says which file was launched, not which bytes are running now.
     //
-    // Everything underneath is cached (path index by database mtime,
-    // per-executable records by (dev, inode, mtime)), and this whole
-    // function is itself behind PROCESS_CACHE, so a steady flow of packets
-    // from a known process does no work here at all.
-    let sha256 = exe_sha256(pid);
-    let (package, provenance) = crate::provenance::describe(&exe_for_provenance, sha256.as_deref());
+    // Provenance retains its own bounded caches. Policy identity itself is
+    // refreshed because a process can exec between two queued packets.
+    let (package, provenance) = if exe.as_os_str() == cfc_core::UNKNOWN_EXE {
+        (None, cfc_core::Provenance::Unknown)
+    } else {
+        crate::provenance::describe(&exe_for_provenance, sha256.as_deref())
+    };
 
     Ok(Process {
         pid,
@@ -260,7 +227,8 @@ fn resolve_inner(
 
 /// Find the pid that owns a socket matching the given 5-tuple.
 ///
-/// Tries a sock_diag netlink query first, then /proc/net/{tcp,udp}{,6}.
+/// TCP tries sock_diag first. UDP requires a unique inode across all relevant
+/// tables before a diagnostic cookie or an fd walk may identify the owner.
 /// Returns None if no match found within a short budget; caller falls
 /// back to `Process::unknown`.
 ///
@@ -294,16 +262,30 @@ pub fn pid_for_socket(
     src_port: u16,
     dst_ip: IpAddr,
     dst_port: u16,
+    uid: Option<u32>,
 ) -> Option<u32> {
     if direction == Direction::Inbound {
         return None;
     }
     let deadline = Instant::now() + RESOLVE_BUDGET;
 
+    // UDP diagnostics return one socket, not proof that it sent this packet.
+    // An exact connected socket can overlap an unconnected or wildcard one.
+    // Check every compatible inode across both address-family tables first.
+    let udp_inode = if protocol == Protocol::Udp {
+        Some(proc_net_inode(
+            protocol, src_ip, src_port, dst_ip, dst_port, uid, deadline,
+        )?)
+    } else {
+        None
+    };
+
     // Fast path: one exact-tuple kernel query. Any failure (EPERM,
     // unsupported protocol, unconnected UDP the kernel won't match)
     // falls through to the table scan.
-    let info = crate::sock_diag::query(protocol, src_ip, src_port, dst_ip, dst_port);
+    let info = crate::sock_diag::query(protocol, src_ip, src_port, dst_ip, dst_port)
+        .filter(|info| uid.is_none_or(|uid| info.uid == uid))
+        .filter(|info| udp_inode.is_none_or(|inode| info.inode == inode));
 
     // Fastest path: the kernel recorded cookie -> tgid at connect() time
     // (`SOCK_PIDS`, written by cfc_connect4|6 in the connecting process's own
@@ -318,9 +300,9 @@ pub fn pid_for_socket(
         }
     }
 
-    let inode = info
-        .map(|i| i.inode)
-        .or_else(|| proc_net_inode(protocol, src_ip, src_port, dst_ip, dst_port, deadline))?;
+    let inode = udp_inode
+        .or_else(|| info.map(|i| i.inode))
+        .or_else(|| proc_net_inode(protocol, src_ip, src_port, dst_ip, dst_port, uid, deadline))?;
 
     pid_owning_inode(inode, deadline)
 }
@@ -375,15 +357,26 @@ fn proc_net_inode(
     src_port: u16,
     dst_ip: IpAddr,
     dst_port: u16,
+    uid: Option<u32>,
     deadline: Instant,
 ) -> Option<u64> {
-    let tables: &[&str] = match (protocol, src_ip) {
+    let tables: &[&str] = match (protocol, src_ip.to_canonical()) {
         (Protocol::Tcp, IpAddr::V4(_)) => &["/proc/net/tcp", "/proc/net/tcp6"],
         (Protocol::Tcp, IpAddr::V6(_)) => &["/proc/net/tcp6"],
         (Protocol::Udp, IpAddr::V4(_)) => &["/proc/net/udp", "/proc/net/udp6"],
         (Protocol::Udp, IpAddr::V6(_)) => &["/proc/net/udp6"],
         _ => return None,
     };
+
+    if protocol == Protocol::Udp {
+        return udp_inode_from_tables(
+            tables,
+            (src_ip, src_port),
+            (dst_ip, dst_port),
+            uid,
+            deadline,
+        );
+    }
 
     for table in tables {
         if Instant::now() > deadline {
@@ -392,13 +385,44 @@ fn proc_net_inode(
         let Ok(contents) = fs::read_to_string(table) else {
             continue;
         };
-        if let Some(inode) =
-            scan_table_content(&contents, protocol, (src_ip, src_port), (dst_ip, dst_port))
-        {
+        if let Some(inode) = scan_table_content(
+            &contents,
+            protocol,
+            (src_ip, src_port),
+            (dst_ip, dst_port),
+            uid,
+        ) {
             return Some(inode);
         }
     }
     None
+}
+
+/// A partial table read cannot establish uniqueness. Failure or expiry means
+/// unknown, including when the first table already contained one candidate.
+fn udp_inode_from_tables(
+    tables: &[&str],
+    local: (IpAddr, u16),
+    remote: (IpAddr, u16),
+    uid: Option<u32>,
+    deadline: Instant,
+) -> Option<u64> {
+    let mut entries = Vec::new();
+    for table in tables {
+        if Instant::now() > deadline {
+            return None;
+        }
+        let contents = fs::read_to_string(table).ok()?;
+        entries.extend(contents.lines().skip(1).filter_map(parse_table_line));
+    }
+    if Instant::now() > deadline {
+        return None;
+    }
+    let inode = scan_table_entries(&entries, Protocol::Udp, local, remote, uid);
+    if Instant::now() > deadline {
+        return None;
+    }
+    inode
 }
 
 /// One parsed row of a /proc/net table.
@@ -407,10 +431,12 @@ struct TableEntry {
     local: (IpAddr, u16),
     remote: (IpAddr, u16),
     inode: u64,
+    uid: u32,
 }
 
 /// Match a socket table (the text of /proc/net/{tcp,udp}{,6}) against a
-/// flow, in decreasing order of precision. Stops at the first hit.
+/// flow. UDP requires one unique compatible inode across all match classes.
+/// TCP uses decreasing precision and stops at the first hit.
 ///
 /// Pass 1 - exact local+remote: connected TCP/UDP sockets.
 /// Pass 2 - UDP only, exact local, zero remote: unconnected UDP sockets
@@ -427,35 +453,56 @@ fn scan_table_content(
     protocol: Protocol,
     local: (IpAddr, u16),
     remote: (IpAddr, u16),
+    uid: Option<u32>,
 ) -> Option<u64> {
-    // inode 0 rows (TIME_WAIT, orphans) are unattributable; drop them so
-    // they can't shadow a real socket in a later pass.
     let entries: Vec<TableEntry> = content
         .lines()
         .skip(1)
         .filter_map(parse_table_line)
-        .filter(|e| e.inode != 0)
         .collect();
 
+    scan_table_entries(&entries, protocol, local, remote, uid)
+}
+
+fn scan_table_entries(
+    entries: &[TableEntry],
+    protocol: Protocol,
+    local: (IpAddr, u16),
+    remote: (IpAddr, u16),
+    uid: Option<u32>,
+) -> Option<u64> {
+    // inode 0 rows (TIME_WAIT, orphans) cannot identify a process. The queued
+    // packet's socket UID excludes candidates from a different owner.
+    let entries = entries
+        .iter()
+        .filter(|e| e.inode != 0 && uid.is_none_or(|uid| e.uid == uid));
+
+    if protocol == Protocol::Udp {
+        let mut inode = None;
+        for e in entries {
+            if (endpoint_eq(e.local, local)
+                || (e.local.1 == local.1 && e.local.0.to_canonical().is_unspecified()))
+                && (endpoint_eq(e.remote, remote) || endpoint_is_zero(e.remote))
+            {
+                if inode.is_some_and(|inode| inode != e.inode) {
+                    return None;
+                }
+                inode = Some(e.inode);
+            }
+        }
+        return inode;
+    }
+
     // Pass 1: exact 4-tuple.
-    for e in &entries {
+    for e in entries.clone() {
         if endpoint_eq(e.local, local) && endpoint_eq(e.remote, remote) {
             return Some(e.inode);
         }
     }
 
-    // Pass 2: unconnected UDP (exact local, zero remote).
-    if protocol == Protocol::Udp {
-        for e in &entries {
-            if endpoint_eq(e.local, local) && endpoint_is_zero(e.remote) {
-                return Some(e.inode);
-            }
-        }
-    }
-
     // Pass 3: wildcard-bound local (port must match), remote exact or zero
     // (zero covers listeners and wildcard-bound unconnected UDP).
-    for e in &entries {
+    for e in entries {
         if e.local.1 == local.1
             && e.local.0.to_canonical().is_unspecified()
             && (endpoint_eq(e.remote, remote) || endpoint_is_zero(e.remote))
@@ -484,13 +531,14 @@ fn parse_table_line(line: &str) -> Option<TableEntry> {
     let _txrx = cols.next()?;
     let _tr = cols.next()?;
     let _retr = cols.next()?;
-    let _uid = cols.next()?;
+    let uid = cols.next()?.parse::<u32>().ok()?;
     let _timeout = cols.next()?;
     let inode = cols.next()?.parse::<u64>().ok()?;
     Some(TableEntry {
         local,
         remote,
         inode,
+        uid,
     })
 }
 
@@ -644,35 +692,72 @@ fn parse_starttime(stat: &str) -> Option<u64> {
 /// gone, provenance wants to know it was there.
 pub(crate) const DELETED_SUFFIX: &str = " (deleted)";
 
-/// sha256 of the running executable, read through /proc/{pid}/exe.
-///
-/// The magic link resolves to the binary actually mapped by the kernel,
-/// so this hashes what is really running even if the file on disk was
-/// replaced or deleted. Cached by (dev, inode, mtime) of that file.
-/// Returns None for unreadable or oversized (> 64 MiB) binaries.
-fn exe_sha256(pid: u32) -> Option<String> {
-    let path = PathBuf::from(format!("/proc/{pid}/exe"));
-    let meta = fs::metadata(&path).ok()?;
-    if meta.len() > SHA256_MAX_LEN {
-        trace!(pid, len = meta.len(), "exe too large to hash; skipping");
-        return None;
-    }
-    let key = (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec());
-    let now = Instant::now();
-    if let Some(cached) = SHA_CACHE.lock().get(&key, now) {
-        return cached;
-    }
-    let digest = sha256_file(&path, SHA256_MAX_LEN);
-    SHA_CACHE.lock().insert(key, digest.clone(), now);
-    digest
+/// One opened mapped image. Its link and metadata must still describe this
+/// file after hashing; otherwise no executable identity is published.
+struct MappedImage {
+    file: fs::File,
+    path: PathBuf,
+    key: ImageKey,
 }
 
-/// Streaming sha256 of a file; None on I/O error or if the file exceeds
-/// `max_len` (checked up front so we never read an oversized file).
-pub(crate) fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
-    let mut f = fs::File::open(path).ok()?;
-    if f.metadata().ok()?.len() > max_len {
+impl MappedImage {
+    fn open(link: &Path) -> Option<Self> {
+        let file = fs::File::open(link).ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let path = fs::read_link(link).ok()?;
+        let key = image_key(&meta);
+        if image_key(&fs::metadata(link).ok()?) != key {
+            return None;
+        }
+        Some(Self { file, path, key })
+    }
+
+    fn finish(self, link: &Path) -> Option<(PathBuf, Option<String>)> {
+        let meta = self.file.metadata().ok()?;
+        if image_key(&meta) != self.key {
+            return None;
+        }
+        let cacheable = cfc_core::exe_path::file_is_sealed(meta.uid(), meta.mode())
+            && cfc_core::exe_path::is_root_sealed(&self.path).unwrap_or(false);
+        if meta.len() > SHA256_MAX_LEN {
+            trace!(len = meta.len(), "exe too large to hash; skipping");
+        }
+        let sha256 = sha256_open_file(self.file, SHA256_MAX_LEN, cacheable);
+        if image_key(&fs::metadata(link).ok()?) != self.key
+            || fs::read_link(link).ok()? != self.path
+        {
+            return None;
+        }
+        Some((self.path, sha256))
+    }
+}
+
+fn image_key(meta: &fs::Metadata) -> ImageKey {
+    (
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    )
+}
+
+fn sha256_open_file(mut f: fs::File, max_len: u64, cacheable: bool) -> Option<String> {
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max_len {
         return None;
+    }
+    let key = image_key(&meta);
+    let now = Instant::now();
+    if cacheable {
+        if let Some(cached) = SHA_CACHE.lock().get(&key, now) {
+            return Some(cached);
+        }
     }
     // Read in a loop rather than io::copy, and hex-encode by hand rather than
     // with `{:x}`. RustCrypto 0.11 drops `io::Write` on the hashers and returns
@@ -685,20 +770,37 @@ pub(crate) fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
     // never matches.
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
+    let mut read = 0u64;
     loop {
         use std::io::Read as _;
         let n = f.read(&mut buf).ok()?;
         if n == 0 {
             break;
         }
+        read = read.checked_add(n as u64)?;
+        if read > max_len {
+            return None;
+        }
         hasher.update(&buf[..n]);
+    }
+    if read != meta.len() || image_key(&f.metadata().ok()?) != key {
+        return None;
     }
     let mut out = String::with_capacity(64);
     for byte in hasher.finalize() {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
+    if cacheable {
+        SHA_CACHE.lock().insert(key, out.clone(), now);
+    }
     Some(out)
+}
+
+/// Test fixture helper using the same opened-file hashing as the resolver.
+#[cfg(test)]
+pub(crate) fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
+    sha256_open_file(fs::File::open(path).ok()?, max_len, false)
 }
 
 /// Bounded TTL map. `now` is injected so expiry is unit-testable without
@@ -871,7 +973,7 @@ mod tests {
         let remote = v4(1, 1, 1, 1, 443);
         let table = format!("{HEADER}{}", line(local, remote, "01", 777));
         assert_eq!(
-            scan_table_content(&table, Protocol::Tcp, local, remote),
+            scan_table_content(&table, Protocol::Tcp, local, remote, None),
             Some(777)
         );
     }
@@ -885,7 +987,7 @@ mod tests {
             "{HEADER}  272: 0F02000A:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 4242 2 0000000000000000 0\n"
         );
         assert_eq!(
-            scan_table_content(&table, Protocol::Udp, local, v4(224, 0, 0, 251, 5353)),
+            scan_table_content(&table, Protocol::Udp, local, v4(224, 0, 0, 251, 5353), None),
             Some(4242)
         );
     }
@@ -898,7 +1000,7 @@ mod tests {
         let local = v4(10, 0, 2, 15, 5353);
         let table = format!("{HEADER}{}", line(local, v4(0, 0, 0, 0, 0), "0A", 4242));
         assert_eq!(
-            scan_table_content(&table, Protocol::Tcp, local, v4(224, 0, 0, 251, 5353)),
+            scan_table_content(&table, Protocol::Tcp, local, v4(224, 0, 0, 251, 5353), None),
             None
         );
     }
@@ -916,7 +1018,8 @@ mod tests {
                 &table,
                 Protocol::Udp,
                 v4(192, 168, 1, 5, 68),
-                v4(192, 168, 1, 1, 67)
+                v4(192, 168, 1, 1, 67),
+                None
             ),
             Some(555)
         );
@@ -933,7 +1036,8 @@ mod tests {
                 &table,
                 Protocol::Tcp,
                 v4(10, 0, 0, 7, 8080),
-                v4(1, 2, 3, 4, 55000)
+                v4(1, 2, 3, 4, 55000),
+                None
             ),
             Some(909)
         );
@@ -949,7 +1053,7 @@ mod tests {
         // ::ffff:1.142.85.209? Group "D1558E01" -> bytes 01 8E 55 D1.
         let remote = v4(1, 142, 85, 209, 0xC350);
         assert_eq!(
-            scan_table_content(&table, Protocol::Tcp, v4(10, 0, 0, 5, 443), remote),
+            scan_table_content(&table, Protocol::Tcp, v4(10, 0, 0, 5, 443), remote, None),
             Some(31337)
         );
     }
@@ -964,8 +1068,106 @@ mod tests {
             line(local, remote, "01", 2),
         );
         assert_eq!(
-            scan_table_content(&table, Protocol::Tcp, local, remote),
+            scan_table_content(&table, Protocol::Tcp, local, remote, None),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn udp_rejects_ambiguous_compatible_sockets() {
+        let local = v4(10, 0, 2, 15, 9000);
+        let remote = v4(9, 9, 9, 9, 443);
+        for other_local in [local, v4(0, 0, 0, 0, 9000)] {
+            let table = format!(
+                "{HEADER}{}{}",
+                line(local, remote, "01", 1),
+                line(other_local, v4(0, 0, 0, 0, 0), "07", 2),
+            );
+            assert_eq!(
+                scan_table_content(&table, Protocol::Udp, local, remote, None),
+                None,
+                "an exact match cannot identify the sender when another socket also fits"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_keeps_a_unique_compatible_inode_for_the_socket_uid() {
+        let local = v4(10, 0, 2, 15, 9000);
+        let remote = v4(9, 9, 9, 9, 443);
+        let other =
+            line(local, v4(0, 0, 0, 0, 0), "07", 2).replace("  1000        0", "  1001        0");
+        let table = format!("{HEADER}{}{other}", line(local, remote, "01", 1));
+        assert_eq!(
+            scan_table_content(&table, Protocol::Udp, local, remote, Some(1000)),
+            Some(1)
+        );
+        assert_eq!(
+            scan_table_content(&table, Protocol::Udp, local, remote, Some(1001)),
+            Some(2)
+        );
+        assert_eq!(
+            scan_table_content(&table, Protocol::Udp, local, remote, None),
+            None
+        );
+
+        let duplicate = format!(
+            "{HEADER}{}{}",
+            line(local, remote, "01", 1),
+            line(local, v4(0, 0, 0, 0, 0), "07", 1)
+        );
+        assert_eq!(
+            scan_table_content(&duplicate, Protocol::Udp, local, remote, None),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn udp_needs_a_complete_unique_search_across_both_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let table4 = dir.path().join("udp");
+        let table6 = dir.path().join("udp6");
+        let local = v4(10, 0, 2, 15, 9000);
+        let remote = v4(9, 9, 9, 9, 443);
+        fs::write(&table4, format!("{HEADER}{}", line(local, remote, "01", 1))).unwrap();
+        let tables = [table4.to_str().unwrap(), table6.to_str().unwrap()];
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            udp_inode_from_tables(&tables, local, remote, Some(1000), deadline),
+            None
+        );
+
+        fs::write(&table6, HEADER).unwrap();
+        assert_eq!(
+            udp_inode_from_tables(&tables, local, remote, Some(1000), deadline),
+            Some(1)
+        );
+        let mapped = (
+            IpAddr::V6(Ipv4Addr::new(10, 0, 2, 15).to_ipv6_mapped()),
+            9000,
+        );
+        fs::write(
+            &table6,
+            format!(
+                "{HEADER}{}",
+                line(mapped, (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0), "07", 2)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            udp_inode_from_tables(&tables, local, remote, Some(1000), deadline),
+            None
+        );
+        fs::write(&table6, HEADER).unwrap();
+        assert_eq!(
+            udp_inode_from_tables(
+                &tables,
+                local,
+                remote,
+                Some(1000),
+                Instant::now() - Duration::from_secs(1)
+            ),
+            None
         );
     }
 
@@ -977,7 +1179,7 @@ mod tests {
         let remote = v4(1, 1, 1, 1, 443);
         let table = format!("{HEADER}{}", line(local, remote, "06", 0));
         assert_eq!(
-            scan_table_content(&table, Protocol::Tcp, local, remote),
+            scan_table_content(&table, Protocol::Tcp, local, remote, None),
             None
         );
     }
@@ -1021,17 +1223,6 @@ mod tests {
         assert_eq!(c.get(&3, t0 + Duration::from_millis(3)), Some(30));
     }
 
-    #[test]
-    fn pid_reuse_misses_process_cache() {
-        // The process cache key is (pid, starttime): a recycled pid has a
-        // new starttime and must not hit the old entry.
-        let mut c: TtlCache<(u32, u64), &'static str> = TtlCache::new(Duration::from_secs(5), 8);
-        let t0 = Instant::now();
-        c.insert((100, 5000), "old-process", t0);
-        assert_eq!(c.get(&(100, 5000), t0), Some("old-process"));
-        assert_eq!(c.get(&(100, 9000), t0), None, "same pid, new starttime");
-    }
-
     // -- sha256 -------------------------------------------------------------
 
     #[test]
@@ -1048,6 +1239,75 @@ mod tests {
             got.as_deref(),
             Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
         );
+    }
+
+    #[test]
+    fn mutable_images_ignore_cached_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        fs::write(&path, b"hello world").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let key = image_key(&file.metadata().unwrap());
+        SHA_CACHE
+            .lock()
+            .insert(key, "cached-placeholder".into(), Instant::now());
+        assert_eq!(
+            sha256_open_file(file, 1024, false).as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+        );
+        SHA_CACHE.lock().remove(&key);
+    }
+
+    #[test]
+    fn sha256_uses_the_opened_image_after_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        fs::write(&path, b"hello world").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        fs::rename(&path, dir.path().join("previous-image")).unwrap();
+        fs::write(&path, b"different image").unwrap();
+        assert_eq!(
+            sha256_open_file(file, 1024, false).as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+        );
+    }
+
+    #[test]
+    fn mapped_identity_requires_a_consistent_link_and_digest() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        let link = dir.path().join("mapped-image");
+        fs::write(&first, b"hello world").unwrap();
+        fs::write(&second, b"another image").unwrap();
+        symlink(&first, &link).unwrap();
+
+        let (path, digest) = MappedImage::open(&link).unwrap().finish(&link).unwrap();
+        assert_eq!(path, first);
+        assert_eq!(
+            digest.as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+        );
+
+        let image = MappedImage::open(&link).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+        assert_eq!(image.finish(&link), None, "mixed image identity is unknown");
+    }
+
+    #[test]
+    fn digest_keys_track_size_when_modification_time_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        fs::write(&path, b"first image").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let before = file.metadata().unwrap();
+        file.set_len(12).unwrap();
+        file.set_modified(before.modified().unwrap()).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_ne!(image_key(&before), image_key(&after));
     }
 
     #[test]
@@ -1094,18 +1354,20 @@ mod tests {
     }
 
     #[test]
-    fn a_process_that_already_exited_is_named_from_the_exec_record() {
-        // This is the case the pre-eBPF path loses by construction: NFQUEUE
-        // delivers the packet, the process is already reaped, /proc has
-        // nothing, and attribution used to collapse to `unknown`.
+    fn an_exec_record_without_a_mapped_image_cannot_supply_a_policy_path() {
+        // An absolute exec argument may still be an unresolved alias. Only
+        // /proc can attest the mapped path used by executable rules.
         let table = kernel_table(DEAD_PID, "/usr/bin/curl", 1000, 7);
         let p = resolve_inner(DEAD_PID, None, Instant::now(), &table).unwrap();
         assert_eq!(p.pid, DEAD_PID);
-        assert_eq!(p.exe, PathBuf::from("/usr/bin/curl"));
+        assert!(!p.exe_is_known());
+        assert_eq!(p.exe, PathBuf::from(cfc_core::UNKNOWN_EXE));
         assert_eq!(p.uid, Some(1000));
         assert_eq!(p.gid, Some(1001));
         assert_eq!(p.ppid, Some(7));
         assert_eq!(p.sha256, None, "no mapped image left to hash");
+        assert_eq!(p.package, None);
+        assert_eq!(p.provenance, cfc_core::Provenance::Unknown);
         assert!(p.cmdline.is_empty());
     }
 
@@ -1155,7 +1417,7 @@ mod tests {
         // `./configure`-style paths mean nothing outside the launcher's cwd.
         let table = kernel_table(DEAD_PID, "./configure", 1000, 1);
         let p = resolve_inner(DEAD_PID, None, Instant::now(), &table).unwrap();
-        assert_eq!(p.exe, PathBuf::from("<deleted>"));
+        assert_eq!(p.exe, PathBuf::from(cfc_core::UNKNOWN_EXE));
         assert_eq!(p.uid, Some(1000), "the rest of the record is still used");
     }
 

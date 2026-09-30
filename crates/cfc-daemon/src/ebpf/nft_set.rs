@@ -157,6 +157,11 @@ pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
     if *gate {
         bail!("not arming the fast-allow set: the daemon is shutting down");
     }
+    arm_commands(mark, run)
+}
+
+/// The ordered transaction steps, injectable without executing nft in tests.
+fn arm_commands(mark: u32, mut run: impl FnMut(Op) -> Result<(), Failed>) -> anyhow::Result<()> {
     match run(Op::ListSet) {
         Ok(()) => {}
         Err(failed) if failed.is_no_such_object() => {
@@ -184,20 +189,7 @@ pub(super) fn arm(mark: u32) -> anyhow::Result<()> {
     // A mark that is still accepted but that nothing refreshes is the worst
     // shape this set can be in: every process that ever held it can read it
     // back with `getsockopt(SO_MARK)` and set it again.
-    if let Err(failed) = run(Op::FlushSet) {
-        // Not fatal: the add below is still the operation that matters. Not
-        // compensated for either, which an earlier version of this comment
-        // claimed - `holds` asks whether *our* mark is in the set, so it
-        // cannot notice a stranger's left beside it. A failed flush here means
-        // a value this daemon did not choose may stay accepted until something
-        // else tears the table down; the log line is the only trace.
-        if !failed.is_no_such_object() {
-            debug!(
-                "could not flush the fast-allow set before arming: {}",
-                failed.into_error(Op::FlushSet)
-            );
-        }
-    }
+    run(Op::FlushSet).map_err(|failed| failed.into_error(Op::FlushSet))?;
     let op = Op::AddElement(mark);
     run(op).map_err(|failed| failed.into_error(op))?;
     debug!("fast-allow mark added to set {FAMILY} {TABLE} {SET}");
@@ -257,9 +249,8 @@ pub(super) fn table_loaded() -> anyhow::Result<bool> {
 /// function's callers, and they are not.
 ///
 /// A missing table or a missing set is success: there is nothing in either
-/// that could accept a mark, and at shutdown the table is usually already
-/// gone - `colony-firewall-nft.service` is `PartOf=` the daemon and stops
-/// first.
+/// that could accept a mark. The nft table intentionally remains loaded across
+/// daemon restarts and stops; only an explicit nft-unit stop removes it.
 pub(super) fn disarm() -> anyhow::Result<()> {
     let _gate = shutdown_gate();
     flush()
@@ -548,6 +539,21 @@ mod tests {
         // run nft - which on a machine that *does* have the table loaded would
         // put a live element in a live ruleset from a unit test. The gate is
         // two lines and the flag above is the whole of its state.
+    }
+
+    #[test]
+    fn a_failed_flush_never_adds_a_mark() {
+        let mut attempted = Vec::new();
+        let result = arm_commands(0x0003_3331, |op| {
+            attempted.push(op);
+            if op == Op::FlushSet {
+                Err(Failed::Run(anyhow!("flush refused")))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(attempted, [Op::ListSet, Op::FlushSet]);
     }
 
     /// The element check is status-only, like the set probe: `get element`

@@ -58,7 +58,8 @@ pub struct EventFilter {
     pub since_ts_unix_ms: Option<i64>,
 }
 
-/// Drops a `protocol: Some(Other(_))` predicate left behind by an older build.
+/// Drops an unsupported legacy protocol only from restrictive rules.
+/// Legacy Allows keep their predicate and are quarantined for explicit review.
 ///
 /// Before the protocol conversion was made to fail closed, a client sending an
 /// unspecified protocol with `has_protocol = true` produced `Other(0)`. No
@@ -70,12 +71,14 @@ pub struct EventFilter {
 /// while matching almost nothing, and - since the conversion now rejects it -
 /// it makes the rule **uneditable**, because every client edit is a
 /// read-modify-write that would send the value straight back and be refused.
-/// Healing it in memory restores the rule the operator meant and lets them
-/// save over it.
+/// Restrictive rules can be broadened conservatively; Allows require explicit
+/// review because removing a predicate would grant more access.
 ///
 /// Returns whether anything changed.
 fn heal_legacy_protocol(rule: &mut Rule) -> bool {
-    if matches!(rule.scope.protocol, Some(cfc_core::Protocol::Other(_))) {
+    if rule.action != cfc_core::Action::Allow
+        && matches!(rule.scope.protocol, Some(cfc_core::Protocol::Other(_)))
+    {
         rule.scope.protocol = None;
         return true;
     }
@@ -104,6 +107,14 @@ fn heal_legacy_protocol(rule: &mut Rule) -> bool {
 /// read-modify-write that sends the refused scope straight back to a daemon
 /// that now rejects it.
 fn quarantine_reason(rule: &Rule) -> Option<String> {
+    if rule.action == cfc_core::Action::Allow
+        && matches!(rule.scope.protocol, Some(cfc_core::Protocol::Other(_)))
+    {
+        return Some(
+            "legacy Allow has an unsupported protocol; rewriting it requires explicit review"
+                .into(),
+        );
+    }
     crate::convert::reject_unscoped(&rule.scope)
         .and_then(|()| rule.scope.reject_unmatchable_exe())
         .and_then(|()| rule.scope.reject_unmatchable_parent())
@@ -283,6 +294,38 @@ impl RuleStore {
             rusqlite::params![rule.id.to_string(), rule.enabled as i64, json],
         )?;
         Ok(())
+    }
+
+    /// Apply an import in one SQLite transaction; failure restores the old set.
+    pub fn apply_rules(&self, rules: &[Rule], replace: bool) -> anyhow::Result<usize> {
+        let serialized: Vec<_> = rules
+            .iter()
+            .map(|rule| Ok((rule, serde_json::to_string(rule)?)))
+            .collect::<anyhow::Result<_>>()?;
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let removed = if replace {
+            let existing = {
+                let mut statement = tx.prepare("SELECT id FROM rules")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<std::collections::HashSet<_>, _>>()?
+            };
+            let incoming: std::collections::HashSet<_> =
+                rules.iter().map(|rule| rule.id.to_string()).collect();
+            let removed = existing.difference(&incoming).count();
+            tx.execute("DELETE FROM rules", [])?;
+            removed
+        } else {
+            0
+        };
+        for (rule, json) in serialized {
+            tx.execute(
+                "INSERT INTO rules(id, enabled, data) VALUES(?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, data = excluded.data",
+                rusqlite::params![rule.id.to_string(), rule.enabled as i64, json],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn delete(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
@@ -732,6 +775,9 @@ mod tests {
             },
         );
         assert_eq!(rule.scope.specificity(), 2);
+        assert!(!super::heal_legacy_protocol(&mut rule));
+        assert!(super::quarantine_reason(&rule).is_some());
+        rule.action = cfc_core::Action::Deny;
         assert!(super::heal_legacy_protocol(&mut rule));
         assert_eq!(rule.scope.protocol, None);
         assert_eq!(
@@ -821,6 +867,18 @@ mod tests {
         let snap = store.snapshot().unwrap();
         assert_eq!(snap.rules.len(), 1);
         assert_eq!(snap.rules[0].name, "curl-renamed");
+    }
+
+    #[test]
+    fn a_failed_batch_preserves_old_policy() {
+        let store = RuleStore::open_in_memory().unwrap();
+        let old = sample_rule("old");
+        store.upsert(&old).unwrap();
+        store.conn.lock().execute_batch("CREATE TRIGGER reject_bad BEFORE INSERT ON rules WHEN json_extract(NEW.data, '$.name') = 'bad' BEGIN SELECT RAISE(ABORT, 'test write failure'); END;").unwrap();
+        assert!(store
+            .apply_rules(&[sample_rule("new"), sample_rule("bad")], true)
+            .is_err());
+        assert_eq!(store.snapshot().unwrap().rules, vec![old]);
     }
 
     #[test]

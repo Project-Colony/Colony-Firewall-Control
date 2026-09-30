@@ -160,7 +160,7 @@ enum RulesCmd {
     Import {
         /// File to read; reads stdin if omitted.
         file: Option<PathBuf>,
-        /// Replace mode: make the rule set match the file. Nothing is applied unless every rule reads cleanly; rules in the file are written first, then any not in it are removed.
+        /// Replace mode: make the rule set match the source in one atomic batch. Every source rule must validate before anything changes.
         #[arg(long)]
         replace: bool,
     },
@@ -168,7 +168,7 @@ enum RulesCmd {
     ImportOpensnitch {
         /// Path to opensnitch rules dir (e.g. /etc/opensnitchd/rules) or a single .json.
         path: PathBuf,
-        /// Replace mode: make the rule set match the file. Nothing is applied unless every rule reads cleanly; rules in the file are written first, then any not in it are removed.
+        /// Replace mode: make the rule set match the source in one atomic batch. Every source rule must validate before anything changes.
         #[arg(long)]
         replace: bool,
     },
@@ -247,7 +247,7 @@ async fn main() {
     let code = match run(cli).await {
         Ok(()) => error::EXIT_OK,
         Err(e) => {
-            eprintln!("cfc: {e}");
+            eprintln!("cfc: {}", output::terminal_safe(&e.to_string()));
             e.exit_code()
         }
     };

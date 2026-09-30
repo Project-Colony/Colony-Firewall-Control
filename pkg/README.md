@@ -26,10 +26,9 @@ Key design points:
 
 - **`colony-firewall-nft.service`** makes enforcement persistent
   (`nft -f` the snippet on start, `nft delete table inet colony_firewall`
-  on stop). It is `PartOf=colony-firewalld.service`, so stopping the
-  daemon also removes the fail-closed NFQUEUE table — no more manual
-  `nft -f` that vanishes on reboot, and no blackhole when the daemon is
-  down on purpose.
+  on explicit nft-unit stop). The table survives daemon restarts and stops,
+  so new flows fail closed while its queue listener is absent. Upgrades reload
+  active nft units atomically and leave inactive inbound filtering opt-in.
 - **`colony-firewall.sysusers`** creates the `colony-firewall` group used
   to gate access to the daemon's gRPC UNIX socket. Users join with
   `usermod -aG colony-firewall <user>`.
@@ -120,7 +119,7 @@ per platform). Notes on this manifest:
 - `postInstall` is **idempotent**: `daemon.toml` is only installed if
   absent, so upgrades never clobber user config.
 - `preRemove` mirrors the pacman `pre_remove`: stop the units, delete
-  `table inet colony_firewall`, then remove the non-binary files
+  both Colony nft tables and `/sys/fs/bpf/colony-firewall`, then remove the non-binary files
   `postInstall` placed (user config in `/etc/colony-firewall/` is kept).
   Stores too old to know the `preRemove` key ignore it — on those, run the
   `preRemove` commands manually before uninstalling, or outbound traffic
@@ -220,11 +219,13 @@ systemd/nftables-snippet.conf` step and survives reboots.
 
 Order matters because the nftables snippet is fail-closed:
 
-1. `systemctl disable --now colony-firewall-nft colony-firewalld`
+1. `systemctl disable --now colony-firewall-nft-inbound colony-firewall-nft colony-firewalld`
    (stopping the nft unit runs `nft delete table inet colony_firewall`).
-2. `nft delete table inet colony_firewall || true` as a belt-and-braces
-   repeat, in case the table was loaded manually.
-3. Remove files. `/etc/colony-firewall/daemon.toml` is user config and is
+2. Delete `table inet colony_firewall` and `table inet colony_firewall_inbound`
+   if still present, in case either was loaded manually.
+3. Remove `/sys/fs/bpf/colony-firewall` so pinned kernel denials cannot outlive
+   uninstall.
+4. Remove files. `/etc/colony-firewall/daemon.toml` is user config and is
    left behind (pacman saves it as `.pacsave`).
 
 The AUR package does this automatically via `pre_remove`; the Colony

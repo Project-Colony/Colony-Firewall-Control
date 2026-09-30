@@ -10,9 +10,9 @@
 //!
 //! | source | what it improves |
 //! |---|---|
-//! | `sched_process_exec` | exec-time exe/uid/gid/ppid, and a name for processes that died before `/proc` could be read |
-//! | `sched_process_exit` | explicit eviction, so a recycled pid cannot inherit an identity |
-//! | `cgroup_skb/ingress` | first-hand IP -> hostname mappings taken from real resolver answers instead of the destination's own PTR record |
+//! | `sched_process_exec` | exec metadata for diagnostics; policy executable identity still requires a readable mapped image |
+//! | `sched_process_exit` | eviction after confirmed thread-group death, with conservative compatibility fallback |
+//! | `cgroup_skb/ingress` | uncorrelated DNS response decoration, separate from confirmed PTR policy names |
 //!
 //! Every step degrades on its own. A missing object, no `CAP_BPF`, a kernel
 //! without BTF, a verifier rejection, a host with no cgroup v2 - each is a
@@ -29,7 +29,7 @@
 //!    ring-0 layer at all is not a useful default. Opt out with
 //!    `cargo build -p cfc-daemon --no-default-features` (package-scoped on
 //!    purpose; see the comment in `Cargo.toml`).
-//! 2. `[ebpf] enabled` in `daemon.toml`, off by default while this is new.
+//! 2. `[ebpf] enabled` in `daemon.toml`, automatic by default on supported hosts.
 //!
 //! With the feature off, [`start`] returns immediately and reports "compiled
 //! out". With the feature on and the config off, it reports "disabled". Both
@@ -93,8 +93,9 @@ mod nft_set;
 ///
 /// The fast path of attribution: the `cfc_connect4|6` programs record the
 /// association at `connect()` time, in the connecting process's own context, so
-/// this is exact and race-free where the `/proc` walk it replaces was a 37-44ms
-/// scan per new connection. `None` means the layer is not up, the object
+/// this records the creator at connect time and reduces the `/proc` walk. It
+/// does not attest the current sender of a shared, inherited or passed socket;
+/// the resolver must still validate live ownership. `None` means the layer is not up, the object
 /// predates the map, the old-kernel `_basic` variants are attached, or the
 /// entry was evicted - in every case the caller falls back to the walk, which
 /// is what it did before this existed.
@@ -764,7 +765,7 @@ pub fn nft_table_loaded() -> anyhow::Result<bool> {
 /// `main` is the one that knows it is running.
 pub fn flush_stale_fast_allow() {
     if let Err(e) = nft_set::disarm_for_start() {
-        tracing::warn!("could not flush a previous fast-allow mark from nftables: {e:#}");
+        tracing::error!("could not disable previous Fast Allow state: {e:#}; old marks may still bypass filtering; run systemctl reload colony-firewall-nft and inspect the journal before relying on filtering");
     }
 }
 
@@ -794,6 +795,9 @@ pub fn start(
     observed: tokio::sync::broadcast::Sender<crate::nfqueue::ObservedConnection>,
     #[cfg_attr(not(feature = "ebpf"), allow(unused_variables))] stats: crate::stats::Stats,
 ) -> Runtime {
+    if cfg.fast_allow {
+        tracing::warn!("Fast Allow is disabled: socket marks cannot verify the current sender; use normal NFQUEUE filtering and remove fast_allow = true from daemon.toml");
+    }
     // The answer until the layer says otherwise. Every early return below
     // leaves it standing, which is the truthful default: no layer, no fast
     // path.

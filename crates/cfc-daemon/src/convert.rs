@@ -136,7 +136,8 @@ pub fn duration_to_pb(d: cfc_core::Duration) -> pb::Duration {
     match d {
         D::Once => pb::Duration::Once,
         D::UntilRestart => pb::Duration::UntilRestart,
-        D::Always | D::Seconds(_) => pb::Duration::Always,
+        D::Always => pb::Duration::Always,
+        D::Seconds(_) => pb::Duration::Seconds,
     }
 }
 
@@ -148,6 +149,7 @@ pub fn duration_from_pb(d: i32) -> Result<cfc_core::Duration, String> {
         Ok(pb::Duration::Once) => Ok(D::Once),
         Ok(pb::Duration::UntilRestart) => Ok(D::UntilRestart),
         Ok(pb::Duration::Always) => Ok(D::Always),
+        Ok(pb::Duration::Seconds) => Err("timed duration requires duration_seconds".into()),
         Ok(pb::Duration::Unspecified) | Err(_) => Err(format!("duration unspecified/unknown: {d}")),
     }
 }
@@ -175,6 +177,7 @@ pub fn connection_to_pb(c: &Connection) -> pb::ConnectionInfo {
         dst_ip: c.dst_ip.to_string(),
         dst_port: c.dst_port as u32,
         dst_host: c.dst_host.clone().unwrap_or_default(),
+        dst_host_verified: c.dst_host_verified,
     }
 }
 
@@ -306,6 +309,10 @@ pub fn rule_to_pb(r: &Rule) -> pb::RuleInfo {
         enabled: r.enabled,
         action: action_to_pb(r.action) as i32,
         duration: duration_to_pb(r.duration) as i32,
+        duration_seconds: match r.duration {
+            cfc_core::Duration::Seconds(seconds) => seconds,
+            _ => 0,
+        },
         scope: Some(scope_to_pb(&r.scope)),
         created_at_unix_ms: r.created_at.timestamp_millis(),
         hit_count: r.hit_count,
@@ -360,7 +367,17 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
         name: r.name.clone(),
         enabled: r.enabled,
         action: action_from_pb(r.action)?,
-        duration: duration_from_pb(r.duration)?,
+        duration: if r.duration == pb::Duration::Seconds as i32 {
+            if r.duration_seconds == 0 {
+                return Err("duration_seconds must be positive".into());
+            }
+            cfc_core::Duration::Seconds(r.duration_seconds)
+        } else {
+            if r.duration_seconds != 0 {
+                return Err("duration_seconds requires timed duration".into());
+            }
+            duration_from_pb(r.duration)?
+        },
         scope,
         created_at,
         hit_count: r.hit_count,
@@ -511,6 +528,7 @@ mod tests {
             }),
             created_at_unix_ms: 0,
             hit_count: 0,
+            duration_seconds: 0,
         };
         assert!(rule_from_pb(&pb).is_err());
 
@@ -537,6 +555,7 @@ mod tests {
             scope: Some(cfc_proto::v1::RuleScope::default()),
             created_at_unix_ms: 0,
             hit_count: 0,
+            duration_seconds: 0,
         };
         let e = rule_from_pb(&pb).expect_err("an unscoped rule must be refused");
         assert!(e.contains("constrains nothing"), "{e}");
@@ -654,12 +673,19 @@ mod tests {
     }
 
     #[test]
-    fn duration_seconds_collapses_to_always() {
-        // We don't carry the Seconds variant on the wire; it round-trips
-        // through "Always" by design.
+    fn duration_seconds_does_not_collapse_to_always() {
+        let mut rule = Rule::new(
+            "timed",
+            Action::Allow,
+            RuleScope {
+                dst_port: Some(443),
+                ..RuleScope::any()
+            },
+        );
+        rule.duration = Duration::Seconds(60);
         assert_eq!(
-            duration_from_pb(duration_to_pb(Duration::Seconds(60)) as i32).unwrap(),
-            Duration::Always
+            rule_from_pb(&rule_to_pb(&rule)).unwrap().duration,
+            rule.duration
         );
     }
 
@@ -774,6 +800,7 @@ mod tests {
             scope: Some(cfc_proto::v1::RuleScope::default()),
             created_at_unix_ms: 0,
             hit_count: 0,
+            duration_seconds: 0,
         };
         assert!(rule_from_pb(&pb).is_err());
     }

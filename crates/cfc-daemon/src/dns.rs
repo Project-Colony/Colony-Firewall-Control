@@ -1,69 +1,19 @@
-//! IP -> hostname cache, with two sources of very different trustworthiness.
+//! Hostname enrichment with separate policy identity and display decoration.
 //!
-//! The names in here are what `dst_host` rules match on and what the UI shows
-//! next to a destination address. Where a name came from therefore matters
-//! more than the name itself.
+//! Policy names come only from PTR lookups whose forward A/AAAA lookup contains
+//! the original address. They remain asynchronous, cached, best-effort metadata;
+//! neither a hostname Allow nor Deny rule provides domain isolation.
 //!
-//! Crucially, the daemon must skip its OWN outgoing DNS packets in the
-//! NFQUEUE worker (via `is_self()`) - otherwise the resolver's queries
-//! would themselves be intercepted, deadlocking the resolver on a verdict
-//! the daemon hasn't produced yet.
+//! The eBPF ingress hook also observes UDP DNS-shaped responses. Those records
+//! are not tied to a resolver transaction, so they remain diagnostics only and
+//! cannot replace a confirmed policy name. The diagnostic cache prefers fresh
+//! observations; [`DnsCache::cached_named`] reads the independent policy cache.
 //!
-//! # Source 1: PTR + forward confirmation (always available)
-//!
-//! For every observed connection, we kick off a non-blocking PTR lookup so
-//! that subsequent observations of the same destination IP can be displayed
-//! with a hostname instead of just an address.
-//!
-//! A PTR record is published by whoever controls the IP's reverse zone -
-//! i.e. by the operator of the address the traffic is going to, which for
-//! outbound filtering is exactly the party we may be trying to keep the
-//! user away from. Taken at face value, a hostile server could name itself
-//! `api.github.com` and satisfy a `dst_host` allow rule.
-//!
-//! So every PTR answer is forward-confirmed (FCrDNS): we resolve the name
-//! we got back to its A/AAAA set and keep it only if that set contains the
-//! IP we started from. That makes the name as trustworthy as the forward
-//! zone of the claimed domain, instead of as trustworthy as the reverse
-//! zone of an arbitrary IP. Unconfirmed names are discarded, so a rule
-//! never matches on them.
-//!
-//! This is a mitigation, not a guarantee: hostnames are still resolved
-//! after the fact and cached, and an attacker who controls both zones can
-//! still self-consistently name themselves. `dst_host` remains best-effort
-//! metadata - see docs/HARDENING.md.
-//!
-//! # Source 2: observed answers (only with the eBPF layer)
-//!
-//! When `cgroup_skb/ingress` is attached (see [`crate::ebpf`]), the daemon
-//! sees the DNS *responses* the machine actually receives and lifts the
-//! `A`/`AAAA` records straight out of them. [`DnsCache::observe_answer`]
-//! stores those with a higher trust level than anything the PTR path
-//! produces, and [`DnsCache::lookup_cached`] prefers them.
-//!
-//! **Why that is a security win.** An observed answer is *first-hand*: this
-//! host asked a resolver for `example.com`, and the resolver said `93.184.…`.
-//! The mapping comes from the forward zone of the name, which is the party
-//! that owns the name, and it arrives *before* the connection it explains. A
-//! PTR answer is second-hand in the worst possible way - it is published by
-//! the owner of the destination address, i.e. by the server we may be trying
-//! to keep the user away from, and it is fetched *after* the fact. Observed
-//! answers close the "hostile server names itself `api.github.com`" hole
-//! outright, because the destination no longer gets a vote in what it is
-//! called.
-//!
-//! **What it does not close.** The hook reads packets off the wire, before the
-//! resolver's own transaction-id and port checks. Anything that arrives from
-//! source port 53 and parses as a response is observed, including a spoofed or
-//! injected one that the resolving library will go on to reject. So an
-//! attacker who can land forged UDP packets on an open socket can still poison
-//! this cache - the same attacker, note, who can also forge the forward lookup
-//! FCrDNS relies on. The rule stands: `dst_host` is best-effort metadata and a
-//! convenience for *deny* rules, never the boundary an allow rule leans on.
-//!
-//! Both sources feed one map keyed by IP, so a later PTR result can never
-//! displace a live observed answer, and an observed answer always displaces a
-//! PTR one.
+//! At most eight resolver jobs run or wait at once. A permit is acquired before
+//! spawning and remains held until the blocking libc resolver returns. Full
+//! capacity drops enrichment work immediately. Explicit Deny/Reject decisions
+//! do not start new lookups. The daemon's own resolver traffic must be exempted
+//! in NFQUEUE to avoid waiting for its own verdict.
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -74,6 +24,7 @@ use std::time::{Duration, Instant};
 const CACHE_TTL_SECS: u64 = 300;
 const NEGATIVE_TTL_SECS: u64 = 60;
 const CACHE_MAX_ENTRIES: usize = 4096;
+const LOOKUP_MAX_IN_FLIGHT: usize = 8;
 
 /// Floor and ceiling applied to the TTL of an observed answer.
 ///
@@ -85,15 +36,14 @@ const CACHE_MAX_ENTRIES: usize = 4096;
 const OBSERVED_MIN_TTL_SECS: u64 = 60;
 const OBSERVED_MAX_TTL_SECS: u64 = 3600;
 
-/// Where a cached name came from. Ordered: higher is more trustworthy, and
-/// the ordering is what [`Entry::supersedes`] is written in terms of.
+/// Display source preference, used by [`Entry::supersedes`]. This ordering does
+/// not grant policy trust; observed names are excluded from policy identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trust {
     /// Reverse lookup of the destination address, forward-confirmed. The
     /// destination's owner had a say in this name.
     Ptr,
-    /// Lifted from a DNS response this host actually received. The name's own
-    /// zone said so, before the connection happened.
+    /// Lifted from an uncorrelated DNS-shaped response received by this host.
     Observed,
 }
 
@@ -104,9 +54,12 @@ pub struct DnsCache {
 
 struct Inner {
     cache: RwLock<HashMap<IpAddr, Entry>>,
+    policy: RwLock<HashMap<IpAddr, Entry>>,
+    lookups: Arc<tokio::sync::Semaphore>,
     daemon_pid: u32,
 }
 
+#[derive(Clone)]
 struct Entry {
     hostname: Option<String>,
     inserted: Instant,
@@ -125,10 +78,8 @@ impl Entry {
 
     /// Whether a new entry at `trust` may replace this one.
     ///
-    /// A fresh observed answer outranks everything, including a later PTR
-    /// result for the same address; anything else is replaceable. An in-flight
-    /// placeholder is never protected, or a lookup that raced an observation
-    /// could deadlock the slot.
+    /// Fresh observations have display preference over PTR. This does not
+    /// affect the separate policy cache. Expired entries are replaceable.
     fn supersedes(&self, trust: Trust, now: Instant) -> bool {
         trust >= self.trust || !self.is_fresh(now)
     }
@@ -139,6 +90,8 @@ impl DnsCache {
         Self {
             inner: Arc::new(Inner {
                 cache: RwLock::new(HashMap::new()),
+                policy: RwLock::new(HashMap::new()),
+                lookups: Arc::new(tokio::sync::Semaphore::new(LOOKUP_MAX_IN_FLIGHT)),
                 daemon_pid: std::process::id(),
             }),
         }
@@ -169,10 +122,8 @@ impl DnsCache {
             .flatten()
     }
 
-    /// The trust level backing the currently cached name for `ip`, if any.
-    /// Diagnostics and tests; the packet path does not care.
-    /// The cached name for `ip` and whether it was confirmed against that
-    /// address, in one read.
+    /// The confirmed policy name for `ip`, in one read. Display-only observed
+    /// responses never enter this cache.
     ///
     /// Confirmed means a reverse lookup that passed forward confirmation: the
     /// name resolved back to this address, so asserting it takes control of
@@ -180,14 +131,12 @@ impl DnsCache {
     /// not confirmed - nothing ties such a response to a query this host sent
     /// - and only decorates the flow. See `Connection::dst_host_verified`.
     pub fn cached_named(&self, ip: IpAddr) -> Option<(String, bool)> {
-        let now = Instant::now();
-        let cache = self.inner.cache.read();
+        let cache = self.inner.policy.read();
         let entry = cache.get(&ip)?;
-        if !entry.is_fresh(now) {
+        if !entry.is_fresh(Instant::now()) {
             return None;
         }
-        let name = entry.hostname.clone()?;
-        Some((name, entry.trust == Trust::Ptr))
+        Some((entry.hostname.clone()?, true))
     }
 
     pub fn cached_trust(&self, ip: IpAddr) -> Option<Trust> {
@@ -243,14 +192,12 @@ impl DnsCache {
     /// Fire-and-forget reverse lookup. The next call to `lookup_cached(ip)`
     /// after the response will return the hostname.
     ///
-    /// A no-op when a fresh entry already exists, which now includes an
-    /// observed answer: with the eBPF layer running, most destinations are
-    /// already named by the time a packet reaches this point and the daemon
-    /// stops emitting PTR queries for them altogether.
+    /// A no-op when fresh policy identity or an in-flight PTR lookup already
+    /// exists. Display observations do not suppress policy enrichment.
     pub fn enqueue_lookup(&self, ip: IpAddr) {
         let now = Instant::now();
         {
-            let cache = self.inner.cache.read();
+            let cache = self.inner.policy.read();
             if let Some(entry) = cache.get(&ip) {
                 if entry.in_flight || entry.is_fresh(now) {
                     return;
@@ -258,11 +205,17 @@ impl DnsCache {
             }
         }
 
-        // Reserve the slot so concurrent observations don't double-spawn.
+        // Bound both running lookups and work waiting for a blocking thread.
+        // Never queue a task waiting for a permit on this packet path.
+        let Ok(permit) = self.inner.lookups.clone().try_acquire_owned() else {
+            return;
+        };
+
+        // Reserve the slot so concurrent connections do not double-spawn.
         {
-            let mut cache = self.inner.cache.write();
-            // Re-check under the write lock: an observation may have landed
-            // between the two, and the placeholder would throw it away.
+            let mut cache = self.inner.policy.write();
+            // Re-check under the write lock: another connection may already
+            // have reserved or completed this policy lookup.
             if let Some(entry) = cache.get(&ip) {
                 if entry.in_flight || entry.is_fresh(Instant::now()) {
                     return;
@@ -286,6 +239,9 @@ impl DnsCache {
             // `dns_lookup` is sync (getnameinfo/getaddrinfo); move to a
             // blocking thread so the tokio runtime stays responsive.
             let hostname = tokio::task::spawn_blocking(move || {
+                // Keep the permit in the blocking job even if its async waiter
+                // is cancelled while libc is still resolving.
+                let _permit = permit;
                 let name = dns_lookup::lookup_addr(&ip)
                     .ok()
                     // libc may return the input IP as a string if no PTR
@@ -311,46 +267,36 @@ impl DnsCache {
 /// trust ordering below is what stops a late PTR answer from overwriting a
 /// live observed one, and it must not be bypassable.
 fn record_ptr_result(inner: &Inner, ip: IpAddr, hostname: Option<String>, now: Instant) {
-    let mut cache = inner.cache.write();
-    // Only ever *update* a key `enqueue_lookup` reserved; never create one.
-    //
-    // This is the bound, and it is a branch rather than a call to
-    // `evict_if_full`. Every insert site but this one is paired with a
-    // reservation, so this one adding an eviction would be a third O(n) scan
-    // under the write lock for no gain - and it would still not bound the map,
-    // because eviction removes exactly one entry per insert while a completing
-    // lookup whose placeholder was already evicted adds one. The map ratcheted
-    // upward by one per orphaned completion, without limit, on any workload
-    // touching more distinct destinations than the cache holds.
-    //
-    // A completion whose placeholder is gone has nothing to say: the entry it
-    // would describe was evicted precisely because nothing had asked for it
-    // recently. Dropping the answer costs one hostname, and the next packet to
-    // that address enqueues a fresh lookup.
-    let Some(existing) = cache.get(&ip) else {
-        tracing::trace!(%ip, "PTR result arrived after its reservation was evicted; dropping");
-        return;
+    let entry = Entry {
+        ttl: Duration::from_secs(if hostname.is_some() {
+            CACHE_TTL_SECS
+        } else {
+            NEGATIVE_TTL_SECS
+        }),
+        hostname,
+        inserted: now,
+        in_flight: false,
+        trust: Trust::Ptr,
     };
-    // An answer observed on the wire while this lookup was in flight is
-    // better than the result we just got; do not clobber it.
-    if !existing.supersedes(Trust::Ptr, now) {
+    {
+        let mut policy = inner.policy.write();
+        // A completion cannot recreate an evicted reservation.
+        if !policy.contains_key(&ip) {
+            return;
+        }
+        policy.insert(ip, entry.clone());
+    }
+    let mut cache = inner.cache.write();
+    if cache
+        .get(&ip)
+        .is_some_and(|old| !old.supersedes(Trust::Ptr, now))
+    {
         return;
     }
-    let ttl = Duration::from_secs(if hostname.is_some() {
-        CACHE_TTL_SECS
-    } else {
-        NEGATIVE_TTL_SECS
-    });
-    cache.insert(
-        ip,
-        Entry {
-            hostname,
-            inserted: now,
-            in_flight: false,
-            trust: Trust::Ptr,
-            ttl,
-        },
-    );
+    if !cache.contains_key(&ip) {
+        evict_if_full(&mut cache);
+    }
+    cache.insert(ip, entry);
 }
 
 /// Keeps the map bounded by dropping the oldest entry. Called with the write
@@ -414,6 +360,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uncorrelated_observations_cannot_replace_policy_identity() {
+        let cache = DnsCache::new();
+        let addr = ip("203.0.113.7");
+        insert_ptr(&cache, addr, Some("blocked.example"), Instant::now());
+        cache.observe_answer(addr, "untrusted.example", 300);
+        assert_eq!(
+            cache.lookup_cached(addr).as_deref(),
+            Some("untrusted.example")
+        );
+        assert_eq!(
+            cache.cached_named(addr),
+            Some(("blocked.example".into(), true))
+        );
+    }
+
+    #[test]
+    fn an_observation_alone_has_no_policy_identity() {
+        let cache = DnsCache::new();
+        let addr = ip("203.0.113.8");
+        cache.observe_answer(addr, "untrusted.example", 300);
+        assert_eq!(cache.cached_named(addr), None);
+    }
+
+    #[test]
     fn forward_confirmation_requires_the_original_ip() {
         let want: IpAddr = "93.184.216.34".parse().unwrap();
         let other: IpAddr = "203.0.113.7".parse().unwrap();
@@ -472,20 +442,31 @@ mod tests {
     /// away an observation. A helper that overwrote would have made every
     /// trust-ordering test below pass for the wrong reason.
     fn reserve(cache: &DnsCache, addr: IpAddr, now: Instant) {
-        let mut c = cache.inner.cache.write();
-        if c.contains_key(&addr) {
-            return;
-        }
-        c.insert(
-            addr,
-            Entry {
-                hostname: None,
-                inserted: now,
-                in_flight: true,
-                trust: Trust::Ptr,
-                ttl: Duration::from_secs(NEGATIVE_TTL_SECS),
-            },
-        );
+        let entry = Entry {
+            hostname: None,
+            inserted: now,
+            in_flight: true,
+            trust: Trust::Ptr,
+            ttl: Duration::from_secs(NEGATIVE_TTL_SECS),
+        };
+        cache
+            .inner
+            .policy
+            .write()
+            .entry(addr)
+            .or_insert(entry.clone());
+        cache.inner.cache.write().entry(addr).or_insert(entry);
+    }
+
+    #[test]
+    fn saturated_lookups_do_not_spawn_or_reserve_another_job() {
+        let cache = DnsCache::new();
+        let _permits: Vec<_> = (0..8)
+            .map(|_| cache.inner.lookups.clone().try_acquire_owned().unwrap())
+            .collect();
+        // No runtime and no network: saturation must return before spawning.
+        cache.enqueue_lookup(ip("203.0.113.9"));
+        assert!(cache.inner.policy.read().is_empty());
     }
 
     #[test]
@@ -543,8 +524,8 @@ mod tests {
 
     #[test]
     fn an_observation_beats_an_existing_ptr_name() {
-        // The whole point: a destination that named itself via PTR loses to
-        // what the resolver actually answered for the name.
+        // Diagnostic naming prefers a fresh observation; policy identity does
+        // not use this preference.
         let cache = DnsCache::new();
         let now = Instant::now();
         insert_ptr(&cache, ip("203.0.113.7"), Some("api.github.com"), now);
@@ -564,8 +545,7 @@ mod tests {
         let now = Instant::now();
         cache.observe_answer_at(ip("93.184.216.34"), "example.com", 300, now);
         // A PTR lookup for the same address completes later, claiming
-        // something else. The destination's reverse zone does not get to
-        // rename a host we watched the resolver answer for.
+        // something else. Display preference does not alter policy identity.
         insert_ptr(&cache, ip("93.184.216.34"), Some("evil.example"), now);
         assert_eq!(
             cache.lookup_at(ip("93.184.216.34"), now).as_deref(),

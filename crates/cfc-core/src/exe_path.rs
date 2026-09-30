@@ -266,8 +266,9 @@ pub fn file_is_sealed(uid: u32, mode: u32) -> bool {
 ///
 /// True only when the file *and every ancestor directory* pass the sealed
 /// tests above: a root-owned file under a directory someone else can rename
-/// is not a sealed file. Symlinks are resolved first - judging the link and
-/// trusting the target would check the wrong file.
+/// is not a sealed file. Callers must supply an absolute resolved path.
+/// Symlinks do not qualify: following a replacement link could judge a
+/// different image while granting trust to the original pathname.
 ///
 /// Two callers, two consequences:
 /// * the daemon binds a prompt-created **allow** to the binary's hash when
@@ -281,14 +282,16 @@ pub fn file_is_sealed(uid: u32, mode: u32) -> bool {
 pub fn is_root_sealed(path: &std::path::Path) -> std::io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let real = std::fs::canonicalize(path)?;
-    let meta = std::fs::metadata(&real)?;
+    if !path.is_absolute() {
+        return Ok(false);
+    }
+    let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_file() || !file_is_sealed(meta.uid(), meta.mode()) {
         return Ok(false);
     }
-    for dir in real.ancestors().skip(1) {
-        let m = std::fs::metadata(dir)?;
-        if !dir_is_sealed(m.uid(), m.mode()) {
+    for dir in path.ancestors().skip(1) {
+        let m = std::fs::symlink_metadata(dir)?;
+        if !m.is_dir() || !dir_is_sealed(m.uid(), m.mode()) {
             return Ok(false);
         }
     }

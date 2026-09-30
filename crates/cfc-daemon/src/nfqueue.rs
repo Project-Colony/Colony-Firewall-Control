@@ -203,6 +203,26 @@ pub struct ObservedConnection {
     pub verdict: Verdict,
 }
 
+/// Record refusals before the bounded, lossy live-feed channel.
+pub fn publish_observation(tx: &broadcast::Sender<ObservedConnection>, obs: ObservedConnection) {
+    if obs.verdict.action != Action::Allow {
+        info!(
+            action = ?obs.verdict.action,
+            source = crate::convert::verdict_source_db_str(&obs.verdict.source),
+            exe = ?obs.process.exe,
+            pid = obs.process.pid,
+            uid = ?obs.process.uid,
+            dst = %format_args!("{}:{}", obs.connection.dst_ip, obs.connection.dst_port),
+            "connection blocked"
+        );
+    }
+    let _ = tx.send(obs);
+}
+
+fn prompt_session_seed() -> u64 {
+    uuid::Uuid::new_v4().as_u128() as u64 & (u64::MAX >> 1)
+}
+
 /// One packet taken off the queue, as the worker needs to see it.
 ///
 /// Deliberately borrow-based: `payload` hands back the buffer the message
@@ -391,7 +411,7 @@ pub fn spawn(
         resolver: Box::new(ProcfsResolver),
         waiters: HashMap::new(),
         pending_flows: HashMap::new(),
-        next_prompt_id: 1,
+        next_prompt_id: prompt_session_seed(),
         verdict_channel_open: true,
         tuning: Tuning::default(),
         stop: stop.clone(),
@@ -413,34 +433,39 @@ pub fn spawn(
 }
 
 /// Identity of a flow for prompt dedup: one outstanding prompt per
-/// (origin, destination, protocol). The source port is deliberately not
+/// (UID, executable image, destination, protocol). The source port is deliberately not
 /// part of the key so SYN retransmits *and* parallel connections from the
 /// same app to the same destination share a single prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FlowKey {
     origin: FlowOrigin,
+    uid: Option<u32>,
     dst_ip: IpAddr,
     dst_port: u16,
     protocol: Protocol,
 }
 
-/// Prompt-dedup origin: the executable path when attribution succeeded,
-/// otherwise the pid (0 when even the pid is unknown).
+/// Only a known image may share a prompt; uncertain identities never do.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FlowOrigin {
-    Exe(PathBuf),
-    Pid(u32),
+    Exe { path: PathBuf, sha256: String },
+    Unattributed(uuid::Uuid),
 }
 
 impl FlowKey {
     fn for_flow(conn: &Connection, proc: &Process) -> Self {
-        let origin = if !proc.exe_is_known() {
-            FlowOrigin::Pid(proc.pid)
-        } else {
-            FlowOrigin::Exe(proc.exe.clone())
+        let origin = match (&proc.sha256, proc.exe_is_known(), proc.uid) {
+            (Some(sha256), true, Some(_)) => FlowOrigin::Exe {
+                path: proc.exe.clone(),
+                sha256: sha256.clone(),
+            },
+            // Neither a PID nor a path identifies an unknown execution.
+            // Such packets must receive independent authorization.
+            _ => FlowOrigin::Unattributed(uuid::Uuid::new_v4()),
         };
         Self {
             origin,
+            uid: proc.uid,
             dst_ip: conn.dst_ip,
             dst_port: conn.dst_port,
             protocol: conn.protocol,
@@ -451,12 +476,16 @@ impl FlowKey {
 /// Per-prompt bookkeeping on the worker thread.
 struct PendingPrompt<M> {
     flow: FlowKey,
-    connection: Connection,
-    process: Process,
-    /// Every packet parked on this prompt; all get the same verdict.
-    packets: Vec<M>,
+    /// Current closed policy is checked separately for every parked packet.
+    packets: Vec<ParkedPacket<M>>,
     /// Applied if the router disappears before answering.
     fallback: Verdict,
+}
+
+struct ParkedPacket<M> {
+    message: M,
+    connection: Connection,
+    process: Process,
 }
 
 /// Loop timings. Constant in production; the tests shrink them so that
@@ -640,8 +669,7 @@ impl<Q: PacketQueue> Worker<Q> {
     }
 
     /// Applies a resolved prompt: verdicts every parked packet, drops the
-    /// waiters + pending_flows entries, records stats once (one prompt ==
-    /// one logical connection) and publishes the observation.
+    /// waiters + pending_flows entries, and records each actual verdict.
     fn resolve_prompt(&mut self, pv: PromptVerdict) {
         let Some(pending) = self.waiters.remove(&pv.prompt_id) else {
             // Late duplicate (the prompt already resolved another way);
@@ -654,19 +682,28 @@ impl<Q: PacketQueue> Worker<Q> {
         };
         self.pending_flows.remove(&pending.flow);
 
-        for msg in pending.packets {
+        for packet in pending.packets {
             // Per packet, not per prompt: a Reject response is derived from
             // the individual segment (its sequence numbers, its source
             // port), and parallel connections share one prompt.
-            self.apply_action(msg, pv.verdict.action);
+            let verdict = match self.engine.evaluate(&packet.connection, &packet.process) {
+                Decision::Resolved(current) if current.action != Action::Allow => current,
+                _ => pv.verdict,
+            };
+            self.apply_action(packet.message, verdict.action);
+            if verdict.action == Action::Allow {
+                self.dns.enqueue(packet.connection.dst_ip);
+            }
+            record(&self.stats, verdict.action);
+            publish_observation(
+                &self.observed_tx,
+                ObservedConnection {
+                    connection: packet.connection,
+                    process: packet.process,
+                    verdict,
+                },
+            );
         }
-
-        record(&self.stats, pv.verdict.action);
-        let _ = self.observed_tx.send(ObservedConnection {
-            connection: pending.connection,
-            process: pending.process,
-            verdict: pv.verdict,
-        });
     }
 
     fn handle_message(&mut self, msg: Q::Msg) {
@@ -689,11 +726,14 @@ impl<Q: PacketQueue> Worker<Q> {
                 verdict,
             } => {
                 self.apply_action(msg, verdict.action);
-                let _ = self.observed_tx.send(ObservedConnection {
-                    connection,
-                    process,
-                    verdict,
-                });
+                publish_observation(
+                    &self.observed_tx,
+                    ObservedConnection {
+                        connection,
+                        process,
+                        verdict,
+                    },
+                );
             }
             PacketOutcome::Prompt {
                 connection,
@@ -739,7 +779,11 @@ impl<Q: PacketQueue> Worker<Q> {
                     prompt_id,
                     "flow already prompting; parking packet on existing prompt"
                 );
-                pending.packets.push(msg);
+                pending.packets.push(ParkedPacket {
+                    message: msg,
+                    connection,
+                    process,
+                });
                 return;
             }
             // The waiters/pending_flows bijection documented on [`Worker`]
@@ -776,7 +820,10 @@ impl<Q: PacketQueue> Worker<Q> {
         }
 
         let prompt_id = self.next_prompt_id;
-        self.next_prompt_id += 1;
+        self.next_prompt_id = self
+            .next_prompt_id
+            .checked_add(1)
+            .unwrap_or_else(prompt_session_seed);
         let req = PromptRequest {
             prompt_id,
             connection: connection.clone(),
@@ -789,9 +836,11 @@ impl<Q: PacketQueue> Worker<Q> {
                     prompt_id,
                     PendingPrompt {
                         flow,
-                        connection,
-                        process,
-                        packets: vec![msg],
+                        packets: vec![ParkedPacket {
+                            message: msg,
+                            connection,
+                            process,
+                        }],
                         fallback,
                     },
                 );
@@ -821,12 +870,18 @@ impl<Q: PacketQueue> Worker<Q> {
         fallback: Verdict,
     ) {
         self.apply_action(msg, fallback.action);
+        if fallback.action == Action::Allow {
+            self.dns.enqueue(connection.dst_ip);
+        }
         record(&self.stats, fallback.action);
-        let _ = self.observed_tx.send(ObservedConnection {
-            connection,
-            process,
-            verdict: fallback,
-        });
+        publish_observation(
+            &self.observed_tx,
+            ObservedConnection {
+                connection,
+                process,
+                verdict: fallback,
+            },
+        );
     }
 
     /// Applies a policy action to a queued packet.
@@ -874,6 +929,7 @@ impl<Q: PacketQueue> Worker<Q> {
 /// Process attribution seam so [`handle_packet`] is testable without a
 /// live /proc.
 trait ProcessResolver {
+    #[allow(clippy::too_many_arguments)] // socket tuple plus kernel UID attribution
     fn pid_for_socket(
         &self,
         protocol: Protocol,
@@ -882,6 +938,7 @@ trait ProcessResolver {
         src_port: u16,
         dst_ip: IpAddr,
         dst_port: u16,
+        uid: Option<u32>,
     ) -> Option<u32>;
     fn resolve(&self, pid: u32) -> Process;
 }
@@ -898,8 +955,11 @@ impl ProcessResolver for ProcfsResolver {
         src_port: u16,
         dst_ip: IpAddr,
         dst_port: u16,
+        uid: Option<u32>,
     ) -> Option<u32> {
-        process_resolve::pid_for_socket(protocol, direction, src_ip, src_port, dst_ip, dst_port)
+        process_resolve::pid_for_socket(
+            protocol, direction, src_ip, src_port, dst_ip, dst_port, uid,
+        )
     }
 
     fn resolve(&self, pid: u32) -> Process {
@@ -1021,6 +1081,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
             conn.src_port,
             conn.dst_ip,
             conn.dst_port,
+            meta.uid,
         )
     };
 
@@ -1028,7 +1089,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
     // resolver would itself be intercepted, deadlocking on a verdict
     // we can't produce until the resolver returns.
     if let Some(pid) = pid_hint {
-        if deps.dns.is_self(pid) {
+        if deps.dns.is_self(pid) && meta.uid == Some(0) {
             return PacketOutcome::Silent(NfqVerdict::Accept);
         }
     }
@@ -1056,14 +1117,16 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
         conn.uid = proc.uid;
     }
 
-    // Attach cached hostname if any, kick off a fresh lookup for next time.
+    // Cached policy names never cause network work for a refused flow.
     if let Some((host, verified)) = deps.dns.cached_host(conn.dst_ip) {
         conn = conn.with_host_verified(host, verified);
     }
-    deps.dns.enqueue(conn.dst_ip);
 
     match deps.engine.evaluate(&conn, &proc) {
         Decision::Resolved(verdict) => {
+            if verdict.action == Action::Allow {
+                deps.dns.enqueue(conn.dst_ip);
+            }
             record(deps.stats, verdict.action);
             PacketOutcome::Deliver {
                 connection: conn,
@@ -1105,6 +1168,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                 // without a prompt.
                 debug!(dst = %conn.dst_ip, "paused: allowing unmatched flow without prompting");
                 let verdict = Verdict::default_allow();
+                deps.dns.enqueue(conn.dst_ip);
                 record(deps.stats, verdict.action);
                 return PacketOutcome::Deliver {
                     connection: conn,
@@ -1199,6 +1263,7 @@ mod tests {
             gid: Some(1000),
             exe: PathBuf::from(exe),
             cmdline: vec![exe.to_string()],
+            sha256: Some("aa".repeat(32)),
             ..Process::unknown(pid)
         }
     }
@@ -1224,6 +1289,7 @@ mod tests {
             _src_port: u16,
             _dst_ip: IpAddr,
             _dst_port: u16,
+            _uid: Option<u32>,
         ) -> Option<u32> {
             self.socket_lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1456,8 +1522,8 @@ mod tests {
             .chain((0..MAX_PACKETS_PER_PROMPT).map(|i| (i as u32, NfqVerdict::Accept)))
             .collect();
         assert_eq!(h.verdicts(), expected);
-        // One prompt is one logical connection, counted once.
-        assert_eq!(h.stats.connections_allowed(), 1);
+        // Each parked packet receives its own policy decision and audit record.
+        assert_eq!(h.stats.connections_allowed(), MAX_PACKETS_PER_PROMPT as u64);
         assert!(h.worker().waiters.is_empty());
         assert!(h.worker().pending_flows.is_empty());
     }
@@ -1793,11 +1859,97 @@ mod tests {
         // must pass or the reverse resolver deadlocks.
         let mut env = TestEnv::new(vec![deny_port_rule(53)], dp_deny());
         env.dns.self_pid = Some(4242);
+        let meta = PacketMeta {
+            uid: Some(0),
+            ..NO_META
+        };
         assert!(matches!(
-            env.handle(&tcp_packet(53), &NO_META),
+            env.handle(&tcp_packet(53), &meta),
             PacketOutcome::Silent(NfqVerdict::Accept)
         ));
         assert_eq!(env.stats.connections_total(), 0);
+    }
+
+    #[test]
+    fn a_socket_hint_does_not_exempt_a_different_uid_from_policy() {
+        let mut env = TestEnv::new(vec![deny_port_rule(53)], dp_deny());
+        env.dns.self_pid = Some(4242);
+        let meta = PacketMeta {
+            uid: Some(1000),
+            ..NO_META
+        };
+        match env.handle(&tcp_packet(53), &meta) {
+            PacketOutcome::Deliver { verdict, .. } => assert_eq!(verdict.action, Action::Deny),
+            other => panic!("a foreign UID must follow policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_flow_does_not_start_dns_enrichment() {
+        struct CountingDns(std::sync::atomic::AtomicUsize);
+        impl HostCache for CountingDns {
+            fn is_self(&self, _: u32) -> bool {
+                false
+            }
+            fn cached_host(&self, _: IpAddr) -> Option<(String, bool)> {
+                None
+            }
+            fn enqueue(&self, _: IpAddr) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dns = CountingDns(std::sync::atomic::AtomicUsize::new(0));
+        let env = TestEnv::new(vec![deny_port_rule(443)], dp_deny());
+        let deps = PipelineDeps {
+            engine: &env.engine,
+            stats: &env.stats,
+            dns: &dns,
+            resolver: &env.resolver,
+        };
+        assert!(matches!(
+            handle_packet(&tcp_packet(443), &NO_META, &deps),
+            PacketOutcome::Deliver { .. }
+        ));
+        assert_eq!(dns.0.load(Ordering::Relaxed), 0);
+        env.engine.upsert_rule(allow_port_rule(80));
+        let _ = handle_packet(&tcp_packet(80), &NO_META, &deps);
+        assert_eq!(dns.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn blocked_packet_is_logged_without_a_live_feed_receiver() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = bytes.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(capture.clone()))
+            .finish();
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443)], dp_deny());
+        drop(h.observed_rx);
+        tracing::subscriber::with_default(subscriber, || {
+            h.worker
+                .as_mut()
+                .unwrap()
+                .handle_message(FakeMsg::new(7, tcp_packet(443)))
+        });
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("connection blocked"),
+            "missing independent audit record: {output}"
+        );
+        assert!(output.contains("5.6.7.8:443"));
     }
 
     #[test]
@@ -1952,6 +2104,73 @@ mod tests {
     }
 
     #[test]
+    fn prompts_do_not_share_authorization_between_users_or_images() {
+        let conn = conn_to(443, 5555);
+        let mut owner = test_process(1, "/usr/bin/curl");
+        owner.sha256 = Some("aa".repeat(32));
+        let mut other = owner.clone();
+        other.uid = Some(1001);
+        assert_ne!(
+            FlowKey::for_flow(&conn, &owner),
+            FlowKey::for_flow(&conn, &other)
+        );
+        other.uid = owner.uid;
+        other.sha256 = Some("bb".repeat(32));
+        assert_ne!(
+            FlowKey::for_flow(&conn, &owner),
+            FlowKey::for_flow(&conn, &other)
+        );
+    }
+
+    #[test]
+    fn prompt_release_checks_each_packets_current_policy() {
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+        let mut first = conn_to(443, 5555);
+        first.src_port = 10000;
+        let mut second = first.clone();
+        second.src_port = 10001;
+        let mut process = test_process(4242, "/usr/bin/curl");
+        process.sha256 = Some("aa".repeat(32));
+        h.worker().park_for_prompt(
+            FakeMsg::new(1, tcp_packet(443)),
+            first,
+            process.clone(),
+            Verdict::default_deny(),
+        );
+        h.worker().park_for_prompt(
+            FakeMsg::new(2, tcp_packet(443)),
+            second,
+            process,
+            Verdict::default_deny(),
+        );
+        let request = h.prompt_rx.try_recv().unwrap();
+        let mut deny = deny_port_rule(443);
+        deny.scope.src_port = Some(10001);
+        h.worker().engine.upsert_rule(deny);
+        h.worker().resolve_prompt(PromptVerdict {
+            prompt_id: request.prompt_id,
+            verdict: Verdict::default_allow(),
+        });
+        assert_eq!(
+            h.verdicts(),
+            vec![(1, NfqVerdict::Accept), (2, NfqVerdict::Drop)]
+        );
+    }
+
+    #[test]
+    fn missing_executable_cannot_lift_a_deny_when_paused() {
+        let mut rule = deny_port_rule(443);
+        rule.scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let mut env = TestEnv::new(vec![rule], dp_allow());
+        env.resolver.pid = None;
+        env.stats.set_paused(true);
+        match env.handle(&tcp_packet(443), &NO_META) {
+            PacketOutcome::Deliver { verdict, .. } => assert_eq!(verdict.action, Action::Deny),
+            other => panic!("expected closed policy, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn flow_key_uses_exe_when_known_else_pid() {
         let conn = conn_to(443, 1111);
         // Same app, different pids: one prompt.
@@ -1964,8 +2183,8 @@ mod tests {
             FlowKey::for_flow(&conn, &test_process(1, "/usr/bin/curl")),
             FlowKey::for_flow(&conn, &test_process(1, "/usr/bin/wget"))
         );
-        // Unattributed processes fall back to the pid.
-        assert_eq!(
+        // An unknown execution cannot share authorization, even at one PID.
+        assert_ne!(
             FlowKey::for_flow(&conn, &Process::unknown(7)),
             FlowKey::for_flow(&conn, &Process::unknown(7))
         );
@@ -2303,8 +2522,8 @@ mod tests {
         let mut got = h.verdicts();
         got.sort_by_key(|(id, _)| *id);
         assert_eq!(got, vec![(1, NfqVerdict::Drop), (2, NfqVerdict::Drop)]);
-        // One prompt is one logical connection, counted once.
-        assert_eq!(h.stats.connections_denied(), 1);
+        // Both packet verdicts are counted even though the prompt is shared.
+        assert_eq!(h.stats.connections_denied(), 2);
 
         h.stop_and_expect_ok(&done);
     }

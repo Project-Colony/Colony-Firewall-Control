@@ -34,7 +34,17 @@ pub fn duration_label(d: i32) -> &'static str {
         pb::Duration::Once => "once",
         pb::Duration::UntilRestart => "until-restart",
         pb::Duration::Always => "always",
+        pb::Duration::Seconds => "seconds",
         pb::Duration::Unspecified => "?",
+    }
+}
+
+/// Human-readable duration including a timed rule's exact lifetime.
+pub fn rule_duration_label(rule: &pb::RuleInfo) -> String {
+    if rule.duration == pb::Duration::Seconds as i32 {
+        format!("{}s", rule.duration_seconds)
+    } else {
+        duration_label(rule.duration).to_string()
     }
 }
 

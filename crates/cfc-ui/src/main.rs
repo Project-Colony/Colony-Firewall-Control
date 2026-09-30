@@ -92,6 +92,9 @@ pub struct App {
 pub struct RuleEditor {
     /// Some when editing an existing rule, None when creating a new one.
     pub editing_id: Option<String>,
+    pub prompt_id: Option<String>,
+    pub prompt_hash_required: bool,
+    pub duration_seconds: u32,
     pub name: String,
     pub action: proto::Action,
     pub duration: proto::Duration,
@@ -207,6 +210,9 @@ impl Default for RuleEditor {
     fn default() -> Self {
         Self {
             editing_id: None,
+            prompt_id: None,
+            prompt_hash_required: false,
+            duration_seconds: 0,
             name: String::new(),
             action: proto::Action::Allow,
             duration: proto::Duration::Always,
@@ -233,6 +239,9 @@ impl RuleEditor {
             .filter(|p| !matches!(p, proto::Protocol::Unspecified));
         Self {
             editing_id: Some(rule.id.clone()),
+            prompt_id: None,
+            prompt_hash_required: false,
+            duration_seconds: rule.duration_seconds,
             name: rule.name.clone(),
             action: proto::Action::try_from(rule.action).unwrap_or(proto::Action::Allow),
             duration: proto::Duration::try_from(rule.duration).unwrap_or(proto::Duration::Always),
@@ -255,10 +264,8 @@ impl RuleEditor {
     /// Seeds the editor from a pending prompt ("Customize this rule before
     /// creating it").
     ///
-    /// The prompt itself is answered separately with a one-off allow: the
-    /// daemon is holding a real connection open behind this card, and
-    /// leaving it hanging while the user fills in a form would time the
-    /// flow out under them.
+    /// The connection remains pending until Save submits an explicit verdict,
+    /// or the daemon applies its timeout policy.
     pub fn from_prompt(ev: &proto::PromptEvent) -> Self {
         let exe = ev
             .process
@@ -274,7 +281,17 @@ impl RuleEditor {
             ),
             None => ("", "", 0, 0),
         };
-        Self::from_observed(exe, dst_host, dst_ip, dst_port, protocol)
+        let mut editor = Self::from_observed(exe, dst_host, dst_ip, dst_port, protocol);
+        editor.prompt_id = Some(ev.prompt_id.clone());
+        editor.prompt_hash_required = ev.binds_to_hash;
+        if ev.binds_to_hash {
+            editor.carried_scope.exe_sha256 = ev
+                .process
+                .as_ref()
+                .map(|p| p.sha256.clone())
+                .unwrap_or_default();
+        }
+        editor
     }
 
     /// Seeds the editor from an observed flow (live feed "make rule").
@@ -415,7 +432,7 @@ pub enum Message {
     PromptEvent(proto::PromptEvent),
     PromptStreamEnded(String),
     /// "Customize this rule before creating it": opens the rule editor
-    /// seeded from the prompt and answers the prompt allow-once.
+    /// seeded from the prompt while leaving its verdict pending.
     CustomizePromptRule(String),
     SubmitVerdict {
         prompt_id: String,
@@ -458,6 +475,7 @@ pub enum Message {
     EditorProtocol(Option<proto::Protocol>),
     SaveRule,
     RuleSaved(Result<String, String>),
+    PromptRuleSaved(Result<(String, bool, Option<String>), String>),
 }
 
 /// Raw key press forwarded from the subscription. The decision of what a
@@ -594,6 +612,14 @@ impl App {
                 true
             }
         });
+        if self
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.prompt_id.as_ref())
+            .is_some_and(|id| !self.prompts.iter().any(|card| &card.event.prompt_id == id))
+        {
+            self.editor = None;
+        }
         for label in expired {
             self.log.warn(
                 format!(
@@ -762,6 +788,14 @@ impl App {
             }
             Message::PromptStreamEnded(e) => {
                 self.stream_trouble = true;
+                self.prompts.clear();
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.prompt_id.is_some())
+                {
+                    self.editor = None;
+                }
                 info!("prompt stream interrupted: {e}");
                 Task::none()
             }
@@ -772,17 +806,7 @@ impl App {
                 };
                 self.editor = Some(RuleEditor::from_prompt(&card.event));
                 self.tab = Tab::Rules;
-                // The daemon is holding a real connection open behind this
-                // card. Answering it one-off now means the user edits the
-                // rule at their own pace instead of racing the deadline -
-                // and `Once` is the only answer that persists nothing, so
-                // whatever they save is the only rule they get.
-                self.update(Message::SubmitVerdict {
-                    prompt_id,
-                    action: proto::Action::Allow,
-                    scope: None,
-                    duration: proto::Duration::Once,
-                })
+                Task::none()
             }
             Message::SubmitVerdict {
                 prompt_id,
@@ -793,7 +817,7 @@ impl App {
                 self.prompts.retain(|p| p.event.prompt_id != prompt_id);
                 let socket = self.socket_path.clone();
                 Task::perform(
-                    submit_verdict(socket, prompt_id, action, scope, duration),
+                    submit_verdict(socket, prompt_id, action, scope, duration, false),
                     Message::VerdictSubmitted,
                 )
             }
@@ -941,6 +965,9 @@ impl App {
             Message::EditorDuration(d) => {
                 if let Some(ed) = &mut self.editor {
                     ed.duration = d;
+                    if d != proto::Duration::Seconds {
+                        ed.duration_seconds = 0;
+                    }
                 }
                 Task::none()
             }
@@ -982,7 +1009,19 @@ impl App {
                     Ok(rule) => {
                         editor.validation = None;
                         let socket = self.socket_path.clone();
-                        Task::perform(upsert_rule(socket, rule), Message::RuleSaved)
+                        if let Some(prompt_id) = editor.prompt_id.clone() {
+                            let action = editor.action;
+                            let duration = editor.duration;
+                            let scope = rule.scope;
+                            self.prompts
+                                .retain(|card| card.event.prompt_id != prompt_id);
+                            Task::perform(
+                                submit_verdict(socket, prompt_id, action, scope, duration, true),
+                                Message::PromptRuleSaved,
+                            )
+                        } else {
+                            Task::perform(upsert_rule(socket, rule), Message::RuleSaved)
+                        }
                     }
                     Err(e) => {
                         editor.validation = Some(e);
@@ -990,6 +1029,15 @@ impl App {
                     }
                 }
             }
+            Message::PromptRuleSaved(Ok((id, true, note))) => {
+                self.editor = None;
+                self.update(Message::VerdictSubmitted(Ok((id, true, note))))
+            }
+            Message::PromptRuleSaved(Ok((_, false, _))) => {
+                self.editor = None;
+                self.update(Message::VerdictSubmitted(Ok((String::new(), false, None))))
+            }
+            Message::PromptRuleSaved(Err(error)) => self.update(Message::RuleSaved(Err(error))),
             Message::RuleSaved(Ok(_)) => {
                 self.editor = None;
                 let socket = self.socket_path.clone();
@@ -1495,6 +1543,23 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         return Err("a saved rule needs \"Until restart\" or \"Always\"".into());
     }
 
+    if ed.duration == proto::Duration::Seconds
+        && (ed.duration_seconds == 0 || ed.editing_id.is_none() || ed.prompt_id.is_some())
+    {
+        return Err(
+            "only an existing timed rule with a positive lifetime can retain Seconds".into(),
+        );
+    }
+
+    if ed.prompt_hash_required
+        && ed.action == proto::Action::Allow
+        && ed.carried_scope.exe_sha256.is_empty()
+    {
+        return Err(
+            "the prompted image could not be hashed; only a one-time Allow is available".into(),
+        );
+    }
+
     // Need at least one scope predicate, else the rule would match
     // everything. Carried predicates count: a uid-only rule created from
     // the CLI is narrow, and refusing to save it would make it uneditable.
@@ -1517,7 +1582,9 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
     // AppImages, Steam). Without this the GUI's most likely input is the one
     // case the daemon cannot fix, and the rule saves looking fine.
     let typed = ed.exe.trim();
-    let exe = if typed.is_empty() {
+    let exe = if ed.prompt_id.is_some() {
+        typed.to_string()
+    } else if typed.is_empty() {
         String::new()
     } else {
         cfc_core::exe_path::resolve(std::path::Path::new(typed))
@@ -1560,6 +1627,7 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         enabled: ed.enabled,
         action: ed.action as i32,
         duration: ed.duration as i32,
+        duration_seconds: ed.duration_seconds,
         scope: Some(scope),
         created_at_unix_ms: ed.created_at_unix_ms,
         hit_count: ed.hit_count,
@@ -1583,6 +1651,7 @@ async fn submit_verdict(
     action: proto::Action,
     scope: Option<proto::RuleScope>,
     duration: proto::Duration,
+    require_confirmed_rule: bool,
 ) -> Result<(String, bool, Option<String>), String> {
     let wanted_rule = scope.is_some();
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
@@ -1597,6 +1666,9 @@ async fn submit_verdict(
         return Err(outcome
             .persist_error
             .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()));
+    }
+    if outcome.accepted && require_confirmed_rule && outcome.rule_persisted != Some(true) {
+        return Err("the verdict applied, but this daemon did not confirm a standing rule; restart the updated daemon".into());
     }
     Ok((prompt_id, outcome.accepted, outcome.persist_note))
 }
@@ -1627,6 +1699,22 @@ mod tests {
         ed.duration = proto::Duration::Once;
         let err = build_rule_from_editor(&ed).unwrap_err();
         assert!(err.contains("Until restart"), "{err}");
+    }
+
+    #[test]
+    fn editing_a_timed_rule_preserves_its_exact_lifetime() {
+        let mut rule = existing_rule();
+        rule.duration = proto::Duration::Seconds as i32;
+        rule.duration_seconds = 90;
+        let mut editor = RuleEditor::from_existing(&rule);
+        let saved = build_rule_from_editor(&editor).unwrap();
+        assert_eq!(saved.duration, rule.duration);
+        assert_eq!(saved.duration_seconds, 90);
+        editor.duration_seconds = 0;
+        assert!(build_rule_from_editor(&editor).is_err());
+        editor.duration_seconds = 90;
+        editor.prompt_id = Some("pending".into());
+        assert!(build_rule_from_editor(&editor).is_err());
     }
 
     #[test]
@@ -1672,6 +1760,7 @@ mod tests {
             }),
             created_at_unix_ms: 1_700_000_000_000,
             hit_count: 42,
+            duration_seconds: 0,
         }
     }
 
@@ -1837,6 +1926,67 @@ mod tests {
             deadline_unix_ms: 1_700_000_015_000,
             binds_to_hash: false,
         }
+    }
+
+    #[test]
+    fn customization_waits_for_a_verdict_and_drops_stale_actions() {
+        let (mut app, _) = App::new();
+        let event = prompt_event();
+        app.prompts.push(PromptCard::new(event.clone()));
+        let task = app.update(Message::CustomizePromptRule(event.prompt_id.clone()));
+        assert_eq!(task.units(), 0, "opening the editor issues no verdict RPC");
+        assert_eq!(app.prompts.len(), 1, "the prompt remains pending");
+        assert_eq!(
+            app.editor.as_ref().unwrap().prompt_id.as_ref(),
+            Some(&event.prompt_id)
+        );
+        let _ = app.update(Message::PromptStreamEnded("disconnected".into()));
+        assert!(app.prompts.is_empty());
+        assert!(app.editor.is_none());
+        assert_eq!(
+            app.update(Message::CustomizePromptRule(event.prompt_id))
+                .units(),
+            0
+        );
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn an_expired_prompt_closes_its_customization() {
+        let (mut app, _) = App::new();
+        let event = prompt_event();
+        app.prompts.push(PromptCard::new(event.clone()));
+        app.editor = Some(RuleEditor::from_prompt(&event));
+        app.now_ms = event.deadline_unix_ms + 1;
+        app.housekeeping();
+        assert!(app.prompts.is_empty());
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn customization_cannot_save_an_allow_without_its_required_hash() {
+        let mut event = prompt_event();
+        event.binds_to_hash = true;
+        let mut editor = RuleEditor::from_prompt(&event);
+        assert!(build_rule_from_editor(&editor).is_err());
+        editor.action = proto::Action::Deny;
+        assert!(build_rule_from_editor(&editor).is_ok());
+    }
+
+    #[test]
+    fn customizing_a_prompt_preserves_the_promised_digest() {
+        let mut event = prompt_event();
+        event.binds_to_hash = true;
+        event.process.as_mut().unwrap().sha256 = "a".repeat(64);
+        let editor = RuleEditor::from_prompt(&event);
+        assert_eq!(
+            build_rule_from_editor(&editor)
+                .unwrap()
+                .scope
+                .unwrap()
+                .exe_sha256,
+            "a".repeat(64)
+        );
     }
 
     #[test]

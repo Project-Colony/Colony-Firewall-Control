@@ -325,6 +325,8 @@ impl RuleScope {
             "an executable path"
         } else if self.exe_sha256.is_some() {
             "an executable hash"
+        } else if self.uid.is_some() {
+            "a user ID"
         } else {
             return Ok(());
         };
@@ -338,39 +340,28 @@ impl RuleScope {
     /// True when this scope cannot be evaluated against `proc` because the
     /// process's identity is only partly known.
     ///
-    /// Exactly one predicate can be in that position: `exe_sha256`. Hashing a
-    /// binary is not something the `exec` path does - it costs a full read of
-    /// the file - so a caller deciding at exec time has `proc.sha256 == None`
-    /// and genuinely cannot say whether a hash-scoped rule applies.
-    ///
-    /// Treating "cannot say" as "does not match" would be a real bug rather
-    /// than a rounding error: precedence is ordered, so silently skipping a
-    /// hash-scoped *allow* would hand the decision to a lower-precedence
-    /// *deny* that the packet path - which does know the hash - would never
-    /// have applied.
-    ///
-    /// Scopes already excluded by something knowable are decidable: a missing
-    /// hash does not matter for a rule whose `exe_path` names a different
-    /// binary.
+    /// Missing executable, UID or digest is uncertainty, not evidence that
+    /// a rule does not match. Known incompatible predicates still exclude
+    /// the rule before any missing identity is considered.
     pub fn undecidable_for(&self, proc: &crate::Process) -> bool {
-        if self.exe_sha256.is_none() || proc.sha256.is_some() {
-            return false;
-        }
         if let Some(p) = &self.exe_path {
-            // An unidentified process satisfies no exe-scoped rule. Comparing
-            // the placeholder as if it were a path made a single rule match
-            // every unattributable flow - and inbound flows are always
-            // unattributable, so it silently admitted all of them.
-            if !proc.exe_is_known() || &proc.exe != p {
+            if proc.exe_is_known() && &proc.exe != p {
+                return false;
+            }
+        }
+        if let (Some(expected), Some(actual)) = (&self.exe_sha256, &proc.sha256) {
+            if expected != actual {
                 return false;
             }
         }
         if let Some(u) = self.uid {
-            if proc.uid != Some(u) {
+            if proc.uid.is_some_and(|actual| actual != u) {
                 return false;
             }
         }
-        true
+        (self.exe_path.is_some() && !proc.exe_is_known())
+            || (self.exe_sha256.is_some() && proc.sha256.is_none())
+            || (self.uid.is_some() && proc.uid.is_none())
     }
 
     /// The process half of [`Self::matches`], on its own.
@@ -455,7 +446,9 @@ impl RuleScope {
         }
         if let Some(h) = &self.dst_host {
             match &conn.dst_host {
-                Some(d) if d == h => {}
+                Some(d)
+                    if d.trim_end_matches('.')
+                        .eq_ignore_ascii_case(h.trim_end_matches('.')) => {}
                 _ => return false,
             }
         }
@@ -614,14 +607,15 @@ impl RuleSet {
     /// `now_unix_ms` is the current wall-clock time; rules whose
     /// `Duration::Seconds(..)` window has elapsed are skipped (see
     /// [`Rule::is_expired`]).
-    /// A rule that is about this flow but cannot be decided stops the walk,
-    /// rather than being skipped as if it did not match. See [`Match`].
+    /// Missing identity cannot yield to a lower Allow. A definite refusal
+    /// may still answer after earlier possible refusals. See [`Match`].
     pub fn lookup(
         &self,
         conn: &crate::Connection,
         proc: &crate::Process,
         now_unix_ms: i64,
     ) -> Match<'_> {
+        let mut undecidable = None;
         for rule in self
             .rules
             .iter()
@@ -634,21 +628,28 @@ impl RuleSet {
             if !rule.scope.matches_connection(conn) {
                 continue;
             }
+            if rule.permits_on_an_unverified_name(conn) {
+                continue;
+            }
             if rule.scope.undecidable_for(proc) {
-                return Match::Undecidable(rule);
+                let first = *undecidable.get_or_insert(rule);
+                // A possible Allow keeps its precedence. Only a sequence
+                // of possible closed actions may yield to a definite Deny.
+                if rule.action == Action::Allow {
+                    return Match::Undecidable(first);
+                }
+                continue;
             }
             if rule.scope.matches_process(proc) {
-                if rule.permits_on_an_unverified_name(conn) {
-                    // A name nobody confirmed may refuse traffic, never admit
-                    // it. Skip this rule and keep walking: something below it
-                    // may still answer, and anything below an allow is at
-                    // least as restrictive.
-                    continue;
+                if rule.action == Action::Allow {
+                    if let Some(first) = undecidable {
+                        return Match::Undecidable(first);
+                    }
                 }
                 return Match::Rule(rule);
             }
         }
-        Match::None
+        undecidable.map_or(Match::None, Match::Undecidable)
     }
 }
 
@@ -671,9 +672,9 @@ impl RuleSet {
 pub enum Match<'a> {
     /// This rule answered.
     Rule(&'a Rule),
-    /// This rule is about this flow and outranks everything below it, but the
-    /// daemon cannot tell whether it matches. Nobody answers; the caller must
-    /// treat it as "no rule decided" and fall back to asking.
+    /// This rule could apply, but its process identity cannot be decided.
+    /// The caller must refuse conservatively; a prompt or permissive fallback
+    /// cannot establish the missing identity.
     Undecidable(&'a Rule),
     /// No rule is about this flow.
     None,
@@ -720,6 +721,49 @@ mod tests {
 
     fn now() -> i64 {
         chrono::Utc::now().timestamp_millis()
+    }
+
+    #[test]
+    fn hostname_policy_ignores_dns_case_and_root_dot() {
+        let mut scope = RuleScope::any();
+        scope.dst_host = Some("Example.COM.".into());
+        let mut conn = mk_conn();
+        conn.dst_host = Some("example.com".into());
+        assert!(scope.matches_connection(&conn));
+        conn.dst_host = Some("another.example.com".into());
+        assert!(!scope.matches_connection(&conn));
+    }
+
+    #[test]
+    fn inbound_uid_is_rejected_like_other_unattributable_identity() {
+        let mut scope = RuleScope::any();
+        scope.direction = Some(Direction::Inbound);
+        scope.uid = Some(1000);
+        scope.dst_port = Some(443);
+        assert!(scope.reject_unattributable_inbound_scope().is_err());
+        scope.direction = Some(Direction::Outbound);
+        assert!(scope.reject_unattributable_inbound_scope().is_ok());
+    }
+
+    #[test]
+    fn missing_identity_does_not_exclude_a_possible_deny() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        assert!(scope.undecidable_for(&Process::unknown(0)));
+        assert!(!scope.undecidable_for(&mk_proc("/usr/bin/wget")));
+        scope.uid = Some(1001);
+        assert!(!scope.undecidable_for(&mk_proc("/usr/bin/curl")));
+        scope.exe_path = None;
+        assert!(scope.undecidable_for(&Process::unknown(0)));
+    }
+
+    #[test]
+    fn undecidable_closed_rule_cannot_hide_a_definite_closed_rule() {
+        let mut set = deny_by_hash_over_allow(None);
+        set.rules[1].action = Action::Reject;
+        set.sort_deterministic();
+        let result = set.lookup(&mk_conn(), &mk_proc("/usr/bin/curl"), now());
+        assert_eq!(result.rule().map(|r| r.action), Some(Action::Reject));
     }
 
     /// The rule set the defect needs: a hash-scoped deny ranking above a
