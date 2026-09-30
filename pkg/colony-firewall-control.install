@@ -30,6 +30,12 @@ post_upgrade() {
     # Refresh active units only; inbound remains opt-in. ExecReload applies
     # the new snippet atomically and removes old Fast Allow acceptance.
     systemctl daemon-reload
+    # Recreate native network-manager dependencies for enabled deployments.
+    for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do
+        if systemctl is-enabled --quiet "$unit"; then
+            systemctl reenable "$unit" || return 1
+        fi
+    done
     systemctl try-reload-or-restart colony-firewall-nft.service colony-firewall-nft-inbound.service || {
         echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
         return 1

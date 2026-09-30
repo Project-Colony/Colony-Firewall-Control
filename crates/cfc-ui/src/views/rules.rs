@@ -365,14 +365,25 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
         Message::EditorExe,
         "/usr/bin/curl",
     );
-    let host_field = labeled_input(
-        "Destination host",
-        &ed.dst_host,
-        Message::EditorDstHost,
-        "example.com",
-    );
+    let host_field: Element<'_, Message> = if ed.dst_host.is_empty() {
+        text("Destination rules use numeric IPs. DNS names are diagnostic only.")
+            .size(11)
+            .into()
+    } else {
+        column![
+            text(format!(
+                "Legacy hostname: {} (policy is uncertain; saving requires explicit removal)",
+                ed.dst_host
+            ))
+            .size(11),
+            button(text("Remove legacy hostname from this rule"))
+                .on_press(Message::EditorDstHost(String::new())),
+        ]
+        .spacing(6)
+        .into()
+    };
     let net_field = labeled_input(
-        "Destination CIDR",
+        "Destination IP / CIDR (/32 for IPv4, /128 for IPv6 endpoint)",
         &ed.dst_net,
         Message::EditorDstNet,
         "10.0.0.0/8",

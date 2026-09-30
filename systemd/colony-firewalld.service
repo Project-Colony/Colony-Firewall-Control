@@ -1,10 +1,10 @@
 [Unit]
 Description=Colony Firewall Control daemon
 Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
-# Order before cooperating network configuration services. The nft unit
-# requires a ready daemon on its first start, so initial failure may leave boot
-# networking unfiltered. Loaded nft tables survive daemon stops and restarts.
-# Bootstrap rules cover DHCP/DNS/NTP before a UI session is connected.
+# Filtering is installed independently before daemon initialization. A failed
+# daemon leaves the fail-closed table loaded; a failed nft load blocks startup.
+Requires=colony-firewall-nft.service
+After=colony-firewall-nft.service
 Before=network-pre.target
 Wants=network-pre.target
 
@@ -227,3 +227,4 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 
 [Install]
 WantedBy=multi-user.target
+Also=colony-firewall-nft.service

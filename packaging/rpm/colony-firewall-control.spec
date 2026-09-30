@@ -172,6 +172,11 @@ cargo test --workspace --locked --no-fail-fast
 if [ $1 -gt 1 ]; then
     # Reload active nft units atomically before the daemon restart in postun.
     systemctl daemon-reload
+    for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do
+        if systemctl is-enabled --quiet "$unit"; then
+            systemctl reenable "$unit" || exit 1
+        fi
+    done
     systemctl try-reload-or-restart colony-firewall-nft.service colony-firewall-nft-inbound.service || {
         echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
         exit 1

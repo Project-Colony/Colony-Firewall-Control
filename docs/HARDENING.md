@@ -54,9 +54,11 @@ You can still set either to `"Allow"` explicitly under `[default_policy]`
 — see below. The change is that nothing does it on your behalf.
 
 The danger with `strict` is bootstrap: the units are ordered
-`Before=network-pre.target`, to load filtering before cooperating network
-services configure interfaces. Initial daemon failure prevents the nft unit
-from loading and may leave boot traffic unfiltered. Once loaded, strict
+before the daemon and `network-pre.target`. Enabled enforcement is required
+by NetworkManager and systemd-networkd, so an nft load failure blocks their
+startup. Initial daemon failure leaves the table loaded and drops new flows.
+This does not cover initramfs networking, already configured interfaces, or
+other network managers. Once loaded, strict
 filtering denies unmatched flows, so DHCP, DNS and NTP need standing rules or
 the machine cannot even get a lease. Network managers retrying DNS will
 look like total network failure. **Only flip to strict after you have
@@ -92,57 +94,34 @@ This is idempotent: it skips rules already present by name.
 
 ## What to *deny* first
 
-A short blocklist that pays off on most workstations:
+Start with executable rules for unwanted telemetry or resolver clients, and
+numeric `dst_net` scopes for endpoints whose addresses you manage. An IP scope
+matches addresses, not a website: shared hosting and address changes require
+an explicit policy review.
 
-- Any DNS-over-TLS or DoH client you didn't install on purpose
-- Adobe / Microsoft / Google telemetry endpoints (use `dst_host` rules)
-- Crashpad processes in browsers that you don't want phoning home
+### DNS names are diagnostic only
 
-Example with the CLI:
+New rules and imports cannot use `dst_host`. Neither observed DNS answers nor
+forward-confirmed PTR records establish the hostname an application intended
+to contact, or enumerate all names associated with an address.
 
-```sh
-cfc rules add --action deny --dst-host 'incoming.telemetry.mozilla.org' \
-              --name 'block-firefox-telemetry'
-```
+Legacy hostname rules keep their scope and priority. When their other known
+predicates are compatible, their uncertainty refuses the flow before a lower
+Allow, pause or prompt can admit it. Replace these rules explicitly with
+executable or numeric scopes; a legacy hostname Allow no longer grants access.
+The editor requires the old hostname to be removed before saving a replacement.
 
-### A warning about `dst_host`
-
-Hostname matching is based on reverse DNS: the daemon does a PTR lookup
-on the destination IP and matches `dst_host` against whatever comes
-back. **PTR records are published by whoever controls the destination
-IP** - which, for outbound filtering, is exactly the party you may be
-trying to keep the user away from. Taken at face value, a hostile server
-could name itself `api.github.com` and satisfy an allow rule.
-
-The daemon mitigates this with forward confirmation (FCrDNS): every PTR
-answer is resolved back to its A/AAAA set, and the name is kept only if
-that set contains the IP we started from. Names that fail confirmation
-are discarded, so a rule never matches on one. That makes a hostname as
-trustworthy as the *forward* zone of the claimed domain rather than the
-reverse zone of an arbitrary IP.
-
-It is a mitigation, not a guarantee. Names are still resolved after the
-fact and cached (300s positive, 60s negative), and an attacker who
-controls both zones can still name themselves self-consistently. Treat
-`dst_host` as best-effort metadata and a convenience for *deny* rules (a
-telemetry endpoint has no incentive to hide its own PTR). Do **not**
-lean on a hostname *allow* rule as your only boundary. For allow rules,
-pin `exe` + `dst_port` (+ `dst_net` where destinations are stable)
-instead.
-
-Only forward-confirmed PTR names enter policy identity. DNS enrichment starts
-after Allow or an unresolved decision; an explicit Deny/Reject starts no new
-lookup. Eight permits bound active and queued resolver jobs, and a full pool
-skips enrichment. A lookup may finish only after the first flow was decided,
-so hostname Deny rules cannot guarantee domain isolation. Use stable IP scopes
-or separate containment when that property is required.
+CLI and GUI destination presets use the observed numeric endpoint, as `/32`
+for IPv4 or `/128` for IPv6, and label it as an IP. They do not turn a domain
+into a permanent IP rule. DNS enrichment starts only after an Allow; explicit
+Deny/Reject decisions start no lookup. Eight permits bound resolver jobs.
 
 #### Observed answers, with `[ebpf] enabled`
 
 The ingress hook copies DNS-shaped UDP responses received from source port 53.
 It does not validate a resolver transaction, sender or question. These records
 remain untrusted diagnostics in a separate cache. They cannot satisfy a
-policy rule or replace a forward-confirmed PTR policy name. Diagnostic entries
+policy rule. Observations and forward-confirmed PTR diagnostics use separate caches. Diagnostic entries
 retain the record TTL, clamped to 60s..1h; the policy cache remains separate.
 
 ## Deny or Reject?
@@ -210,7 +189,7 @@ real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
   sockets outside the shipped IP OUTPUT hooks. These rules do not provide
   layer-2 containment.
 - **DNS-over-HTTPS embedded in browsers**: the firewall sees the outer HTTPS
-  flow. A best-effort hostname rule cannot enforce domain isolation.
+  flow. Domain isolation requires an application-aware proxy or separate containment.
 - **Container traffic**: Docker / Podman / LXC route through their own
   bridges. You need to enqueue their veth interfaces explicitly in nftables.
 
@@ -325,17 +304,18 @@ journalctl -u colony-firewalld -g 'rule upserted|rule delete|verdict submitted|p
 so "who deleted the rule blocking that telemetry endpoint" is answerable
 after the fact.
 
-**2. journald, for every blocked connection.** Deny and Reject verdicts
+**2. journald, for parsed NFQUEUE refusals.** Deny and Reject verdicts
 log the action, its source, the executable, pid, uid and destination:
 
 ```sh
 journalctl -u colony-firewalld -g 'connection blocked'
 ```
 
-This line is emitted whether or not the row makes it to disk.
+This line is emitted after the refusal row commits and verdict delivery succeeds.
+A failed commit drops the packet and ends the worker before live publication.
 
-**3. The events table, for everything.** Every observed connection and
-its verdict is persisted in the rules database and queried with `cfc log`:
+**3. The events table.** Parsed NFQUEUE refusals commit synchronously;
+Allow observations use best-effort asynchronous persistence. Query with `cfc log`:
 
 ```sh
 cfc log --since 24h --action deny
@@ -343,9 +323,11 @@ cfc log --exe firefox --limit 200
 cfc log --json --since 1h | jq -r '.[] | .dst_host // .dst_ip' | sort | uniq -c
 ```
 
-Persistence happens off the packet path through a bounded queue, so a
-slow disk can never delay a verdict; if the queue fills, rows are dropped
-and the loss is logged. Retention is a row cap, not a time window:
+Refusal commits can delay a verdict. WAL and synchronous=FULL are required at
+startup. Mutex and SQLite busy waits each have a 250 ms limit, which does not
+bound filesystem I/O or fsync. Allow rows can be dropped when their queue fills;
+that loss is logged. Malformed packets, nftables drops and in-kernel refusals
+are not covered by this durable NFQUEUE gate. Retention is a row cap, not a time window:
 `[events] max_rows` (default 100000), pruned every 60 seconds. Raise it
 if you want a longer history, and remember the table lives in
 `/var/lib/colony-firewall/rules.db` - back it up or ship it off the host
@@ -433,10 +415,9 @@ without `bypass` - is in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#fail-open-vs-fail-closed-matrix).
 Read it before enabling enforcement on a machine you only reach over SSH.
 
-Note that `[nfqueue] fail_open` is a *different* knob: it governs what
-the kernel does when the queue overflows while the daemon is running
-(default `false`, drop). The `bypass` keyword governs what happens when
-no daemon is attached at all.
+`[nfqueue] fail_open` must be `false`; `true` is rejected. Queue overflow
+must drop traffic instead of bypassing policy and durable refusal auditing.
+The nftables `bypass` keyword governs missing listeners and is not shipped.
 
 ## When something stops working
 

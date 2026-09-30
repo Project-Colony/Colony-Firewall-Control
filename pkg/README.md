@@ -29,6 +29,15 @@ Key design points:
   on explicit nft-unit stop). The table survives daemon restarts and stops,
   so new flows fail closed while its queue listener is absent. Upgrades reload
   active nft units atomically and leave inactive inbound filtering opt-in.
+  The daemon requires this unit before initialization. Enabling either nft
+  unit creates native `Requires` links from NetworkManager and
+  systemd-networkd, ordered after nft loading; load failure blocks those
+  managers' startup. Enabling the daemon also enables outbound enforcement.
+  Upgrade scripts reenable existing deployments to create those links.
+  Explicit disable and uninstall remove them. The units load after a
+  distribution `nftables.service` in the same boot transaction. This contract
+  excludes initramfs networking, already configured interfaces, other network
+  managers and later external ruleset flushes.
 - **`colony-firewall.sysusers`** creates the `colony-firewall` group used
   to gate access to the daemon's gRPC UNIX socket. Users join with
   `usermod -aG colony-firewall <user>`.
@@ -199,8 +208,11 @@ sudo install -Dm755 target/release/colony-firewall  /usr/bin/colony-firewall
 sudo install -Dm755 target/release/cfc              /usr/bin/cfc
 sudo install -Dm644 systemd/colony-firewalld.service     /usr/lib/systemd/system/colony-firewalld.service
 sudo install -Dm644 systemd/colony-firewall-nft.service  /usr/lib/systemd/system/colony-firewall-nft.service
+sudo install -Dm644 systemd/colony-firewall-nft-inbound.service /usr/lib/systemd/system/colony-firewall-nft-inbound.service
 sudo install -Dm644 systemd/colony-firewall.sysusers     /usr/lib/sysusers.d/colony-firewall.conf
 sudo install -Dm644 systemd/nftables-snippet.conf /usr/share/colony-firewall/nftables-snippet.conf
+sudo install -Dm644 systemd/nftables-inbound.conf /usr/share/colony-firewall/nftables-inbound.conf
+sudo install -Dm755 scripts/inbound-lockout-guard.sh /usr/lib/colony-firewall/inbound-lockout-guard.sh
 sudo install -Dm644 systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
 sudo install -Dm644 pkg/colony-firewall.desktop /usr/share/applications/colony-firewall.desktop
 sudo install -Dm644 pkg/colony-firewall-autostart.desktop /etc/xdg/autostart/colony-firewall.desktop

@@ -268,6 +268,14 @@ pub async fn set_enabled(
     let want = target.unwrap_or(!was);
 
     if want != was {
+        if let Some(scope) = rule
+            .scope
+            .as_ref()
+            .filter(|scope| !scope.exe_path.is_empty())
+        {
+            cfc_core::exe_path::resolve_policy(std::path::Path::new(&scope.exe_path))
+                .map_err(CliError::runtime)?;
+        }
         rule.enabled = want;
         client.upsert_rule(rule.clone()).await?;
     }
@@ -369,7 +377,7 @@ pub struct AddArgs {
     #[arg(long)]
     pub uid: Option<u32>,
 
-    /// Match flows whose dst hostname equals this string.
+    /// Unsupported: hostnames are diagnostic only; use --dst-net for numeric policy.
     #[arg(long = "dst-host")]
     pub dst_host: Option<String>,
 
@@ -453,6 +461,12 @@ impl ProtocolArg {
 }
 
 pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> CliResult {
+    cfc_core::RuleScope {
+        dst_host: args.dst_host.clone(),
+        ..cfc_core::RuleScope::any()
+    }
+    .reject_hostname_policy()
+    .map_err(anyhow::Error::msg)?;
     if let Some(net) = &args.dst_net {
         net.parse::<ipnet::IpNet>()
             .with_context(|| format!("--dst-net {net} is not a valid CIDR"))?;
@@ -501,13 +515,11 @@ pub async fn add(client: &mut Client, args: AddArgs, format: OutputFormat) -> Cl
         DurationArg::Always => proto::Duration::Always,
     };
 
-    // Resolve the path to the form /proc reports, and say so. Rules match on
-    // exact string equality, so `--exe /bin/curl` on a usr-merged host produces
-    // a rule that lists, ranks by specificity, and never fires - the worst
-    // failure a rule can have, because it is indistinguishable from working.
+    // Require the mapped target explicitly; silently snapshotting an alias
+    // would lose the operator's intent when that alias is retargeted.
     let exe = match args.exe.as_deref() {
         Some(p) => {
-            let outcome = cfc_core::exe_path::resolve(p);
+            let outcome = cfc_core::exe_path::resolve_policy(p).map_err(CliError::runtime)?;
             if let Some(note) = outcome.note() {
                 if outcome.is_inert() {
                     eprintln!("warning: {}", output::terminal_safe(&note));
@@ -826,6 +838,12 @@ impl ExportedRule {
                 return Err(format!("rule `{name}`: {field} is present but empty"));
             }
         }
+        cfc_core::RuleScope {
+            dst_host: self.scope.dst_host.clone(),
+            ..cfc_core::RuleScope::any()
+        }
+        .reject_hostname_policy()
+        .map_err(|e| format!("rule `{name}`: {e}"))?;
         let duration = match self.duration.to_ascii_lowercase().as_str() {
             "always" => proto::Duration::Always,
             "seconds" if self.duration_seconds > 0 => proto::Duration::Seconds,
@@ -903,6 +921,8 @@ impl ExportedRule {
                      match on absolute executable paths, so it could never fire"
                 ));
             }
+            cfc_core::exe_path::resolve_policy(std::path::Path::new(exe))
+                .map_err(|error| format!("rule `{name}`: {error}"))?;
         }
         let exe_sha256 = match self.scope.exe_sha256.as_deref() {
             Some(h) => Some(
@@ -1191,6 +1211,10 @@ fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<pr
     if let Some(op) = osn.operator {
         apply_operator(&op, &mut scope)?;
     }
+    if !scope.exe_path.is_empty() {
+        cfc_core::exe_path::resolve_policy(std::path::Path::new(&scope.exe_path))
+            .map_err(anyhow::Error::msg)?;
+    }
 
     let scope_empty = scope.exe_sha256.is_empty()
         && scope.exe_path.is_empty()
@@ -1289,7 +1313,9 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
                 .map_err(|_| anyhow::anyhow!("operand `user.id`: `{}` is not a uid", s.data))?;
             scope.has_uid = true;
         }
-        "dest.host" | "dest.domain" => set_once("dest.host", &mut scope.dst_host, s.data.clone())?,
+        "dest.host" | "dest.domain" => anyhow::bail!(
+            "hostname policy is unsupported; use an explicit numeric dest.ip or dest.network"
+        ),
         "dest.ip" => {
             // single IP -> /32 or /128
             let net = if s.data.contains(':') {
@@ -1376,11 +1402,8 @@ struct BundleRule {
 impl BundleRule {
     /// The path to use on this machine, or `None` if the program is not here.
     ///
-    /// `is_file()` follows symlinks, so the first *existing* candidate can be a
-    /// link — and a rule stored for the link never matches, because /proc
-    /// reports the target. The shipped lists happen to put `/usr/...` first
-    /// everywhere, so they escaped this by luck rather than design; a
-    /// distribution that lays things out differently would not have.
+    /// Bundles deliberately snapshot the current mapped target of a fixed
+    /// shipped candidate list. They do not claim to follow a mutable alias.
     fn resolve(&self) -> Option<PathBuf> {
         // An entry with no candidates is not "the program is missing", it is
         // "this rule is not about a program". Returning an empty path lets it
@@ -2459,6 +2482,32 @@ mod json_tests {
     }
 
     #[test]
+    fn imported_hostname_policy_is_refused_without_substitution() {
+        for action in ["allow", "deny", "reject"] {
+            let mut rule = exported(action);
+            rule.scope.dst_host = Some("example.org".into());
+            rule.scope.dst_net = Some("1.2.3.4/32".into());
+            assert!(rule.try_into_proto().is_err());
+        }
+    }
+
+    #[test]
+    fn export_preserves_legacy_hostname_policy_for_explicit_review() {
+        let rule = proto::RuleInfo {
+            scope: Some(proto::RuleScope {
+                dst_host: "Example.ORG.".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let exported = exported_rule(&rule);
+        assert_eq!(exported.scope.dst_host.as_deref(), Some("Example.ORG."));
+        let json = serde_json::to_string(&exported).unwrap();
+        let back: ExportedRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scope.dst_host.as_deref(), Some("Example.ORG."));
+    }
+
+    #[test]
     fn export_round_trips_through_json() {
         let scope = proto::RuleScope {
             exe_path: "/usr/bin/curl".into(),
@@ -2466,8 +2515,8 @@ mod json_tests {
             parent_exe: String::new(),
             uid: 1000,
             has_uid: true,
-            dst_host: "example.com".into(),
-            dst_net: String::new(),
+            dst_host: String::new(),
+            dst_net: "93.184.216.34/32".into(),
             dst_port: 443,
             has_dst_port: true,
             protocol: proto::Protocol::Tcp as i32,
@@ -2505,7 +2554,8 @@ mod json_tests {
         assert_eq!(s.exe_path, "/usr/bin/curl");
         assert_eq!(s.uid, 1000);
         assert!(s.has_uid);
-        assert_eq!(s.dst_host, "example.com");
+        assert!(s.dst_host.is_empty());
+        assert_eq!(s.dst_net, "93.184.216.34/32");
         assert_eq!(s.dst_port, 443);
         assert!(s.has_dst_port);
         assert_eq!(s.protocol, proto::Protocol::Tcp as i32);
@@ -2980,6 +3030,16 @@ mod opensnitch_tests {
     }
 
     #[test]
+    fn opensnitch_hostname_policy_is_refused_without_substitution() {
+        for operand in ["dest.host", "dest.domain"] {
+            let source = format!(
+                r#"{{"action":"deny","duration":"always","operator":{{"type":"simple","operand":"{operand}","data":"example.org"}}}}"#
+            );
+            assert!(parse(&source).is_err());
+        }
+    }
+
+    #[test]
     fn deny_action_recognized() {
         let r = parse(
             r#"{
@@ -2988,15 +3048,15 @@ mod opensnitch_tests {
               "duration": "always",
               "operator": {
                 "type": "simple",
-                "operand": "dest.host",
-                "data": "evil.example"
+                "operand": "dest.ip",
+                "data": "1.2.3.4"
               }
             }"#,
         )
         .unwrap();
         assert_eq!(r.action, proto::Action::Deny as i32);
         assert_eq!(r.duration, proto::Duration::Always as i32);
-        assert_eq!(r.scope.unwrap().dst_host, "evil.example");
+        assert_eq!(r.scope.unwrap().dst_net, "1.2.3.4/32");
     }
 
     #[test]

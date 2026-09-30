@@ -281,7 +281,7 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
             })?),
             false => None,
         };
-    Ok(RuleScope {
+    let scope = RuleScope {
         direction,
         src_net,
         src_port,
@@ -299,7 +299,9 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
         dst_net,
         dst_port,
         protocol,
-    })
+    };
+    scope.reject_hostname_policy()?;
+    Ok(scope)
 }
 
 pub fn rule_to_pb(r: &Rule) -> pb::RuleInfo {
@@ -702,7 +704,7 @@ mod tests {
             exe_sha256: Some("a".repeat(64)),
             parent_exe: Some(PathBuf::from("/bin/bash")),
             uid: Some(1000),
-            dst_host: Some("example.com".into()),
+            dst_host: None,
             dst_net: Some("10.0.0.0/8".parse().unwrap()),
             dst_port: Some(443),
             protocol: Some(Protocol::Tcp),
@@ -718,6 +720,29 @@ mod tests {
         let pb = scope_to_pb(&scope);
         let back = scope_from_pb(&pb).expect("a scope we produced must convert back");
         assert_eq!(back, scope);
+    }
+
+    #[test]
+    fn hostname_policy_is_refused_at_the_wire_boundary() {
+        for host in ["example.org", "Example.ORG.", " ", "1.2.3.4"] {
+            let scope = pb::RuleScope {
+                dst_host: host.into(),
+                dst_net: "1.2.3.4/32".into(),
+                ..Default::default()
+            };
+            assert!(scope_from_pb(&scope).is_err(), "{host:?}");
+            for action in [Action::Allow, Action::Deny, Action::Reject] {
+                let rule = Rule::new("named", action, RuleScope::any());
+                let mut wire = rule_to_pb(&rule);
+                wire.scope = Some(scope.clone());
+                assert!(rule_from_pb(&wire).is_err());
+            }
+        }
+        let scope = pb::RuleScope {
+            dst_net: "2001:db8::1/128".into(),
+            ..Default::default()
+        };
+        assert!(scope_from_pb(&scope).is_ok());
     }
 
     #[test]

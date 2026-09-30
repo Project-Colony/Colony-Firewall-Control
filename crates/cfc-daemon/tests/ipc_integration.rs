@@ -1284,8 +1284,7 @@ async fn list_events_filters_and_pages() {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }
 
-/// The other half of that surface: rows the daemon writes itself, from the
-/// live feed, through the batching pipeline `main` spawns.
+/// Allows use the async pipeline; refusals are committed before publication.
 #[tokio::test]
 async fn observed_connections_reach_list_events_through_the_pipeline() {
     let d = TestDaemon::builder().event_pipeline(1000).build().await;
@@ -1294,8 +1293,16 @@ async fn observed_connections_reach_list_events_through_the_pipeline() {
     d.observed_tx
         .send(observed(443, Action::Allow))
         .expect("the pipeline is subscribed");
+    let blocked = observed(25, Action::Deny);
+    d.store
+        .insert_events(&[cfc_daemon::convert::event_row_from_observed(
+            &blocked.connection,
+            &blocked.process,
+            &blocked.verdict,
+        )])
+        .expect("committing refusal before publication");
     d.observed_tx
-        .send(observed(25, Action::Deny))
+        .send(blocked)
         .expect("the pipeline is subscribed");
 
     // The writer batches for a second before it touches sqlite.

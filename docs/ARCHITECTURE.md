@@ -221,6 +221,20 @@ the record and falls back to `/proc`.
 
 ## Rule evaluation
 
+Executable policies name the canonical mapped target explicitly. New CLI,
+GUI, native import, OpenSnitch import and daemon writes refuse paths that
+resolve through an alias instead of silently saving its current target.
+Shipped system-service bundles intentionally select a current fixed target
+from their candidate list. They do not track later alias changes.
+
+Missing absolute targets remain valid before installation when their existing
+ancestors need no rewriting and no unresolved symlink is present. An alias
+installed there later needs operator review. Existing stored paths remain
+fixed targets: older rules lost the original alias spelling, so an automatic
+migration cannot recover that intent. This is a policy-entry contract; it
+does not pin an inode, follow aliases at exec time, or attest future pathname
+changes. Legacy alias intent loss is not repaired by this validation.
+
 `RuleSet` is kept sorted so that lookup is a linear scan that returns the
 first match, and the order does not depend on what SQLite happened to
 return:
@@ -260,22 +274,23 @@ merged at the very last step, when the kernel is told to DROP.
 
 ## Event log
 
-Deny and Reject observations are logged to journald before publishing to the
-live feed. Database persistence remains off the packet path and bounded:
+Parsed NFQUEUE policy refusals commit to SQLite with WAL/FULL before verdict
+delivery, the journald message and live publication. Commit failure drops the
+current packet and ends the worker, so later queued packets cannot be allowed
+by that worker after an unaudited refusal.
 
 ```
-worker --> journald audit (Deny/Reject) --> broadcast live feed
-                                             |
-                                             v
-                                           feeder --> bounded mpsc (4096) --> writer
-                                                                              |
-                                                                              v
-                                                                        events table
+parsed Deny/Reject --> durable events commit --> verdict --> journal/live feed
+Allow             --> verdict --> live feed --> bounded queue --> async writer
 ```
 
-The feed and database pipeline can lose observations under load. The feeder
-uses `try_send` and logs lag or drops; persistence never blocks a verdict.
-This is a best-effort event history, not a durable or lossless audit.
+The live feed and async Allow history can lose observations under load. The
+feeder uses `try_send` and logs lag or drops; it skips already committed refusals.
+Refusal commits can delay delivery. Database mutex and SQLite busy waits are
+each limited to 250 ms; filesystem I/O and fsync are not bounded by these limits.
+This gate does not audit malformed packets, nftables drops or kernel-ring
+refusals. It is not a universal lossless audit or protection against root
+rewriting the database.
 The table is pruned to `[events] max_rows` every 60 seconds. `ListEvents`
 queries it with executable-substring, action and since filters; `cfc log` is
 the front end.
@@ -323,9 +338,14 @@ with the calling uid and pid. See [HARDENING.md](HARDENING.md).
   Prompts go out on a broadcast channel; verdicts come back on a dedicated
   channel the worker polls.
 - **ipc server** - tonic gRPC over the Unix socket.
-- **event writer** - batches rows into SQLite and prunes on a timer.
+- **event writer** - batches Allow observations into SQLite and prunes on a timer.
+  Parsed NFQUEUE Deny/Reject decisions commit synchronously before their verdict
+  and live publication. Audit failure drops the packet and ends the worker.
 - **storage** - sqlite behind a mutex. Reads are served from the in-memory
-  `RuleSet`; writes are kept off the hot path.
+  `RuleSet`. Production startup requires WAL with synchronous=FULL. Refusal
+  commits are on the packet path; lock and SQLite busy waits are each limited
+  to 250 ms. These limits do not bound filesystem I/O or fsync. Kernel/nftables
+  drops and malformed packets are not covered by this durable delivery gate.
 
 ## Lifecycle and systemd integration
 

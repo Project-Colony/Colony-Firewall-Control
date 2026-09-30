@@ -68,6 +68,7 @@ use crate::packet;
 use crate::process_resolve;
 use crate::reject::Rejecter;
 use crate::stats::Stats;
+use crate::storage::RuleStore;
 use anyhow::Context as _;
 use cfc_core::{Action, Connection, Direction, Process, Protocol, Verdict};
 use nfq::{Message, Queue, Verdict as NfqVerdict};
@@ -335,6 +336,7 @@ impl NfqHandles {
 }
 
 /// Binds the queue and starts the worker thread.
+#[allow(clippy::too_many_arguments)] // shared daemon handles; no new runtime wrapper
 pub fn spawn(
     cfg: &NfqConfig,
     engine: Engine,
@@ -342,8 +344,13 @@ pub fn spawn(
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
+    store: RuleStore,
     dns_cache: DnsCache,
 ) -> anyhow::Result<NfqHandles> {
+    anyhow::ensure!(
+        !cfg.fail_open,
+        "NFQUEUE fail_open bypasses mandatory verdict auditing"
+    );
     let queue_num = cfg.queue_num;
     info!(queue_num, "opening NFQUEUE");
 
@@ -407,6 +414,7 @@ pub fn spawn(
         verdict_rx,
         observed_tx,
         stats,
+        store,
         dns: Box::new(dns_cache),
         resolver: Box::new(ProcfsResolver),
         waiters: HashMap::new(),
@@ -534,6 +542,7 @@ struct Worker<Q: PacketQueue> {
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
+    store: RuleStore,
     /// Reverse-DNS / self-identification seam; [`DnsCache`] in production.
     dns: Box<dyn HostCache + Send>,
     /// Process attribution seam; [`ProcfsResolver`] in production.
@@ -549,9 +558,9 @@ struct Worker<Q: PacketQueue> {
     /// Set by main's shutdown path; observed at the top of every iteration.
     stop: Arc<AtomicBool>,
     /// Watchdog liveness cell shared with main's heartbeat task: the
-    /// unix-ms at which the loop last turned. Since no iteration blocks for
-    /// longer than `tuning.poll_interval`, a stale stamp means the worker
-    /// wedged and main withholds the WATCHDOG=1 heartbeat.
+    /// unix-ms at which the loop last turned. The idle wait is bounded;
+    /// packet processing also includes the durable audit commit. A stale
+    /// stamp means main must withhold the WATCHDOG=1 heartbeat.
     last_activity: Arc<AtomicI64>,
 }
 
@@ -580,15 +589,15 @@ impl<Q: PacketQueue> Worker<Q> {
             // Watchdog heartbeat source: one stamp per iteration. main's
             // heartbeat task withholds WATCHDOG=1 once this goes stale.
             self.stamp_activity();
-            self.drain_verdicts();
+            self.drain_verdicts()?;
 
             match self.queue.recv() {
                 Ok(msg) => {
                     consecutive_errors = 0;
-                    self.handle_message(msg);
+                    self.handle_message(msg)?;
                 }
                 // No packet ready: spend the beat waiting for a verdict.
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.idle_wait(),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.idle_wait()?,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     consecutive_errors += 1;
@@ -612,32 +621,32 @@ impl<Q: PacketQueue> Worker<Q> {
     /// The queue had nothing ready. Wait a short beat on the verdict
     /// channel instead of spinning; this is also what bounds how long the
     /// stop flag can go unobserved.
-    fn idle_wait(&mut self) {
+    fn idle_wait(&mut self) -> anyhow::Result<()> {
         if !self.verdict_channel_open {
             // Nothing left to wait for, and `recv_timeout` on a hung-up
             // channel returns instantly: pace the loop by hand.
             std::thread::sleep(self.tuning.poll_interval);
-            return;
+            return Ok(());
         }
         match self.verdict_rx.recv_timeout(self.tuning.poll_interval) {
-            Ok(pv) => self.resolve_prompt(pv),
+            Ok(pv) => self.resolve_prompt(pv)?,
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => self.close_verdict_channel(),
+            Err(RecvTimeoutError::Disconnected) => self.close_verdict_channel()?,
         }
+        Ok(())
     }
 
     /// Drains every verdict the router has produced so far.
-    fn drain_verdicts(&mut self) {
+    fn drain_verdicts(&mut self) -> anyhow::Result<()> {
         if !self.verdict_channel_open {
-            return;
+            return Ok(());
         }
         loop {
             match self.verdict_rx.try_recv() {
-                Ok(pv) => self.resolve_prompt(pv),
-                Err(TryRecvError::Empty) => return,
+                Ok(pv) => self.resolve_prompt(pv)?,
+                Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => {
-                    self.close_verdict_channel();
-                    return;
+                    return self.close_verdict_channel();
                 }
             }
         }
@@ -645,17 +654,17 @@ impl<Q: PacketQueue> Worker<Q> {
 
     /// The router is gone for good: remember it (so the idle path stops
     /// polling a dead channel) and unstrand whatever was parked.
-    fn close_verdict_channel(&mut self) {
+    fn close_verdict_channel(&mut self) -> anyhow::Result<()> {
         self.verdict_channel_open = false;
-        self.flush_waiters_disconnected();
+        self.flush_waiters_disconnected()
     }
 
     /// The router side of the verdict channel is gone; no pending prompt
     /// can ever resolve. Apply each prompt's fallback so its parked packets
     /// aren't stranded until the kernel times them out.
-    fn flush_waiters_disconnected(&mut self) {
+    fn flush_waiters_disconnected(&mut self) -> anyhow::Result<()> {
         if self.waiters.is_empty() {
-            return;
+            return Ok(());
         }
         warn!(
             count = self.waiters.len(),
@@ -664,13 +673,14 @@ impl<Q: PacketQueue> Worker<Q> {
         let ids: Vec<u64> = self.waiters.keys().copied().collect();
         for prompt_id in ids {
             let verdict = self.waiters[&prompt_id].fallback;
-            self.resolve_prompt(PromptVerdict { prompt_id, verdict });
+            self.resolve_prompt(PromptVerdict { prompt_id, verdict })?;
         }
+        Ok(())
     }
 
     /// Applies a resolved prompt: verdicts every parked packet, drops the
     /// waiters + pending_flows entries, and records each actual verdict.
-    fn resolve_prompt(&mut self, pv: PromptVerdict) {
+    fn resolve_prompt(&mut self, pv: PromptVerdict) -> anyhow::Result<()> {
         let Some(pending) = self.waiters.remove(&pv.prompt_id) else {
             // Late duplicate (the prompt already resolved another way);
             // the first resolution won.
@@ -678,7 +688,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 prompt_id = pv.prompt_id,
                 "verdict for already-resolved prompt, ignoring"
             );
-            return;
+            return Ok(());
         };
         self.pending_flows.remove(&pending.flow);
 
@@ -690,23 +700,19 @@ impl<Q: PacketQueue> Worker<Q> {
                 Decision::Resolved(current) if current.action != Action::Allow => current,
                 _ => pv.verdict,
             };
-            self.apply_action(packet.message, verdict.action);
-            if verdict.action == Action::Allow {
-                self.dns.enqueue(packet.connection.dst_ip);
-            }
-            record(&self.stats, verdict.action);
-            publish_observation(
-                &self.observed_tx,
+            self.deliver(
+                packet.message,
                 ObservedConnection {
                     connection: packet.connection,
                     process: packet.process,
                     verdict,
                 },
-            );
+            )?;
         }
+        Ok(())
     }
 
-    fn handle_message(&mut self, msg: Q::Msg) {
+    fn handle_message(&mut self, msg: Q::Msg) -> anyhow::Result<()> {
         let meta = PacketMeta {
             uid: msg.uid(),
             gid: msg.gid(),
@@ -724,17 +730,14 @@ impl<Q: PacketQueue> Worker<Q> {
                 connection,
                 process,
                 verdict,
-            } => {
-                self.apply_action(msg, verdict.action);
-                publish_observation(
-                    &self.observed_tx,
-                    ObservedConnection {
-                        connection,
-                        process,
-                        verdict,
-                    },
-                );
-            }
+            } => self.deliver(
+                msg,
+                ObservedConnection {
+                    connection,
+                    process,
+                    verdict,
+                },
+            ),
             PacketOutcome::Prompt {
                 connection,
                 process,
@@ -753,7 +756,7 @@ impl<Q: PacketQueue> Worker<Q> {
         connection: Connection,
         process: Process,
         fallback: Verdict,
-    ) {
+    ) -> anyhow::Result<()> {
         let flow = FlowKey::for_flow(&connection, &process);
         if let Some(&prompt_id) = self.pending_flows.get(&flow) {
             if let Some(pending) = self.waiters.get_mut(&prompt_id) {
@@ -772,8 +775,7 @@ impl<Q: PacketQueue> Worker<Q> {
                         parked = pending.packets.len(),
                         "prompt already holds its packet cap; applying the fallback"
                     );
-                    self.deliver_fallback(msg, connection, process, fallback);
-                    return;
+                    return self.deliver_fallback(msg, connection, process, fallback);
                 }
                 trace!(
                     prompt_id,
@@ -784,7 +786,7 @@ impl<Q: PacketQueue> Worker<Q> {
                     connection,
                     process,
                 });
-                return;
+                return Ok(());
             }
             // The waiters/pending_flows bijection documented on [`Worker`]
             // was violated: a flow points at a prompt that no longer
@@ -815,8 +817,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 parked = self.waiters.len(),
                 "prompt backlog at its cap; applying the fallback rather than parking"
             );
-            self.deliver_fallback(msg, connection, process, fallback);
-            return;
+            return self.deliver_fallback(msg, connection, process, fallback);
         }
 
         let prompt_id = self.next_prompt_id;
@@ -849,9 +850,10 @@ impl<Q: PacketQueue> Worker<Q> {
                 // Router saturated or gone: apply the default policy now
                 // rather than stranding the packet.
                 trace!("prompt channel unavailable ({e}); applying fallback");
-                self.deliver_fallback(msg, connection, process, fallback);
+                return self.deliver_fallback(msg, connection, process, fallback);
             }
         }
+        Ok(())
     }
 
     /// Answers a packet with the prompt fallback right now, with everything
@@ -868,20 +870,40 @@ impl<Q: PacketQueue> Worker<Q> {
         connection: Connection,
         process: Process,
         fallback: Verdict,
-    ) {
-        self.apply_action(msg, fallback.action);
-        if fallback.action == Action::Allow {
-            self.dns.enqueue(connection.dst_ip);
-        }
-        record(&self.stats, fallback.action);
-        publish_observation(
-            &self.observed_tx,
+    ) -> anyhow::Result<()> {
+        self.deliver(
+            msg,
             ObservedConnection {
                 connection,
                 process,
                 verdict: fallback,
             },
-        );
+        )
+    }
+
+    /// Commit parsed refusals before releasing the packet or publishing it.
+    /// Storage failure drops this packet and propagates out of the worker,
+    /// so a later packet cannot receive Allow after an unaudited refusal.
+    fn deliver(&mut self, msg: Q::Msg, obs: ObservedConnection) -> anyhow::Result<()> {
+        if obs.verdict.action != Action::Allow {
+            let row = crate::convert::event_row_from_observed(
+                &obs.connection,
+                &obs.process,
+                &obs.verdict,
+            );
+            if let Err(e) = self.store.insert_events(&[row]) {
+                self.send_verdict(msg, NfqVerdict::Drop)
+                    .context("dropping packet after verdict audit failure")?;
+                return Err(e).context("committing verdict audit before NFQUEUE delivery");
+            }
+        }
+        self.apply_action(msg, obs.verdict.action)?;
+        if obs.verdict.action == Action::Allow {
+            self.dns.enqueue(obs.connection.dst_ip);
+        }
+        record(&self.stats, obs.verdict.action);
+        publish_observation(&self.observed_tx, obs);
+        Ok(())
     }
 
     /// Applies a policy action to a queued packet.
@@ -892,11 +914,11 @@ impl<Q: PacketQueue> Worker<Q> {
     /// unreachable) so the app fails immediately instead of retransmitting
     /// until its own timeout. The injection is best-effort: if it can't be
     /// sent the packet is still dropped, i.e. Reject degrades to Deny.
-    fn apply_action(&mut self, msg: Q::Msg, action: Action) {
+    fn apply_action(&mut self, msg: Q::Msg, action: Action) -> anyhow::Result<()> {
         if action == Action::Reject {
             self.inject_refusal(&msg);
         }
-        self.send_verdict(msg, nfq_verdict_for(action));
+        self.send_verdict(msg, nfq_verdict_for(action))
     }
 
     /// Reparses this specific packet (cheap, and only on the Reject path)
@@ -918,11 +940,9 @@ impl<Q: PacketQueue> Worker<Q> {
         }
     }
 
-    fn send_verdict(&mut self, mut msg: Q::Msg, verdict: NfqVerdict) {
+    fn send_verdict(&mut self, mut msg: Q::Msg, verdict: NfqVerdict) -> anyhow::Result<()> {
         msg.set_verdict(verdict);
-        if let Err(e) = self.queue.verdict(msg) {
-            warn!("setting NFQUEUE verdict failed: {e}");
-        }
+        self.queue.verdict(msg).context("setting NFQUEUE verdict")
     }
 }
 
@@ -1017,8 +1037,7 @@ enum PacketOutcome {
     /// Immediate verdict with nothing to observe (self traffic, packets we
     /// can't parse). Not counted in stats.
     Silent(NfqVerdict),
-    /// Immediate verdict, already recorded in stats; the caller publishes
-    /// the observation.
+    /// Parsed decision, committed and counted by the final delivery gate.
     Deliver {
         connection: Connection,
         process: Process,
@@ -1123,17 +1142,11 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
     }
 
     match deps.engine.evaluate(&conn, &proc) {
-        Decision::Resolved(verdict) => {
-            if verdict.action == Action::Allow {
-                deps.dns.enqueue(conn.dst_ip);
-            }
-            record(deps.stats, verdict.action);
-            PacketOutcome::Deliver {
-                connection: conn,
-                process: proc,
-                verdict,
-            }
-        }
+        Decision::Resolved(verdict) => PacketOutcome::Deliver {
+            connection: conn,
+            process: proc,
+            verdict,
+        },
         Decision::NeedsPrompt { fallback } => {
             // Inbound never asks.
             //
@@ -1155,7 +1168,6 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                     action = ?verdict.action,
                     "inbound flow matched no rule; applying the inbound default"
                 );
-                record(deps.stats, verdict.action);
                 return PacketOutcome::Deliver {
                     connection: conn,
                     process: proc,
@@ -1168,8 +1180,6 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                 // without a prompt.
                 debug!(dst = %conn.dst_ip, "paused: allowing unmatched flow without prompting");
                 let verdict = Verdict::default_allow();
-                deps.dns.enqueue(conn.dst_ip);
-                record(deps.stats, verdict.action);
                 return PacketOutcome::Deliver {
                     connection: conn,
                     process: proc,
@@ -1406,15 +1416,17 @@ mod tests {
         // Fill to the cap through the real path, so the state is exactly what
         // production would hold.
         for i in 0..MAX_PARKED_PROMPTS {
-            h.worker().park_for_prompt(
-                FakeMsg::new(i as u32, tcp_packet(443)),
-                // A distinct destination per park: `FlowKey` folds packets of
-                // the same flow onto one prompt, which is the behaviour under
-                // test elsewhere and would collapse this to a single waiter.
-                conn_to(1024 + i as u16, 1111),
-                test_process(4242, "/usr/bin/curl"),
-                Verdict::default_deny(),
-            );
+            h.worker()
+                .park_for_prompt(
+                    FakeMsg::new(i as u32, tcp_packet(443)),
+                    // A distinct destination per park: `FlowKey` folds packets of
+                    // the same flow onto one prompt, which is the behaviour under
+                    // test elsewhere and would collapse this to a single waiter.
+                    conn_to(1024 + i as u16, 1111),
+                    test_process(4242, "/usr/bin/curl"),
+                    Verdict::default_deny(),
+                )
+                .unwrap();
             // Drain as we go: the harness channel holds 16, and a full channel
             // takes the saturation branch instead of parking - which is the
             // *other* fallback path and would hide what this test is about.
@@ -1425,12 +1437,14 @@ mod tests {
 
         // One more. It must be answered, not parked.
         let overflow_id = MAX_PARKED_PROMPTS as u32 + 1;
-        h.worker().park_for_prompt(
-            FakeMsg::new(overflow_id, tcp_packet(443)),
-            conn_to(9000, 1111),
-            test_process(4242, "/usr/bin/curl"),
-            Verdict::default_deny(),
-        );
+        h.worker()
+            .park_for_prompt(
+                FakeMsg::new(overflow_id, tcp_packet(443)),
+                conn_to(9000, 1111),
+                test_process(4242, "/usr/bin/curl"),
+                Verdict::default_deny(),
+            )
+            .unwrap();
 
         assert_eq!(
             h.worker().waiters.len(),
@@ -1475,12 +1489,14 @@ mod tests {
         // One flow throughout: the destination stays fixed and the source
         // port varies, as a parallel-connection burst would.
         for i in 0..MAX_PACKETS_PER_PROMPT {
-            h.worker().park_for_prompt(
-                FakeMsg::new(i as u32, tcp_packet(443)),
-                conn_to(443, 1111 + i as u16),
-                test_process(4242, "/usr/bin/curl"),
-                Verdict::default_deny(),
-            );
+            h.worker()
+                .park_for_prompt(
+                    FakeMsg::new(i as u32, tcp_packet(443)),
+                    conn_to(443, 1111 + i as u16),
+                    test_process(4242, "/usr/bin/curl"),
+                    Verdict::default_deny(),
+                )
+                .unwrap();
         }
         assert_eq!(h.worker().waiters.len(), 1, "one flow is one prompt");
         assert!(h.verdicts().is_empty(), "up to the cap, packets park");
@@ -1488,12 +1504,14 @@ mod tests {
 
         // One more packet of the same flow. It must be answered, not parked.
         let overflow_id = MAX_PACKETS_PER_PROMPT as u32;
-        h.worker().park_for_prompt(
-            FakeMsg::new(overflow_id, tcp_packet(443)),
-            conn_to(443, 9999),
-            test_process(4242, "/usr/bin/curl"),
-            Verdict::default_deny(),
-        );
+        h.worker()
+            .park_for_prompt(
+                FakeMsg::new(overflow_id, tcp_packet(443)),
+                conn_to(443, 9999),
+                test_process(4242, "/usr/bin/curl"),
+                Verdict::default_deny(),
+            )
+            .unwrap();
 
         assert_eq!(
             h.verdicts(),
@@ -1516,7 +1534,7 @@ mod tests {
         // the packets that parked, none of them double-verdicted.
         let req = h.prompt_rx.try_recv().expect("prompt dispatched");
         h.send_verdict(req.prompt_id, Verdict::default_allow());
-        h.worker().drain_verdicts();
+        h.worker().drain_verdicts().unwrap();
 
         let expected: Vec<_> = std::iter::once((overflow_id, NfqVerdict::Drop))
             .chain((0..MAX_PACKETS_PER_PROMPT).map(|i| (i as u32, NfqVerdict::Accept)))
@@ -1769,7 +1787,7 @@ mod tests {
             }
             other => panic!("expected Deliver, got {other:?}"),
         }
-        assert_eq!(env.stats.connections_allowed(), 1);
+        assert_eq!(env.stats.connections_allowed(), 0);
         assert_eq!(env.stats.connections_denied(), 0);
     }
 
@@ -1782,7 +1800,7 @@ mod tests {
             }
             other => panic!("expected Deliver, got {other:?}"),
         }
-        assert_eq!(env.stats.connections_denied(), 1);
+        assert_eq!(env.stats.connections_denied(), 0);
     }
 
     #[test]
@@ -1814,7 +1832,7 @@ mod tests {
             }
             other => panic!("expected Deliver, got {other:?}"),
         }
-        assert_eq!(env.stats.connections_denied(), 1);
+        assert_eq!(env.stats.connections_denied(), 0);
     }
 
     #[test]
@@ -1827,7 +1845,7 @@ mod tests {
             }
             other => panic!("expected Deliver, got {other:?}"),
         }
-        assert_eq!(env.stats.connections_allowed(), 1);
+        assert_eq!(env.stats.connections_allowed(), 0);
     }
 
     #[test]
@@ -1885,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_flow_does_not_start_dns_enrichment() {
+    fn decisions_do_not_start_dns_enrichment_before_delivery() {
         struct CountingDns(std::sync::atomic::AtomicUsize);
         impl HostCache for CountingDns {
             fn is_self(&self, _: u32) -> bool {
@@ -1913,43 +1931,27 @@ mod tests {
         assert_eq!(dns.0.load(Ordering::Relaxed), 0);
         env.engine.upsert_rule(allow_port_rule(80));
         let _ = handle_packet(&tcp_packet(80), &NO_META, &deps);
-        assert_eq!(dns.0.load(Ordering::Relaxed), 1);
+        assert_eq!(dns.0.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn blocked_packet_is_logged_without_a_live_feed_receiver() {
-        #[derive(Clone)]
-        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = bytes.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || Capture(capture.clone()))
-            .finish();
         let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443)], dp_deny());
         drop(h.observed_rx);
-        tracing::subscriber::with_default(subscriber, || {
-            h.worker
-                .as_mut()
-                .unwrap()
-                .handle_message(FakeMsg::new(7, tcp_packet(443)))
-        });
-        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-        assert!(
-            output.contains("connection blocked"),
-            "missing independent audit record: {output}"
+        h.worker
+            .as_mut()
+            .unwrap()
+            .handle_message(FakeMsg::new(7, tcp_packet(443)))
+            .unwrap();
+        let rows = h.store.query_events(10, 0, Default::default()).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "refusal must survive absent live-feed receivers"
         );
-        assert!(output.contains("5.6.7.8:443"));
+        assert_eq!(rows[0].action, "Deny");
+        assert_eq!(rows[0].dst_ip.as_deref(), Some("5.6.7.8"));
+        assert_eq!(rows[0].dst_port, Some(443));
     }
 
     #[test]
@@ -2012,61 +2014,31 @@ mod tests {
     }
 
     #[test]
-    fn an_unverified_name_may_refuse_but_may_not_admit() {
-        // A name the daemon lifted off the wire decorates the flow and is
-        // shown to the user. It may still refuse traffic - an attacker gains
-        // nothing by calling themselves something the user denied - but it
-        // must not admit any, because anything answering from source port 53
-        // can assert any name for its own address.
+    fn legacy_hostname_policy_refuses_independently_of_diagnostic_dns() {
         let named = |action| {
-            let mut scope = cfc_core::RuleScope::any();
+            let mut scope = RuleScope::any();
             scope.dst_host = Some("example.org".to_string());
-            Rule::new("by-name".to_string(), action, scope)
+            Rule::new("legacy-name", action, scope)
         };
-
-        // Allow + unverified: the rule does not answer, so the default does.
-        let mut env = TestEnv::new(vec![named(Action::Allow)], dp_deny());
-        env.dns.host = Some("example.org".into());
-        env.dns.host_verified = false;
-        match env.handle(&tcp_packet(443), &NO_META) {
-            PacketOutcome::Prompt { connection, .. } => {
-                assert_eq!(
-                    connection.dst_host.as_deref(),
-                    Some("example.org"),
-                    "the name is still attached, for the log and the live feed"
-                );
-                assert!(!connection.dst_host_verified);
+        for action in [Action::Allow, Action::Deny, Action::Reject] {
+            for host in [None, Some("example.org"), Some("alternate.example.org")] {
+                for verified in [false, true] {
+                    let mut env = TestEnv::new(vec![named(action)], dp_allow());
+                    env.dns.host = host.map(str::to_owned);
+                    env.dns.host_verified = verified;
+                    match env.handle(&tcp_packet(443), &NO_META) {
+                        PacketOutcome::Deliver {
+                            connection,
+                            verdict,
+                            ..
+                        } => {
+                            assert_eq!(connection.dst_host.as_deref(), host);
+                            assert_eq!(verdict.action, Action::Deny);
+                        }
+                        other => panic!("uncertain hostname policy must refuse, got {other:?}"),
+                    }
+                }
             }
-            other => panic!("an unverified name must not admit, got {other:?}"),
-        }
-
-        // Deny + unverified: it answers, exactly as it did before. Refusing
-        // the name in both directions would have disarmed every deny rule
-        // written against a name on a host running the DNS observer.
-        let mut env = TestEnv::new(vec![named(Action::Deny)], dp_allow());
-        env.dns.host = Some("example.org".into());
-        env.dns.host_verified = false;
-        match env.handle(&tcp_packet(443), &NO_META) {
-            PacketOutcome::Deliver { verdict, .. } => {
-                assert_eq!(verdict.action, Action::Deny, "a deny by name still fires");
-            }
-            other => panic!("an unverified name must still refuse, got {other:?}"),
-        }
-
-        // Allow + confirmed against the address: the rule answers.
-        let mut env = TestEnv::new(vec![named(Action::Allow)], dp_deny());
-        env.dns.host = Some("example.org".into());
-        env.dns.host_verified = true;
-        match env.handle(&tcp_packet(443), &NO_META) {
-            PacketOutcome::Deliver {
-                connection,
-                verdict,
-                ..
-            } => {
-                assert!(connection.dst_host_verified);
-                assert_eq!(verdict.action, Action::Allow);
-            }
-            other => panic!("a confirmed name should have matched, got {other:?}"),
         }
     }
 
@@ -2131,26 +2103,32 @@ mod tests {
         second.src_port = 10001;
         let mut process = test_process(4242, "/usr/bin/curl");
         process.sha256 = Some("aa".repeat(32));
-        h.worker().park_for_prompt(
-            FakeMsg::new(1, tcp_packet(443)),
-            first,
-            process.clone(),
-            Verdict::default_deny(),
-        );
-        h.worker().park_for_prompt(
-            FakeMsg::new(2, tcp_packet(443)),
-            second,
-            process,
-            Verdict::default_deny(),
-        );
+        h.worker()
+            .park_for_prompt(
+                FakeMsg::new(1, tcp_packet(443)),
+                first,
+                process.clone(),
+                Verdict::default_deny(),
+            )
+            .unwrap();
+        h.worker()
+            .park_for_prompt(
+                FakeMsg::new(2, tcp_packet(443)),
+                second,
+                process,
+                Verdict::default_deny(),
+            )
+            .unwrap();
         let request = h.prompt_rx.try_recv().unwrap();
         let mut deny = deny_port_rule(443);
         deny.scope.src_port = Some(10001);
         h.worker().engine.upsert_rule(deny);
-        h.worker().resolve_prompt(PromptVerdict {
-            prompt_id: request.prompt_id,
-            verdict: Verdict::default_allow(),
-        });
+        h.worker()
+            .resolve_prompt(PromptVerdict {
+                prompt_id: request.prompt_id,
+                verdict: Verdict::default_allow(),
+            })
+            .unwrap();
         assert_eq!(
             h.verdicts(),
             vec![(1, NfqVerdict::Accept), (2, NfqVerdict::Drop)]
@@ -2260,6 +2238,8 @@ mod tests {
         modes: Vec<bool>,
         /// recv calls, so a test can tell a turning loop from a stuck one.
         recv_calls: u64,
+        audit_probe: Option<crate::storage::RuleStore>,
+        audited_at_verdict: Vec<usize>,
     }
 
     struct FakeQueue {
@@ -2285,7 +2265,15 @@ mod tests {
 
         fn verdict(&mut self, msg: FakeMsg) -> std::io::Result<()> {
             let verdict = msg.verdict.expect("worker verdicted without a verdict");
-            self.log.lock().unwrap().verdicts.push((msg.id, verdict));
+            let mut log = self.log.lock().unwrap();
+            if let Some(store) = &log.audit_probe {
+                let count = store
+                    .query_events(100, 0, Default::default())
+                    .unwrap()
+                    .len();
+                log.audited_at_verdict.push(count);
+            }
+            log.verdicts.push((msg.id, verdict));
             Ok(())
         }
     }
@@ -2315,6 +2303,7 @@ mod tests {
         verdict_tx: Option<VerdictTx>,
         prompt_rx: mpsc::Receiver<PromptRequest>,
         observed_rx: broadcast::Receiver<ObservedConnection>,
+        store: crate::storage::RuleStore,
     }
 
     impl LoopHarness {
@@ -2328,6 +2317,7 @@ mod tests {
             let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
             let (observed_tx, observed_rx) = broadcast::channel(16);
             let stats = Stats::new();
+            let store = RuleStore::open_in_memory().unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let worker = Worker {
                 queue: FakeQueue {
@@ -2340,6 +2330,7 @@ mod tests {
                 verdict_rx,
                 observed_tx,
                 stats: stats.clone(),
+                store: store.clone(),
                 dns: Box::new(StubDns {
                     self_pid: None,
                     host: None,
@@ -2366,7 +2357,15 @@ mod tests {
                 verdict_tx: Some(verdict_tx),
                 prompt_rx,
                 observed_rx,
+                store,
             }
+        }
+
+        fn with_store(mut self, store: crate::storage::RuleStore) -> Self {
+            self.log.lock().unwrap().audit_probe = Some(store.clone());
+            self.worker().store = store.clone();
+            self.store = store;
+            self
         }
 
         fn with_tuning(mut self, tuning: Tuning) -> Self {
@@ -2446,6 +2445,173 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         None
+    }
+
+    #[test]
+    fn parsed_refusals_commit_before_the_verdict_and_live_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        let store = crate::storage::RuleStore::open(&path).unwrap();
+        let mut reject = deny_port_rule(80);
+        reject.action = Action::Reject;
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443), reject], dp_deny())
+            .with_store(store.clone());
+        h.worker()
+            .handle_message(FakeMsg::new(1, tcp_packet(443)))
+            .unwrap();
+        h.worker()
+            .handle_message(FakeMsg::new(2, tcp_packet(80)))
+            .unwrap();
+        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1, 2]);
+        assert_eq!(
+            h.verdicts(),
+            vec![(1, NfqVerdict::Drop), (2, NfqVerdict::Drop)]
+        );
+        assert_eq!(
+            h.observed_rx.try_recv().unwrap().verdict.action,
+            Action::Deny
+        );
+        assert_eq!(
+            h.observed_rx.try_recv().unwrap().verdict.action,
+            Action::Reject
+        );
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "commits must be visible to an independent connection"
+        );
+        drop(reader);
+        drop(h);
+        drop(store);
+        assert_eq!(
+            crate::storage::RuleStore::open(&path)
+                .unwrap()
+                .query_events(10, 0, Default::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_audit_commit_drops_current_packet_and_stops_before_next_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        let store = crate::storage::RuleStore::open(&path).unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TRIGGER refuse_audit BEFORE INSERT ON events \
+            BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
+            )
+            .unwrap();
+        let mut h = LoopHarness::new(
+            vec![
+                Ok(FakeMsg::new(1, tcp_packet(443))),
+                Ok(FakeMsg::new(2, tcp_packet(80))),
+            ],
+            vec![deny_port_rule(443), allow_port_rule(80)],
+            dp_deny(),
+        )
+        .with_store(store);
+        let done = h.start();
+        let result = done.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            h.stop_and_expect_ok(&done);
+        }
+        assert!(result
+            .expect("audit failure must terminate the worker")
+            .is_err());
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
+        assert_eq!(h.stats.connections_total(), 0);
+        assert!(h.observed_rx.try_recv().is_err(), "no unaudited live entry");
+    }
+
+    #[test]
+    fn prompt_refusals_and_unavailable_router_use_the_same_audit_gate() {
+        let store = crate::storage::RuleStore::open_in_memory().unwrap();
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny()).with_store(store.clone());
+        h.worker()
+            .handle_message(FakeMsg::new(1, tcp_packet(443)))
+            .unwrap();
+        let prompt = h.prompt_rx.try_recv().unwrap();
+        h.worker()
+            .resolve_prompt(PromptVerdict {
+                prompt_id: prompt.prompt_id,
+                verdict: Verdict::from_policy(Action::Reject),
+            })
+            .unwrap();
+        h.prompt_rx.close();
+        h.worker()
+            .handle_message(FakeMsg::new(2, tcp_packet(80)))
+            .unwrap();
+        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1, 2]);
+        let rows = store.query_events(10, 0, Default::default()).unwrap();
+        assert!(rows.iter().any(|r| r.action == "Reject"));
+        assert!(rows.iter().any(|r| r.action == "Deny"));
+        assert_eq!(h.stats.connections_denied(), 2);
+    }
+
+    #[test]
+    fn allowed_delivery_enriches_and_counts_once_without_a_refusal_audit() {
+        struct CountingDns(Arc<std::sync::atomic::AtomicUsize>);
+        impl HostCache for CountingDns {
+            fn is_self(&self, _: u32) -> bool {
+                false
+            }
+            fn cached_host(&self, _: IpAddr) -> Option<(String, bool)> {
+                None
+            }
+            fn enqueue(&self, _: IpAddr) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = RuleStore::open_in_memory().unwrap();
+        let mut h = LoopHarness::new(vec![], vec![allow_port_rule(443)], dp_deny())
+            .with_store(store.clone());
+        h.worker().dns = Box::new(CountingDns(calls.clone()));
+        h.worker()
+            .handle_message(FakeMsg::new(1, tcp_packet(443)))
+            .unwrap();
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(h.stats.connections_allowed(), 1);
+        assert_eq!(
+            h.observed_rx.try_recv().unwrap().verdict.action,
+            Action::Allow
+        );
+        assert!(store
+            .query_events(10, 0, Default::default())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn live_feed_lag_does_not_lose_parsed_refusal_audits() {
+        let store = RuleStore::open_in_memory().unwrap();
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443)], dp_deny())
+            .with_store(store.clone());
+        for id in 0..64 {
+            h.worker()
+                .handle_message(FakeMsg::new(id, tcp_packet(443)))
+                .unwrap();
+        }
+        assert!(matches!(
+            h.observed_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        assert_eq!(
+            store
+                .query_events(100, 0, Default::default())
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(h.verdicts().len(), 64);
     }
 
     #[test]
@@ -2635,17 +2801,19 @@ mod tests {
         // is empty gets picked up; drive it directly so the test does not
         // race `drain_verdicts` for the same message.
         let mut h = LoopHarness::new(vec![], vec![], dp_deny());
-        h.worker().park_for_prompt(
-            FakeMsg::new(4, tcp_packet(443)),
-            conn_to(443, 1111),
-            test_process(4242, "/usr/bin/curl"),
-            Verdict::default_deny(),
-        );
+        h.worker()
+            .park_for_prompt(
+                FakeMsg::new(4, tcp_packet(443)),
+                conn_to(443, 1111),
+                test_process(4242, "/usr/bin/curl"),
+                Verdict::default_deny(),
+            )
+            .unwrap();
         let req = h.prompt_rx.try_recv().expect("prompt dispatched");
         assert!(h.verdicts().is_empty());
 
         h.send_verdict(req.prompt_id, Verdict::default_allow());
-        h.worker().idle_wait();
+        h.worker().idle_wait().unwrap();
 
         assert_eq!(h.verdicts(), vec![(4, NfqVerdict::Accept)]);
         assert!(h.worker().waiters.is_empty());
@@ -2689,12 +2857,12 @@ mod tests {
         drop(h.verdict_tx.take());
 
         // First call notices the hangup...
-        h.worker().idle_wait();
+        h.worker().idle_wait().unwrap();
         assert!(!h.worker().verdict_channel_open);
 
         // ...after which the wait is paced by hand.
         let started = Instant::now();
-        h.worker().idle_wait();
+        h.worker().idle_wait().unwrap();
         assert!(
             started.elapsed() >= Duration::from_millis(20),
             "idle wait returned in {:?}, i.e. it is spinning",
@@ -2755,12 +2923,14 @@ mod tests {
         let flow = FlowKey::for_flow(&conn, &proc);
         h.worker().pending_flows.insert(flow.clone(), 99);
 
-        h.worker().park_for_prompt(
-            FakeMsg::new(5, tcp_packet(443)),
-            conn,
-            proc,
-            Verdict::default_deny(),
-        );
+        h.worker()
+            .park_for_prompt(
+                FakeMsg::new(5, tcp_packet(443)),
+                conn,
+                proc,
+                Verdict::default_deny(),
+            )
+            .unwrap();
 
         let req = h.prompt_rx.try_recv().expect("flow re-prompted");
         assert_eq!(req.prompt_id, 1);

@@ -87,7 +87,9 @@ fn heal_legacy_protocol(rule: &mut Rule) -> bool {
 
 /// Why a stored rule must not be applied, or `None` when it may be.
 ///
-/// The exact gate list `rule_from_pb` runs at the API boundary, because the
+/// The API validation gates, except legacy hostname rules: those remain
+/// conservative uncertainty guards without changing their stored scope.
+/// The database is one more door into the engine, because the
 /// database is one more door into the engine: rows written by an older build
 /// (before a given gate existed), by a hand edit, or through a path that
 /// missed a gate deserialize here with none of the wire checks re-run. This
@@ -107,6 +109,11 @@ fn heal_legacy_protocol(rule: &mut Rule) -> bool {
 /// read-modify-write that sends the refused scope straight back to a daemon
 /// that now rejects it.
 fn quarantine_reason(rule: &Rule) -> Option<String> {
+    // A legacy hostname never authorizes a flow. Retain its complete scope
+    // and original priority as uncertainty instead of removing its guard.
+    if rule.scope.dst_host.is_some() {
+        return None;
+    }
     if rule.action == cfc_core::Action::Allow
         && matches!(rule.scope.protocol, Some(cfc_core::Protocol::Other(_)))
     {
@@ -144,21 +151,27 @@ fn quarantine_reason(rule: &Rule) -> Option<String> {
 /// that program, the power went out, and it is allowed again" is not a
 /// trade this program gets to make on the user's behalf for 2 ms.
 ///
-/// Both pragmas are advisory here: a database on a filesystem that refuses WAL
-/// (some network mounts) keeps its old mode, and the daemon works either way.
-/// That is why nothing below is fatal.
-fn tune(conn: &Connection) {
+/// Production storage requires WAL and FULL before the datapath can start.
+/// Only the test-only in-memory store may keep its memory journal.
+fn tune(conn: &Connection, durable: bool) -> anyhow::Result<()> {
     // `query_row`, not `execute`: journal_mode returns the mode it settled on,
     // and rusqlite treats a row-returning statement passed to `execute` as an
     // error - which would turn a successful tuning into a logged failure.
-    match conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)) {
-        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
-        Ok(mode) => tracing::debug!(%mode, "sqlite kept its journal mode; WAL unavailable here"),
-        Err(e) => tracing::debug!("could not set journal_mode=WAL: {e}"),
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .context("requiring sqlite WAL journal")?;
+    if durable && !mode.eq_ignore_ascii_case("wal") {
+        anyhow::bail!("durable storage requires WAL; sqlite selected {mode}");
     }
-    if let Err(e) = conn.pragma_update(None, "synchronous", "FULL") {
-        tracing::debug!("could not set synchronous=FULL: {e}");
-    }
+    conn.pragma_update(None, "synchronous", "FULL")
+        .context("requiring sqlite synchronous=FULL")?;
+    let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+    anyhow::ensure!(
+        synchronous == 2,
+        "durable storage requires synchronous=FULL"
+    );
+    conn.busy_timeout(std::time::Duration::from_millis(250))?;
+    Ok(())
 }
 
 impl RuleStore {
@@ -167,7 +180,7 @@ impl RuleStore {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path).context("opening sqlite")?;
-        let store = Self::from_conn(conn)?;
+        let store = Self::from_conn(conn, true)?;
 
         // "Until restart" and "once" rules must not survive a daemon restart;
         // open() runs at daemon start, so purging here implements that
@@ -188,8 +201,8 @@ impl RuleStore {
         Ok(store)
     }
 
-    fn from_conn(conn: Connection) -> anyhow::Result<Self> {
-        tune(&conn);
+    fn from_conn(conn: Connection, durable: bool) -> anyhow::Result<Self> {
+        tune(&conn, durable)?;
         migrate(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -221,7 +234,7 @@ impl RuleStore {
                     // operator meant, and dropping the inert predicate can
                     // itself leave the scope empty - which the gate below
                     // must then see.
-                    if heal_legacy_protocol(&mut rule) {
+                    if rule.scope.dst_host.is_none() && heal_legacy_protocol(&mut rule) {
                         healed_ids.push(id.clone());
                     }
                     if let Some(reason) = quarantine_reason(&rule) {
@@ -286,6 +299,9 @@ impl RuleStore {
     }
 
     pub fn upsert(&self, rule: &Rule) -> anyhow::Result<()> {
+        rule.scope
+            .reject_hostname_policy()
+            .map_err(anyhow::Error::msg)?;
         let json = serde_json::to_string(rule)?;
         let conn = self.conn.lock();
         conn.execute(
@@ -298,6 +314,11 @@ impl RuleStore {
 
     /// Apply an import in one SQLite transaction; failure restores the old set.
     pub fn apply_rules(&self, rules: &[Rule], replace: bool) -> anyhow::Result<usize> {
+        for rule in rules {
+            rule.scope
+                .reject_hostname_policy()
+                .map_err(anyhow::Error::msg)?;
+        }
         let serialized: Vec<_> = rules
             .iter()
             .map(|rule| Ok((rule, serde_json::to_string(rule)?)))
@@ -429,7 +450,10 @@ impl RuleStore {
         if batch.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock();
+        let conn = self
+            .conn
+            .try_lock_for(std::time::Duration::from_millis(250))
+            .context("audit storage mutex unavailable within 250ms")?;
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -585,7 +609,7 @@ impl RuleStore {
     /// so tests control purge timing explicitly.
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory().context("opening sqlite :memory:")?;
-        Self::from_conn(conn)
+        Self::from_conn(conn, false)
     }
 
     fn user_version(&self) -> i64 {
@@ -598,6 +622,95 @@ impl RuleStore {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn event_commit_does_not_wait_indefinitely_for_the_store_mutex() {
+        let store = RuleStore::open_in_memory().unwrap();
+        let held = store.conn.lock();
+        let writer = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            tx.send(writer.insert_events(&[sample_event(1, "test", "Deny")]))
+                .unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        task.join().unwrap();
+        assert!(result
+            .expect("audit lock acquisition must be bounded")
+            .is_err());
+    }
+
+    #[test]
+    fn production_storage_requires_a_file_and_bounded_sqlite_contention() {
+        assert!(RuleStore::open(Path::new(":memory:")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let store = RuleStore::open(&dir.path().join("audit.db")).unwrap();
+        let timeout: i64 = store
+            .conn
+            .lock()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(timeout > 0 && timeout <= 500, "busy timeout = {timeout}");
+    }
+
+    #[test]
+    fn event_commit_bounds_contention_from_another_sqlite_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        let store = RuleStore::open(&path).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let result = store.insert_events(&[sample_event(1, "test", "Reject")]);
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        store
+            .insert_events(&[sample_event(2, "test", "Deny")])
+            .unwrap();
+        assert_eq!(
+            store
+                .query_events(10, 0, EventFilter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hostname_writes_are_refused_but_legacy_rows_remain_loaded() {
+        let store = RuleStore::open_in_memory().unwrap();
+        let mut named = sample_rule("legacy-name");
+        named.scope.dst_host = Some("example.org".into());
+        named.action = Action::Deny;
+        assert!(store.upsert(&named).is_err());
+        let existing = sample_rule("numeric-control");
+        store.upsert(&existing).unwrap();
+        assert!(store.apply_rules(&[named.clone()], true).is_err());
+        assert_eq!(store.snapshot().unwrap().rules, vec![existing.clone()]);
+
+        store
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO rules(id, enabled, data) VALUES(?1, 1, ?2)",
+                rusqlite::params![named.id.to_string(), serde_json::to_string(&named).unwrap()],
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert!(snapshot.rules.contains(&named));
+        let stored: String = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT data FROM rules WHERE id = ?1",
+                [named.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Rule>(&stored).unwrap(), named);
+    }
 
     /// The pragmas are what make the event writer 2.5x cheaper; a silent
     /// revert to sqlite's defaults would cost that back with nothing failing.

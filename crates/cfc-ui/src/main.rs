@@ -295,10 +295,10 @@ impl RuleEditor {
     }
 
     /// Seeds the editor from an observed flow (live feed "make rule").
-    /// Prefers the hostname, like the prompt card does.
+    /// Pins the numeric endpoint IP; DNS names remain diagnostic.
     pub fn from_observed(
         exe: &str,
-        dst_host: &str,
+        _dst_host: &str,
         dst_ip: &str,
         dst_port: u32,
         protocol: i32,
@@ -309,12 +309,8 @@ impl RuleEditor {
         Self {
             name: String::new(),
             exe: exe.to_string(),
-            dst_host: dst_host.to_string(),
-            dst_net: if dst_host.is_empty() {
-                format::host_cidr(dst_ip)
-            } else {
-                String::new()
-            },
+            dst_host: String::new(),
+            dst_net: format::host_cidr(dst_ip),
             dst_port: if dst_port == 0 {
                 String::new()
             } else {
@@ -1505,6 +1501,13 @@ async fn fetch_rules(path: PathBuf) -> Result<Vec<proto::RuleInfo>, String> {
 }
 
 async fn upsert_rule(path: PathBuf, rule: proto::RuleInfo) -> Result<String, String> {
+    if let Some(scope) = rule
+        .scope
+        .as_ref()
+        .filter(|scope| !scope.exe_path.is_empty())
+    {
+        cfc_core::exe_path::resolve_policy(std::path::Path::new(&scope.exe_path))?;
+    }
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
     client.upsert_rule(rule).await.map_err(|e| e.to_string())
 }
@@ -1515,6 +1518,12 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
     } else {
         ed.name.trim().to_string()
     };
+
+    cfc_core::RuleScope {
+        dst_host: (!ed.dst_host.is_empty()).then(|| ed.dst_host.clone()),
+        ..cfc_core::RuleScope::any()
+    }
+    .reject_hostname_policy()?;
 
     let dst_port = if ed.dst_port.trim().is_empty() {
         None
@@ -1575,19 +1584,13 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         );
     }
 
-    // Resolved here, not only in the daemon. The daemon does resolve on
-    // UpsertRule, but it runs under `ProtectHome=true` and `PrivateTmp=true`,
-    // so /home and /tmp are simply not there in its namespace - and those are
-    // exactly the paths a person types by hand (~/.local/bin, ~/.cargo/bin,
-    // AppImages, Steam). Without this the GUI's most likely input is the one
-    // case the daemon cannot fix, and the rule saves looking fine.
+    // Validate in the user's namespace as well as the daemon's: ProtectHome
+    // and PrivateTmp hide exactly the paths a person commonly enters.
     let typed = ed.exe.trim();
-    let exe = if ed.prompt_id.is_some() {
-        typed.to_string()
-    } else if typed.is_empty() {
+    let exe = if typed.is_empty() {
         String::new()
     } else {
-        cfc_core::exe_path::resolve(std::path::Path::new(typed))
+        cfc_core::exe_path::resolve_policy(std::path::Path::new(typed))?
             .into_path()
             .to_string_lossy()
             .into_owned()
@@ -1724,6 +1727,17 @@ mod tests {
     }
 
     #[test]
+    fn editor_refuses_hostname_policy_without_dropping_it() {
+        let mut ed = editor_with_scope();
+        ed.dst_host = "example.org".into();
+        assert!(build_rule_from_editor(&ed).is_err());
+        assert_eq!(ed.dst_host, "example.org");
+        ed.dst_host.clear();
+        ed.dst_net = "2001:db8::1/128".into();
+        assert!(build_rule_from_editor(&ed).is_ok());
+    }
+
+    #[test]
     fn editor_builds_a_persistable_rule() {
         let rule = build_rule_from_editor(&editor_with_scope()).unwrap();
         assert_eq!(rule.duration, proto::Duration::Always as i32);
@@ -1731,10 +1745,10 @@ mod tests {
     }
 
     #[test]
-    fn observed_seed_prefers_host_over_cidr() {
+    fn observed_seed_pins_the_numeric_endpoint_even_with_a_hostname() {
         let ed = RuleEditor::from_observed("/bin/x", "example.com", "1.2.3.4", 443, 1);
-        assert_eq!(ed.dst_host, "example.com");
-        assert!(ed.dst_net.is_empty(), "host rules should not pin the IP");
+        assert!(ed.dst_host.is_empty());
+        assert_eq!(ed.dst_net, "1.2.3.4/32");
         assert_eq!(ed.dst_port, "443");
 
         let ed = RuleEditor::from_observed("/bin/x", "", "2001:db8::1", 0, 0);
@@ -1993,8 +2007,8 @@ mod tests {
     fn customizing_a_prompt_seeds_a_new_rule_from_it() {
         let ed = RuleEditor::from_prompt(&prompt_event());
         assert_eq!(ed.exe, "/usr/bin/curl");
-        assert_eq!(ed.dst_host, "example.com");
-        assert!(ed.dst_net.is_empty(), "the hostname wins over the address");
+        assert!(ed.dst_host.is_empty());
+        assert_eq!(ed.dst_net, "93.184.216.34/32");
         assert_eq!(ed.dst_port, "443");
         assert_eq!(ed.protocol, Some(proto::Protocol::Tcp));
         // It is a new rule, not an edit of an existing one.

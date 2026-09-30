@@ -62,7 +62,7 @@ pub enum Scope {
     ExeAndPort,
     /// This executable, anywhere.
     Exe,
-    /// This destination, from any executable.
+    /// This numeric endpoint IP, from any executable.
     Destination,
 }
 
@@ -99,17 +99,8 @@ pub fn build_scope(
         }
         Scope::Destination => {
             let c = conn?;
-            if !c.dst_host.is_empty() {
-                out.dst_host = c.dst_host.clone();
-            } else if !c.dst_ip.is_empty() {
-                out.dst_net = if c.dst_ip.contains(':') {
-                    format!("{}/128", c.dst_ip)
-                } else {
-                    format!("{}/32", c.dst_ip)
-                };
-            } else {
-                return None;
-            }
+            let ip = c.dst_ip.parse::<std::net::IpAddr>().ok()?;
+            out.dst_net = ipnet::IpNet::from(ip).to_string();
         }
     }
     Some(out)
@@ -581,7 +572,8 @@ async fn handle_prompt(
     let (duration, scope) = match duration {
         None => (proto::Duration::Once, None),
         Some(duration) => {
-            let scope_label = "scope: [1] this app + port [2] this app [3] this destination";
+            let scope_label =
+                "scope: [1] this app + port [2] this app [3] this endpoint IP (/32 or /128)";
             term.announce(scope_label);
             let picked = match term
                 .choose(
@@ -771,11 +763,11 @@ mod tests {
     }
 
     #[test]
-    fn destination_scope_prefers_the_hostname() {
+    fn destination_scope_pins_the_numeric_endpoint_even_with_a_hostname() {
         let s = build_scope(Scope::Destination, Some(&process()), Some(&conn())).unwrap();
-        assert_eq!(s.dst_host, "example.com");
+        assert!(s.dst_host.is_empty());
         assert!(s.exe_path.is_empty());
-        assert!(s.dst_net.is_empty());
+        assert_eq!(s.dst_net, "93.184.216.34/32");
     }
 
     #[test]
@@ -830,7 +822,8 @@ mod tests {
         // unattributed flow - that is the rule shape such prompts should use.
         p.exe = convert::UNKNOWN_EXE.to_string();
         let s = build_scope(Scope::Destination, Some(&p), Some(&conn())).unwrap();
-        assert_eq!(s.dst_host, "example.com");
+        assert!(s.dst_host.is_empty());
+        assert_eq!(s.dst_net, "93.184.216.34/32");
         assert!(s.exe_path.is_empty());
     }
 

@@ -162,9 +162,8 @@ async fn run() -> anyhow::Result<()> {
     let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
     let router = prompts::PromptRouter::new(policy.clone(), stats.clone(), verdict_tx);
 
-    // Persist every decided flow into the events table. Subscribes to the
-    // live feed before the datapath starts so nothing is missed, and never
-    // blocks it (bounded queue + drop counting, see ipc.rs).
+    // Allow observations use the bounded async event pipeline. NFQUEUE
+    // refusals commit synchronously before verdict delivery and publication.
     ipc::spawn_event_pipeline(store.clone(), &observed_tx, cfg.events.max_rows);
 
     let (mut ipc_handle, prompt_tx) = ipc::spawn(
@@ -197,6 +196,7 @@ async fn run() -> anyhow::Result<()> {
             verdict_rx,
             observed_tx.clone(),
             stats.clone(),
+            store.clone(),
             // Cloned rather than moved: the eBPF consumers write observed DNS
             // answers into the same cache, and they are started after READY=1
             // (see below) so the handle has to outlive this call.

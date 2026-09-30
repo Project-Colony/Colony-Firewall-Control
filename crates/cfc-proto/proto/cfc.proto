@@ -100,6 +100,7 @@ message ConnectionInfo {
   uint32 src_port = 6;
   string dst_ip = 7;
   uint32 dst_port = 8;
+  // Diagnostic only; forward-confirmed PTR does not authenticate an application hostname.
   string dst_host = 9;
   bool dst_host_verified = 10;
 }
@@ -135,6 +136,7 @@ message RuleScope {
   string parent_exe = 3;
   uint32 uid = 4;
   bool has_uid = 5;
+  // Legacy policy field. Writes/imports reject non-empty values; use numeric dst_net.
   string dst_host = 6;
   string dst_net = 7;
   uint32 dst_port = 8;

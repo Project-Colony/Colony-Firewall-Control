@@ -68,7 +68,7 @@ use tonic::transport::server::{Connected, UdsConnectInfo};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-/// Resolves a rule's executable path without blocking the IPC worker.
+/// Validates a rule's explicit executable target without blocking IPC.
 ///
 /// `canonicalize` is a synchronous syscall on a path any `colony-firewall`
 /// group member supplies, and this runs inside a `#[tonic::async_trait]`
@@ -79,38 +79,25 @@ use tracing::{info, warn};
 /// reasoning already puts `dns.rs` and `nfqueue.rs`'s blocking calls on the
 /// blocking pool.
 ///
-/// Best effort throughout: a path that cannot be resolved is kept verbatim
-/// rather than refused, because writing a rule for a program you have not
-/// installed yet is legitimate and this is the wrong layer to have an opinion
-/// about it.
-async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) {
+/// Missing canonical targets support preinstallation; aliases, other lookup
+/// failures and worker failures refuse the policy write.
+async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) -> Result<(), Status> {
     let Some(current) = scope.exe_path.clone() else {
-        return;
+        return Ok(());
     };
-    let outcome =
-        match tokio::task::spawn_blocking(move || cfc_core::exe_path::resolve(&current)).await {
-            Ok(o) => o,
-            // The blocking pool is shutting down, or the task panicked. Neither is
-            // a reason to refuse the rule; store what the client sent.
-            Err(e) => {
-                warn!("could not resolve the rule's exe path: {e}");
-                return;
-            }
-        };
-    // A rewrite is a policy-relevant change nobody typed - the stored rule is
-    // about a different path than the one sent - so it is a warning, not a note.
-    // The client that sent it may have no way to show the difference.
-    match &outcome {
-        cfc_core::ResolvedExe::Rewritten { .. } => {
-            warn!("rule exe path: {}", outcome.note().unwrap_or_default())
-        }
-        _ => {
-            if let Some(note) = outcome.note() {
-                info!("rule exe path: {note}");
-            }
-        }
+    let outcome = tokio::task::spawn_blocking(move || cfc_core::exe_path::resolve_policy(&current))
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "executable policy validation worker failed: {error}"
+            ))
+        })?
+        .map_err(Status::invalid_argument)?;
+    if let Some(note) = outcome.note() {
+        info!("rule exe path: {note}");
     }
     scope.exe_path = Some(outcome.into_path());
+    Ok(())
 }
 
 fn bind_prompt_allow(
@@ -587,11 +574,9 @@ impl Firewall for FirewallService {
                 Ok(rule)
             }) {
                 Ok(mut rule) => {
-                    // The same resolution UpsertRule does, in the same order
-                    // (convert, then resolve). It matters most exactly when
-                    // attribution fell back to the exec event's path, which is
-                    // whatever string was passed to execve() and may well be
-                    // `/bin/curl`.
+                    // Persist only an explicit mapped target. The one-time
+                    // verdict is already applied, so report a rejected standing
+                    // policy through persist_error rather than retrying it.
                     if let Err(error) = bind_prompt_allow(&mut rule, &binding) {
                         persist_error = format!("the verdict was applied, but the standing rule could not be saved: {error}");
                         return Ok(Response::new(VerdictResponse {
@@ -602,8 +587,15 @@ impl Firewall for FirewallService {
                             error: String::new(),
                         }));
                     }
-                    if rule.scope.exe_path != binding.exe {
-                        resolve_exe_off_thread(&mut rule.scope).await;
+                    if let Err(error) = resolve_exe_off_thread(&mut rule.scope).await {
+                        persist_error = format!("the verdict was applied, but the standing rule could not be saved: {error}");
+                        return Ok(Response::new(VerdictResponse {
+                            accepted,
+                            persisted_rule_id: String::new(),
+                            persist_error,
+                            persist_note,
+                            error: String::new(),
+                        }));
                     }
                     if rule.action == cfc_core::Action::Allow && binding.hash_expected {
                         persist_note = "the allow is bound to the prompted binary's sha256; a changed file will prompt again".into();
@@ -693,17 +685,9 @@ impl Firewall for FirewallService {
             .ok_or_else(|| Status::invalid_argument("rule required"))?;
         let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
         convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
-        // Resolve the executable path here as well as in the CLI, because this
-        // is where *every* client's rule arrives - the GUI's editor takes a
-        // typed path too. Matching is exact string equality against what /proc
-        // reports, which the kernel has already resolved, so an unresolved rule
-        // path is inert while still looking present in every listing.
-        //
-        // Best effort by design: a path that cannot be resolved (not installed
-        // yet, or unreadable) is kept verbatim rather than refused. Refusing it
-        // would break the legitimate "write the rule before installing the
-        // program" case, and this is the wrong layer to have that opinion.
-        resolve_exe_off_thread(&mut rule.scope).await;
+        // Every caller must select the canonical mapped target explicitly.
+        // Missing targets with unchanged ancestry remain valid for preinstallation.
+        resolve_exe_off_thread(&mut rule.scope).await?;
         // hit_count and created_at belong to the daemon: a client editing a
         // rule must not be able to rewrite its history, deliberately or (as
         // every read-modify-write client did) by echoing back a count that
@@ -757,7 +741,7 @@ impl Firewall for FirewallService {
             if !ids.insert(rule.id) {
                 return Err(Status::invalid_argument("duplicate rule id"));
             }
-            resolve_exe_off_thread(&mut rule.scope).await;
+            resolve_exe_off_thread(&mut rule.scope).await?;
             pending.push(rule);
         }
         let _mutation = self.mutations.lock();
@@ -1162,10 +1146,10 @@ fn secure_socket(path: &Path, ipc: &IpcConfig) -> SocketAuth {
 // Event persistence pipeline
 // ---------------------------------------------------------------------------
 
-/// Subscribes to the observed-connection feed and persists every decided
-/// flow into the `events` table.
+/// Persists Allow observations. Deny/Reject are committed synchronously by
+/// the NFQUEUE delivery gate before publication and must not be duplicated.
 ///
-/// Two tasks so the datapath is never blocked by sqlite:
+/// Two tasks keep Allow observation writes off the datapath:
 ///
 /// - a *feeder* that converts broadcast items to [`EventRow`]s and
 ///   `try_send`s them into a bounded queue, counting (never awaiting on)
@@ -1186,6 +1170,9 @@ pub fn spawn_event_pipeline(
         loop {
             match sub.recv().await {
                 Ok(obs) => {
+                    if obs.verdict.action != cfc_core::Action::Allow {
+                        continue;
+                    }
                     let row = convert::event_row_from_observed(
                         &obs.connection,
                         &obs.process,
@@ -1340,6 +1327,25 @@ pub async fn spawn(
 mod tests {
     use super::*;
     use crate::stats::TablePresence;
+
+    #[tokio::test]
+    async fn executable_policy_validation_refuses_alias_without_rewriting_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("target");
+        std::fs::write(&target, b"local policy test data").unwrap();
+        let alias = target.with_file_name("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let mut scope = cfc_core::RuleScope::any();
+        scope.exe_path = Some(alias.clone());
+        let error = resolve_exe_off_thread(&mut scope).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(scope.exe_path, Some(alias));
+        scope.exe_path = Some(target.clone());
+        resolve_exe_off_thread(&mut scope).await.unwrap();
+        assert_eq!(scope.exe_path, Some(target));
+    }
 
     // -- authorization ------------------------------------------------------
 
@@ -1716,7 +1722,15 @@ mod tests {
         spawn_event_pipeline(store.clone(), &tx, 1000);
 
         tx.send(observed(443, cfc_core::Action::Allow)).unwrap();
-        tx.send(observed(80, cfc_core::Action::Deny)).unwrap();
+        let blocked = observed(80, cfc_core::Action::Deny);
+        store
+            .insert_events(&[convert::event_row_from_observed(
+                &blocked.connection,
+                &blocked.process,
+                &blocked.verdict,
+            )])
+            .unwrap();
+        tx.send(blocked).unwrap();
 
         // Well past the batch interval; paused time auto-advances.
         tokio::time::sleep(std::time::Duration::from_secs(

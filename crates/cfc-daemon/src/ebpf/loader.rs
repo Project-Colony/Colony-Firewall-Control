@@ -302,13 +302,12 @@ fn nft_arm_state(mark: u32, deadline_secs: u64, reduced: Option<String>) -> Fast
 }
 
 /// The reported state for a failed nftables arm. A missing *table* is the
-/// normal boot order (the nft unit starts after this daemon) and reads as
-/// waiting; a missing *set* is an operator-visible fact - a snippet that
+/// ruleset unavailable and reads as waiting; a missing *set* is an operator-visible fact - a snippet that
 /// predates the feature - and carries the fix; anything else is quoted.
 fn nft_arm_state_from_error(e: &anyhow::Error) -> FastAllow {
     match e.downcast_ref::<super::nft_set::Absent>() {
         Some(super::nft_set::Absent::Table) => FastAllow::Off(
-            "waiting for the nftables table (colony-firewall-nft.service starts after the daemon)"
+            "waiting for the nftables table (colony-firewall-nft.service has not installed filtering)"
                 .to_string(),
         ),
         Some(super::nft_set::Absent::Set) => FastAllow::Off(format!("{e}")),

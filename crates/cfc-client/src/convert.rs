@@ -149,7 +149,7 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
     let target = scope
         .and_then(|s| {
             if !s.dst_host.is_empty() {
-                Some(s.dst_host.clone())
+                Some(format!("{} [legacy hostname; uncertain]", s.dst_host))
             } else if !s.dst_net.is_empty() {
                 Some(s.dst_net.clone())
             } else {
@@ -308,7 +308,10 @@ mod tests {
             has_dst_port: true,
             ..Default::default()
         }));
-        assert_eq!(s, "allow   /usr/bin/curl -> example.com:443");
+        assert_eq!(
+            s,
+            "allow   /usr/bin/curl -> example.com [legacy hostname; uncertain]:443"
+        );
     }
 
     #[test]

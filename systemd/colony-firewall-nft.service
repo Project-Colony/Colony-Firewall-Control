@@ -1,7 +1,6 @@
 # Keep the fail-closed NFQUEUE table installed across daemon restarts and stops.
 # Stop this unit explicitly to remove filtering, or uninstall the package.
-# Startup requires a ready daemon to preserve network recovery after a failed
-# initial launch. This availability choice can leave boot traffic unfiltered.
+# Load before the daemon, including when its initialization fails.
 
 [Unit]
 Description=Colony Firewall nftables NFQUEUE rules
@@ -10,35 +9,21 @@ Documentation=https://github.com/Project-Colony/Colony-Firewall-Control
 # daemon crash does not remove the table -- fail-closed stays fail-closed
 # while Restart=on-failure brings the daemon back.
 Wants=colony-firewalld.service
-# After the daemon (a fail-closed table with nobody on the queue would
-# drop everything), yet BEFORE network-pre.target like the daemon itself:
-# the ruleset is in the kernel before any interface is configured.
-After=colony-firewalld.service
-Before=network-pre.target
+# A distribution nftables unit may flush the ruleset while starting. Load our
+# table after it, before the daemon and the supported network managers.
+After=nftables.service
+Before=colony-firewalld.service network-pre.target NetworkManager.service systemd-networkd.service
 Wants=network-pre.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Refuse to load a fail-closed table when there is no daemon to answer the
-# queue. Wants= above is deliberate and stays: a daemon that crashes and is
-# restarted by Restart=on-failure should NOT get a window where traffic flows
-# unfiltered. But Wants= also tolerates a daemon that never started at all, and
-# then the table is loaded with nobody on NFQUEUE 0 and every new outbound
-# connection is dropped, permanently.
-#
-# That is not hypothetical. On 2026-08-21 an Arch Colony machine ran
-# `systemctl enable --now colony-firewalld colony-firewall-nft`; the daemon died
-# at 226/NAMESPACE, this unit started anyway, and the machine lost DNS and every
-# mirror — including the one that would have delivered the fix.
-#
-# The daemon is Type=notify, so After= means it has signalled readiness by the
-# time this runs. ExecStartPre only runs on start, so a later crash still leaves
-# the table in place, which is the property Wants= exists to keep.
-ExecStartPre=/usr/bin/systemctl is-active --quiet colony-firewalld.service
 ExecStart=/usr/bin/nft -f /usr/share/colony-firewall/nftables-snippet.conf
 ExecReload=/usr/bin/nft -f /usr/share/colony-firewall/nftables-snippet.conf
 ExecStop=/usr/bin/nft delete table inet colony_firewall
 
 [Install]
 WantedBy=multi-user.target
+# Native .requires links make nft load failure prevent manager startup.
+# They exist only after enforcement is enabled and are removed on disable.
+RequiredBy=NetworkManager.service systemd-networkd.service

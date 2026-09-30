@@ -124,17 +124,23 @@ sudo install -Dm755 target/release/colony-firewall  /usr/bin/colony-firewall
 sudo install -Dm755 target/release/cfc              /usr/bin/cfc
 sudo install -Dm755 target/release/colony-firewall-tray /usr/bin/colony-firewall-tray
 
-# Both units. colony-firewall-nft.service is what First run step 1
+# All units. colony-firewall-nft.service is what First run step 1
 # enables; without it that step fails with "Unit ... not found".
 sudo install -Dm644 systemd/colony-firewalld.service \
      /usr/lib/systemd/system/colony-firewalld.service
 sudo install -Dm644 systemd/colony-firewall-nft.service \
      /usr/lib/systemd/system/colony-firewall-nft.service
+sudo install -Dm644 systemd/colony-firewall-nft-inbound.service \
+     /usr/lib/systemd/system/colony-firewall-nft-inbound.service
 
 # The ruleset colony-firewall-nft.service loads. The unit hardcodes this
 # path, so it is not optional either.
 sudo install -Dm644 systemd/nftables-snippet.conf \
      /usr/share/colony-firewall/nftables-snippet.conf
+sudo install -Dm644 systemd/nftables-inbound.conf \
+     /usr/share/colony-firewall/nftables-inbound.conf
+sudo install -Dm755 scripts/inbound-lockout-guard.sh \
+     /usr/lib/colony-firewall/inbound-lockout-guard.sh
 
 # Config, and the group that gates the control socket
 sudo install -Dm644 systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
@@ -154,15 +160,13 @@ sudo install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
      /etc/xdg/autostart/colony-firewall-tray.desktop
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now colony-firewalld
 
 # The control socket is root:colony-firewall 0660. Join the group, then
 # log out and back in, or the GUI and cfc get "permission denied".
 sudo usermod -aG colony-firewall "$USER"
 ```
 
-Installing only puts the binaries and daemon in place - no traffic is
-filtered until you enable enforcement. See First run below.
+Enable the installed daemon and enforcement in First run below.
 
 ## First run
 
@@ -174,12 +178,10 @@ these three things, in order:
 nftables ruleset at boot and removes it on stop:
 
 ```sh
-sudo systemctl enable --now colony-firewall-nft.service
+sudo systemctl enable --now colony-firewalld.service colony-firewall-nft.service
 ```
 
-Alternatively, apply the snippet by hand - but note this does **not**
-survive a reboot; after restarting, the daemon runs while enforcing
-nothing:
+Applying the snippet by hand does **not** create the boot dependencies:
 
 ```sh
 sudo nft -f /usr/share/colony-firewall/nftables-snippet.conf   # installed
@@ -249,14 +251,21 @@ This cannot lock you out of a remote machine: the ruleset hooks `output`
 on `ct state new` only, so an inbound SSH session's replies are
 `ct state established` and are never queued.
 
-**Boot behaviour.** The units are ordered `Before=network-pre.target`
-to load filtering before cooperating network services configure interfaces.
-The nft unit requires a ready daemon before its first load. If that initial
-launch fails, it leaves networking available and filtering may be absent;
-this is not a boot-time isolation guarantee. Once loaded, the fail-closed
-tables survive daemon stops and restarts. Stop the nft unit explicitly to
-remove its table. Early unmatched flows use `no_ui_action`, and bootstrap
-DHCP/DNS/NTP rules keep strict configurations usable.
+**Boot behaviour.** The nft units load independently before the daemon,
+`network-pre.target`, NetworkManager and systemd-networkd, after the
+distribution's `nftables.service` when it is in the same boot transaction.
+Enabling enforcement creates native requirements from those two network
+managers: a failed nft load blocks their startup. A failed daemon start leaves
+the loaded tables dropping new flows. The daemon also requires the outbound
+table before initialization. Tables survive daemon stops and restarts; stop
+the nft unit explicitly to remove its table. Inbound stays opt-in. Its lockout
+guard reads saved SQLite rules without a running daemon.
+
+This contract covers systemd-managed NetworkManager and systemd-networkd
+after enforcement is enabled. It does not cover networking configured in an
+initramfs, interfaces already configured before these units, other network
+managers, or a later external ruleset flush. Early unmatched flows use
+`no_ui_action`; bootstrap DHCP/DNS/NTP rules keep strict configurations usable.
 
 **Scope.** Rules decide new tracked flows; established and related traffic
 retains its connection-wide authorization. Passed or inherited sockets and
@@ -323,6 +332,14 @@ cfc rules export --out rules.json
 # Migrate from an existing opensnitch install
 cfc rules import-opensnitch /etc/opensnitchd/rules
 ```
+
+Executable rules require the canonical mapped target explicitly. An alias
+such as `/bin/tool` on a system where `/bin` links to `/usr/bin` is refused;
+review and name `/usr/bin/tool` instead. Rules remain attached to that fixed
+target and do not follow later alias changes. Missing canonical paths can be
+prepared before installation, but installing an alias there requires review.
+Legacy rules retain their stored targets; lost original alias intent cannot
+be migrated automatically.
 
 ### Scripting
 

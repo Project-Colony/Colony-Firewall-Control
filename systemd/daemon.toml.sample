@@ -97,7 +97,8 @@ queue_num = 0
 queue_max_len = 4096
 # What the KERNEL does with packets when this queue overflows: false drops
 # them (fail-closed, default), true lets them through unfiltered
-# (fail-open).
+# (fail-open). This setting must be false: true is rejected so overflow
+# cannot bypass policy or durable refusal auditing.
 #
 # Not to be confused with the `bypass` keyword on the nftables rule, which
 # decides what happens when NO daemon is attached to the queue at all. This

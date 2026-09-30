@@ -28,8 +28,6 @@
 # a live session. CFC_INBOUND_FORCE=1 overrides.
 set -eu
 
-CFC="${CFC_BIN:-/usr/bin/cfc}"
-
 if [ "${CFC_INBOUND_FORCE:-0}" = "1" ]; then
     echo "inbound-lockout-guard: CFC_INBOUND_FORCE=1 set, skipping the check" >&2
     exit 0
@@ -53,15 +51,42 @@ listening="$(ss -Hltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un 
 established="$(ss -Htn state established 2>/dev/null | awk '{print $3" "$4}' || true)"
 [ -n "$established" ] || exit 0
 
-rules_json="$("$CFC" rules list --json 2>/dev/null || echo '[]')"
+LISTENING="$listening" ESTABLISHED="$established" python3 - <<'PY'
+import json, os, sqlite3, sys
+from pathlib import Path
 
-RULES_JSON="$rules_json" LISTENING="$listening" ESTABLISHED="$established" python3 - <<'PY'
-import json, os, sys
-
-rules = json.loads(os.environ.get("RULES_JSON") or "[]")
-if isinstance(rules, dict):
-    rules = rules.get("rules", [])
 listening = {l.strip() for l in os.environ["LISTENING"].split() if l.strip()}
+inbound = []
+for line in os.environ["ESTABLISHED"].splitlines():
+    parts = line.split()
+    if len(parts) != 2:
+        continue
+    local, peer = parts
+    port = local.rsplit(":", 1)[-1]
+    ip = peer.rsplit(":", 1)[0].strip("[]")
+    if port in listening and not (ip.startswith("127.") or ip == "::1"):
+        inbound.append((ip, port))
+if not inbound:
+    sys.exit(0)
+
+# Read only: a first boot must neither create a database nor wait for IPC.
+# Custom storage paths come from the same config as the installed daemon.
+try:
+    database = os.environ.get("CFC_RULES_DB")
+    if not database:
+        config = Path(os.environ.get("CFC_CONFIG", "/etc/colony-firewall/daemon.toml"))
+        settings = {}
+        if config.exists():
+            import tomllib
+            with config.open("rb") as source:
+                settings = tomllib.load(source)
+        database = settings.get("storage", {}).get("path", "/var/lib/colony-firewall/rules.db")
+    with sqlite3.connect(Path(database).resolve().as_uri() + "?mode=ro", uri=True) as connection:
+        rules = [json.loads(row[0]) for row in connection.execute(
+            "SELECT data FROM rules WHERE enabled = 1")]
+except (ImportError, OSError, ValueError, sqlite3.Error) as error:
+    print(f"inbound-lockout-guard: cannot read saved inbound rules: {error}", file=sys.stderr)
+    sys.exit(1)
 
 # Ports an enabled inbound Allow rule could admit. `None` means the rule names
 # no port, so it could admit any of them.
@@ -89,17 +114,7 @@ for r in rules:
         admitted.add(str(port))
 
 at_risk = []
-for line in os.environ["ESTABLISHED"].splitlines():
-    parts = line.split()
-    if len(parts) != 2:
-        continue
-    local, peer = parts
-    lport = local.rsplit(":", 1)[-1]
-    pip = peer.rsplit(":", 1)[0].strip("[]")
-    if lport not in listening:
-        continue  # an outbound connection's ephemeral local port
-    if pip.startswith("127.") or pip == "::1":
-        continue  # loopback is accepted unconditionally
+for pip, lport in inbound:
     if any_port or lport in admitted:
         continue
     at_risk.append(f"  {pip} -> port {lport}")
