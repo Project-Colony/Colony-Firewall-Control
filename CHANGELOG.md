@@ -6,6 +6,51 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-30
+
+### Added
+
+- `cfc applications run` and `stop` provide opt-in, administrator-controlled
+  confinement for fresh headless application trees. Network access is denied
+  by default; `--allow IP` approves exact numeric peers for the whole tree
+  across TCP/UDP ports, including any relay that peer provides. Ordinary CFC
+  rules can further restrict new connections. Revocation stops the complete tree.
+- The initial confinement profile requires x86_64 Linux, cgroup v2, systemd
+  262+, Bubblewrap 0.13+, working system D-Bus and libbpf interface filters.
+  Launches verify the native filters and require a sealed runtime on a
+  supported local filesystem. Private namespaces, dropped capabilities and
+  seccomp restrict local relays and inherited resources. Desktop services,
+  shared home directories, standard input/output and live grant changes are
+  unavailable. This mode covers only explicitly launched trees; ordinary
+  socket attribution and established-flow authorization remain unchanged.
+
+### Security
+
+- All profile defaults now refuse unattended and unanswered connections.
+  Explicit administrator overrides remain supported. Incomplete process
+  identity and compatible undecidable rules refuse before pause or prompts.
+- Fast Allow is disabled in every runtime configuration, including existing
+  `fast_allow = true` settings. Allowed flows use NFQUEUE.
+- Hostnames are diagnostic only. New hostname rules and imports are rejected;
+  compatible legacy hostname rules refuse before a lower Allow or fallback.
+  Replace them explicitly with executable or numeric destination scopes.
+- New executable rules require the canonical target explicitly instead of
+  silently rewriting aliases. This does not recover legacy alias intent or
+  pin future executable contents; hash scopes remain a separate control.
+- Parsed NFQUEUE Deny/Reject decisions commit to SQLite before their verdict
+  or live publication. Audit failure drops the packet and stops the worker.
+  Kernel drops, malformed packets and journal delivery are outside this gate.
+- Enabled nftables units load independently before daemon initialization and
+  are required by NetworkManager and systemd-networkd. Failed table loading
+  blocks those managers; daemon failure leaves filtering installed. This
+  contract excludes initramfs networking and already configured interfaces.
+- Control mutations verify each peer's actual group credentials. Non-root
+  prompt replies require delivery to that user, persisted prompt Allows retain the
+  prompted image binding, and rule imports publish committed batches atomically.
+- Packet attribution, rejection parsing and eBPF object selection validate
+  their inputs more strictly. Build jobs use read-only repository permissions;
+  release publication runs after successful builds with separate write access.
+
 ## [0.6.0] - 2026-09-28
 
 ### Changed
