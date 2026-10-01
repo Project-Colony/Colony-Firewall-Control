@@ -11,7 +11,7 @@ desktop, not what's theoretically pure.
 2. Click through prompts for a week. Save persistent rules as you go.
 3. Run `cfc rules bootstrap-defaults` to install common system rules.
 4. Once the prompt rate drops to maybe 1-2 a day, switch to
-   `profile = "strict"` for fail-closed behavior.
+   `profile = "strict"` if you prefer a shorter prompt timeout.
 5. Audit `cfc rules list` monthly. Remove rules for apps you no longer
    use, and check `cfc log --since 30d` for destinations you did not
    expect.
@@ -23,14 +23,14 @@ running" throughout - it subscribes the same way the GUI does.
 
 | Profile  | No UI    | Timeout  | Window | Use when                                      |
 |----------|----------|----------|--------|------------------------------------------------|
-| relaxed  | Allow    | Deny     | 60s    | Headless servers / can't always be at the UI   |
-| balanced | Allow    | Deny     | 30s    | Daily-driver workstations (default)            |
-| strict   | Deny     | Deny     | 15s    | Lockdown posture, UI always present            |
+| relaxed  | Deny     | Deny     | 60s    | Longer time to answer prompts                  |
+| balanced | Deny     | Deny     | 30s    | Daily-driver workstations (default)            |
+| strict   | Deny     | Deny     | 15s    | Shorter time to answer prompts                 |
 
-**No profile ever permits a connection by itself.** Not on timeout, not
+**No profile ever permits a remote connection by itself.** Not on timeout, not
 when nothing is subscribed. The presets differ only in how long a prompt
-waits for an answer. Only a stored rule, or a person answering, allows
-traffic.
+waits for an answer. Under these presets, a stored rule or a prompt answer
+permits remote traffic. Unmatched local IPC is allowed without prompting.
 
 A timeout means the question *was* put to you and went unanswered; if
 that granted access, the cheapest attack would be to connect while
@@ -58,8 +58,8 @@ before the daemon and `network-pre.target`. Enabled enforcement is required
 by NetworkManager and systemd-networkd, so an nft load failure blocks their
 startup. Initial daemon failure leaves the table loaded and drops new flows.
 This does not cover initramfs networking, already configured interfaces, or
-other network managers. Once loaded, strict
-filtering denies unmatched flows, so DHCP, DNS and NTP need standing rules or
+other network managers. Once loaded, strict filtering denies unmatched remote
+flows, so DHCP, DNS and NTP need standing rules or
 the machine cannot even get a lease. Network managers retrying DNS will
 look like total network failure. **Only flip to strict after you have
 rules for every always-on system service**.
@@ -174,20 +174,32 @@ real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
 
 ## What this firewall does *not* protect against
 
+Normal mode follows the desktop application firewall model of OpenSnitch and
+Windows Firewall Control. It filters new tracked IP flows using socket
+attribution. [Explicit application confinement](../README.md#explicit-application-confinement)
+is a separate launch mode.
+
 - **Anything from root**: `/usr/bin/colony-firewalld` itself is trusted,
   and so is any other root process. Use this firewall alongside, not
   instead of, traditional access controls.
 - **eBPF / unprivileged user namespaces**: a sufficiently privileged user
   can bypass NFQUEUE entirely with `unshare -rn` and a custom net namespace.
-- **Local relays and DNS**: loopback is exempt. A denied application can use
-  an allowed local resolver or proxy; outbound traffic is attributed to that
-  service. Hostname rules and observed answers do not isolate DNS queries.
+- **Local relays and DNS**: explicit rules apply to new direct loopback flows.
+  Unmatched local IPC is allowed without prompting. An authorized local
+  resolver or proxy can relay remote traffic, which is attributed to that
+  service. CFC cannot establish the originating application's identity from
+  remote flows delegated through AF_UNIX or D-Bus brokers. Existing local
+  connections retain their authorization. Hostname rules and observed answers
+  do not isolate DNS queries.
 - **Inherited or passed sockets**: established/related traffic keeps its
   connection-wide authorization. An inherited or passed descriptor is not
-  reauthorized for each sending executable.
-- **Packet-layer privileges**: applications with `CAP_NET_RAW` can use packet
-  sockets outside the shipped IP OUTPUT hooks. These rules do not provide
-  layer-2 containment.
+  reauthorized for each sending executable. Current descriptor ownership
+  and validated eBPF hints reduce false attribution; neither proves which
+  process sent a packet.
+- **Raw and packet sockets**: applications with `CAP_NET_RAW` can use AF_PACKET
+  outside the shipped `inet OUTPUT` hook. Raw IP packets can coincide with
+  another socket's tuple even when TCP matching is strict. Tuple and inode
+  checks do not prove raw packet provenance or provide layer-2 containment.
 - **DNS-over-HTTPS embedded in browsers**: the firewall sees the outer HTTPS
   flow. Domain isolation requires an application-aware proxy or separate containment.
 - **Container traffic**: Docker / Podman / LXC route through their own
@@ -361,8 +373,8 @@ to shrink what a code-execution bug could reach:
 **`ProtectProc=invisible` is deliberately absent.** It would hide other
 processes' `/proc` entries from the daemon, and that is precisely how
 process attribution works: `/proc/net/{tcp,udp}` gives a socket inode,
-and the owning pid is found by walking `/proc/*/fd` for a matching
-`socket:[inode]` link. Turning it on makes every connection resolve to an
+and a current descriptor holder is found by walking `/proc/*/fd` for a
+matching `socket:[inode]` link. Turning it on makes every connection resolve to an
 unknown process, which defeats the entire tool. Same reason
 `CAP_SYS_PTRACE` is in the bounding set. If you are hand-editing the
 unit, do not "harden" either of these.

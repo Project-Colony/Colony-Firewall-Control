@@ -156,8 +156,9 @@ impl Profile {
     ///
     /// The outbound table cannot lock an operator out of a remote machine: it
     /// hooks `output` on `ct state new` only, so an inbound SSH session's
-    /// replies are `ct state established` and are never queued, and loopback is
-    /// accepted outright. Rules can still be added with `cfc-cli` from that
+    /// replies are `ct state established` and are never queued. New loopback
+    /// flows follow explicit policy; unmatched local IPC is allowed without
+    /// prompting. Rules can still be added with `cfc-cli` from that
     /// session. What it *does* mean on a fresh headless install is that
     /// outbound traffic — package updates, NTP, backups — is denied until
     /// rules exist for it.

@@ -171,7 +171,7 @@ Enable the installed daemon and enforcement in First run below.
 ## First run
 
 A fresh install has **zero rules**: once enforcement is on, every new
-outbound connection prompts (or falls back to the profile default). Do
+remote outbound connection prompts (or falls back to the profile default). Do
 these three things, in order:
 
 **1. Enable enforcement persistently.** A companion unit loads the
@@ -204,11 +204,10 @@ systemd-timesyncd and chronyd NTP (:123/udp), the DHCP clients (dhcpcd,
 NetworkManager and systemd-networkd, :67 and :547/udp), pacman and paru
 HTTPS mirrors (:443/tcp), and the SSH client (:22/tcp) - and is
 idempotent (already-present rules are skipped by name; `--dry-run`
-previews). **Do not skip this step.** No profile allows anything on its
-own, so on a machine with no rules and no UI connected nothing outbound
-gets through - including the DHCP lease. Filtering starts before the
-network is configured (see below), and these rules are what let the
-machine come up at all.
+previews). **Do not skip this step.** No profile allows unmatched remote flows
+on its own. With no rules and no UI connected, unmatched queued remote
+connections are denied. Filtering starts before the network is configured
+(see below), and these rules keep DHCP, DNS and NTP usable.
 
 For everything else, there are bundles:
 
@@ -240,8 +239,8 @@ On a headless machine, answer them from the terminal instead:
 cfc prompts
 ```
 
-With no subscriber at all the daemon applies `no_ui_action` to every
-unmatched flow without asking anyone. **That is a denial under every
+With no subscriber at all the daemon applies `no_ui_action` to unmatched
+remote flows without asking anyone. **That is a denial under every
 profile.** "Nobody is connected" is a permanent condition on a headless
 box, not a passing one, and answering it with an allow would mean those
 hosts had no outbound firewall whatsoever. Stored rules are what such a
@@ -267,11 +266,19 @@ initramfs, interfaces already configured before these units, other network
 managers, or a later external ruleset flush. Early unmatched flows use
 `no_ui_action`; bootstrap DHCP/DNS/NTP rules keep strict configurations usable.
 
-**Scope.** Rules decide new tracked flows; established and related traffic
-retains its connection-wide authorization. Passed or inherited sockets and
-local DNS/proxy relays are not confined to their original executable.
-Loopback is exempt, and packet-layer traffic from applications with
-`CAP_NET_RAW` is outside these IP hooks. Use OS containment for those cases.
+**Scope.** Normal mode decides new tracked IP flows from socket attribution;
+established and related traffic retains its connection-wide authorization.
+Passed or inherited sockets are not reauthorized for each sending executable.
+A current descriptor holder does not prove which process sent a packet.
+New direct loopback flows follow explicit rules; unmatched local IPC is allowed
+without prompting. An allowed local resolver or proxy can still relay remote
+traffic. CFC cannot establish the originating application's identity from
+remote flows delegated through local brokers, including AF_UNIX and D-Bus.
+
+Applications with `CAP_NET_RAW` can use AF_PACKET outside the `inet OUTPUT`
+hook. Raw IP packets can also coincide with another socket's tuple; socket
+attribution does not prove their origin. Use explicit application confinement
+or OS containment for those cases.
 Fast Allow is disabled even when `fast_allow = true` is configured; allowed
 flows use the normal NFQUEUE path.
 

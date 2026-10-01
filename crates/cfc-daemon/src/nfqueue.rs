@@ -240,6 +240,8 @@ trait PacketMessage {
     /// addresses - and guessing would be wrong on a multi-homed or routed
     /// host. This is what makes one queue able to serve both chains.
     fn hook(&self) -> u8;
+    /// Kernel output interface index; zero means it was not reported.
+    fn outdev(&self) -> u32;
     fn set_verdict(&mut self, verdict: NfqVerdict);
 }
 
@@ -276,6 +278,10 @@ impl PacketMessage for Message {
 
     fn hook(&self) -> u8 {
         self.get_hook()
+    }
+
+    fn outdev(&self) -> u32 {
+        self.get_outdev()
     }
 
     fn set_verdict(&mut self, verdict: NfqVerdict) {
@@ -351,6 +357,15 @@ pub fn spawn(
         !cfg.fail_open,
         "NFQUEUE fail_open bypasses mandatory verdict auditing"
     );
+    // Interface metadata, rather than destination addresses, includes every
+    // local host address routed over lo. A missing index cannot grant access.
+    // SAFETY: the C string is terminated and valid for this read-only query.
+    let loopback_ifindex = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+    anyhow::ensure!(
+        loopback_ifindex != 0,
+        "resolving loopback output interface: {}",
+        std::io::Error::last_os_error()
+    );
     let queue_num = cfg.queue_num;
     info!(queue_num, "opening NFQUEUE");
 
@@ -408,6 +423,7 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let worker = Worker {
         queue,
+        loopback_ifindex,
         engine,
         rejecter,
         prompt_tx,
@@ -533,6 +549,7 @@ impl Default for Tuning {
 ///   for why the earlier blocking-when-idle mode had to go).
 struct Worker<Q: PacketQueue> {
     queue: Q,
+    loopback_ifindex: u32,
     engine: Engine,
     /// Injects the TCP RST / ICMP port-unreachable that makes
     /// [`Action::Reject`] differ from [`Action::Deny`]. Inert (drop-only)
@@ -717,6 +734,9 @@ impl<Q: PacketQueue> Worker<Q> {
             uid: msg.uid(),
             gid: msg.gid(),
             direction: direction_for_hook(msg.hook()),
+            loopback: msg.hook() == NF_INET_LOCAL_OUT
+                && self.loopback_ifindex != 0
+                && msg.outdev() == self.loopback_ifindex,
         };
         let deps = PipelineDeps {
             engine: &self.engine,
@@ -950,7 +970,7 @@ impl<Q: PacketQueue> Worker<Q> {
 /// live /proc.
 trait ProcessResolver {
     #[allow(clippy::too_many_arguments)] // socket tuple plus kernel UID attribution
-    fn pid_for_socket(
+    fn socket_owner(
         &self,
         protocol: Protocol,
         direction: Direction,
@@ -959,15 +979,15 @@ trait ProcessResolver {
         dst_ip: IpAddr,
         dst_port: u16,
         uid: Option<u32>,
-    ) -> Option<u32>;
-    fn resolve(&self, pid: u32) -> Process;
+    ) -> Option<process_resolve::SocketOwner>;
+    fn resolve(&self, owner: &process_resolve::SocketOwner) -> Process;
 }
 
 /// Production resolver backed by /proc.
 struct ProcfsResolver;
 
 impl ProcessResolver for ProcfsResolver {
-    fn pid_for_socket(
+    fn socket_owner(
         &self,
         protocol: Protocol,
         direction: Direction,
@@ -976,14 +996,12 @@ impl ProcessResolver for ProcfsResolver {
         dst_ip: IpAddr,
         dst_port: u16,
         uid: Option<u32>,
-    ) -> Option<u32> {
-        process_resolve::pid_for_socket(
-            protocol, direction, src_ip, src_port, dst_ip, dst_port, uid,
-        )
+    ) -> Option<process_resolve::SocketOwner> {
+        process_resolve::socket_owner(protocol, direction, src_ip, src_port, dst_ip, dst_port, uid)
     }
 
-    fn resolve(&self, pid: u32) -> Process {
-        process_resolve::resolve(pid)
+    fn resolve(&self, owner: &process_resolve::SocketOwner) -> Process {
+        owner.resolve()
     }
 }
 
@@ -1021,6 +1039,8 @@ struct PacketMeta {
     gid: Option<u32>,
     /// Which way this packet is going, from the netfilter hook.
     direction: Direction,
+    /// Kernel OUTPUT interface is lo; includes local non-loopback addresses.
+    loopback: bool,
 }
 
 /// Environment for [`handle_packet`].
@@ -1081,7 +1101,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
 
     // Inbound is not asked, rather than asked and told nothing.
     //
-    // `pid_for_socket` searches for a socket already holding this 4-tuple.
+    // `socket_owner` searches for a socket already holding this 4-tuple.
     // An inbound SYN has none - nothing has accepted it yet - so the search
     // could only ever miss, and missing meant reading /proc/net/tcp and
     // /proc/net/tcp6: 2.40 ms per packet for an answer of `None`.
@@ -1090,10 +1110,10 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
     // one is silent: the verdict is identical either way, so nothing would
     // have failed - the firewall would just be fourteen times slower on the
     // inbound side and say nothing about it.
-    let pid_hint = if conn.direction == Direction::Inbound {
+    let owner = if conn.direction == Direction::Inbound {
         None
     } else {
-        deps.resolver.pid_for_socket(
+        deps.resolver.socket_owner(
             conn.protocol,
             conn.direction,
             conn.src_ip,
@@ -1103,6 +1123,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
             meta.uid,
         )
     };
+    let pid_hint = owner.as_ref().map(process_resolve::SocketOwner::pid);
 
     // Always allow our own traffic. Otherwise the daemon's reverse DNS
     // resolver would itself be intercepted, deadlocking on a verdict
@@ -1113,8 +1134,8 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
         }
     }
 
-    let mut proc = match pid_hint {
-        Some(pid) => deps.resolver.resolve(pid),
+    let mut proc = match owner.as_ref() {
+        Some(owner) => deps.resolver.resolve(owner),
         None => Process::unknown(0),
     };
     // The kernel-reported socket uid/gid come from the sk_buff itself and
@@ -1172,6 +1193,15 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                     connection: conn,
                     process: proc,
                     verdict,
+                };
+            }
+            // Preserve desktop IPC for unmatched local flows after explicit
+            // policy and incomplete-identity refusals have had their say.
+            if meta.loopback {
+                return PacketOutcome::Deliver {
+                    connection: conn,
+                    process: proc,
+                    verdict: Verdict::default_allow(),
                 };
             }
             if deps.stats.is_paused() {
@@ -1291,7 +1321,7 @@ mod tests {
     }
 
     impl ProcessResolver for StubResolver {
-        fn pid_for_socket(
+        fn socket_owner(
             &self,
             _protocol: Protocol,
             _direction: Direction,
@@ -1300,13 +1330,13 @@ mod tests {
             _dst_ip: IpAddr,
             _dst_port: u16,
             _uid: Option<u32>,
-        ) -> Option<u32> {
+        ) -> Option<process_resolve::SocketOwner> {
             self.socket_lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.pid
+            self.pid.map(process_resolve::SocketOwner::for_test)
         }
 
-        fn resolve(&self, _pid: u32) -> Process {
+        fn resolve(&self, _owner: &process_resolve::SocketOwner) -> Process {
             self.process.clone()
         }
     }
@@ -1346,6 +1376,7 @@ mod tests {
         uid: None,
         gid: None,
         direction: Direction::Outbound,
+        loopback: false,
     };
 
     /// The same, for a packet the kernel queued from the input hook.
@@ -1353,6 +1384,7 @@ mod tests {
         uid: None,
         gid: None,
         direction: Direction::Inbound,
+        loopback: false,
     };
 
     struct TestEnv {
@@ -1960,7 +1992,7 @@ mod tests {
         let meta = PacketMeta {
             uid: Some(0),
             gid: Some(0),
-            direction: Direction::Outbound,
+            ..NO_META
         };
         match env.handle(&tcp_packet(443), &meta) {
             PacketOutcome::Prompt {
@@ -1984,7 +2016,7 @@ mod tests {
         let meta = PacketMeta {
             uid: Some(1000),
             gid: None,
-            direction: Direction::Outbound,
+            ..NO_META
         };
         match env.handle(&tcp_packet(443), &meta) {
             PacketOutcome::Prompt {
@@ -2189,6 +2221,7 @@ mod tests {
         uid: Option<u32>,
         gid: Option<u32>,
         hook: u8,
+        outdev: u32,
         verdict: Option<NfqVerdict>,
     }
 
@@ -2200,12 +2233,17 @@ mod tests {
                 uid: None,
                 gid: None,
                 hook: NF_INET_LOCAL_OUT,
+                outdev: 0,
                 verdict: None,
             }
         }
     }
 
     impl PacketMessage for FakeMsg {
+        fn outdev(&self) -> u32 {
+            self.outdev
+        }
+
         fn hook(&self) -> u8 {
             self.hook
         }
@@ -2324,6 +2362,7 @@ mod tests {
                     script: script.into(),
                     log: log.clone(),
                 },
+                loopback_ifindex: 1,
                 engine: Engine::new(RuleSet { rules }, Arc::new(std::sync::RwLock::new(policy))),
                 rejecter: Rejecter::open(),
                 prompt_tx,
@@ -2553,6 +2592,106 @@ mod tests {
         assert!(rows.iter().any(|r| r.action == "Reject"));
         assert!(rows.iter().any(|r| r.action == "Deny"));
         assert_eq!(h.stats.connections_denied(), 2);
+    }
+
+    #[test]
+    fn loopback_unmatched_flows_keep_the_nonprompting_local_default() {
+        // The output interface, including local host addresses, defines this
+        // exception. IPv4 loopback, IPv6 loopback, and a local host address
+        // must all retain the same desktop IPC behavior.
+        let mut ipv4 = tcp_packet(53);
+        ipv4[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        ipv4[16..20].copy_from_slice(&[127, 0, 0, 53]);
+        let mut ipv6 = vec![0u8; 44];
+        ipv6[0] = 0x60;
+        ipv6[6] = 6;
+        ipv6[23] = 1;
+        ipv6[39] = 1;
+        ipv6[40..42].copy_from_slice(&5555u16.to_be_bytes());
+        ipv6[42..44].copy_from_slice(&53u16.to_be_bytes());
+        for payload in [ipv4, ipv6, tcp_packet(53)] {
+            let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+            let mut msg = FakeMsg::new(1, payload);
+            msg.outdev = 1;
+            h.worker().handle_message(msg).unwrap();
+            assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+            assert!(h.prompt_rx.try_recv().is_err(), "local IPC must not prompt");
+            assert_eq!(h.stats.connections_allowed(), 1);
+        }
+    }
+
+    #[test]
+    fn loopback_addresses_without_the_local_output_interface_still_prompt() {
+        for outdev in [0, 2] {
+            let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+            let mut payload = tcp_packet(53);
+            payload[16..20].copy_from_slice(&[127, 0, 0, 53]);
+            let mut msg = FakeMsg::new(1, payload);
+            msg.outdev = outdev;
+            h.worker().handle_message(msg).unwrap();
+            assert!(h.verdicts().is_empty());
+            assert!(h.prompt_rx.try_recv().is_ok());
+        }
+    }
+
+    #[test]
+    fn loopback_closed_rules_are_audited_before_release_even_when_paused() {
+        for action in [Action::Deny, Action::Reject] {
+            let mut scope = RuleScope::any();
+            scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+            let rule = Rule::new("local application refusal", action, scope);
+            let store = RuleStore::open_in_memory().unwrap();
+            let mut h = LoopHarness::new(vec![], vec![rule], dp_deny()).with_store(store);
+            h.stats.set_paused(true);
+            let mut payload = tcp_packet(53);
+            // Policy needs only ports. No complete TCP header keeps refusal
+            // injection inert while testing the real verdict and audit gate.
+            payload.truncate(24);
+            let mut msg = FakeMsg::new(1, payload);
+            msg.outdev = 1;
+            h.worker().handle_message(msg).unwrap();
+            assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
+            assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1]);
+            assert_eq!(h.observed_rx.try_recv().unwrap().verdict.action, action);
+            assert!(h.prompt_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn loopback_missing_identity_cannot_override_an_application_refusal() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let rule = Rule::new("local application refusal", Action::Deny, scope);
+        let store = RuleStore::open_in_memory().unwrap();
+        let mut h = LoopHarness::new(vec![], vec![rule], dp_deny()).with_store(store);
+        h.worker().resolver = Box::new(StubResolver {
+            pid: None,
+            process: Process::unknown(0),
+            socket_lookups: std::sync::atomic::AtomicUsize::new(0),
+        });
+        h.stats.set_paused(true);
+        let mut msg = FakeMsg::new(1, tcp_packet(53));
+        msg.outdev = 1;
+        h.worker().handle_message(msg).unwrap();
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
+        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1]);
+        assert!(h.prompt_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn loopback_keeps_the_root_daemon_dns_exception() {
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(53)], dp_deny());
+        h.worker().dns = Box::new(StubDns {
+            self_pid: Some(4242),
+            ..Default::default()
+        });
+        let mut msg = FakeMsg::new(1, tcp_packet(53));
+        msg.outdev = 1;
+        msg.uid = Some(0);
+        h.worker().handle_message(msg).unwrap();
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+        assert!(h.prompt_rx.try_recv().is_err());
+        assert_eq!(h.stats.connections_total(), 0);
     }
 
     #[test]

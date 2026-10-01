@@ -9,7 +9,8 @@
 //!      unconnected-UDP, wildcard-bind, v4-mapped-in-v6).
 //!   3. inode -> pid via a verified TTL cache, else a /proc/*/fd walk.
 //!
-//! TOCTOU note: the resolved pid may have exited by the time we describe it.
+//! Socket ownership retains the process generation and descriptor across
+//! image reads. A changed generation or closed descriptor leaves identity unknown.
 //! Process identity is read on every resolve: exec preserves pid and starttime.
 //! The inode cache re-verifies its answer with a single readlink before
 //! trusting it.
@@ -95,6 +96,52 @@ pub fn resolve(pid: u32) -> Process {
     match resolve_inner(pid, starttime, now, crate::ebpf::proc_table::global()) {
         Ok(p) => p,
         Err(_) => Process::unknown(pid),
+    }
+}
+
+/// Descriptor ownership carried across process-image resolution. This
+/// establishes a current holder, not the process that sent a queued packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketOwner {
+    pid: u32,
+    starttime: u64,
+    inode: u64,
+    fd: i32,
+}
+
+impl SocketOwner {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn resolve(&self) -> Process {
+        if read_starttime(self.pid) != Some(self.starttime) {
+            return Process::unknown(self.pid);
+        }
+        let process = resolve_inner(
+            self.pid,
+            Some(self.starttime),
+            Instant::now(),
+            crate::ebpf::proc_table::global(),
+        )
+        .unwrap_or_else(|_| Process::unknown(self.pid));
+        if fd_points_at_socket(self.pid, self.fd, self.inode)
+            && read_starttime(self.pid) == Some(self.starttime)
+        {
+            process
+        } else {
+            Process::unknown(self.pid)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(pid: u32) -> Self {
+        Self {
+            pid,
+            starttime: 0,
+            inode: 0,
+            fd: -1,
+        }
     }
 }
 
@@ -225,7 +272,7 @@ fn resolve_inner(
     })
 }
 
-/// Find the pid that owns a socket matching the given 5-tuple.
+/// Find a current descriptor holder for a socket matching the given 5-tuple.
 ///
 /// TCP tries sock_diag first. UDP requires a unique inode across all relevant
 /// tables before a diagnostic cookie or an fd walk may identify the owner.
@@ -255,7 +302,7 @@ fn resolve_inner(
 /// flow to the process *listening* on the port is a real and separate thing,
 /// and it would be one netlink round trip rather than two /proc scans; it is
 /// not done here because it would change which rules match, not just how fast.
-pub fn pid_for_socket(
+pub fn socket_owner(
     protocol: Protocol,
     direction: Direction,
     src_ip: IpAddr,
@@ -263,7 +310,7 @@ pub fn pid_for_socket(
     dst_ip: IpAddr,
     dst_port: u16,
     uid: Option<u32>,
-) -> Option<u32> {
+) -> Option<SocketOwner> {
     if direction == Direction::Inbound {
         return None;
     }
@@ -287,24 +334,16 @@ pub fn pid_for_socket(
         .filter(|info| uid.is_none_or(|uid| info.uid == uid))
         .filter(|info| udp_inode.is_none_or(|inode| info.inode == inode));
 
-    // Fastest path: the kernel recorded cookie -> tgid at connect() time
-    // (`SOCK_PIDS`, written by cfc_connect4|6 in the connecting process's own
-    // context). One map lookup replaces the /proc walk below, which measures
-    // 37-44 ms on a loaded desktop - per NEW connection, before rule
-    // evaluation, on the only worker thread. This one line is the difference
-    // between the firewall being invisible and being felt.
-    if let Some(cookie) = info.as_ref().and_then(|i| i.cookie) {
-        if let Some(pid) = crate::ebpf::cookie_pid(cookie) {
-            record_resolved_pid(pid);
-            return Some(pid);
-        }
-    }
+    let cookie_pid = info
+        .as_ref()
+        .and_then(|i| i.cookie)
+        .and_then(crate::ebpf::cookie_pid);
 
     let inode = udp_inode
         .or_else(|| info.map(|i| i.inode))
         .or_else(|| proc_net_inode(protocol, src_ip, src_port, dst_ip, dst_port, uid, deadline))?;
 
-    pid_owning_inode(inode, deadline)
+    pid_owning_inode(inode, cookie_pid, deadline)
 }
 
 /// Pids that recently owned a resolved socket, most recent first.
@@ -332,15 +371,30 @@ fn record_resolved_pid(pid: u32) {
 ///
 /// The unit of work the probe lists reuse: one process's fd table instead of
 /// every process's.
-fn pid_has_socket_inode(pid: u32, inode: u64) -> Option<u32> {
+fn pid_has_socket_inode(pid: u32, inode: u64, deadline: Instant) -> Option<SocketOwner> {
+    if inode == 0 || Instant::now() >= deadline {
+        return None;
+    }
     let p = ProcFsProcess::new(pid as i32).ok()?;
+    let starttime = read_starttime(pid)?;
     let fds = p.fd().ok()?;
     for fd in fds.flatten() {
+        if Instant::now() >= deadline {
+            return None;
+        }
         if matches!(fd.target, FDTarget::Socket(i) if i == inode) {
+            if read_starttime(pid) != Some(starttime) {
+                return None;
+            }
             INODE_PID_CACHE
                 .lock()
                 .insert(inode, (pid, fd.fd), Instant::now());
-            return Some(pid);
+            return Some(SocketOwner {
+                pid,
+                starttime,
+                inode,
+                fd: fd.fd,
+            });
         }
     }
     None
@@ -430,21 +484,16 @@ fn udp_inode_from_tables(
 struct TableEntry {
     local: (IpAddr, u16),
     remote: (IpAddr, u16),
+    state: u8,
     inode: u64,
     uid: u32,
 }
 
 /// Match a socket table (the text of /proc/net/{tcp,udp}{,6}) against a
 /// flow. UDP requires one unique compatible inode across all match classes.
-/// TCP uses decreasing precision and stops at the first hit.
-///
-/// Pass 1 - exact local+remote: connected TCP/UDP sockets.
-/// Pass 2 - UDP only, exact local, zero remote: unconnected UDP sockets
-///   doing plain sendto() (mDNS, NTP, syslog, QUIC stacks) list their
-///   remote as 0.0.0.0:0, so an exact-remote match can never hit them.
-/// Pass 3 - wildcard local addr, matching port, remote exact-or-zero:
-///   sockets bound to 0.0.0.0 / :: show the wildcard, not the address
-///   the flow actually uses.
+/// TCP requires an exact connected tuple and never selects a listener.
+/// UDP also includes zero-remote and wildcard-local sockets for sendto()
+/// users (mDNS, NTP, syslog, QUIC); every compatible inode must agree.
 ///
 /// All address comparisons canonicalize v4-mapped v6 (::ffff:a.b.c.d) to
 /// plain v4 first, which is how dual-stack sockets appear in the v6 tables.
@@ -493,19 +542,11 @@ fn scan_table_entries(
         return inode;
     }
 
-    // Pass 1: exact 4-tuple.
-    for e in entries.clone() {
-        if endpoint_eq(e.local, local) && endpoint_eq(e.remote, remote) {
-            return Some(e.inode);
-        }
-    }
-
-    // Pass 3: wildcard-bound local (port must match), remote exact or zero
-    // (zero covers listeners and wildcard-bound unconnected UDP).
     for e in entries {
-        if e.local.1 == local.1
-            && e.local.0.to_canonical().is_unspecified()
-            && (endpoint_eq(e.remote, remote) || endpoint_is_zero(e.remote))
+        if e.state != 0x0A // TCP_LISTEN
+            && !endpoint_is_zero(e.remote)
+            && endpoint_eq(e.local, local)
+            && endpoint_eq(e.remote, remote)
         {
             return Some(e.inode);
         }
@@ -527,7 +568,7 @@ fn parse_table_line(line: &str) -> Option<TableEntry> {
     let _sl = cols.next()?;
     let local = parse_hex_addr_port(cols.next()?)?;
     let remote = parse_hex_addr_port(cols.next()?)?;
-    let _state = cols.next()?;
+    let state = u8::from_str_radix(cols.next()?, 16).ok()?;
     let _txrx = cols.next()?;
     let _tr = cols.next()?;
     let _retr = cols.next()?;
@@ -537,6 +578,7 @@ fn parse_table_line(line: &str) -> Option<TableEntry> {
     Some(TableEntry {
         local,
         remote,
+        state,
         inode,
         uid,
     })
@@ -600,12 +642,33 @@ fn format_addr_port(ip: IpAddr, port: u16) -> String {
 /// A verified cache fronts the /proc/*/fd walk: on a hit we re-readlink
 /// the remembered fd and only trust the pid if it still points at
 /// `socket:[inode]`; otherwise the entry is dropped and we re-walk.
-fn pid_owning_inode(inode: u64, deadline: Instant) -> Option<u32> {
+fn pid_owning_inode(inode: u64, cookie_pid: Option<u32>, deadline: Instant) -> Option<SocketOwner> {
+    if inode == 0 || Instant::now() >= deadline {
+        return None;
+    }
+    // The connect-time cookie records a numeric PID, not its lifetime or
+    // current descriptor ownership. It is only a hint for the verified walk.
+    if let Some(pid) = cookie_pid {
+        if let Some(found) = pid_has_socket_inode(pid, inode, deadline) {
+            record_resolved_pid(found.pid);
+            return Some(found);
+        }
+    }
     let now = Instant::now();
     let cached = INODE_PID_CACHE.lock().get(&inode, now);
     if let Some((pid, fd)) = cached {
-        if fd_points_at_socket(pid, fd, inode) {
-            return Some(pid);
+        let starttime = read_starttime(pid);
+        if fd_points_at_socket(pid, fd, inode) && Instant::now() < deadline {
+            if let Some(starttime) =
+                starttime.filter(|starttime| read_starttime(pid) == Some(*starttime))
+            {
+                return Some(SocketOwner {
+                    pid,
+                    starttime,
+                    inode,
+                    fd,
+                });
+            }
         }
         INODE_PID_CACHE.lock().remove(&inode);
     }
@@ -625,15 +688,15 @@ fn pid_owning_inode(inode: u64, deadline: Instant) -> Option<u32> {
     // (16 entries against 24), which makes the miss cheaper as well.
     let recently_resolved: Vec<u32> = RESOLVED_PIDS.lock().iter().copied().collect();
     for pid in recently_resolved {
-        if let Some(found) = pid_has_socket_inode(pid, inode) {
-            record_resolved_pid(found);
+        if let Some(found) = pid_has_socket_inode(pid, inode, deadline) {
+            record_resolved_pid(found.pid);
             return Some(found);
         }
     }
     let recent_execs = crate::ebpf::proc_table::global().recent_pids(24, Instant::now());
     for pid in recent_execs {
-        if let Some(found) = pid_has_socket_inode(pid, inode) {
-            record_resolved_pid(found);
+        if let Some(found) = pid_has_socket_inode(pid, inode, deadline) {
+            record_resolved_pid(found.pid);
             return Some(found);
         }
     }
@@ -652,8 +715,8 @@ fn pid_owning_inode(inode: u64, deadline: Instant) -> Option<u32> {
         if Instant::now() > deadline {
             return None;
         }
-        if let Some(found) = pid_has_socket_inode(pid, inode) {
-            record_resolved_pid(found);
+        if let Some(found) = pid_has_socket_inode(pid, inode, deadline) {
+            record_resolved_pid(found.pid);
             return Some(found);
         }
     }
@@ -952,6 +1015,52 @@ mod tests {
 
     // -- table scanning ---------------------------------------------------
 
+    #[test]
+    fn cookie_pid_hint_requires_live_socket_ownership() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixDatagram;
+
+        let pid = std::process::id();
+        let socket = UnixDatagram::unbound().unwrap();
+        let link = fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
+        let inode = link
+            .to_str()
+            .unwrap()
+            .strip_prefix("socket:[")
+            .unwrap()
+            .strip_suffix(']')
+            .unwrap()
+            .parse()
+            .unwrap();
+        let budget = || Instant::now() + Duration::from_secs(2);
+        let owner = pid_owning_inode(inode, Some(pid), budget()).unwrap();
+        assert_eq!(owner.pid(), pid);
+        assert_ne!(owner.resolve().exe.to_str(), Some(cfc_core::UNKNOWN_EXE));
+        assert_eq!(pid_owning_inode(u64::MAX, Some(pid), budget()), None);
+        // A dead hint must not mask the descriptor's current holder.
+        assert_eq!(
+            pid_owning_inode(inode, Some(u32::MAX), budget()).map(|o| o.pid()),
+            Some(pid)
+        );
+        assert_eq!(pid_owning_inode(0, Some(pid), budget()), None);
+        assert_eq!(
+            pid_owning_inode(inode, Some(pid), Instant::now() - Duration::from_secs(1)),
+            None
+        );
+        // Model a different process generation at the validation-to-use edge.
+        let changed_generation = SocketOwner {
+            starttime: owner.starttime + 1,
+            ..owner
+        };
+        assert_eq!(
+            changed_generation.resolve().exe.to_str(),
+            Some(cfc_core::UNKNOWN_EXE)
+        );
+        // A closed descriptor cannot authorize a subsequently read image.
+        drop(socket);
+        assert_eq!(owner.resolve().exe.to_str(), Some(cfc_core::UNKNOWN_EXE));
+    }
+
     const HEADER: &str =
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
 
@@ -994,9 +1103,7 @@ mod tests {
 
     #[test]
     fn unconnected_fallback_is_udp_only() {
-        // The zero-remote pass must not apply to TCP: a TCP row with a
-        // zero remote is a listener, matched (if at all) by the wildcard
-        // pass, not by pretending it is connected to our destination.
+        // The zero-remote UDP match must not attribute TCP to a listener.
         let local = v4(10, 0, 2, 15, 5353);
         let table = format!("{HEADER}{}", line(local, v4(0, 0, 0, 0, 0), "0A", 4242));
         assert_eq!(
@@ -1026,8 +1133,8 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_v6_matches_v4_flow() {
-        // Dual-stack socket bound to [::]:8080 must attribute v4 traffic.
+    fn outbound_tcp_cannot_borrow_a_dual_stack_listener() {
+        // An outbound flow must not inherit a listening application's policy.
         let local = (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8080);
         let remote = (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
         let table = format!("{HEADER}{}", line(local, remote, "0A", 909));
@@ -1039,7 +1146,28 @@ mod tests {
                 v4(1, 2, 3, 4, 55000),
                 None
             ),
-            Some(909)
+            None
+        );
+    }
+
+    #[test]
+    fn outbound_tcp_requires_a_connected_exact_tuple() {
+        let local = v4(10, 0, 0, 7, 8080);
+        let remote = v4(1, 2, 3, 4, 55000);
+        for listener_local in [local, v4(0, 0, 0, 0, 8080)] {
+            let table = format!(
+                "{HEADER}{}",
+                line(listener_local, v4(0, 0, 0, 0, 0), "0A", 909)
+            );
+            assert_eq!(
+                scan_table_content(&table, Protocol::Tcp, local, remote, Some(1000)),
+                None
+            );
+        }
+        let table = format!("{HEADER}{}", line(local, remote, "0A", 909));
+        assert_eq!(
+            scan_table_content(&table, Protocol::Tcp, local, remote, Some(1000)),
+            None
         );
     }
 

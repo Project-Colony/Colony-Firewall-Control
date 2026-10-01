@@ -210,18 +210,23 @@ fn reply_seq(buf: &[u8]) -> Option<u32> {
 }
 
 /// answer with a single SOCK_DIAG_BY_FAMILY message or an NLMSG_ERROR.
-fn parse_response(buf: &[u8]) -> Option<SockInfo> {
+fn parse_response(buf: &[u8], protocol: u8) -> Option<SockInfo> {
     if buf.len() < NLMSG_HDR_LEN {
         return None;
     }
     let msg_len = u32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
     let msg_type = u16::from_ne_bytes(buf[4..6].try_into().ok()?);
-    if msg_type != SOCK_DIAG_BY_FAMILY || msg_len > buf.len() {
+    if msg_type != SOCK_DIAG_BY_FAMILY || msg_len < NLMSG_HDR_LEN || msg_len > buf.len() {
         // NLMSG_ERROR (no such socket, EPERM, ...) or truncated reply.
         return None;
     }
     let payload = &buf[NLMSG_HDR_LEN..msg_len];
     if payload.len() < INET_DIAG_MSG_LEN {
+        return None;
+    }
+    // A listener is not the connected socket that emitted an outbound flow.
+    // UDP's unconnected state remains valid and is checked by the caller.
+    if protocol == libc::IPPROTO_TCP as u8 && payload[1] == 0x0A {
         return None;
     }
     // struct inet_diag_msg: id.idiag_cookie sits at payload offset 44
@@ -323,7 +328,7 @@ impl DiagSocket {
             trace!("sock_diag answered a different request; discarding the socket");
             return Reply::Desync;
         }
-        match parse_response(buf) {
+        match parse_response(buf, req[17]) {
             Some(info) => Reply::Found(info),
             None => Reply::NotFound,
         }
@@ -442,12 +447,33 @@ mod tests {
         buf[NLMSG_HDR_LEN + 64..NLMSG_HDR_LEN + 68].copy_from_slice(&1000u32.to_ne_bytes());
         buf[NLMSG_HDR_LEN + 68..NLMSG_HDR_LEN + 72].copy_from_slice(&31337u32.to_ne_bytes());
         assert_eq!(
-            parse_response(&buf),
+            parse_response(&buf, libc::IPPROTO_TCP as u8),
             Some(SockInfo {
                 inode: 31337,
                 cookie: None,
                 uid: 1000
             })
+        );
+    }
+
+    #[test]
+    fn outbound_tcp_diag_rejects_listeners_without_rejecting_udp() {
+        let mut buf = vec![0u8; NLMSG_HDR_LEN + INET_DIAG_MSG_LEN];
+        let len = buf.len() as u32;
+        buf[0..4].copy_from_slice(&len.to_ne_bytes());
+        buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+        buf[NLMSG_HDR_LEN + 68..NLMSG_HDR_LEN + 72].copy_from_slice(&31337u32.to_ne_bytes());
+        for state in [0x01, 0x02, 0x0A] {
+            buf[NLMSG_HDR_LEN + 1] = state;
+            assert_eq!(
+                parse_response(&buf, libc::IPPROTO_TCP as u8).map(|i| i.inode),
+                (state != 0x0A).then_some(31337)
+            );
+        }
+        buf[NLMSG_HDR_LEN + 1] = 0x07;
+        assert_eq!(
+            parse_response(&buf, libc::IPPROTO_UDP as u8).map(|i| i.inode),
+            Some(31337)
         );
     }
 
@@ -459,17 +485,19 @@ mod tests {
         buf[0..4].copy_from_slice(&len.to_ne_bytes());
         buf[4..6].copy_from_slice(&2u16.to_ne_bytes());
         buf[NLMSG_HDR_LEN..].copy_from_slice(&(-2i32).to_ne_bytes()); // -ENOENT
-        assert_eq!(parse_response(&buf), None);
+        assert_eq!(parse_response(&buf, libc::IPPROTO_TCP as u8), None);
     }
 
     #[test]
     fn truncated_reply_is_none() {
-        assert_eq!(parse_response(&[0u8; 8]), None);
+        assert_eq!(parse_response(&[0u8; 8], libc::IPPROTO_TCP as u8), None);
         let mut buf = vec![0u8; NLMSG_HDR_LEN + 8];
         let len = buf.len() as u32;
         buf[0..4].copy_from_slice(&len.to_ne_bytes());
         buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
-        assert_eq!(parse_response(&buf), None);
+        assert_eq!(parse_response(&buf, libc::IPPROTO_TCP as u8), None);
+        buf[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        assert_eq!(parse_response(&buf, libc::IPPROTO_TCP as u8), None);
     }
 
     #[test]
