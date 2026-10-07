@@ -314,7 +314,7 @@ the entire attack surface. Two layers:
    exist the daemon does not refuse to start: it warns with the exact fix and
    leaves the socket 0600, root-only.
 2. **Peer credentials.** Every connection carries `SO_PEERCRED`. Mutating
-   RPCs (`UpsertRule`, `DeleteRule`, `SetPaused`, `SubmitVerdict`) require
+   RPCs (`UpsertRule`, `ApplyRules`, `DeleteRule`, `SetPaused`, `SubmitVerdict`) require
    uid 0 or a socket that is genuinely group-gated. Read-only RPCs
    (`ListRules`, `GetStatus`, `ListEvents`, `StreamConnections`,
    `StreamPrompts`) are open to any peer that got past layer 1.

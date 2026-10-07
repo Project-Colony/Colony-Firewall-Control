@@ -42,6 +42,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Rules quarantined at load were reported only in the journal. `cfc status`
   and the GUI now count them with the rows that could not be loaded, and
   `cfc rules remove <id>` with the full id deletes such an unlisted row.
+- `ApplyRules`, behind `cfc rules import` and `import --replace`, was the
+  only mutating RPC that left no journal line. It now logs the caller's uid
+  and pid, whether it replaced the rule set, and the applied and removed
+  counts as "rules applied".
 
 ## [0.7.0] - 2026-09-30
 

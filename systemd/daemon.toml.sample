@@ -255,7 +255,7 @@ enabled = true
 #      authentication, no per-user identity, no password.
 #   2. Peer credentials. Every connection carries SO_PEERCRED, and the
 #      daemon logs the calling uid/pid for every mutating RPC. Mutating
-#      RPCs (UpsertRule, DeleteRule, SetPaused, SubmitVerdict) need uid 0
+#      RPCs (UpsertRule, ApplyRules, DeleteRule, SetPaused, SubmitVerdict) need uid 0
 #      or a socket that is genuinely group-gated. Read-only RPCs
 #      (ListRules, GetStatus, ListEvents, StreamConnections, StreamPrompts)
 #      are open to any peer that got through layer 1.

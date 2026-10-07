@@ -727,7 +727,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<ApplyRulesRequest>,
     ) -> Result<Response<ApplyRulesResponse>, Status> {
-        self.authorize(&req, Access::Mutate)?;
+        let peer = self.authorize(&req, Access::Mutate)?;
         let req = req.into_inner();
         if req.replace && req.rules.is_empty() {
             return Err(Status::invalid_argument("refusing an empty replacement"));
@@ -762,7 +762,18 @@ impl Firewall for FirewallService {
             .store
             .apply_rules(&pending, req.replace)
             .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let assigned = pending.iter().map(|rule| rule.id.to_string()).collect();
+        let assigned: Vec<String> = pending.iter().map(|rule| rule.id.to_string()).collect();
+        info!(
+            rpc = "ApplyRules",
+            peer_uid = peer.uid,
+            peer_pid = ?peer.pid,
+            replace = req.replace,
+            applied = assigned.len(),
+            removed,
+            rule_ids = ?assigned,
+            outcome = "ok",
+            "rules applied"
+        );
         let mut final_rules = if req.replace {
             Vec::new()
         } else {

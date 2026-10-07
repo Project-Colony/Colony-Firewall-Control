@@ -239,7 +239,7 @@ and the daemon checks the caller per RPC:
 
 | RPC class | RPCs                        | Requires                    |
 |-----------|-----------------------------|-----------------------------|
-| Mutating  | `UpsertRule`, `DeleteRule`, `SetPaused`, `SubmitVerdict` | uid 0, **or** a socket that is genuinely group-gated |
+| Mutating  | `UpsertRule`, `ApplyRules`, `DeleteRule`, `SetPaused`, `SubmitVerdict` | uid 0, **or** a socket that is genuinely group-gated |
 | Read-only | `ListRules`, `GetStatus`, `ListEvents`, `StreamConnections`, `StreamPrompts` | Only layer 1 |
 
 `require_group = false` in `[ipc]` turns the mutating check off. Leave it
@@ -315,7 +315,7 @@ Three places record what the firewall did:
 logged with the calling uid and pid, the target, and the outcome:
 
 ```sh
-journalctl -u colony-firewalld -g 'rule upserted|rule delete|verdict submitted|paused'
+journalctl -u colony-firewalld -g 'rule upserted|rules applied|rule delete|verdict submitted|paused'
 ```
 
 so "who deleted the rule blocking that telemetry endpoint" is answerable
