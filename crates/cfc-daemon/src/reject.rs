@@ -900,6 +900,31 @@ mod tests {
     const APP_PORT: u16 = 5555;
     const PEER_PORT: u16 = 80;
 
+    /// Any process can set a socket mark, so the shipped snippet may accept
+    /// on a mark only together with root ownership, and only for this
+    /// module's refusals. A Fast Allow style `meta mark ... accept` must not
+    /// come back.
+    #[test]
+    fn the_snippet_accepts_marks_only_for_root_refusals() {
+        let snippet = include_str!("../../../systemd/nftables-snippet.conf");
+        let exception = format!("meta skuid 0 meta mark {REJECT_MARK:#x} ");
+        let marked: Vec<&str> = snippet
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#') && l.contains("mark"))
+            .filter(|l| !matches!(*l, "set fast_allow {" | "type mark"))
+            .collect();
+        assert_eq!(marked.len(), 3, "{marked:#?}");
+        for line in marked {
+            assert!(line.starts_with(&exception), "{line}");
+            assert!(
+                line.ends_with("tcp flags & rst == rst accept")
+                    || line.ends_with("type destination-unreachable accept"),
+                "{line}"
+            );
+        }
+    }
+
     /// Deliberately naive, independent one's-complement checksum used to
     /// cross-check [`checksum16`]. Written from RFC 1071 directly rather
     /// than shared with the implementation, so a bug in one shows up as a
