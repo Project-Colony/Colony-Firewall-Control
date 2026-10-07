@@ -1830,10 +1830,7 @@ mod tests {
         // the file the kernel mapped is not the file the package shipped.
         let tampered = describe(curl, Some(&"0".repeat(64)));
         println!("/usr/bin/curl with a foreign digest -> {tampered:?}");
-        assert_eq!(
-            tampered,
-            (Some("curl 8.21.0-1".to_string()), Provenance::Modified)
-        );
+        assert_eq!(tampered, (package.clone(), Provenance::Modified));
 
         // A byte-identical copy in /tmp is owned by nobody: the dropper case.
         let tmp = tempfile::tempdir().unwrap();
