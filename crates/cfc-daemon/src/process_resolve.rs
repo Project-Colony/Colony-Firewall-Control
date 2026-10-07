@@ -454,6 +454,10 @@ fn proc_net_inode(
 
 /// A partial table read cannot establish uniqueness. Failure or expiry means
 /// unknown, including when the first table already contained one candidate.
+/// An absent table is complete and empty: a kernel booted with
+/// `ipv6.disable=1` (or built without IPv6) has no `/proc/net/udp6` and so
+/// no IPv6 sockets, and reading that as a failure would leave every IPv4 UDP
+/// flow unattributed.
 fn udp_inode_from_tables(
     tables: &[&str],
     local: (IpAddr, u16),
@@ -466,7 +470,11 @@ fn udp_inode_from_tables(
         if Instant::now() > deadline {
             return None;
         }
-        let contents = fs::read_to_string(table).ok()?;
+        let contents = match fs::read_to_string(table) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
         entries.extend(contents.lines().skip(1).filter_map(parse_table_line));
     }
     if Instant::now() > deadline {
@@ -1260,9 +1268,17 @@ mod tests {
         fs::write(&table4, format!("{HEADER}{}", line(local, remote, "01", 1))).unwrap();
         let tables = [table4.to_str().unwrap(), table6.to_str().unwrap()];
         let deadline = Instant::now() + Duration::from_secs(1);
+        // A table that exists but cannot be read leaves the search partial.
+        fs::create_dir(&table6).unwrap();
         assert_eq!(
             udp_inode_from_tables(&tables, local, remote, Some(1000), deadline),
             None
+        );
+        // An absent table (ipv6.disable=1) holds no sockets at all.
+        fs::remove_dir(&table6).unwrap();
+        assert_eq!(
+            udp_inode_from_tables(&tables, local, remote, Some(1000), deadline),
+            Some(1)
         );
 
         fs::write(&table6, HEADER).unwrap();

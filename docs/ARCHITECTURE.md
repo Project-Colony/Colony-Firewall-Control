@@ -156,8 +156,9 @@ hundred microseconds before the packet's latency becomes visible.
 2. **`/proc/net/{tcp,udp}{,6}` fallback**, silently, whenever the fast path
    misses. UDP always reads all relevant tables first and requires one unique
    compatible inode: exact or wildcard local address, with exact or zero
-   remote address. Missing tables, an exhausted lookup budget or several
-   compatible inodes leave attribution unknown. The packet's socket UID,
+   remote address. An unreadable table, an exhausted lookup budget or
+   several compatible inodes leave attribution unknown; an absent table
+   (`udp6` under `ipv6.disable=1`) counts as empty. The packet's socket UID,
    when present, filters candidates. All comparisons run on canonical form,
    so `::ffff:a.b.c.d`
    rows in the v6 tables match plain IPv4 flows - which is what dual-stack

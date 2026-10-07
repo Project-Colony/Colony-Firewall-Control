@@ -25,6 +25,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require, so the inbound table no longer drops MLD or refuses IGMP queries
   either. Other untracked traffic, including explicit `notrack` flows, still
   drops; TROUBLESHOOTING.md says how to keep it.
+- On kernels booted with `ipv6.disable=1` the missing `/proc/net/udp6` left
+  every IPv4 UDP flow unattributed, so executable-scoped Allows such as the
+  DNS, NTP and DHCP bootstrap rules refused. An absent table now counts as
+  empty.
 
 ## [0.7.0] - 2026-09-30
 
