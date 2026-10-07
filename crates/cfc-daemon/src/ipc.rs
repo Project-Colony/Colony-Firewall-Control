@@ -499,7 +499,9 @@ impl FirewallService {
                 old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
             })
         {
-            return Err(Status::invalid_argument("a timed rule cannot be changed to Always by an older read-modify-write client; delete and recreate it explicitly"));
+            return Err(Status::invalid_argument(
+                "a timed rule cannot become Always in place; delete it and create a new rule",
+            ));
         }
         self.engine.preserve_server_owned(&mut rule);
         self.store
