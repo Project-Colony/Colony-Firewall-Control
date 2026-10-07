@@ -50,6 +50,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "Allow always" given meanwhile for the same program now allowed them. A
   rule's Allow now takes precedence over the timeout or no-UI fallback; an
   explicit user answer still stands.
+- Every new flow from an executable that was not root-sealed (anything under
+  a home directory, and any program still running after its package was
+  upgraded) reread and rehashed up to 64 MiB on the single packet thread, so
+  one such program opening connections in a loop stalled new flows for the
+  whole machine. Digests are cached again by device, inode, size, mtime and
+  ctime, and only once ctime is two seconds old, so a changed file is always
+  rehashed and an unchanged one never is.
 
 ## [0.7.0] - 2026-09-30
 

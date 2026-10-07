@@ -54,7 +54,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::trace;
 
 /// Per-lookup budget for the /proc slow path.
@@ -65,9 +65,29 @@ const RESOLVE_BUDGET: Duration = Duration::from_millis(50);
 /// produces (SYN, first payload, retransmits).
 const INODE_CACHE_TTL: Duration = Duration::from_secs(2);
 
-/// Only root-sealed images reuse digests. Mutable images are read afresh:
-/// filesystem timestamps are change hints, not a content identity.
+/// Digests live until their image key changes or they are evicted.
+///
+/// The key is the image's dev, inode, size, mtime and ctime with nanoseconds.
+/// mtime alone would be a change hint, not a content identity: its owner can
+/// set it back with `utimes`. ctime cannot be set from userspace; any write,
+/// truncate or metadata change moves it to the current time. So once a file's
+/// ctime is older than [`DIGEST_SETTLE`] when hashing starts, a later change
+/// gets a different key. Only such settled images are cached, which closes the
+/// window where a write lands in the same timestamp tick as the hash.
+///
+/// Without the cache every new flow from an image that was not root-sealed
+/// reread and rehashed up to 64 MiB on the single packet thread, so one
+/// program in a connect loop stalled every new flow on the machine.
+///
+/// Known limit: a store through a shared writable mapping moves ctime only
+/// when the page is first dirtied, so bytes changed that way before writeback
+/// can keep their key. That takes write access to the file, which a
+/// root-sealed image does not give anyone but root.
 const SHA_CACHE_TTL: Duration = Duration::from_secs(u64::MAX / 2);
+
+/// How old an image's ctime must be before its digest is cached. Far above
+/// any filesystem's timestamp granularity.
+const DIGEST_SETTLE: Duration = Duration::from_secs(2);
 
 /// Don't hash executables larger than this. Shared with the CLI's
 /// `--pin-hash` (`cfc_core::rule`), which must refuse to create what this
@@ -791,12 +811,10 @@ impl MappedImage {
         if image_key(&meta) != self.key {
             return None;
         }
-        let cacheable = cfc_core::exe_path::file_is_sealed(meta.uid(), meta.mode())
-            && cfc_core::exe_path::is_root_sealed(&self.path).unwrap_or(false);
         if meta.len() > SHA256_MAX_LEN {
             trace!(len = meta.len(), "exe too large to hash; skipping");
         }
-        let sha256 = sha256_open_file(self.file, SHA256_MAX_LEN, cacheable);
+        let sha256 = sha256_open_file(self.file, SHA256_MAX_LEN);
         if image_key(&fs::metadata(link).ok()?) != self.key
             || fs::read_link(link).ok()? != self.path
         {
@@ -818,18 +836,33 @@ fn image_key(meta: &fs::Metadata) -> ImageKey {
     )
 }
 
-fn sha256_open_file(mut f: fs::File, max_len: u64, cacheable: bool) -> Option<String> {
+/// Whether `meta`'s ctime is at least [`DIGEST_SETTLE`] before `now`. A
+/// ctime in the future (clock stepped back) is not settled.
+fn settled(meta: &fs::Metadata, now: SystemTime) -> bool {
+    let (Ok(secs), Ok(nanos)) = (
+        u64::try_from(meta.ctime()),
+        u32::try_from(meta.ctime_nsec()),
+    ) else {
+        return false;
+    };
+    let ctime = UNIX_EPOCH + Duration::new(secs, nanos);
+    now.duration_since(ctime)
+        .is_ok_and(|age| age >= DIGEST_SETTLE)
+}
+
+fn sha256_open_file(mut f: fs::File, max_len: u64) -> Option<String> {
     let meta = f.metadata().ok()?;
     if !meta.is_file() || meta.len() > max_len {
         return None;
     }
     let key = image_key(&meta);
     let now = Instant::now();
-    if cacheable {
-        if let Some(cached) = SHA_CACHE.lock().get(&key, now) {
-            return Some(cached);
-        }
+    if let Some(cached) = SHA_CACHE.lock().get(&key, now) {
+        return Some(cached);
     }
+    // Decided before reading: a change during or after the read must land
+    // at a later ctime than the one in `key`.
+    let cacheable = settled(&meta, SystemTime::now());
     // Read in a loop rather than io::copy, and hex-encode by hand rather than
     // with `{:x}`. RustCrypto 0.11 drops `io::Write` on the hashers and returns
     // an `Array` that no longer implements `LowerHex`, so both idioms stop
@@ -871,7 +904,7 @@ fn sha256_open_file(mut f: fs::File, max_len: u64, cacheable: bool) -> Option<St
 /// Test fixture helper using the same opened-file hashing as the resolver.
 #[cfg(test)]
 pub(crate) fn sha256_file(path: &Path, max_len: u64) -> Option<String> {
-    sha256_open_file(fs::File::open(path).ok()?, max_len, false)
+    sha256_open_file(fs::File::open(path).ok()?, max_len)
 }
 
 /// Bounded TTL map. `now` is injected so expiry is unit-testable without
@@ -1386,20 +1419,46 @@ mod tests {
     }
 
     #[test]
-    fn mutable_images_ignore_cached_digests() {
+    fn an_unchanged_image_is_not_rehashed_and_a_changed_one_is() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("image");
-        fs::write(&path, b"hello world").unwrap();
-        let file = fs::File::open(&path).unwrap();
-        let key = image_key(&file.metadata().unwrap());
+        fs::write(&path, b"first").unwrap();
+        let key = image_key(&fs::metadata(&path).unwrap());
         SHA_CACHE
             .lock()
             .insert(key, "cached-placeholder".into(), Instant::now());
         assert_eq!(
-            sha256_open_file(file, 1024, false).as_deref(),
-            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+            sha256_open_file(fs::File::open(&path).unwrap(), 1024).as_deref(),
+            Some("cached-placeholder"),
+            "same key, no reread"
+        );
+        fs::write(&path, b"hello world").unwrap();
+        assert_ne!(image_key(&fs::metadata(&path).unwrap()), key);
+        assert_eq!(
+            sha256_open_file(fs::File::open(&path).unwrap(), 1024).as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"),
+            "a changed image misses the cache"
         );
         SHA_CACHE.lock().remove(&key);
+    }
+
+    #[test]
+    fn only_settled_images_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image");
+        fs::write(&path, b"fresh image").unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let ctime = UNIX_EPOCH + Duration::new(meta.ctime() as u64, meta.ctime_nsec() as u32);
+        assert!(!settled(&meta, ctime));
+        assert!(!settled(&meta, ctime - Duration::from_secs(5)));
+        assert!(settled(&meta, ctime + DIGEST_SETTLE));
+
+        // Written just now, so hashing it must not fill the cache.
+        assert!(sha256_open_file(fs::File::open(&path).unwrap(), 1024).is_some());
+        assert_eq!(
+            SHA_CACHE.lock().get(&image_key(&meta), Instant::now()),
+            None
+        );
     }
 
     #[test]
@@ -1411,7 +1470,7 @@ mod tests {
         fs::rename(&path, dir.path().join("previous-image")).unwrap();
         fs::write(&path, b"different image").unwrap();
         assert_eq!(
-            sha256_open_file(file, 1024, false).as_deref(),
+            sha256_open_file(file, 1024).as_deref(),
             Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
         );
     }

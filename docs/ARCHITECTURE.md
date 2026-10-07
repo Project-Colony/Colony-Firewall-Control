@@ -170,12 +170,12 @@ hundred microseconds before the packet's latency becomes visible.
    walking `/proc/*/fd` for a `socket:[inode]` link. A shared or passed socket
    descriptor still does not identify which holder sent a packet.
 
-Two bounded caches avoid repeated socket walks and sealed-image hashing:
+Two bounded caches avoid repeated socket walks and image hashing:
 
 | Cache          | Key                                         | Lifetime |
 |----------------|---------------------------------------------|----------|
 | inode -> pid   | socket inode                                | 2s       |
-| sealed exe digest | dev, inode, length, mtime and ctime with nanoseconds | key change or eviction |
+| exe digest     | dev, inode, length, mtime and ctime with nanoseconds | key change or eviction |
 
 A complete process record is read on every resolution: exec changes policy
 identity without changing pid or start time. A cache hit on the inode cache
@@ -186,9 +186,13 @@ The binary's SHA-256 is read through `/proc/<pid>/exe`, so it hashes the
 image actually running even if the file on disk was replaced or deleted.
 The same opened file supplies metadata and bytes. Content changes during
 hashing are rejected; the mapped link, metadata and process start time must
-still agree before publishing executable identity. Mutable images are never
-served from the digest cache. Files over 64 MiB retain their path but have no
-digest. This remains a read-time snapshot: an exec after the final check can
+still agree before publishing executable identity. A digest is cached only
+when the image's ctime was at least 2 seconds old as hashing began. Userspace
+cannot set ctime and any write moves it, so a changed image misses the cache;
+an unchanged one is never rehashed per packet on the single worker. The
+exception is a store through a shared writable mapping, which moves ctime only
+when the page is first dirtied; it needs write access to the file. Files over
+64 MiB retain their path but have no digest. This remains a read-time snapshot: an exec after the final check can
 change the process before the queued packet receives its verdict.
 
 The kernel also reports the originating uid and gid with each queued packet

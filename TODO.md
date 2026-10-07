@@ -117,8 +117,9 @@ are worth stating rather than discovering:
 Process resolution now rereads policy identity for every packet lookup; pid
 and start time do not identify an executable across exec. Its path and digest
 come from one opened mapped image, with metadata and link consistency checks.
-Mutable images bypass the digest cache. A raw exec-event filename is retained
-for diagnostics only; once `/proc` is gone, the policy executable is unknown.
+Digests are cached by full image key, ctime included, once ctime has settled.
+A raw exec-event filename is retained for diagnostics only; once `/proc` is
+gone, the policy executable is unknown.
 Shared or passed socket descriptors remain outside sender attribution, and
 the mapped image is still a read-time snapshot rather than packet-time proof.
 
