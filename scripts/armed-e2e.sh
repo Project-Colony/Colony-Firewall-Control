@@ -144,6 +144,15 @@ queue_bound && fail "something is already bound to NFQUEUE 0"
 say "Fail-closed before the daemon ever started"
 expect_drop "${ALLOW_PORT}"
 
+say "IPv6 neighbour discovery passes the fail-closed chain"
+in_fw ip -6 addr add fd00:200::1/64 dev fw0 nodad
+in_srv ip -6 addr add fd00:200::2/64 dev srv0 nodad
+# SRV's echo request is inbound to FW and FW's reply is established, so only
+# FW's Neighbour Advertisement, which conntrack leaves untracked, meets the
+# output chain's policy here.
+in_srv ping -6 -c 1 -W 3 fd00:200::1 >/dev/null \
+    || fail "IPv6 ping into FW failed; its neighbour advertisement was dropped"
+
 cat >"${W}/daemon.toml" <<TOML
 profile = "balanced"
 [storage]

@@ -16,6 +16,16 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nftables set, disarms the legacy pinned maps and removes the old sendmsg
   link pins.
 
+### Fixed
+
+- Since 0.7.0 the outbound table dropped IPv6 neighbour discovery and MLD,
+  which conntrack marks untracked, so IPv6 stopped working on hosts that load
+  it. Both tables now accept neighbour discovery, MLD and IGMP membership
+  traffic in the kernel, limited to the hop limits and sources the RFCs
+  require, so the inbound table no longer drops MLD or refuses IGMP queries
+  either. Other untracked traffic, including explicit `notrack` flows, still
+  drops; TROUBLESHOOTING.md says how to keep it.
+
 ## [0.7.0] - 2026-09-30
 
 ### Added

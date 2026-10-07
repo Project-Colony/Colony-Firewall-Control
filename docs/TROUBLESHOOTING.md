@@ -269,6 +269,24 @@ Note the daemon already exempts its *own* reverse-DNS lookups internally
 (they would otherwise deadlock the queue); the loopback rule is about
 everyone else's DNS.
 
+## Traffic that never reaches the daemon
+
+The `output` chain (and the inbound one) only queues `ct state new`.
+Two kinds of packet are settled in the kernel instead:
+
+- **Link control is accepted.** IPv6 neighbour discovery and MLD, which
+  conntrack itself marks untracked, and IGMP membership traffic. Only the
+  hop limits (and, for MLD, the sources) the RFCs require match, so these
+  stay on the link. Without them IPv6 neighbour resolution and multicast group
+  membership stop working; ND and MLD never reach the queue, so no rule
+  could restore them.
+- **Other INVALID and UNTRACKED packets drop**, including flows an
+  explicit `notrack` rule touched (a busy DNS or NTP server's tuning, for
+  instance). An `accept` in another table does not override this chain's
+  `policy drop`. To keep such flows, load a local copy of the snippet with
+  an accept for them above the queue rules, and point the unit at it with
+  a drop-in.
+
 ## Fail-open vs fail-closed matrix
 
 What happens to a **new outbound connection** in each state:
