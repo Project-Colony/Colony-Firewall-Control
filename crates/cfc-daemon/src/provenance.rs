@@ -1806,7 +1806,11 @@ mod tests {
              (cold, incl. index build: {:?})",
             started.elapsed()
         );
-        assert_eq!(package.as_deref(), Some("curl 8.21.0-1"));
+        // The owning package, not a version: curl updates under this test.
+        assert!(
+            package.as_deref().is_some_and(|p| p.starts_with("curl ")),
+            "/usr/bin/curl must belong to the curl package, got {package:?}"
+        );
         assert_eq!(
             provenance,
             Provenance::Verified,
