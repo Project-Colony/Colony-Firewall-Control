@@ -778,13 +778,18 @@ pub(super) fn load_and_attach(
                     // `set_live` has not run yet - so the live loop no-ops,
                     // and it is the orphan sweep that reconciles the denials
                     // the previous daemon left in `VERDICTS`.
-                    sink.resync();
+                    //
+                    // The observer goes in first. IPC is already serving, and
+                    // a rule changed after this resync read the rules but
+                    // before an observer existed would never reach the kernel.
+                    // An extra resync is harmless; runs are serialized.
                     let weak = std::sync::Arc::downgrade(&sink);
                     engine.set_on_change(Box::new(move || {
                         if let Some(sink) = weak.upgrade() {
                             sink.resync();
                         }
                     }));
+                    sink.resync();
                     Some(sink)
                 }
                 Err(e) => {

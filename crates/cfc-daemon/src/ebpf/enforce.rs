@@ -179,6 +179,10 @@ pub(super) struct VerdictSink {
     /// What was last written to the kernel, so an unchanged recompute costs no
     /// syscalls. `None` until the first compile.
     last_compiled: Arc<Mutex<Option<std::collections::HashMap<u64, u32>>>>,
+    /// Held for a whole [`Self::resync`]. Each run decides from the rules it
+    /// read and writes afterwards, so two overlapping runs could finish in the
+    /// wrong order and leave the older rule set's answers in the kernel.
+    resync: Arc<Mutex<()>>,
 }
 
 impl VerdictSink {
@@ -218,6 +222,7 @@ impl VerdictSink {
             exe_rules,
             exe_rules_on,
             last_compiled: Arc::new(Mutex::new(None)),
+            resync: Arc::new(Mutex::new(())),
         })
     }
 
@@ -249,6 +254,9 @@ impl VerdictSink {
     /// all. The orphan sweep has said so since it was written; the live loop
     /// inherited the constraint the moment it started reading /proc too.
     pub(super) fn resync(&self) {
+        // One run at a time, so the last run to write is the one that read the
+        // newest rules. Not the map lock: the ring consumers never wait on this.
+        let _run = self.resync.lock();
         // The kernel's table first: it governs processes that do not exist yet,
         // and it is what survives this daemon.
         self.compile_rules();
