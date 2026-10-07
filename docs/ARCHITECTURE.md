@@ -95,7 +95,9 @@ The worker keeps two maps that are created and destroyed together:
 
 - `waiters: HashMap<prompt_id, PendingPrompt>` holds the fallback and each
   parked packet's connection and process snapshot. A prompt answer is
-  checked against current policy for every packet; a new refusal takes precedence.
+  checked against current policy for every packet; a new refusal takes
+  precedence, and a rule's Allow takes precedence over a timeout or no-UI
+  fallback, though not over a user's own answer.
 - `pending_flows: HashMap<FlowKey, prompt_id>` - the deduplication index.
 
 Verdicts arrive asynchronously on a separate channel and are applied out of

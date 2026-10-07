@@ -46,6 +46,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only mutating RPC that left no journal line. It now logs the caller's uid
   and pid, whether it replaced the rule set, and the applied and removed
   counts as "rules applied".
+- Packets parked on a prompt that timed out were refused even when an
+  "Allow always" given meanwhile for the same program now allowed them. A
+  rule's Allow now takes precedence over the timeout or no-UI fallback; an
+  explicit user answer still stands.
 
 ## [0.7.0] - 2026-09-30
 

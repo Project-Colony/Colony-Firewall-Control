@@ -70,7 +70,7 @@ use crate::process_resolve;
 use crate::reject::Rejecter;
 use crate::stats::Stats;
 use anyhow::Context as _;
-use cfc_core::{Action, Connection, Direction, Process, Protocol, Verdict};
+use cfc_core::{Action, Connection, Direction, Process, Protocol, Verdict, VerdictSource};
 use nfq::{Message, Queue, Verdict as NfqVerdict};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -716,7 +716,21 @@ impl<Q: PacketQueue> Worker<Q> {
             // the individual segment (its sequence numbers, its source
             // port), and parallel connections share one prompt.
             let verdict = match self.engine.evaluate(&packet.connection, &packet.process) {
+                // A refusal decided since the prompt opened always wins.
                 Decision::Resolved(current) if current.action != Action::Allow => current,
+                // So does a rule's Allow over a fallback nobody chose: a rule
+                // added while this prompt waited (another prompt's "Allow
+                // always" for the same program) must not lose to the timeout
+                // Deny. A user's own answer stands.
+                Decision::Resolved(current)
+                    if matches!(current.source, VerdictSource::Rule(_))
+                        && matches!(
+                            pv.verdict.source,
+                            VerdictSource::DefaultPolicy | VerdictSource::Timeout
+                        ) =>
+                {
+                    current
+                }
                 _ => pv.verdict,
             };
             self.deliver(
@@ -2564,6 +2578,34 @@ mod tests {
         assert!(rows.iter().any(|r| r.action == "Reject"));
         assert!(rows.iter().any(|r| r.action == "Deny"));
         assert_eq!(h.stats.connections_denied(), 2);
+    }
+
+    #[test]
+    fn a_rule_allow_added_while_parked_beats_the_fallback_but_not_the_user() {
+        for (answer, expected) in [
+            (Verdict::from_policy(Action::Deny), NfqVerdict::Accept),
+            (
+                Verdict {
+                    action: Action::Deny,
+                    source: VerdictSource::UserPrompt,
+                },
+                NfqVerdict::Drop,
+            ),
+        ] {
+            let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+            h.worker()
+                .handle_message(FakeMsg::new(1, tcp_packet(443)))
+                .unwrap();
+            let prompt = h.prompt_rx.try_recv().unwrap();
+            h.worker().engine.upsert_rule(allow_port_rule(443));
+            h.worker()
+                .resolve_prompt(PromptVerdict {
+                    prompt_id: prompt.prompt_id,
+                    verdict: answer,
+                })
+                .unwrap();
+            assert_eq!(h.verdicts(), vec![(1, expected)], "{answer:?}");
+        }
     }
 
     #[test]
