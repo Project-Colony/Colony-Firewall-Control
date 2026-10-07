@@ -811,6 +811,10 @@ impl MappedImage {
         if image_key(&meta) != self.key {
             return None;
         }
+        if !path_names_image(&self.path, &self.key) {
+            trace!(path = %self.path.display(), "exe path names another file here");
+            return None;
+        }
         if meta.len() > SHA256_MAX_LEN {
             trace!(len = meta.len(), "exe too large to hash; skipping");
         }
@@ -822,6 +826,21 @@ impl MappedImage {
         }
         Some((self.path, sha256))
     }
+}
+
+/// Whether `path`, read in the daemon's own mount namespace, can stand for
+/// the mapped image `key` describes.
+///
+/// The kernel renders `/proc/<pid>/exe` relative to the process's own mount
+/// namespace. Any user who can create one (`unshare -rm`, a container) can
+/// mount their own bytes at `/usr/bin/curl` and present that path, which then
+/// matched every path-only rule for the host's curl and passed as root-sealed
+/// in prompt binding. So a path that names a different file here is not this
+/// image's identity. A path the daemon cannot stat at all (a Flatpak `/app`
+/// path, a home directory behind `ProtectHome`, a replaced image's
+/// " (deleted)" name) names nothing here and is left as is.
+fn path_names_image(path: &Path, key: &ImageKey) -> bool {
+    fs::metadata(path).map_or(true, |m| (m.dev(), m.ino()) == (key.0, key.1))
 }
 
 fn image_key(meta: &fs::Metadata) -> ImageKey {
@@ -1497,6 +1516,22 @@ mod tests {
         fs::remove_file(&link).unwrap();
         symlink(&second, &link).unwrap();
         assert_eq!(image.finish(&link), None, "mixed image identity is unknown");
+    }
+
+    #[test]
+    fn a_path_naming_another_file_here_is_not_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("curl");
+        let mounted = dir.path().join("mounted-over-curl");
+        fs::write(&host, b"host image").unwrap();
+        fs::write(&mounted, b"namespace image").unwrap();
+        let mounted_key = image_key(&fs::metadata(&mounted).unwrap());
+        assert!(!path_names_image(&host, &mounted_key));
+        assert!(path_names_image(&mounted, &mounted_key));
+        assert!(
+            path_names_image(&dir.path().join("absent"), &mounted_key),
+            "a path invisible here cannot be judged"
+        );
     }
 
     #[test]

@@ -342,6 +342,8 @@ fn compute_binding(process: &cfc_core::Process) -> PromptBinding {
     // certainly not root-sealed. Never re-read a PID here: it may have exec'd
     // or been recycled since the worker recorded this process.
     // The sealed check rejects symlinks instead of re-resolving this snapshot.
+    // The resolver publishes a path only if it names the mapped image here or
+    // names nothing here, so a sealed path is the host file that was running.
     if cfc_core::exe_path::is_root_sealed(&exe).unwrap_or(false) {
         return PromptBinding {
             exe: Some(exe),

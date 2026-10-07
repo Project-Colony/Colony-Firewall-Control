@@ -201,6 +201,16 @@ is a separate launch mode.
   reauthorized for each sending executable. Current descriptor ownership
   and validated eBPF hints reduce false attribution; neither proves which
   process sent a packet.
+- **Mount namespaces and same-user code**: a process reports its executable
+  path as its own mount namespace sees it. When that path names a different
+  file in the daemon's view (a container's or `unshare -rm` user's
+  `/usr/bin/curl`), the executable is reported as unknown, so path rules for
+  the host's file do not match it. A path the daemon cannot see at all (a
+  Flatpak `/app` path, anything under `/home`, hidden by `ProtectHome`) is
+  taken as reported: a hand-written path-only rule for such a path can be
+  matched from a mount namespace, so pin its hash. Code already running as a
+  user can also borrow an allowed program's identity by running it with
+  chosen arguments or with `LD_PRELOAD`, which a hash pin does not prevent.
 - **Raw and packet sockets**: applications with `CAP_NET_RAW` can use AF_PACKET
   outside the shipped `inet OUTPUT` hook. Raw IP packets can coincide with
   another socket's tuple even when TCP matching is strict. Tuple and inode

@@ -57,6 +57,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whole machine. Digests are cached again by device, inode, size, mtime and
   ctime, and only once ctime is two seconds old, so a changed file is always
   rehashed and an unchanged one never is.
+- A process in its own mount namespace (`unshare -rm`, a container) could
+  mount its own bytes at a host path such as `/usr/bin/curl` and match every
+  path-only rule for the host's program, including prompt-created Allows that
+  skip hash binding for root-sealed paths. An executable path that names a
+  different file in the daemon's view is now reported as unknown. Container
+  and Flatpak runtime binaries at such paths therefore lose their executable
+  identity instead of borrowing the host's.
 
 ## [0.7.0] - 2026-09-30
 
