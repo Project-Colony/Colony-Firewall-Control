@@ -3,6 +3,10 @@
 //! Generated from `proto/cfc.proto`. Speaks daemon <-> UI/CLI over a Unix
 //! domain socket (typically `/run/colony-firewall/cfc.sock`).
 
+// Generated code. Clippy 1.99's double_must_use fires inside the
+// #[async_trait] that tonic emits for the server trait; nothing here can
+// change that. unknown_lints keeps older clippy versions quiet about the name.
+#[allow(unknown_lints, clippy::double_must_use)]
 pub mod v1 {
     tonic::include_proto!("cfc.v1");
 }
