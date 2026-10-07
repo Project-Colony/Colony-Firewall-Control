@@ -447,7 +447,6 @@ struct FirewallService {
     resume_at_ms: Arc<AtomicI64>,
     pause_default_secs: u64,
     dry_run: bool,
-    mutations: Mutex<()>,
 }
 
 impl FirewallService {
@@ -493,7 +492,7 @@ impl FirewallService {
         // rule must not be able to rewrite its history, deliberately or (as
         // every read-modify-write client did) by echoing back a count that
         // already included an unflushed delta.
-        let _mutation = self.mutations.lock();
+        let _mutation = self.engine.lock_mutations();
         if rule.duration == cfc_core::Duration::Always
             && self.engine.snapshot().rules.iter().any(|old| {
                 old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
@@ -549,7 +548,7 @@ impl FirewallService {
             }
             pending.push(rule);
         }
-        let _mutation = self.mutations.lock();
+        let _mutation = self.engine.lock_mutations();
         let existing = self.engine.snapshot();
         for rule in &mut pending {
             if rule.duration == cfc_core::Duration::Always
@@ -759,7 +758,7 @@ impl Firewall for FirewallService {
                     if rule.action == cfc_core::Action::Allow && binding.hash_expected {
                         persist_note = "the allow is bound to the prompted binary's sha256; a changed file will prompt again".into();
                     }
-                    let _mutation = self.mutations.lock();
+                    let _mutation = self.engine.lock_mutations();
                     match self.store.upsert(&rule) {
                         Ok(()) => {
                             persisted_rule = Some(rule.id);
@@ -863,7 +862,7 @@ impl Firewall for FirewallService {
         let id_str = req.into_inner().id;
         let id = uuid::Uuid::parse_str(&id_str)
             .map_err(|e| Status::invalid_argument(format!("bad uuid: {e}")))?;
-        let _mutation = self.mutations.lock();
+        let _mutation = self.engine.lock_mutations();
         let deleted = self
             .store
             .delete(id)
@@ -1436,7 +1435,6 @@ pub async fn spawn(
         resume_at_ms: Arc::new(AtomicI64::new(0)),
         pause_default_secs: opts.pause_default_secs,
         dry_run: opts.dry_run,
-        mutations: Mutex::new(()),
     };
 
     info!(socket = %socket_path.display(), "IPC listening");

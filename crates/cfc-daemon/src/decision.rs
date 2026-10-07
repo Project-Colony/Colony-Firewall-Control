@@ -42,6 +42,9 @@ struct EngineInner {
     /// it a `Weak` capture on the caller's side is what stops the cycle
     /// (the observer holds this `Engine`).
     on_change: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Serializes every write that touches both the store and these rules.
+    /// See [`Engine::lock_mutations`].
+    mutations: Mutex<()>,
 }
 
 pub enum Decision {
@@ -63,8 +66,24 @@ impl Engine {
                 default_policy,
                 hits: Mutex::new(HashMap::new()),
                 on_change: RwLock::new(None),
+                mutations: Mutex::new(()),
             }),
         }
+    }
+
+    /// Held across any change that writes the rule store and this engine
+    /// together: the IPC rule writes, and the flush task's hit merge and
+    /// expiry.
+    ///
+    /// The store and the engine are two copies of one rule set, and without a
+    /// shared lock their writers interleave. The flush drains hit deltas into
+    /// these rules, then adds them to the stored rows; an UpsertRule landing in
+    /// between stored the already-folded count, and the merge added the delta
+    /// a second time, inflating the count for good.
+    ///
+    /// Never taken on the packet path. Lock order: this before `rules`.
+    pub fn lock_mutations(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.mutations.lock()
     }
 
     /// Registers the callback invoked after every rule-set change.

@@ -217,6 +217,9 @@ async fn run() -> anyhow::Result<()> {
         tick.tick().await; // skip immediate fire
         loop {
             tick.tick().await;
+            // The whole tick: a rule write between the drain and the merge
+            // would count the drained hits twice (see `lock_mutations`).
+            let _mutation = flush_engine.lock_mutations();
             let deltas = flush_engine.drain_hits();
             if !deltas.is_empty() {
                 if let Err(e) = flush_store.merge_hit_counts(&deltas) {
