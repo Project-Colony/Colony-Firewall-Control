@@ -362,12 +362,14 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
     scope.reject_unmatchable_parent()?;
     scope.reject_inbound_destination_scope()?;
     scope.reject_unattributable_inbound_scope()?;
-    let created_at = if r.created_at_unix_ms == 0 {
-        chrono::Utc::now()
-    } else {
-        chrono::DateTime::from_timestamp_millis(r.created_at_unix_ms)
-            .unwrap_or_else(chrono::Utc::now)
-    };
+    // Never in the future: a timed rule expires at created_at + n, so a
+    // client-supplied date in 2100 made "allow for 90s" permanent while every
+    // list still showed 90s. A past date is kept, which is what an import
+    // of an exported rule needs.
+    let now = chrono::Utc::now();
+    let created_at = chrono::DateTime::from_timestamp_millis(r.created_at_unix_ms)
+        .filter(|_| r.created_at_unix_ms != 0)
+        .map_or(now, |at| at.min(now));
     Ok(Rule {
         id,
         name: r.name.clone(),
@@ -837,6 +839,25 @@ mod tests {
             duration_seconds: 0,
         };
         assert!(rule_from_pb(&pb).is_err());
+    }
+
+    #[test]
+    fn a_future_creation_date_cannot_postpone_expiry() {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+        let mut pb = rule_to_pb(&Rule::new("x", Action::Allow, scope));
+        pb.duration = cfc_proto::v1::Duration::Seconds as i32;
+        pb.duration_seconds = 90;
+        let year_2100 = 4_102_444_800_000;
+        pb.created_at_unix_ms = year_2100;
+        let rule = rule_from_pb(&pb).unwrap();
+        assert!(rule.created_at <= chrono::Utc::now());
+        // A past date, as an export carries, is kept.
+        pb.created_at_unix_ms = 1_000;
+        assert_eq!(
+            rule_from_pb(&pb).unwrap().created_at.timestamp_millis(),
+            1_000
+        );
     }
 
     #[test]
