@@ -1769,6 +1769,9 @@ mod tests {
         // The legacy disarm, on the path that needs it: a pinned MARK left
         // armed by a 0.4-0.6 daemon that died, met by a restart on the
         // inherited path with no engine. Only a bpffs host can show this.
+        // The fixture is inert while it sits there: a deadline already in
+        // the past (the hooks honour nothing) and a grant for a pid no
+        // process can hold.
         {
             let dir = enforce::pin_dir();
             let mark = MapData::from_pin(dir.join(enforce::MAP_FAST_ALLOW_MARK))
@@ -1780,12 +1783,12 @@ mod tests {
                 .expect("reopen the pinned FAST_ALLOW_UNTIL");
             let mut until = aya::maps::Array::<_, u64>::try_from(aya::maps::Map::Array(until))
                 .expect("FAST_ALLOW_UNTIL is an array");
-            until.set(0, u64::MAX, 0).expect("set a legacy deadline");
+            until.set(0, 1, 0).expect("set a lapsed legacy deadline");
             let grants = MapData::from_pin(dir.join(enforce::MAP_FAST_ALLOW))
                 .expect("reopen the pinned FAST_ALLOW");
             let mut grants = BpfHashMap::<_, u32, u32>::try_from(aya::maps::Map::HashMap(grants))
                 .expect("FAST_ALLOW is a hash map");
-            grants.insert(1, 1, 0).expect("leave a legacy grant");
+            grants.insert(u32::MAX, 1, 0).expect("leave a legacy grant");
         }
         let (attached, report) = load_and_attach(
             Path::new(&path),
