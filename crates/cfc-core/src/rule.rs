@@ -215,16 +215,16 @@ impl RuleScope {
     /// proto API and `cfc rules import` both take the field, which is exactly
     /// how the `<unknown>` rule got onto a real machine.
     pub fn reject_unmatchable_parent(&self) -> Result<(), String> {
-        let Some(parent) = &self.parent_exe else {
+        // The value is not echoed: it is any length a client sent, and the
+        // message becomes a gRPC status and a log line.
+        if self.parent_exe.is_none() {
             return Ok(());
-        };
-        Err(format!(
-            "cannot scope a rule on parent_exe ({}): the predicate is not \
+        }
+        Err("cannot scope a rule on parent_exe: the predicate is not \
              evaluated, so the rule would match every process rather than the \
              ones launched by it - and it would outrank narrower rules while \
-             doing so. Scope on the executable itself.",
-            parent.display()
-        ))
+             doing so. Scope on the executable itself."
+            .to_string())
     }
 
     /// Refuse a scope whose `exe_path` is not an absolute path.
@@ -243,6 +243,29 @@ impl RuleScope {
         let Some(exe) = &self.exe_path else {
             return Ok(());
         };
+        // A path no filesystem can hold is a path no process can be running,
+        // so such a rule can never fire - the same test as the two below, for
+        // a value that arrives over the wire.
+        //
+        // The bound is here rather than at the wire because this is the gate
+        // both writers already run. What it stops is not a bad rule: it is the
+        // work of *rejecting* one. `exe_path` is a bare proto string, capped
+        // only by the 4 MiB decode limit, and resolution walks one
+        // `canonicalize(2)` per path component from the leaf upward - about
+        // two million syscalls for a 4 MiB path, on a blocking pool of
+        // sixteen that the prompt router also depends on.
+        //
+        // First, and the message deliberately does not print the path: the
+        // arms below format it into a string that becomes a gRPC status and a
+        // log line, which for this input would be the denial-of-service
+        // repeated on the way out.
+        if exe.as_os_str().len() > MAX_EXE_PATH_LEN {
+            return Err(format!(
+                "exe path is {} bytes; the kernel cannot hold a path longer \
+                 than {MAX_EXE_PATH_LEN}, so no process could ever match it",
+                exe.as_os_str().len()
+            ));
+        }
         if exe.as_os_str() == crate::UNKNOWN_EXE {
             return Err(format!(
                 "cannot scope a rule to {}: that is what this program shows \
@@ -258,29 +281,6 @@ impl RuleScope {
                 "exe path {} is not absolute; rules match on absolute \
                  executable paths, so a relative one can never fire",
                 exe.display()
-            ));
-        }
-        // A path no filesystem can hold is a path no process can be running,
-        // so such a rule can never fire - the same test as the two above, for
-        // a value that arrives over the wire.
-        //
-        // The bound is here rather than at the wire because this is the gate
-        // both writers already run. What it stops is not a bad rule: it is the
-        // work of *rejecting* one. `exe_path` is a bare proto string, capped
-        // only by the 4 MiB decode limit, and resolution walks one
-        // `canonicalize(2)` per path component from the leaf upward - about
-        // two million syscalls for a 4 MiB path, on a blocking pool of
-        // sixteen that the prompt router also depends on.
-        //
-        // The message deliberately does not print the path. Every other arm
-        // here formats it into a string that becomes a gRPC status and a log
-        // line, which for this input is the denial-of-service repeated on the
-        // way out.
-        if exe.as_os_str().len() > MAX_EXE_PATH_LEN {
-            return Err(format!(
-                "exe path is {} bytes; the kernel cannot hold a path longer \
-                 than {MAX_EXE_PATH_LEN}, so no process could ever match it",
-                exe.as_os_str().len()
             ));
         }
         Ok(())
@@ -1639,5 +1639,22 @@ mod parent_exe_tests {
     #[test]
     fn a_scope_without_a_parent_is_untouched() {
         assert!(RuleScope::any().reject_unmatchable_parent().is_ok());
+    }
+
+    /// A refusal becomes a gRPC status and a log line, so a 4 MiB value must
+    /// not come back out in it, whichever check refuses it first.
+    #[test]
+    fn refusals_never_echo_an_oversized_path() {
+        let huge = "a".repeat(MAX_EXE_PATH_LEN * 4);
+        for exe in [huge.clone(), format!("/{huge}")] {
+            let mut scope = RuleScope::any();
+            scope.exe_path = Some(PathBuf::from(exe));
+            let err = scope.reject_unmatchable_exe().expect_err("refused");
+            assert!(err.len() < 512, "{} bytes", err.len());
+        }
+        let mut scope = RuleScope::any();
+        scope.parent_exe = Some(PathBuf::from(format!("/{huge}")));
+        let err = scope.reject_unmatchable_parent().expect_err("refused");
+        assert!(err.len() < 512, "{} bytes", err.len());
     }
 }

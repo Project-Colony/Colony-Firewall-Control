@@ -252,7 +252,9 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
 /// the `has_*` flags carry presence explicitly.
 pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
     let dst_net = match empty_to_none(&s.dst_net) {
-        Some(n) => Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad dst_net `{n}`: {e}"))?),
+        Some(n) => {
+            Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad dst_net `{n:.64}`: {e}"))?)
+        }
         None => None,
     };
     let protocol = match s.has_protocol {
@@ -271,7 +273,9 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
         false => None,
     };
     let src_net = match empty_to_none(&s.src_net) {
-        Some(n) => Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad src_net `{n}`: {e}"))?),
+        Some(n) => {
+            Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad src_net `{n:.64}`: {e}"))?)
+        }
         None => None,
     };
     let src_port =
@@ -759,6 +763,11 @@ mod tests {
             "the message must name the field: {e}"
         );
         assert!(e.contains("10.0.0.0/33"), "and quote the value: {e}");
+        // But only so much of it: the message is a gRPC status and a log line.
+        let mut long = pb.clone();
+        long.dst_net = "9".repeat(1 << 20);
+        let e = scope_from_pb(&long).expect_err("refused");
+        assert!(e.len() < 256, "{} bytes", e.len());
 
         // A rule carrying it is refused whole, rather than persisted narrower
         // than it reads.
