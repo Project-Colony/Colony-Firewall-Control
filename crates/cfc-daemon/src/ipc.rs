@@ -55,7 +55,7 @@ use anyhow::Context;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -1401,7 +1401,15 @@ pub async fn spawn(
 ) -> anyhow::Result<(JoinHandle<()>, PromptTx)> {
     let socket_path = opts.socket_path;
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // An explicit mode: the umask is only tightened below, and a daemon
+        // started by hand under umask 000 made this directory world-writable,
+        // so any local user could swap the socket for one of their own.
+        // Systemd's RuntimeDirectoryMode creates it 0755 before we get here.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)
+            .ok();
     }
     let _ = std::fs::remove_file(&socket_path);
 
