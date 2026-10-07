@@ -100,6 +100,23 @@ async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) -> Result<(), S
     Ok(())
 }
 
+/// Logs a rule write the daemon refused, with its reason.
+///
+/// Without it the journal held only successful writes and authorization
+/// refusals, so "the client never sent it" and "the daemon refused it" looked
+/// the same (issue #46). Authorization refusals are logged by `authorize`.
+fn log_refusal(rpc: &'static str, peer: PeerId, status: &Status) {
+    warn!(
+        rpc,
+        peer_uid = peer.uid,
+        peer_pid = ?peer.pid,
+        code = ?status.code(),
+        reason = status.message(),
+        outcome = "refused",
+        "rule write refused"
+    );
+}
+
 fn bind_prompt_allow(
     rule: &mut cfc_core::Rule,
     binding: &crate::prompts::PromptBinding,
@@ -435,6 +452,118 @@ impl FirewallService {
         )))
     }
 
+    async fn upsert_rule_checked(
+        &self,
+        peer: PeerId,
+        req: UpsertRuleRequest,
+    ) -> Result<UpsertRuleResponse, Status> {
+        let proto = req
+            .rule
+            .ok_or_else(|| Status::invalid_argument("rule required"))?;
+        let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
+        convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
+        // Every caller must select the canonical mapped target explicitly.
+        // Missing targets with unchanged ancestry remain valid for preinstallation.
+        resolve_exe_off_thread(&mut rule.scope).await?;
+        // hit_count and created_at belong to the daemon: a client editing a
+        // rule must not be able to rewrite its history, deliberately or (as
+        // every read-modify-write client did) by echoing back a count that
+        // already included an unflushed delta.
+        let _mutation = self.mutations.lock();
+        if rule.duration == cfc_core::Duration::Always
+            && self.engine.snapshot().rules.iter().any(|old| {
+                old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
+            })
+        {
+            return Err(Status::invalid_argument("a timed rule cannot be changed to Always by an older read-modify-write client; delete and recreate it explicitly"));
+        }
+        self.engine.preserve_server_owned(&mut rule);
+        self.store
+            .upsert(&rule)
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        let id = rule.id.to_string();
+        info!(
+            rpc = "UpsertRule",
+            peer_uid = peer.uid,
+            peer_pid = ?peer.pid,
+            rule_id = %id,
+            action = ?rule.action,
+            duration = ?rule.duration,
+            enabled = rule.enabled,
+            outcome = "ok",
+            "rule upserted"
+        );
+        self.engine.upsert_rule(rule);
+        Ok(UpsertRuleResponse {
+            id,
+            error: String::new(),
+        })
+    }
+
+    async fn apply_rules_checked(
+        &self,
+        peer: PeerId,
+        req: ApplyRulesRequest,
+    ) -> Result<ApplyRulesResponse, Status> {
+        if req.replace && req.rules.is_empty() {
+            return Err(Status::invalid_argument("refusing an empty replacement"));
+        }
+        let mut pending = Vec::with_capacity(req.rules.len());
+        let mut ids = HashSet::new();
+        for proto in req.rules {
+            let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
+            convert::reject_unpersistable_duration(rule.duration)
+                .map_err(Status::invalid_argument)?;
+            if !ids.insert(rule.id) {
+                return Err(Status::invalid_argument("duplicate rule id"));
+            }
+            resolve_exe_off_thread(&mut rule.scope).await?;
+            pending.push(rule);
+        }
+        let _mutation = self.mutations.lock();
+        let existing = self.engine.snapshot();
+        for rule in &mut pending {
+            if rule.duration == cfc_core::Duration::Always
+                && existing.rules.iter().any(|old| {
+                    old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
+                })
+            {
+                return Err(Status::invalid_argument(
+                    "a timed rule cannot become Always in place; delete it and create a new rule",
+                ));
+            }
+            self.engine.preserve_server_owned(rule);
+        }
+        let removed = self
+            .store
+            .apply_rules(&pending, req.replace)
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        let assigned: Vec<String> = pending.iter().map(|rule| rule.id.to_string()).collect();
+        info!(
+            rpc = "ApplyRules",
+            peer_uid = peer.uid,
+            peer_pid = ?peer.pid,
+            replace = req.replace,
+            applied = assigned.len(),
+            removed,
+            rule_ids = ?assigned,
+            outcome = "ok",
+            "rules applied"
+        );
+        let mut final_rules = if req.replace {
+            Vec::new()
+        } else {
+            self.engine.snapshot().rules
+        };
+        final_rules.retain(|rule| !ids.contains(&rule.id));
+        final_rules.extend(pending);
+        self.engine.replace_rules(final_rules);
+        Ok(ApplyRulesResponse {
+            ids: assigned,
+            removed: u32::try_from(removed).unwrap_or(u32::MAX),
+        })
+    }
+
     fn policy(&self) -> crate::config::DefaultPolicy {
         *self
             .policy
@@ -679,48 +808,10 @@ impl Firewall for FirewallService {
         req: Request<UpsertRuleRequest>,
     ) -> Result<Response<UpsertRuleResponse>, Status> {
         let peer = self.authorize(&req, Access::Mutate)?;
-        let proto = req
-            .into_inner()
-            .rule
-            .ok_or_else(|| Status::invalid_argument("rule required"))?;
-        let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
-        convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
-        // Every caller must select the canonical mapped target explicitly.
-        // Missing targets with unchanged ancestry remain valid for preinstallation.
-        resolve_exe_off_thread(&mut rule.scope).await?;
-        // hit_count and created_at belong to the daemon: a client editing a
-        // rule must not be able to rewrite its history, deliberately or (as
-        // every read-modify-write client did) by echoing back a count that
-        // already included an unflushed delta.
-        let _mutation = self.mutations.lock();
-        if rule.duration == cfc_core::Duration::Always
-            && self.engine.snapshot().rules.iter().any(|old| {
-                old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
-            })
-        {
-            return Err(Status::invalid_argument("a timed rule cannot be changed to Always by an older read-modify-write client; delete and recreate it explicitly"));
-        }
-        self.engine.preserve_server_owned(&mut rule);
-        self.store
-            .upsert(&rule)
-            .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let id = rule.id.to_string();
-        info!(
-            rpc = "UpsertRule",
-            peer_uid = peer.uid,
-            peer_pid = ?peer.pid,
-            rule_id = %id,
-            action = ?rule.action,
-            duration = ?rule.duration,
-            enabled = rule.enabled,
-            outcome = "ok",
-            "rule upserted"
-        );
-        self.engine.upsert_rule(rule);
-        Ok(Response::new(UpsertRuleResponse {
-            id,
-            error: String::new(),
-        }))
+        self.upsert_rule_checked(peer, req.into_inner())
+            .await
+            .map(Response::new)
+            .inspect_err(|status| log_refusal("UpsertRule", peer, status))
     }
 
     async fn apply_rules(
@@ -728,64 +819,10 @@ impl Firewall for FirewallService {
         req: Request<ApplyRulesRequest>,
     ) -> Result<Response<ApplyRulesResponse>, Status> {
         let peer = self.authorize(&req, Access::Mutate)?;
-        let req = req.into_inner();
-        if req.replace && req.rules.is_empty() {
-            return Err(Status::invalid_argument("refusing an empty replacement"));
-        }
-        let mut pending = Vec::with_capacity(req.rules.len());
-        let mut ids = HashSet::new();
-        for proto in req.rules {
-            let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
-            convert::reject_unpersistable_duration(rule.duration)
-                .map_err(Status::invalid_argument)?;
-            if !ids.insert(rule.id) {
-                return Err(Status::invalid_argument("duplicate rule id"));
-            }
-            resolve_exe_off_thread(&mut rule.scope).await?;
-            pending.push(rule);
-        }
-        let _mutation = self.mutations.lock();
-        let existing = self.engine.snapshot();
-        for rule in &mut pending {
-            if rule.duration == cfc_core::Duration::Always
-                && existing.rules.iter().any(|old| {
-                    old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
-                })
-            {
-                return Err(Status::invalid_argument(
-                    "a timed rule cannot become Always in place; delete it and create a new rule",
-                ));
-            }
-            self.engine.preserve_server_owned(rule);
-        }
-        let removed = self
-            .store
-            .apply_rules(&pending, req.replace)
-            .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let assigned: Vec<String> = pending.iter().map(|rule| rule.id.to_string()).collect();
-        info!(
-            rpc = "ApplyRules",
-            peer_uid = peer.uid,
-            peer_pid = ?peer.pid,
-            replace = req.replace,
-            applied = assigned.len(),
-            removed,
-            rule_ids = ?assigned,
-            outcome = "ok",
-            "rules applied"
-        );
-        let mut final_rules = if req.replace {
-            Vec::new()
-        } else {
-            self.engine.snapshot().rules
-        };
-        final_rules.retain(|rule| !ids.contains(&rule.id));
-        final_rules.extend(pending);
-        self.engine.replace_rules(final_rules);
-        Ok(Response::new(ApplyRulesResponse {
-            ids: assigned,
-            removed: u32::try_from(removed).unwrap_or(u32::MAX),
-        }))
+        self.apply_rules_checked(peer, req.into_inner())
+            .await
+            .map(Response::new)
+            .inspect_err(|status| log_refusal("ApplyRules", peer, status))
     }
 
     async fn delete_rule(
