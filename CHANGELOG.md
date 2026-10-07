@@ -29,6 +29,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every IPv4 UDP flow unattributed, so executable-scoped Allows such as the
   DNS, NTP and DHCP bootstrap rules refused. An absent table now counts as
   empty.
+- Every refused packet was committed to SQLite with an fsync on the single
+  packet thread before its verdict, so a flood of refused traffic stalled
+  every new flow on the machine, and a store mutex held for 250 ms (a long
+  `cfc log` query, the minute prune) or a full disk ended the daemon and
+  dropped all new connections until systemd restarted it. Refusals are now
+  queued after their verdict to the same bounded batch writer as Allow rows.
+  Rows it cannot take are counted and logged instead of stopping anything.
 
 ## [0.7.0] - 2026-09-30
 

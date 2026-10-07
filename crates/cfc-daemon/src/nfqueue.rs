@@ -64,11 +64,11 @@
 use crate::config::NfqConfig;
 use crate::decision::{Decision, Engine};
 use crate::dns::DnsCache;
+use crate::ipc::EventSink;
 use crate::packet;
 use crate::process_resolve;
 use crate::reject::Rejecter;
 use crate::stats::Stats;
-use crate::storage::RuleStore;
 use anyhow::Context as _;
 use cfc_core::{Action, Connection, Direction, Process, Protocol, Verdict};
 use nfq::{Message, Queue, Verdict as NfqVerdict};
@@ -204,7 +204,8 @@ pub struct ObservedConnection {
     pub verdict: Verdict,
 }
 
-/// Record refusals before the bounded, lossy live-feed channel.
+/// Logs a refusal to the journal, then publishes to the bounded, lossy live
+/// feed.
 pub fn publish_observation(tx: &broadcast::Sender<ObservedConnection>, obs: ObservedConnection) {
     if obs.verdict.action != Action::Allow {
         info!(
@@ -350,7 +351,7 @@ pub fn spawn(
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
-    store: RuleStore,
+    events: EventSink,
     dns_cache: DnsCache,
 ) -> anyhow::Result<NfqHandles> {
     anyhow::ensure!(
@@ -430,7 +431,7 @@ pub fn spawn(
         verdict_rx,
         observed_tx,
         stats,
-        store,
+        events,
         dns: Box::new(dns_cache),
         resolver: Box::new(ProcfsResolver),
         waiters: HashMap::new(),
@@ -559,7 +560,8 @@ struct Worker<Q: PacketQueue> {
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
-    store: RuleStore,
+    /// Refusal rows go here, after the verdict; see [`Worker::deliver`].
+    events: EventSink,
     /// Reverse-DNS / self-identification seam; [`DnsCache`] in production.
     dns: Box<dyn HostCache + Send>,
     /// Process attribution seam; [`ProcfsResolver`] in production.
@@ -575,9 +577,9 @@ struct Worker<Q: PacketQueue> {
     /// Set by main's shutdown path; observed at the top of every iteration.
     stop: Arc<AtomicBool>,
     /// Watchdog liveness cell shared with main's heartbeat task: the
-    /// unix-ms at which the loop last turned. The idle wait is bounded;
-    /// packet processing also includes the durable audit commit. A stale
-    /// stamp means main must withhold the WATCHDOG=1 heartbeat.
+    /// unix-ms at which the loop last turned. The idle wait is bounded and
+    /// nothing on this thread waits for storage. A stale stamp means main
+    /// must withhold the WATCHDOG=1 heartbeat.
     last_activity: Arc<AtomicI64>,
 }
 
@@ -901,25 +903,24 @@ impl<Q: PacketQueue> Worker<Q> {
         )
     }
 
-    /// Commit parsed refusals before releasing the packet or publishing it.
-    /// Storage failure drops this packet and propagates out of the worker,
-    /// so a later packet cannot receive Allow after an unaudited refusal.
+    /// Verdicts the packet, then records it. A refusal row goes straight
+    /// into the event writer's bounded queue rather than through the lossy
+    /// live feed. Nothing here waits for storage: an fsync per refusal on
+    /// this single thread let a deny flood stall every new flow on the
+    /// machine, and a failed commit used to end the worker, which took all
+    /// networking down until systemd restarted the daemon. A row the queue
+    /// cannot take is counted and logged by [`EventSink`]; the journal line
+    /// from [`publish_observation`] still names the refusal.
     fn deliver(&mut self, msg: Q::Msg, obs: ObservedConnection) -> anyhow::Result<()> {
-        if obs.verdict.action != Action::Allow {
-            let row = crate::convert::event_row_from_observed(
-                &obs.connection,
-                &obs.process,
-                &obs.verdict,
-            );
-            if let Err(e) = self.store.insert_events(&[row]) {
-                self.send_verdict(msg, NfqVerdict::Drop)
-                    .context("dropping packet after verdict audit failure")?;
-                return Err(e).context("committing verdict audit before NFQUEUE delivery");
-            }
-        }
         self.apply_action(msg, obs.verdict.action)?;
         if obs.verdict.action == Action::Allow {
             self.dns.enqueue(obs.connection.dst_ip);
+        } else {
+            self.events.push(crate::convert::event_row_from_observed(
+                &obs.connection,
+                &obs.process,
+                &obs.verdict,
+            ));
         }
         record(&self.stats, obs.verdict.action);
         publish_observation(&self.observed_tx, obs);
@@ -1057,7 +1058,7 @@ enum PacketOutcome {
     /// Immediate verdict with nothing to observe (self traffic, packets we
     /// can't parse). Not counted in stats.
     Silent(NfqVerdict),
-    /// Parsed decision, committed and counted by the final delivery gate.
+    /// Parsed decision, verdicted, recorded and counted by [`Worker::deliver`].
     Deliver {
         connection: Connection,
         process: Process,
@@ -1975,7 +1976,7 @@ mod tests {
             .unwrap()
             .handle_message(FakeMsg::new(7, tcp_packet(443)))
             .unwrap();
-        let rows = h.store.query_events(10, 0, Default::default()).unwrap();
+        let rows: Vec<_> = std::iter::from_fn(|| h.events.try_recv().ok()).collect();
         assert_eq!(
             rows.len(),
             1,
@@ -2276,8 +2277,6 @@ mod tests {
         modes: Vec<bool>,
         /// recv calls, so a test can tell a turning loop from a stuck one.
         recv_calls: u64,
-        audit_probe: Option<crate::storage::RuleStore>,
-        audited_at_verdict: Vec<usize>,
     }
 
     struct FakeQueue {
@@ -2303,15 +2302,7 @@ mod tests {
 
         fn verdict(&mut self, msg: FakeMsg) -> std::io::Result<()> {
             let verdict = msg.verdict.expect("worker verdicted without a verdict");
-            let mut log = self.log.lock().unwrap();
-            if let Some(store) = &log.audit_probe {
-                let count = store
-                    .query_events(100, 0, Default::default())
-                    .unwrap()
-                    .len();
-                log.audited_at_verdict.push(count);
-            }
-            log.verdicts.push((msg.id, verdict));
+            self.log.lock().unwrap().verdicts.push((msg.id, verdict));
             Ok(())
         }
     }
@@ -2341,7 +2332,8 @@ mod tests {
         verdict_tx: Option<VerdictTx>,
         prompt_rx: mpsc::Receiver<PromptRequest>,
         observed_rx: broadcast::Receiver<ObservedConnection>,
-        store: crate::storage::RuleStore,
+        /// The event writer's end of the worker's [`EventSink`].
+        events: mpsc::Receiver<crate::storage::EventRow>,
     }
 
     impl LoopHarness {
@@ -2355,7 +2347,7 @@ mod tests {
             let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
             let (observed_tx, observed_rx) = broadcast::channel(16);
             let stats = Stats::new();
-            let store = RuleStore::open_in_memory().unwrap();
+            let (sink, events) = EventSink::channel(256);
             let stop = Arc::new(AtomicBool::new(false));
             let worker = Worker {
                 queue: FakeQueue {
@@ -2369,7 +2361,7 @@ mod tests {
                 verdict_rx,
                 observed_tx,
                 stats: stats.clone(),
-                store: store.clone(),
+                events: sink,
                 dns: Box::new(StubDns {
                     self_pid: None,
                     host: None,
@@ -2396,15 +2388,20 @@ mod tests {
                 verdict_tx: Some(verdict_tx),
                 prompt_rx,
                 observed_rx,
-                store,
+                events,
             }
         }
 
-        fn with_store(mut self, store: crate::storage::RuleStore) -> Self {
-            self.log.lock().unwrap().audit_probe = Some(store.clone());
-            self.worker().store = store.clone();
-            self.store = store;
+        fn with_event_queue_depth(mut self, depth: usize) -> Self {
+            let (sink, events) = EventSink::channel(depth);
+            self.worker().events = sink;
+            self.events = events;
             self
+        }
+
+        /// Every row the worker has queued for the event writer so far.
+        fn audited(&mut self) -> Vec<crate::storage::EventRow> {
+            std::iter::from_fn(|| self.events.try_recv().ok()).collect()
         }
 
         fn with_tuning(mut self, tuning: Tuning) -> Self {
@@ -2487,25 +2484,22 @@ mod tests {
     }
 
     #[test]
-    fn parsed_refusals_commit_before_the_verdict_and_live_feed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.db");
-        let store = crate::storage::RuleStore::open(&path).unwrap();
+    fn parsed_refusals_are_queued_for_the_event_writer() {
         let mut reject = deny_port_rule(80);
         reject.action = Action::Reject;
-        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443), reject], dp_deny())
-            .with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443), reject], dp_deny());
         h.worker()
             .handle_message(FakeMsg::new(1, tcp_packet(443)))
             .unwrap();
         h.worker()
             .handle_message(FakeMsg::new(2, tcp_packet(80)))
             .unwrap();
-        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1, 2]);
         assert_eq!(
             h.verdicts(),
             vec![(1, NfqVerdict::Drop), (2, NfqVerdict::Drop)]
         );
+        let actions: Vec<_> = h.audited().into_iter().map(|r| r.action).collect();
+        assert_eq!(actions, vec!["Deny", "Reject"]);
         assert_eq!(
             h.observed_rx.try_recv().unwrap().verdict.action,
             Action::Deny
@@ -2514,65 +2508,40 @@ mod tests {
             h.observed_rx.try_recv().unwrap().verdict.action,
             Action::Reject
         );
-        let reader = rusqlite::Connection::open(&path).unwrap();
-        let count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            count, 2,
-            "commits must be visible to an independent connection"
-        );
-        drop(reader);
-        drop(h);
-        drop(store);
-        assert_eq!(
-            crate::storage::RuleStore::open(&path)
-                .unwrap()
-                .query_events(10, 0, Default::default())
-                .unwrap()
-                .len(),
-            2
-        );
     }
 
     #[test]
-    fn failed_audit_commit_drops_current_packet_and_stops_before_next_allow() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.db");
-        let store = crate::storage::RuleStore::open(&path).unwrap();
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer
-            .execute_batch(
-                "CREATE TRIGGER refuse_audit BEFORE INSERT ON events \
-            BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
-            )
-            .unwrap();
+    fn a_full_event_queue_costs_the_row_not_the_packet_or_the_worker() {
         let mut h = LoopHarness::new(
             vec![
                 Ok(FakeMsg::new(1, tcp_packet(443))),
-                Ok(FakeMsg::new(2, tcp_packet(80))),
+                Ok(FakeMsg::new(2, tcp_packet(443))),
+                Ok(FakeMsg::new(3, tcp_packet(80))),
             ],
             vec![deny_port_rule(443), allow_port_rule(80)],
             dp_deny(),
         )
-        .with_store(store);
+        .with_event_queue_depth(1);
+        let sink = h.worker().events.clone();
         let done = h.start();
-        let result = done.recv_timeout(Duration::from_secs(1));
-        if result.is_err() {
-            h.stop_and_expect_ok(&done);
-        }
-        assert!(result
-            .expect("audit failure must terminate the worker")
-            .is_err());
-        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
-        assert_eq!(h.stats.connections_total(), 0);
-        assert!(h.observed_rx.try_recv().is_err(), "no unaudited live entry");
+        assert!(wait_until(|| h.verdicts().len() == 3));
+        h.stop_and_expect_ok(&done);
+        assert_eq!(
+            h.verdicts(),
+            vec![
+                (1, NfqVerdict::Drop),
+                (2, NfqVerdict::Drop),
+                (3, NfqVerdict::Accept)
+            ]
+        );
+        assert_eq!(sink.dropped(), 1);
+        assert_eq!(h.audited().len(), 1);
+        assert_eq!(h.stats.connections_total(), 3);
     }
 
     #[test]
     fn prompt_refusals_and_unavailable_router_use_the_same_audit_gate() {
-        let store = crate::storage::RuleStore::open_in_memory().unwrap();
-        let mut h = LoopHarness::new(vec![], vec![], dp_deny()).with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
         h.worker()
             .handle_message(FakeMsg::new(1, tcp_packet(443)))
             .unwrap();
@@ -2587,8 +2556,11 @@ mod tests {
         h.worker()
             .handle_message(FakeMsg::new(2, tcp_packet(80)))
             .unwrap();
-        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1, 2]);
-        let rows = store.query_events(10, 0, Default::default()).unwrap();
+        assert_eq!(
+            h.verdicts(),
+            vec![(1, NfqVerdict::Drop), (2, NfqVerdict::Drop)]
+        );
+        let rows = h.audited();
         assert!(rows.iter().any(|r| r.action == "Reject"));
         assert!(rows.iter().any(|r| r.action == "Deny"));
         assert_eq!(h.stats.connections_denied(), 2);
@@ -2635,23 +2607,22 @@ mod tests {
     }
 
     #[test]
-    fn loopback_closed_rules_are_audited_before_release_even_when_paused() {
+    fn loopback_closed_rules_are_audited_even_when_paused() {
         for action in [Action::Deny, Action::Reject] {
             let mut scope = RuleScope::any();
             scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
             let rule = Rule::new("local application refusal", action, scope);
-            let store = RuleStore::open_in_memory().unwrap();
-            let mut h = LoopHarness::new(vec![], vec![rule], dp_deny()).with_store(store);
+            let mut h = LoopHarness::new(vec![], vec![rule], dp_deny());
             h.stats.set_paused(true);
             let mut payload = tcp_packet(53);
             // Policy needs only ports. No complete TCP header keeps refusal
-            // injection inert while testing the real verdict and audit gate.
+            // injection inert while testing the real verdict and audit path.
             payload.truncate(24);
             let mut msg = FakeMsg::new(1, payload);
             msg.outdev = 1;
             h.worker().handle_message(msg).unwrap();
             assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
-            assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1]);
+            assert_eq!(h.audited().len(), 1);
             assert_eq!(h.observed_rx.try_recv().unwrap().verdict.action, action);
             assert!(h.prompt_rx.try_recv().is_err());
         }
@@ -2662,8 +2633,7 @@ mod tests {
         let mut scope = RuleScope::any();
         scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         let rule = Rule::new("local application refusal", Action::Deny, scope);
-        let store = RuleStore::open_in_memory().unwrap();
-        let mut h = LoopHarness::new(vec![], vec![rule], dp_deny()).with_store(store);
+        let mut h = LoopHarness::new(vec![], vec![rule], dp_deny());
         h.worker().resolver = Box::new(StubResolver {
             pid: None,
             process: Process::unknown(0),
@@ -2674,7 +2644,7 @@ mod tests {
         msg.outdev = 1;
         h.worker().handle_message(msg).unwrap();
         assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
-        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1]);
+        assert_eq!(h.audited().len(), 1);
         assert!(h.prompt_rx.try_recv().is_err());
     }
 
@@ -2709,9 +2679,7 @@ mod tests {
             }
         }
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let store = RuleStore::open_in_memory().unwrap();
-        let mut h = LoopHarness::new(vec![], vec![allow_port_rule(443)], dp_deny())
-            .with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![allow_port_rule(443)], dp_deny());
         h.worker().dns = Box::new(CountingDns(calls.clone()));
         h.worker()
             .handle_message(FakeMsg::new(1, tcp_packet(443)))
@@ -2723,17 +2691,12 @@ mod tests {
             h.observed_rx.try_recv().unwrap().verdict.action,
             Action::Allow
         );
-        assert!(store
-            .query_events(10, 0, Default::default())
-            .unwrap()
-            .is_empty());
+        assert!(h.audited().is_empty(), "Allow rows come off the live feed");
     }
 
     #[test]
     fn live_feed_lag_does_not_lose_parsed_refusal_audits() {
-        let store = RuleStore::open_in_memory().unwrap();
-        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443)], dp_deny())
-            .with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443)], dp_deny());
         for id in 0..64 {
             h.worker()
                 .handle_message(FakeMsg::new(id, tcp_packet(443)))
@@ -2743,13 +2706,7 @@ mod tests {
             h.observed_rx.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(_))
         ));
-        assert_eq!(
-            store
-                .query_events(100, 0, Default::default())
-                .unwrap()
-                .len(),
-            64
-        );
+        assert_eq!(h.audited().len(), 64);
         assert_eq!(h.verdicts().len(), 64);
     }
 

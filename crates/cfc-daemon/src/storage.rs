@@ -450,10 +450,7 @@ impl RuleStore {
         if batch.is_empty() {
             return Ok(());
         }
-        let conn = self
-            .conn
-            .try_lock_for(std::time::Duration::from_millis(250))
-            .context("audit storage mutex unavailable within 250ms")?;
+        let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -622,24 +619,6 @@ impl RuleStore {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn event_commit_does_not_wait_indefinitely_for_the_store_mutex() {
-        let store = RuleStore::open_in_memory().unwrap();
-        let held = store.conn.lock();
-        let writer = store.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let task = std::thread::spawn(move || {
-            tx.send(writer.insert_events(&[sample_event(1, "test", "Deny")]))
-                .unwrap();
-        });
-        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
-        drop(held);
-        task.join().unwrap();
-        assert!(result
-            .expect("audit lock acquisition must be bounded")
-            .is_err());
-    }
 
     #[test]
     fn production_storage_requires_a_file_and_bounded_sqlite_contention() {

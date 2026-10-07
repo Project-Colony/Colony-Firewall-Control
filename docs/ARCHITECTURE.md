@@ -276,22 +276,28 @@ merged at the very last step, when the kernel is told to DROP.
 
 ## Event log
 
-Parsed NFQUEUE policy refusals commit to SQLite with WAL/FULL before verdict
-delivery, the journald message and live publication. Commit failure drops the
-current packet and ends the worker, so later queued packets cannot be allowed
-by that worker after an unaudited refusal.
+Every verdict is persisted off the packet path. The worker verdicts a parsed
+refusal first, logs it to the journal, then queues its row straight into the
+event writer's bounded queue with `try_send`. Allow rows reach the same queue
+through a feeder on the live feed. The writer commits in batches with WAL and
+synchronous=FULL.
 
 ```
-parsed Deny/Reject --> durable events commit --> verdict --> journal/live feed
+parsed Deny/Reject --> verdict --> journal --> bounded queue --> async writer
+                                   \-> live feed
 Allow             --> verdict --> live feed --> bounded queue --> async writer
 ```
 
-The live feed and async Allow history can lose observations under load. The
-feeder uses `try_send` and logs lag or drops; it skips already committed refusals.
-Refusal commits can delay delivery. Database mutex and SQLite busy waits are
-each limited to 250 ms; filesystem I/O and fsync are not bounded by these limits.
-This gate does not audit malformed packets, nftables drops or kernel-ring
-refusals. It is not a universal lossless audit or protection against root
+Nothing on the worker thread waits for the database. An fsync per refusal
+there let a flood of refused packets stall every new flow on the machine, and
+a failed or slow commit used to end the worker, which dropped all new
+non-loopback traffic until systemd restarted the daemon. Now a full queue,
+feeder lag or a failed batch commit (full disk, I/O error) costs rows instead:
+they are counted and logged ("events were not persisted", "event log write
+failed"), and the journal line still names each refusal. Rows still in the
+writer's batch, at most about a second of them, are lost on a crash, a power
+cut or a stop. This does not audit malformed packets, nftables drops or
+kernel-ring refusals. It is not a lossless audit or protection against root
 rewriting the database.
 The table is pruned to `[events] max_rows` every 60 seconds. `ListEvents`
 queries it with executable-substring, action and since filters; `cfc log` is
@@ -340,14 +346,12 @@ with the calling uid and pid. See [HARDENING.md](HARDENING.md).
   Prompts go out on a broadcast channel; verdicts come back on a dedicated
   channel the worker polls.
 - **ipc server** - tonic gRPC over the Unix socket.
-- **event writer** - batches Allow observations into SQLite and prunes on a timer.
-  Parsed NFQUEUE Deny/Reject decisions commit synchronously before their verdict
-  and live publication. Audit failure drops the packet and ends the worker.
+- **event writer** - batches every verdict into SQLite and prunes on a timer.
+  The worker queues refusals into it after their verdict and never waits for
+  it; rows it cannot take are counted and logged.
 - **storage** - sqlite behind a mutex. Reads are served from the in-memory
-  `RuleSet`. Production startup requires WAL with synchronous=FULL. Refusal
-  commits are on the packet path; lock and SQLite busy waits are each limited
-  to 250 ms. These limits do not bound filesystem I/O or fsync. Kernel/nftables
-  drops and malformed packets are not covered by this durable delivery gate.
+  `RuleSet`. Production startup requires WAL with synchronous=FULL. The packet
+  path never touches it.
 
 ## Lifecycle and systemd integration
 

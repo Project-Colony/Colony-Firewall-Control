@@ -328,11 +328,11 @@ log the action, its source, the executable, pid, uid and destination:
 journalctl -u colony-firewalld -g 'connection blocked'
 ```
 
-This line is emitted after the refusal row commits and verdict delivery succeeds.
-A failed commit drops the packet and ends the worker before live publication.
+This line is emitted once the verdict is delivered, before the row is queued
+for the database.
 
-**3. The events table.** Parsed NFQUEUE refusals commit synchronously;
-Allow observations use best-effort asynchronous persistence. Query with `cfc log`:
+**3. The events table.** Every verdict is written by an asynchronous writer
+that commits in batches; no packet waits for it. Query with `cfc log`:
 
 ```sh
 cfc log --since 24h --action deny
@@ -340,11 +340,27 @@ cfc log --exe firefox --limit 200
 cfc log --json --since 1h | jq -r '.[] | .dst_host // .dst_ip' | sort | uniq -c
 ```
 
-Refusal commits can delay a verdict. WAL and synchronous=FULL are required at
-startup. Mutex and SQLite busy waits each have a 250 ms limit, which does not
-bound filesystem I/O or fsync. Allow rows can be dropped when their queue fills;
-that loss is logged. Malformed packets, nftables drops and in-kernel refusals
-are not covered by this durable NFQUEUE gate. Retention is a row cap, not a time window:
+WAL and synchronous=FULL are required at startup. Rows are lost, never
+waited for, when the writer's queue is full or a batch commit fails (a full
+disk, an I/O error); the loss is counted and logged:
+
+```sh
+journalctl -u colony-firewalld -g 'events were not persisted|event log write failed'
+```
+
+Up to about a second of rows still waiting for their batch is lost on a crash,
+a power cut or a stop. Malformed packets, nftables drops and in-kernel refusals
+are not recorded at all.
+
+Both journal sources share journald's per-unit rate limit (by default 10000
+messages per 30 seconds). A sustained flood of refused packets can exceed it,
+and journald then drops this unit's lines for the rest of that interval,
+including the mutating-RPC lines above; it logs how many it suppressed. Raise
+`LogRateLimitIntervalSec=`/`LogRateLimitBurst=` in a drop-in for the unit if
+that trail matters more than journal volume. The same flood fills the events
+table, whose oldest rows the row cap below evicts.
+
+Retention is a row cap, not a time window:
 `[events] max_rows` (default 100000), pruned every 60 seconds. Raise it
 if you want a longer history, and remember the table lives in
 `/var/lib/colony-firewall/rules.db` - back it up or ship it off the host
@@ -434,7 +450,7 @@ without `bypass` - is in
 Read it before enabling enforcement on a machine you only reach over SSH.
 
 `[nfqueue] fail_open` must be `false`; `true` is rejected. Queue overflow
-must drop traffic instead of bypassing policy and durable refusal auditing.
+must drop traffic instead of bypassing policy and refusal auditing.
 The nftables `bypass` keyword governs missing listeners; the shipped snippet
 uses it only on the loopback rule (`oifname "lo"`).
 

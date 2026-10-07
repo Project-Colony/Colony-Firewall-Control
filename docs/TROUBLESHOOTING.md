@@ -148,7 +148,7 @@ improvement working, and the reason is in the journal:
 journalctl -u colony-firewalld -b --no-pager | tail -40
 ```
 
-The daemon prints hint lines next to the failure. Three causes:
+The daemon prints hint lines next to the failure. Four causes:
 
 **Missing capability.** `failed to open NFQUEUE socket: ...` followed by
 a `CAP_NET_ADMIN` hint. Run it via the bundled unit rather than by hand;
@@ -174,6 +174,24 @@ Either stop the other consumer, or move this daemon to a free number in
 `[nfqueue] queue_num` **and** change the matching `queue num N` in your
 nftables rule. The two must agree or you get the same lockout as a dead
 daemon.
+
+**The rule database cannot be opened.** Startup opens
+`/var/lib/colony-firewall/rules.db` (`[storage] path`) before anything
+else, so these fail on every start:
+
+```sh
+journalctl -u colony-firewalld -b -g 'opening rule store|durable storage requires|newer than this daemon supports'
+```
+
+- `durable storage requires WAL` or `synchronous=FULL`: the path is on a
+  filesystem that cannot hold a WAL journal (a network share, for one), or
+  outside the unit's `ReadWritePaths`. Keep `[storage] path` on local disk
+  under `/var/lib/colony-firewall`.
+- `newer than this daemon supports`: the package was downgraded. Reinstall
+  the newer one, or restore a backup of `rules.db` that the older version
+  wrote.
+- Any other error under `opening rule store` or `purging transient rules`:
+  usually a full `/var`. Free space and start the daemon again.
 
 Once it starts cleanly the unit reports ready only after both the queue
 and the control socket are bound, so `systemctl is-active` genuinely
@@ -462,8 +480,8 @@ Watchdog timeout (limit 30s)!
 ```
 
 in the journal means the worker stopped responding, not that the machine
-was idle - a worker parked in a blocking `recv` with nothing to do is
-explicitly treated as healthy, so an idle system is never killed. Look
+was idle - an idle worker still wakes every few milliseconds to check
+for work, and that counts as progress, so an idle system is never killed. Look
 for the daemon's own complaint just before the restart:
 
 ```sh
@@ -480,8 +498,17 @@ for a stalled one, and under the fail-closed nftables rule a stalled
 daemon is a dead network.
 
 Restarts *without* a watchdog message are ordinary failures -
-`Restart=on-failure` retrying a bind that keeps failing. See "The daemon
-exits immediately" above.
+`Restart=on-failure` retrying a start that keeps failing, such as a queue
+bind or the rule database. See "The daemon exits immediately" above. A
+full disk at runtime does not restart the daemon: it costs event-log rows,
+which the journal reports as `event log write failed`.
+
+If manual restarts pile on top of the automatic ones, systemd can give up
+with `start request repeated too quickly`. Fix the cause, then:
+
+```sh
+sudo systemctl reset-failed colony-firewalld && sudo systemctl start colony-firewalld
+```
 
 ## Some rules are not being enforced
 

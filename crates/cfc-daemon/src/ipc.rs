@@ -1143,51 +1143,96 @@ fn secure_socket(path: &Path, ipc: &IpcConfig) -> SocketAuth {
 // Event persistence pipeline
 // ---------------------------------------------------------------------------
 
-/// Persists Allow observations. Deny/Reject are committed synchronously by
-/// the NFQUEUE delivery gate before publication and must not be duplicated.
+/// The bounded queue into the event writer.
 ///
-/// Two tasks keep Allow observation writes off the datapath:
+/// `push` never waits. The packet worker delivers its verdict first and
+/// records it second, so a slow fsync, a long `ListEvents` holding the store
+/// mutex or a full disk costs audit rows - counted and logged - and never
+/// stalls or ends the datapath. Every refusal is also logged to the journal
+/// as "connection blocked" before it is queued.
+#[derive(Clone)]
+pub struct EventSink {
+    tx: mpsc::Sender<EventRow>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl EventSink {
+    pub(crate) fn channel(depth: usize) -> (Self, mpsc::Receiver<EventRow>) {
+        let (tx, rx) = mpsc::channel(depth);
+        let sink = Self {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        (sink, rx)
+    }
+
+    /// Queues one row for the writer, or counts it as dropped.
+    pub fn push(&self, row: EventRow) {
+        if self.tx.try_send(row).is_err() {
+            count_dropped(&self.dropped, 1, "event log queue full");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Adds `n` to the drop counter and warns on the first drop and every
+/// `EVENT_DROP_LOG_EVERY` after it, rather than once per row.
+fn count_dropped(dropped: &AtomicU64, n: u64, why: &str) {
+    let before = dropped.fetch_add(n, Ordering::Relaxed);
+    let total = before + n;
+    if before == 0 || before / EVENT_DROP_LOG_EVERY != total / EVENT_DROP_LOG_EVERY {
+        warn!(
+            dropped = total,
+            "{why}; events were not persisted (the packet path never waits for persistence)"
+        );
+    }
+}
+
+/// Starts the event persistence pipeline and returns the sink the packet
+/// worker queues its refusals into.
 ///
-/// - a *feeder* that converts broadcast items to [`EventRow`]s and
-///   `try_send`s them into a bounded queue, counting (never awaiting on)
-///   drops;
-/// - a *writer* that drains the queue in batches of `EVENT_BATCH_ROWS` or
-///   every second, whichever comes first, and trims the table to
-///   `max_rows` once a minute.
+/// - Refusals are pushed straight into the bounded queue by the worker, so
+///   they never depend on the lossy live feed.
+/// - A *feeder* converts Allow observations from the live feed to
+///   [`EventRow`]s and pushes them the same way.
+/// - A *writer* drains the queue in batches of `EVENT_BATCH_ROWS` or every
+///   second, whichever comes first, and trims the table to `max_rows` once a
+///   minute.
+///
+/// Every row lost on the way (queue full, feeder lag, failed batch commit)
+/// is counted in one counter and logged.
 pub fn spawn_event_pipeline(
     store: RuleStore,
     observed_tx: &broadcast::Sender<ObservedConnection>,
     max_rows: u32,
-) {
-    let (tx, rx) = mpsc::channel::<EventRow>(EVENT_QUEUE_DEPTH);
+) -> EventSink {
+    let (sink, rx) = EventSink::channel(EVENT_QUEUE_DEPTH);
     let mut sub = observed_tx.subscribe();
 
+    let feeder = sink.clone();
     tokio::spawn(async move {
-        let dropped = AtomicU64::new(0);
         loop {
             match sub.recv().await {
                 Ok(obs) => {
                     if obs.verdict.action != cfc_core::Action::Allow {
                         continue;
                     }
-                    let row = convert::event_row_from_observed(
+                    feeder.push(convert::event_row_from_observed(
                         &obs.connection,
                         &obs.process,
                         &obs.verdict,
-                    );
-                    if tx.try_send(row).is_err() {
-                        let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n == 1 || n.is_multiple_of(EVENT_DROP_LOG_EVERY) {
-                            warn!(
-                                dropped = n,
-                                "event log queue full; dropping events (the packet path is \
-                                 never blocked for persistence)"
-                            );
-                        }
-                    }
+                    ));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(missed = n, "event log feeder lagged behind the live feed");
+                    count_dropped(
+                        &feeder.dropped,
+                        n,
+                        "event log feeder lagged behind the live feed",
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1195,10 +1240,16 @@ pub fn spawn_event_pipeline(
         info!("event log feeder stopped: live feed closed");
     });
 
-    tokio::spawn(event_writer_task(store, rx, max_rows));
+    tokio::spawn(event_writer_task(store, rx, sink.dropped.clone(), max_rows));
+    sink
 }
 
-async fn event_writer_task(store: RuleStore, mut rx: mpsc::Receiver<EventRow>, max_rows: u32) {
+async fn event_writer_task(
+    store: RuleStore,
+    mut rx: mpsc::Receiver<EventRow>,
+    dropped: Arc<AtomicU64>,
+    max_rows: u32,
+) {
     let mut batch: Vec<EventRow> = Vec::with_capacity(EVENT_BATCH_ROWS);
     let mut flush =
         tokio::time::interval(std::time::Duration::from_secs(EVENT_BATCH_INTERVAL_SECS));
@@ -1213,16 +1264,16 @@ async fn event_writer_task(store: RuleStore, mut rx: mpsc::Receiver<EventRow>, m
                 Some(row) => {
                     batch.push(row);
                     if batch.len() >= EVENT_BATCH_ROWS {
-                        write_batch(&store, &mut batch);
+                        write_batch(&store, &mut batch, &dropped);
                     }
                 }
                 None => {
-                    write_batch(&store, &mut batch);
+                    write_batch(&store, &mut batch, &dropped);
                     info!("event log writer stopped: queue closed");
                     return;
                 }
             },
-            _ = flush.tick() => write_batch(&store, &mut batch),
+            _ = flush.tick() => write_batch(&store, &mut batch, &dropped),
             _ = prune.tick() => match store.prune_events(max_rows) {
                 Ok(n) if n > 0 => tracing::debug!(removed = n, cap = max_rows, "pruned old events"),
                 Ok(_) => {}
@@ -1232,12 +1283,17 @@ async fn event_writer_task(store: RuleStore, mut rx: mpsc::Receiver<EventRow>, m
     }
 }
 
-fn write_batch(store: &RuleStore, batch: &mut Vec<EventRow>) {
+fn write_batch(store: &RuleStore, batch: &mut Vec<EventRow>, dropped: &AtomicU64) {
     if batch.is_empty() {
         return;
     }
     if let Err(e) = store.insert_events(batch) {
-        warn!(rows = batch.len(), "event log write failed: {e}");
+        let total = dropped.fetch_add(batch.len() as u64, Ordering::Relaxed) + batch.len() as u64;
+        warn!(
+            rows = batch.len(),
+            dropped = total,
+            "event log write failed: {e:#}"
+        );
     }
     batch.clear();
 }
@@ -1716,17 +1772,17 @@ mod tests {
     async fn event_pipeline_persists_the_live_feed() {
         let store = RuleStore::open_in_memory().unwrap();
         let (tx, _rx) = broadcast::channel(64);
-        spawn_event_pipeline(store.clone(), &tx, 1000);
+        let sink = spawn_event_pipeline(store.clone(), &tx, 1000);
 
         tx.send(observed(443, cfc_core::Action::Allow)).unwrap();
+        // The worker queues a refusal itself and then publishes it; the
+        // feeder must not record it a second time.
         let blocked = observed(80, cfc_core::Action::Deny);
-        store
-            .insert_events(&[convert::event_row_from_observed(
-                &blocked.connection,
-                &blocked.process,
-                &blocked.verdict,
-            )])
-            .unwrap();
+        sink.push(convert::event_row_from_observed(
+            &blocked.connection,
+            &blocked.process,
+            &blocked.verdict,
+        ));
         tx.send(blocked).unwrap();
 
         // Well past the batch interval; paused time auto-advances.
@@ -1775,6 +1831,42 @@ mod tests {
 
         let rows = store.query_events(10, 0, EventFilter::default()).unwrap();
         assert_eq!(rows.len(), 2, "table should be trimmed to max_rows");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_store_costs_counted_rows_never_a_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let store = RuleStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_audit BEFORE INSERT ON events \
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let (tx, _rx) = broadcast::channel(64);
+        let sink = spawn_event_pipeline(store.clone(), &tx, 1000);
+        let blocked = observed(80, cfc_core::Action::Deny);
+        let row = convert::event_row_from_observed(
+            &blocked.connection,
+            &blocked.process,
+            &blocked.verdict,
+        );
+        for _ in 0..3 {
+            sink.push(row.clone());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            EVENT_BATCH_INTERVAL_SECS + 1,
+        ))
+        .await;
+        assert_eq!(sink.dropped(), 3);
+
+        // A full queue drops the row at once instead of waiting for room.
+        let (full, _rx) = EventSink::channel(1);
+        full.push(row.clone());
+        full.push(row);
+        assert_eq!(full.dropped(), 1);
     }
 
     #[test]
