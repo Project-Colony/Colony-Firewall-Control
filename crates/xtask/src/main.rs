@@ -106,8 +106,6 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     // sock_addr programs; the loader tries the cookie ones first
     "cfc_connect4_basic",
     "cfc_connect6_basic",
-    "cfc_sendmsg4",
-    "cfc_sendmsg6",
     // maps
     "EXEC_EVENTS",
     "EXIT_EVENTS",
@@ -122,8 +120,8 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     // "is it worth hashing?" guard
     "EXE_RULES",
     "EXE_RULES_ON",
-    // the fast path: the grant map, the deadline the daemon's heartbeat
-    // refreshes, the mark to set, and the ring the grants are reported on
+    // legacy Fast Allow maps: pinned by name so the daemon can disarm what an
+    // older release armed; gone with the kernel side at the next ABI bump
     "FAST_ALLOW",
     "FAST_ALLOW_UNTIL",
     "FAST_ALLOW_MARK",

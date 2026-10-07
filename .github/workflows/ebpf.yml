@@ -513,19 +513,6 @@ jobs:
             grep -o 'verified_insns: [^ ]* = [0-9]*' guest.log | while read -r _ p _ n; do
               echo "| \`${p}\` verified insns | ${n} |"
             done || true
-            # The fast path's facts as this guest observed them and the
-            # decision the eligibility ladder takes on them with the feature
-            # on. Not what `cfc status` would say on a real host of this
-            # kernel: the guest mounts no bpffs, so `lifecycle_pinned` is
-            # false here on every kernel and the deadline shown is the reduced
-            # one wherever a real host would pin. The other two facts -
-            # `exit_precise` and the capability - are the kernel's own.
-            # `tr -d '\r'`: the guest console writes CRLF, and a CR inside a
-            # table cell ends the markdown row early. `|| true` as above: a
-            # guest that died before printing this already failed on the marker.
-            grep -o 'fast path on this kernel: .*' guest.log | tr -d '\r' | tail -1 | while read -r line; do
-              echo "| fast path | ${line#fast path on this kernel: } |"
-            done || true
           } >> "${GITHUB_STEP_SUMMARY}"
 
           # Wall clock, not just instruction count. They are different
