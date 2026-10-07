@@ -11,8 +11,9 @@ protocol for whoever has such a host. Run it once, report what you see, and
 ## What you need
 
 - A Rocky 9 or Fedora VM with SELinux enforcing (`getenforce` says
-  `Enforcing`). A VM, not your workstation: the ruleset is fail-closed, and a
-  policy gap in the wrong group takes the machine's outbound network down.
+  `Enforcing`). A VM, not your workstation: the ruleset is fail-closed
+  (except new loopback flows), and a policy gap in the wrong group takes the
+  machine's outbound network down.
   For the same reason, have **console access**, not just SSH.
 - The audit tooling: `dnf install audit policycoreutils-python-utils`.
   `semanage` and `audit2allow` live in the second package, and on a minimal
@@ -37,8 +38,9 @@ AVC in the audit log **without being enforced** - observed, not suffered.
 Why that ordering matters here more than for most policies, in the module's
 own words: a denied `netlink_netfilter` socket is not a degraded feature, it
 is a daemon that exits before `READY=1` - and because the nftables ruleset is
-fail-closed (`ct state new queue num 0`, no `bypass`), a daemon that does not
-come up takes the machine's outbound network with it. Running the first pass
+fail-closed for everything except new loopback flows, which are allowed while
+no daemon listens, a daemon that does not come up takes the machine's
+non-loopback outbound network with it. Running the first pass
 permissive converts that outage into a log line.
 
 Dontaudit rules hide denials, and this module carries some

@@ -275,8 +275,10 @@ managers, or a later external ruleset flush. Early unmatched flows use
 established and related traffic retains its connection-wide authorization.
 Passed or inherited sockets are not reauthorized for each sending executable.
 A current descriptor holder does not prove which process sent a packet.
-New direct loopback flows follow explicit rules; unmatched local IPC is allowed
-without prompting. An allowed local resolver or proxy can still relay remote
+While the daemon runs, new direct loopback flows follow explicit rules;
+unmatched local IPC is allowed without prompting. While no daemon listens on
+the queue, new loopback flows are allowed (`queue ... bypass` on `lo` only), so
+the systemd-resolved stub and other local services keep working. An allowed local resolver or proxy can still relay remote
 traffic. CFC cannot establish the originating application's identity from
 remote flows delegated through local brokers, including AF_UNIX and D-Bus.
 
@@ -295,8 +297,9 @@ cfc status     # "enforcing yes", and it warns on stderr when it is not
 ```
 
 > **WARNING - remote / SSH machines:** the shipped nftables snippet is
-> fail-closed. If the daemon is down while the rule is loaded, **all new
-> outbound connections drop**, and a mistake can lock you out of a box you
+> fail-closed for everything except new loopback flows, which are allowed
+> while no daemon listens. If the daemon is down while the rule is loaded,
+> **all new non-loopback outbound connections drop**, and a mistake can lock you out of a box you
 > only reach over SSH. Read
 > [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - specifically the
 > SSH exemption and dead-man's-switch patterns - *before* enabling

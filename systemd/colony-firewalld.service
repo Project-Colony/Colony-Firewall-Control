@@ -54,8 +54,9 @@ TimeoutStopSec=15
 #   without CAP_DAC_READ_SEARCH  every connection resolves to `exe=<unknown>
 #                                pid=0`, so no exe-scoped rule can ever match
 #                                and a fail-closed ruleset denies the whole
-#                                machine's traffic. No warning at all: from the
-#                                daemon's side, nothing failed.
+#                                machine's non-loopback traffic. No warning
+#                                at all: from the daemon's side, nothing
+#                                failed.
 #
 # CAP_DAC_OVERRIDE is deliberately NOT granted: read-and-search is all this
 # needs, and the write half is what would let the daemon edit files it does not

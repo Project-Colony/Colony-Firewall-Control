@@ -101,8 +101,9 @@ allow colony_firewalld_t self:unix_dgram_socket create_socket_perms;
 #
 # This is the group that must not fail. A denial here is not a degraded
 # feature, it is a daemon that exits before READY=1 - and because the nftables
-# ruleset is fail-closed (`ct state new queue num 0`, no `bypass`), a daemon
-# that does not come up takes the machine's outbound network with it.
+# ruleset is fail-closed for everything except new loopback flows, which are
+# allowed while no daemon listens, a daemon that does not come up takes the
+# machine's non-loopback outbound network with it.
 #
 ########################################
 

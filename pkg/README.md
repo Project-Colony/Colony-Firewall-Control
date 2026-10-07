@@ -27,7 +27,7 @@ Key design points:
 - **`colony-firewall-nft.service`** makes enforcement persistent
   (`nft -f` the snippet on start, `nft delete table inet colony_firewall`
   on explicit nft-unit stop). The table survives daemon restarts and stops,
-  so new flows fail closed while its queue listener is absent. Upgrades reload
+  so new non-loopback flows fail closed while its queue listener is absent. Upgrades reload
   active nft units atomically and leave inactive inbound filtering opt-in.
   The daemon requires this unit before initialization. Enabling either nft
   unit creates native `Requires` links from NetworkManager and

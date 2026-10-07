@@ -37,11 +37,15 @@ this check. `CFC_INBOUND_FORCE=1` remains the explicit console override.
 
 ## Testing over SSH without locking yourself out
 
-The shipped nftables snippet is **fail-closed**: `queue num 0` without the
-`bypass` keyword means that if nothing is listening on NFQUEUE 0 (daemon
-stopped, crashed, or not yet started), the kernel drops every *new*
-outbound connection. Your established SSH session survives (`ct state new`
-only matches new flows), but the moment it drops you cannot open a new one.
+The shipped nftables snippet is **fail-closed for everything except new
+loopback flows, which are allowed while no daemon listens**: the final
+`queue num 0` without the `bypass` keyword means that if nothing is
+listening on NFQUEUE 0 (daemon stopped, crashed, or not yet started), the
+kernel drops every *new* non-loopback outbound connection. Only the rule
+just above it, `oifname "lo" ct state new queue num 0 bypass`, lets new
+loopback flows through in that state. Your established SSH session
+survives (`ct state new` only matches new flows), but the moment it drops
+you cannot open a new one.
 
 Three layers of protection, use all of them the first time:
 
@@ -98,8 +102,8 @@ cfc status
 ```
 
 If `systemctl` shows the unit dead while the nftables rule is loaded, you
-are in the fail-closed state described above: packets are queued to NFQUEUE
-0 and nobody answers. Start the daemon or delete the table.
+are in the fail-closed state described above: non-loopback packets are
+queued to NFQUEUE 0 and nobody answers. Start the daemon or delete the table.
 
 **Is the nftables table actually loaded?**
 
@@ -120,7 +124,8 @@ If they differ, packets queue to a number nobody consumes - same lockout
 as a dead daemon.
 
 **The fail-open alternative.** If you would rather lose filtering than
-lose the network when the daemon is down, add the `bypass` keyword:
+lose the network when the daemon is down, add the `bypass` keyword to the
+final queue rule too:
 
 ```
 ct state new queue num 0 bypass
@@ -237,27 +242,26 @@ them apart from a bad argument (2) or a missing rule (3).
 
 The snippet's `output` hook matches loopback traffic too. On systems using
 systemd-resolved, every DNS query goes to the stub resolver at
-`127.0.0.53:53` - over loopback - so each lookup gets intercepted and can
-prompt, time out, or (under `strict`) be denied. The symptom is DNS that
-is slow, flaky, or dead while direct-by-IP connections work.
-
-Exempt loopback above the queue rule:
+`127.0.0.53:53` - over loopback. The shipped ruleset queues new loopback
+flows with their own rule, just above the final queue rule:
 
 ```
-table inet colony_firewall {
-    chain output {
-        type filter hook output priority 0; policy accept;
-        oifname lo accept
-        ct state new queue num 0
-    }
-}
+oifname "lo" ct state new queue num 0 bypass
+ct state new queue num 0
 ```
 
-Loopback traffic never leaves the machine, so exempting it costs you no
-outbound coverage. The ruleset installed by the companion
-`colony-firewall-nft.service` unit includes this exemption; the caveat
-applies mainly if you carry an older copy of the snippet in your own
-`/etc/nftables.conf`.
+While the daemon runs, it judges them like any other flow: explicit rules
+apply, and unmatched local IPC (the stub resolver, CUPS, a local dev
+server) is allowed without prompting. While nothing listens on the queue,
+`bypass` makes the kernel accept them, so local DNS and IPC keep working
+when the daemon is down. Every non-loopback new flow still meets the
+fail-closed rule.
+
+If DNS is slow, flaky, or dead while direct-by-IP connections work, check
+for an older copy of the snippet in your own `/etc/nftables.conf`: one
+without the loopback rule drops the stub resolver whenever the daemon is
+down, and one with an explicit `oifname lo accept` skips the daemon for
+loopback entirely.
 
 Note the daemon already exempts its *own* reverse-DNS lookups internally
 (they would otherwise deadlock the queue); the loopback rule is about
@@ -267,10 +271,10 @@ everyone else's DNS.
 
 What happens to a **new outbound connection** in each state:
 
-| State                              | Without `bypass` (shipped)     | With `bypass`                  |
+| State                              | Without `bypass` on the final rule (shipped) | With `bypass`        |
 |------------------------------------|--------------------------------|--------------------------------|
 | Daemon up, nft rule loaded         | Filtered: rules, then prompts, then profile fallback | Same |
-| Daemon down, nft rule loaded       | **Dropped. Total outbound lockout.** | Allowed, unfiltered (silent) |
+| Daemon down, nft rule loaded       | **Dropped. Outbound lockout** (new loopback flows still allowed) | Allowed, unfiltered (silent) |
 | Daemon up, nft rule *not* loaded   | Allowed, unfiltered (silent - daemon sees nothing) | Same |
 | Daemon paused (`cfc pause`)        | Rules still enforced; only *unmatched* flows pass instead of prompting. Auto-resumes | Same |
 

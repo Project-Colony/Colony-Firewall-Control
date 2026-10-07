@@ -243,15 +243,16 @@ What defeats it completely:
 |---|---|
 | **Root** | narrower than it was, and still open. `nft delete table` no longer lifts the denials held in the kernel - those need `rm -rf /sys/fs/bpf/colony-firewall` as well, and anything not yet decided still falls through to a ruleset root can flush. CFC *is* root; it cannot confine root. |
 | **Code inside an allowed process** | a browser extension, a script under an allowed interpreter, `ptrace`/`LD_PRELOAD` injection. Structural to every application firewall. Making Allow persistent (`72964b5`) improved usability and widened this. |
-| **Loopback** | `oifname "lo" accept`, deliberately - filtering it stalls the systemd-resolved stub. Anything that can reach a local service which egresses is attributed to that service. |
+| **Loopback** | `oifname "lo" ct state new queue num 0 bypass`: the daemon judges new loopback flows while it runs (unmatched local IPC is allowed without prompting), and they are allowed unfiltered while no daemon listens, so the systemd-resolved stub survives a dead daemon. Anything that can reach a local service which egresses is attributed to that service. |
 | **DNS tunnelling** | the resolver must be allowed for anything to work. CFC *observes* answers; it does not inspect or block queries. |
 | **Inherited or passed socket descriptors** | Existing connection authorization is not rechecked for each sending executable; socket attribution is ambiguous when ownership is shared. |
 | **CAP_NET_RAW packet sockets** | Packet-layer egress can bypass the IP OUTPUT hook. Layer-2 confinement is outside the shipped rules. |
 | **Prompt fatigue** | demonstrated on this machine: ten Firefox prompts in a row, all denied, browser lost. A malicious installer generating thirty prompts trains the user to click Allow. |
 
-And one tradeoff worth stating plainly: the ruleset is **fail-closed** (`ct
-state new queue num 0`, no `bypass`). Killing the daemon drops all new outbound
-traffic. That is the right choice for confidentiality and the wrong one for
+And one tradeoff worth stating plainly: the ruleset is **fail-closed for
+everything except new loopback flows, which are allowed while no daemon
+listens** (the final `ct state new queue num 0` has no `bypass`). Killing the
+daemon drops all new non-loopback outbound traffic. That is the right choice for confidentiality and the wrong one for
 availability - anything that can crash the daemon takes the machine's network
 with it.
 

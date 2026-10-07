@@ -95,17 +95,64 @@ probe_layer() {
     stop_daemon
 }
 
+arm() {  # $1 label  $2 binary
+    write_cfg
+    start_daemon "$2" || { echo "FAIL $1"; return 1; }
+    nft -f "$SNIPPET" || { echo "FAIL $1 nft"; stop_daemon; return 1; }
+    write_rules
+    cfc --socket "$SOCK" rules import --replace /tmp/rules.json >/dev/null 2>&1
+    sleep 4
+}
+
+# Loopback round trip: a UDP echo server on 127.0.0.1 and a client that opens
+# one new socket (one new conntrack flow, so one queued packet when armed) per
+# round trip. Armed, this is the snippet's `oifname "lo" ... bypass` rule.
+measure_lo() {  # $1 label  $2 mode(none|queue)
+    local q0 q1
+    say "state: $1  n=1000  mode=$2  loopback udp echo"
+    if [ "$2" != none ]; then arm "$1" /usr/bin/colony-firewalld || return 1; fi
+    q0="$(qseq)"
+    python3 - "$1" 1000 <<'ECHO' | while read -r line; do echo "RESULT $line"; done
+import json, socket, statistics, sys, threading, time
+label, n = sys.argv[1], int(sys.argv[2])
+srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+srv.bind(("127.0.0.1", 0))
+def echo():
+    while True:
+        data, peer = srv.recvfrom(64)
+        srv.sendto(data, peer)
+threading.Thread(target=echo, daemon=True).start()
+ms, fails = [], 0
+for _ in range(n):
+    c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    c.settimeout(2)
+    t = time.perf_counter()
+    try:
+        c.sendto(b"x", srv.getsockname())
+        c.recv(64)
+        ms.append((time.perf_counter() - t) * 1000)
+    except OSError:
+        fails += 1
+    c.close()
+r = {"label": label, "direction": "lo", "ok": len(ms), "failed": fails, "ms": None}
+if len(ms) > 1:
+    q = statistics.quantiles(ms, n=100)
+    r["ms"] = {"mean": statistics.fmean(ms), "p50": q[49], "p90": q[89],
+               "p95": q[94], "p99": q[98], "max": max(ms)}
+print(json.dumps(r))
+ECHO
+    q1="$(qseq)"
+    ctx "$1 queued_packets=$(( q1 - q0 )) conntrack=$(ctcount)"
+    [ "$2" != none ] && stop_daemon
+    return 0
+}
+
 measure() {  # $1 label  $2 n  $3 mode(none|queue)  $4 binary
     local label="$1" n="$2" mode="$3" bin="${4:-/usr/bin/colony-firewalld}" q0 q1
     say "state: $label  n=$n  mode=$mode  daemon=$(basename "$bin")"
     if [ "$mode" != none ]; then
         [ -x "$bin" ] || { echo "SKIP $label: $bin is not in this image"; return 0; }
-        write_cfg
-        start_daemon "$bin" || { echo "FAIL $label"; return 1; }
-        nft -f "$SNIPPET" || { echo "FAIL $label nft"; stop_daemon; return 1; }
-        write_rules
-        cfc --socket "$SOCK" rules import --replace /tmp/rules.json >/dev/null 2>&1
-        sleep 4
+        arm "$label" "$bin" || return 1
     fi
     ctx "$label before sockets=$(sockets) conntrack=$(ctcount)"
     q0="$(qseq)"
@@ -135,4 +182,6 @@ for n in "$SMALL" "$LARGE"; do
     drain; measure "poll200us-$n" "$n" queue /usr/bin/colony-firewalld-alt
 done
 [ "$SMALL" != "$LARGE" ] && { drain; measure "floor-$LARGE" "$LARGE" none; }
+drain; measure_lo lo-floor none
+drain; measure_lo lo-queue queue
 say "done"

@@ -7,7 +7,8 @@ post_install() {
     1. Enable the daemon and the persistent nftables rules:
            systemctl enable --now colony-firewalld colony-firewall-nft
        (colony-firewall-nft loads 'table inet colony_firewall'; it is
-        fail-closed while loaded and survives daemon restarts/stops.
+        fail-closed while loaded, except new loopback flows, and survives
+        daemon restarts/stops.
         Stop colony-firewall-nft explicitly to remove filtering.)
 
     2. Let your desktop user talk to the daemon socket:
@@ -51,7 +52,7 @@ EOF
 pre_remove() {
     # Stop enforcement BEFORE the binaries and the snippet disappear, so
     # the fail-closed NFQUEUE table can never outlive the daemon and
-    # blackhole all new outbound traffic.
+    # blackhole all new non-loopback outbound traffic.
     #
     # The inbound pair belongs here too, and used not to be. Removing the
     # package on a host where the inbound chain had been enabled left

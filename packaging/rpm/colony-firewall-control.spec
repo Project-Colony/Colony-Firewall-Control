@@ -61,8 +61,9 @@ it - and the daemon adds process attribution, DNS display enrichment, and
 in-kernel connect(2) denial. Pinned denials survive a daemon crash. Fast Allow
 was removed; allowed connections go through NFQUEUE.
 
-The ruleset is fail-closed. If the daemon is not running, new outbound
-connections are dropped rather than allowed.
+The ruleset is fail-closed for everything except new loopback flows. If the
+daemon is not running, new non-loopback outbound connections are dropped
+rather than allowed; new loopback flows are allowed so local IPC keeps working.
 
 %package selinux
 Summary:        SELinux policy module for %{name}

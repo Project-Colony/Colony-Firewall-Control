@@ -29,8 +29,14 @@ isolates one cost.
 | `floor` | nothing: no daemon, no table | the veth link and `connect()` itself |
 | `queue-N` | the daemon, the table, a lasting Allow | the NFQUEUE round trip, at N flows |
 | `poll200us-N` | the same, with a daemon built with a shorter `RECV_POLL_INTERVAL` | how much of that round trip is the worker's idle beat |
+| `lo-floor` | nothing; a UDP echo server on `127.0.0.1` inside the guest | the loopback round trip itself |
+| `lo-queue` | the daemon and the table, same echo server | what the `oifname "lo" ... queue num 0 bypass` rule costs a new loopback flow |
 
-Both directions run in every state and they answer different questions. `out`
+The two `lo-*` states run after the sweep. The client opens a new socket per
+round trip (1000 of them), so every round trip is a new conntrack flow,
+and reports mean, p50, p90, p95, p99 and max under direction `lo`.
+
+Both directions run in every veth state and they answer different questions. `out`
 leaves through the host's output chain and meets the queue. `in` is generated
 inside the network namespace, whose own output chain carries no colony table,
 so it never meets a queue - but its client sits in the root cgroup and still

@@ -156,9 +156,10 @@ impl Profile {
     ///
     /// The outbound table cannot lock an operator out of a remote machine: it
     /// hooks `output` on `ct state new` only, so an inbound SSH session's
-    /// replies are `ct state established` and are never queued. New loopback
-    /// flows follow explicit policy; unmatched local IPC is allowed without
-    /// prompting. Rules can still be added with `cfc-cli` from that
+    /// replies are `ct state established` and are never queued. While the
+    /// daemon runs, new loopback flows follow explicit policy and unmatched
+    /// local IPC is allowed without prompting; while no daemon listens, the
+    /// snippet's `bypass` on `lo` allows them. Rules can still be added with `cfc-cli` from that
     /// session. What it *does* mean on a fresh headless install is that
     /// outbound traffic — package updates, NTP, backups — is denied until
     /// rules exist for it.
@@ -379,9 +380,10 @@ impl<'de> Deserialize<'de> for EbpfMode {
     /// `Auto`, matching how `profile` already treats an unknown value, and for
     /// a reason specific to this daemon: a config parse error propagates out of
     /// `Config::load` and the process exits *before* `READY=1`. The nftables
-    /// ruleset is `ct state new queue num 0` with no `bypass`, so a loaded
-    /// table with no daemon behind it blackholes every new outbound connection
-    /// on the machine. A typo in an enrichment layer's switch must not cost
+    /// ruleset is fail-closed for everything except new loopback flows, which
+    /// are allowed while no daemon listens: the final `ct state new queue num
+    /// 0` has no `bypass`, so a loaded table with no daemon behind it
+    /// blackholes every new non-loopback outbound connection on the machine. A typo in an enrichment layer's switch must not cost
     /// someone their network.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct V;
@@ -644,9 +646,10 @@ enabled = " Auto ""#
     /// A typo must not be able to take the machine's network away.
     ///
     /// A config parse error propagates out of `Config::load` and the daemon
-    /// exits *before* `READY=1`. `systemd/nftables-snippet.conf` is
-    /// `ct state new queue num 0` with **no** `bypass`, so a loaded table with
-    /// no daemon behind it drops every new outbound connection. Refusing to
+    /// exits *before* `READY=1`. `systemd/nftables-snippet.conf` ends with
+    /// `ct state new queue num 0` with **no** `bypass` (only the loopback rule
+    /// above it has one), so a loaded table with no daemon behind it drops
+    /// every new non-loopback outbound connection. Refusing to
     /// start over a misspelled enrichment-layer switch would turn a one-letter
     /// mistake into an outage, so an unknown value warns and falls back -
     /// exactly as `profile` already does.

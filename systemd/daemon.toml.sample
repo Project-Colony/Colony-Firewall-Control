@@ -87,9 +87,9 @@ profile = "balanced"
 [nfqueue]
 # NFQUEUE number. Must match the `queue num N` in the nftables/iptables rule
 # that enqueues packets. If they disagree, packets queue to a number nobody
-# consumes - which under the shipped fail-closed rule is a total outbound
-# lockout. Bind failure is fatal: the daemon exits non-zero rather than
-# running while enforcing nothing.
+# consumes - which under the shipped fail-closed rule is an outbound lockout
+# for everything except new loopback flows. Bind failure is fatal: the
+# daemon exits non-zero rather than running while enforcing nothing.
 queue_num = 0
 # Kernel queue length: how many packets may wait for a verdict before the
 # queue overflows. Raise it on a busy host that prompts a lot; each queued

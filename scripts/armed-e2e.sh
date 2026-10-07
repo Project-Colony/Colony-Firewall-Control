@@ -19,6 +19,7 @@ SRV_IP=10.200.0.2
 ALLOW_PORT=8080      # allow rule
 DENY_PORT=8081       # deny rule
 UNMATCHED_PORT=8082  # no rule: balanced profile, nobody subscribed -> Deny
+LO_PORT=8083         # 127.0.0.1 inside FW, last step only
 W="$(mktemp -d "${RUNNER_TEMP:-/tmp}/cfc-e2e.XXXXXX")"
 SOCK="${W}/cfc.sock"
 
@@ -86,7 +87,9 @@ cleanup() {
     if sudo test -s "${W}/daemon.pid"; then
         sudo kill -KILL "$(sudo cat "${W}/daemon.pid")" 2>/dev/null || true
     fi
-    sudo ip netns pids "${SRV}" 2>/dev/null | xargs -r sudo kill 2>/dev/null || true
+    for ns in "${SRV}" "${FW}"; do
+        sudo ip netns pids "${ns}" 2>/dev/null | xargs -r sudo kill 2>/dev/null || true
+    done
     sudo ip netns del "${FW}" 2>/dev/null || true
     sudo ip netns del "${SRV}" 2>/dev/null || true
     if [[ "${rc}" -ne 0 ]]; then
@@ -115,8 +118,9 @@ in_fw ip addr add 10.200.0.1/24 dev fw0
 in_fw ip link set fw0 up
 in_srv ip addr add "${SRV_IP}/24" dev srv0
 in_srv ip link set srv0 up
-# FW's lo stays down on purpose: no loopback flows (the daemon's own reverse
-# DNS to a 127.0.0.53 stub fails fast instead of being queued).
+# FW's lo stays down on purpose while a daemon runs: no loopback flows (the
+# daemon's own reverse DNS to a 127.0.0.53 stub fails fast instead of being
+# queued). The last step brings it up, after the final daemon is gone.
 mkdir "${W}/www"
 for p in "${ALLOW_PORT}" "${DENY_PORT}" "${UNMATCHED_PORT}"; do
     in_srv python3 -m http.server "${p}" --bind "${SRV_IP}" \
@@ -185,5 +189,17 @@ stop_daemon KILL
 table_loaded || fail "table gone after SIGKILL"
 queue_bound && fail "NFQUEUE 0 still bound after SIGKILL"
 expect_drop "${ALLOW_PORT}"
+
+say "No daemon: a new loopback flow still passes (bypass on lo only)"
+in_fw ip link set lo up
+in_fw python3 -m http.server "${LO_PORT}" --bind 127.0.0.1 \
+    --directory "${W}/www" >"${W}/http-lo.log" 2>&1 &
+for _ in $(seq 1 50); do
+    [[ -n "$(in_fw ss -Hltn "sport = :${LO_PORT}")" ]] && break
+    sleep 0.2
+done
+in_fw curl -sS --noproxy '*' -o /dev/null --connect-timeout 3 --max-time 6 \
+    "http://127.0.0.1:${LO_PORT}/" \
+    || fail "new loopback flow failed with no daemon; the lo bypass rule should accept it"
 
 say "Armed e2e passed"

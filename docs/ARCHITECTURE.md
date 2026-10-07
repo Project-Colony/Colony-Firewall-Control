@@ -50,7 +50,8 @@ headless machine gets a say.
 ```
 kernel (nftables OUTPUT hook)
    |
-   |  loopback / established,related / daemon refusal packets accepted
+   |  established,related / daemon refusal packets accepted
+   |  oifname lo ct state new   queue num 0 bypass  (accepted if no daemon)
    |  ct state new   queue num 0
    |  all other traffic dropped
    v

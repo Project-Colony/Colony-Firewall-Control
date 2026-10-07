@@ -184,8 +184,10 @@ is a separate launch mode.
   instead of, traditional access controls.
 - **eBPF / unprivileged user namespaces**: a sufficiently privileged user
   can bypass NFQUEUE entirely with `unshare -rn` and a custom net namespace.
-- **Local relays and DNS**: explicit rules apply to new direct loopback flows.
-  Unmatched local IPC is allowed without prompting. An authorized local
+- **Local relays and DNS**: while the daemon runs, explicit rules apply to
+  new direct loopback flows and unmatched local IPC is allowed without
+  prompting. While no daemon listens on the queue, new loopback flows are
+  allowed unfiltered (`bypass` on the `lo` rule only). An authorized local
   resolver or proxy can relay remote traffic, which is attributed to that
   service. CFC cannot establish the originating application's identity from
   remote flows delegated through AF_UNIX or D-Bus brokers. Existing local
@@ -420,8 +422,9 @@ to `cgroupfs`.
 
 The other half of the security posture is the nftables side, not the
 daemon: whether the kernel drops or accepts new connections when nobody
-is answering the queue. The shipped snippet is fail-closed, which is the
-safer default and also the one that can lock you out of a remote box.
+is answering the queue. The shipped snippet is fail-closed for everything
+except new loopback flows, which are allowed while no daemon listens. That
+is the safer default and also the one that can lock you out of a remote box.
 The full matrix - daemon up or down, table loaded or not, with and
 without `bypass` - is in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#fail-open-vs-fail-closed-matrix).
@@ -429,7 +432,8 @@ Read it before enabling enforcement on a machine you only reach over SSH.
 
 `[nfqueue] fail_open` must be `false`; `true` is rejected. Queue overflow
 must drop traffic instead of bypassing policy and durable refusal auditing.
-The nftables `bypass` keyword governs missing listeners and is not shipped.
+The nftables `bypass` keyword governs missing listeners; the shipped snippet
+uses it only on the loopback rule (`oifname "lo"`).
 
 ## When something stops working
 
