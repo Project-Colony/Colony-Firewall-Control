@@ -398,10 +398,13 @@ fn pid_has_socket_inode(pid: u32, inode: u64, deadline: Instant) -> Option<Socke
     let p = ProcFsProcess::new(pid as i32).ok()?;
     let starttime = read_starttime(pid)?;
     let fds = p.fd().ok()?;
-    for fd in fds.flatten() {
+    // Not `flatten()`: it would skip a run of failed entries (descriptors
+    // closing under the walk) inside one `next()`, past the deadline check.
+    for fd in fds {
         if Instant::now() >= deadline {
             return None;
         }
+        let Ok(fd) = fd else { continue };
         if matches!(fd.target, FDTarget::Socket(i) if i == inode) {
             if read_starttime(pid) != Some(starttime) {
                 return None;
