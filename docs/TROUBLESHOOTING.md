@@ -259,6 +259,12 @@ it can answer from its cache or local records: its queries to the upstream
 servers are new non-loopback flows, so resolving anything else still needs
 the daemon. Every non-loopback new flow still meets the fail-closed rule.
 
+`bypass` only covers a daemon that is not listening. A daemon that listens
+but whose single worker is stuck (an executable on a hung mount being
+hashed, for instance) leaves new loopback flows, local DNS included,
+waiting in the same queue; once it fills they drop until the watchdog
+restarts the daemon, which takes up to about 90 seconds.
+
 If you carry an older copy of the snippet in your own `/etc/nftables.conf`,
 compare it with the shipped one: a copy without the loopback rule drops
 every new loopback flow whenever the daemon is down, and one with an
