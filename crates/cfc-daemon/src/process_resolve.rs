@@ -1522,6 +1522,37 @@ mod tests {
     }
 
     #[test]
+    fn identity_follows_an_exec_at_the_same_pid() {
+        // Pid and start time survive exec, so nothing keyed on them may
+        // stand in for the image: each resolve must see the current one.
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read _; exec sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let link = format!("/proc/{pid}/exe");
+        let before = resolve(pid);
+        assert_eq!(before.exe, fs::read_link(&link).unwrap());
+
+        child.stdin.take().unwrap().write_all(b"\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_link(&link).unwrap() == before.exe && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mapped = fs::read_link(&link).unwrap();
+        let after = resolve(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        if mapped == before.exe {
+            return; // sh and sleep are one multi-call binary here
+        }
+        assert_eq!(after.exe, mapped);
+        assert_ne!(after.sha256, before.sha256);
+    }
+
+    #[test]
     fn a_path_naming_another_file_here_is_not_the_image() {
         let dir = tempfile::tempdir().unwrap();
         let host = dir.path().join("curl");

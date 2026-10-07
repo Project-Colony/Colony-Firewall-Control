@@ -2760,20 +2760,40 @@ mod tests {
         assert_eq!(h.stats.connections_total(), 0);
     }
 
+    /// Counts reverse-DNS lookups `deliver` asks for.
+    struct CountingDns(Arc<std::sync::atomic::AtomicUsize>);
+    impl HostCache for CountingDns {
+        fn is_self(&self, _: u32) -> bool {
+            false
+        }
+        fn cached_host(&self, _: IpAddr) -> Option<(String, bool)> {
+            None
+        }
+        fn enqueue(&self, _: IpAddr) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn refused_deliveries_ask_for_no_reverse_dns() {
+        // A refused process must not make the daemon resolve an address it
+        // chose: that is a DNS side channel out of a denied program.
+        let mut reject = deny_port_rule(443);
+        reject.action = Action::Reject;
+        for rule in [deny_port_rule(443), reject] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut h = LoopHarness::new(vec![], vec![rule], dp_deny());
+            h.worker().dns = Box::new(CountingDns(calls.clone()));
+            h.worker()
+                .handle_message(FakeMsg::new(1, tcp_packet(443)))
+                .unwrap();
+            assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
     #[test]
     fn allowed_delivery_enriches_and_counts_once_without_a_refusal_audit() {
-        struct CountingDns(Arc<std::sync::atomic::AtomicUsize>);
-        impl HostCache for CountingDns {
-            fn is_self(&self, _: u32) -> bool {
-                false
-            }
-            fn cached_host(&self, _: IpAddr) -> Option<(String, bool)> {
-                None
-            }
-            fn enqueue(&self, _: IpAddr) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut h = LoopHarness::new(vec![], vec![allow_port_rule(443)], dp_deny());
         h.worker().dns = Box::new(CountingDns(calls.clone()));
