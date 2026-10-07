@@ -122,8 +122,10 @@ Fast Allow was removed, so allowed flows also pay the queue round trip.
 
 **Prompt deduplication** requires the same UID, executable path, image digest,
 destination IP, destination port and protocol. Source address and port are
-excluded, so equivalent parallel connections may share a prompt. An incomplete
-identity never shares authorization. Persistent prompt Allows use the queued
+excluded, so equivalent parallel connections may share a prompt. An image over
+64 MiB has no digest; it shares by its path when that path is root-sealed, the
+same identity a path-only Allow for it uses. Any other incomplete identity
+never shares authorization. Persistent prompt Allows use the queued
 image digest; they never rehash a later image at a reused PID. A retargeted
 pathname cannot suppress the required hash binding.
 

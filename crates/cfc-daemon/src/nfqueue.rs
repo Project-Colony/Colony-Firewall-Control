@@ -473,7 +473,11 @@ struct FlowKey {
 /// Only a known image may share a prompt; uncertain identities never do.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FlowOrigin {
-    Exe { path: PathBuf, sha256: String },
+    /// `sha256` is `None` only for a root-sealed path.
+    Exe {
+        path: PathBuf,
+        sha256: Option<String>,
+    },
     Unattributed(uuid::Uuid),
 }
 
@@ -482,8 +486,22 @@ impl FlowKey {
         let origin = match (&proc.sha256, proc.exe_is_known(), proc.uid) {
             (Some(sha256), true, Some(_)) => FlowOrigin::Exe {
                 path: proc.exe.clone(),
-                sha256: sha256.clone(),
+                sha256: Some(sha256.clone()),
             },
+            // Images over 64 MiB (Chromium, Electron, VS Code) have no
+            // digest. A root-sealed path still names one image only root can
+            // change, and the resolver publishes it only when it names the
+            // mapped file here, which is why a standing Allow for it is
+            // path-only. Without this every packet, retransmits included,
+            // opened its own prompt.
+            (None, true, Some(_))
+                if cfc_core::exe_path::is_root_sealed(&proc.exe).unwrap_or(false) =>
+            {
+                FlowOrigin::Exe {
+                    path: proc.exe.clone(),
+                    sha256: None,
+                }
+            }
             // Neither a PID nor a path identifies an unknown execution.
             // Such packets must receive independent authorization.
             _ => FlowOrigin::Unattributed(uuid::Uuid::new_v4()),
@@ -2216,6 +2234,41 @@ mod tests {
         assert_ne!(
             FlowKey::for_flow(&conn, &Process::unknown(7)),
             FlowKey::for_flow(&conn, &Process::unknown(8))
+        );
+    }
+
+    #[test]
+    fn digest_less_images_share_a_prompt_only_on_a_sealed_path() {
+        let sealed = "/usr/bin/env";
+        if !cfc_core::exe_path::is_root_sealed(std::path::Path::new(sealed)).unwrap_or(false) {
+            return;
+        }
+        let conn = conn_to(443, 1111);
+        let digest_less = |pid, exe: &str| Process {
+            sha256: None,
+            ..test_process(pid, exe)
+        };
+        // Over 64 MiB, so no digest: retransmits and siblings still share.
+        assert_eq!(
+            FlowKey::for_flow(&conn, &digest_less(1, sealed)),
+            FlowKey::for_flow(&conn, &digest_less(2, sealed))
+        );
+        let other_user = Process {
+            uid: Some(1001),
+            ..digest_less(2, sealed)
+        };
+        assert_ne!(
+            FlowKey::for_flow(&conn, &digest_less(1, sealed)),
+            FlowKey::for_flow(&conn, &other_user)
+        );
+        // A path its user can rewrite is no identity without the digest.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"user image").unwrap();
+        let tool = tool.to_str().unwrap();
+        assert_ne!(
+            FlowKey::for_flow(&conn, &digest_less(1, tool)),
+            FlowKey::for_flow(&conn, &digest_less(1, tool))
         );
     }
 
