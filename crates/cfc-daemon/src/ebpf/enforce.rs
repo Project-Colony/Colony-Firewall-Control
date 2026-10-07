@@ -104,24 +104,21 @@ pub(super) const MAP_DENY_EVENTS: &str = "DENY_EVENTS";
 pub(super) const MAP_EXE_RULES: &str = "EXE_RULES";
 pub(super) const MAP_EXE_RULES_ON: &str = "EXE_RULES_ON";
 
-/// The fast path's maps. All four pinned, for the reason every enforcement
-/// map is: a restarting daemon must steer the maps the still-attached
-/// programs read, and an unpinned one would be a fresh map nobody reads.
-/// Pinning is also what makes the deadline necessary - the programs keep
-/// these alive after the daemon dies, so nothing empties `FAST_ALLOW` by
-/// itself; `FAST_ALLOW_UNTIL` running out is what stops the marks.
+/// The legacy Fast Allow maps. The daemon no longer grants, but the kernel
+/// object still carries them (ABI v4) and the connect programs still read
+/// them, so they stay pinned: [`disarm_legacy_fast_allow`] has to reach the
+/// copies the pinned programs see, not a fresh map nobody reads.
 pub(super) const MAP_FAST_ALLOW: &str = "FAST_ALLOW";
 pub(super) const MAP_FAST_ALLOW_UNTIL: &str = "FAST_ALLOW_UNTIL";
 pub(super) const MAP_FAST_ALLOW_MARK: &str = "FAST_ALLOW_MARK";
 pub(super) const MAP_ALLOW_EVENTS: &str = "ALLOW_EVENTS";
 
-/// The mark decision for UDP that never calls `connect()`. Fast-path only:
-/// they refuse nothing, so a failure to attach them costs the fast path and
-/// not enforcement, and they have no `_basic` twins.
-pub(super) const PROG_SENDMSG4: &str = "cfc_sendmsg4";
-pub(super) const PROG_SENDMSG6: &str = "cfc_sendmsg6";
+/// Pin names a 0.4-0.6 daemon gave its Fast Allow sendmsg links, and the
+/// directory it left beside the connect pins. Nothing attaches or reads these
+/// any more; [`prepare`] removes them.
 pub(super) const LINK_SENDMSG4: &str = "sendmsg4";
 pub(super) const LINK_SENDMSG6: &str = "sendmsg6";
+const LEGACY_COOKIE_MARKER: &str = "cookie-variants";
 
 /// Pin name for the `sched_process_exit` link.
 ///
@@ -182,58 +179,6 @@ pub(super) struct VerdictSink {
     /// What was last written to the kernel, so an unchanged recompute costs no
     /// syscalls. `None` until the first compile.
     last_compiled: Arc<Mutex<Option<std::collections::HashMap<u64, u32>>>>,
-    /// The fast path's maps, `None` when this daemon must not grant: the
-    /// object predates them, or the loader judged the path ineligible (see
-    /// `FastAllow::Off`). Granting is gated here rather than at each call
-    /// site so an ineligible daemon cannot grant by accident from one path
-    /// and not another.
-    fast: Option<FastAllowMaps>,
-}
-
-/// The kernel side of the fast path, from the daemon's chair.
-///
-/// One rule for every writer here: **grants are re-earned, never inherited.**
-/// The kernel clears `FAST_ALLOW` on exec and exit by itself; this side only
-/// adds entries, and only for a process whose process-wide verdict is an
-/// allow from a rule that lasts. Anything else - a deny, an abstention, a
-/// destination-scoped rule, a timed allow, a process the engine cannot decide:
-/// each of these *removes* the entry. There is no "keep" arm as there is for
-/// denies, because a deny kept in doubt fails closed and an allow kept in
-/// doubt is a bypass.
-#[derive(Clone)]
-pub(super) struct FastAllowMaps {
-    map: Arc<Mutex<BpfHashMap<MapData, u32, u32>>>,
-    until: Arc<Mutex<aya::maps::Array<MapData, u64>>>,
-    mark: Arc<Mutex<aya::maps::Array<MapData, u32>>>,
-    /// pid -> the rule that granted and the start time it was judged at.
-    ///
-    /// The rule is so an `ALLOW_EVENTS` record can credit the hit the packet
-    /// path will never see. The start time is what `sweep_stale_grants` compares
-    /// against, on a kernel whose exit detection is leader-only: a pid whose
-    /// start time no longer matches is not the process that was granted.
-    /// Userspace-only; a pid missing here when its event arrives is a grant
-    /// from a previous daemon, credited to nobody rather than to the wrong
-    /// rule.
-    granted_by: Arc<Mutex<std::collections::HashMap<u32, Granted>>>,
-}
-
-/// What the daemon remembers about one grant it wrote.
-#[derive(Debug, Clone, Copy)]
-struct Granted {
-    rule: uuid::Uuid,
-    /// `/proc/<pid>/stat` field 22 when the grant was judged. `None` cannot
-    /// reach the map - `grant_if_still` refuses to grant without one - but the
-    /// type says so rather than the comment.
-    starttime: Option<u64>,
-}
-
-/// One grant decision, for the three writers to share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Grant {
-    /// Write the entry; the rule that justifies it.
-    Yes(uuid::Uuid),
-    /// Remove the entry, whatever it held.
-    No,
 }
 
 impl VerdictSink {
@@ -266,26 +211,6 @@ impl VerdictSink {
             );
         }
 
-        // All three or none: a fast path with a grant map but no deadline map
-        // would be one the kernel honours forever, which is the exact state
-        // the deadline exists to make impossible.
-        let fast = match (
-            bpf.take_map(MAP_FAST_ALLOW)
-                .and_then(|m| BpfHashMap::<_, u32, u32>::try_from(m).ok()),
-            bpf.take_map(MAP_FAST_ALLOW_UNTIL)
-                .and_then(|m| aya::maps::Array::<_, u64>::try_from(m).ok()),
-            bpf.take_map(MAP_FAST_ALLOW_MARK)
-                .and_then(|m| aya::maps::Array::<_, u32>::try_from(m).ok()),
-        ) {
-            (Some(map), Some(until), Some(mark)) => Some(FastAllowMaps {
-                map: Arc::new(Mutex::new(map)),
-                until: Arc::new(Mutex::new(until)),
-                mark: Arc::new(Mutex::new(mark)),
-                granted_by: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            }),
-            _ => None,
-        };
-
         Ok(Self {
             map: Arc::new(Mutex::new(map)),
             engine,
@@ -293,351 +218,7 @@ impl VerdictSink {
             exe_rules,
             exe_rules_on,
             last_compiled: Arc::new(Mutex::new(None)),
-            fast,
         })
-    }
-
-    /// The engine this sink decides with, for the allow consumer to credit
-    /// hits against.
-    pub(super) fn engine(&self) -> &Engine {
-        &self.engine
-    }
-
-    /// Whether this sink can grant at all. The loader consults it to decide
-    /// the reported `FastAllow` state; it is true iff the maps exist.
-    pub(super) fn has_fast_path(&self) -> bool {
-        self.fast.is_some()
-    }
-
-    /// Withdraws the ability to grant, for a daemon that loaded the maps but
-    /// then judged the path ineligible (config off, basic connect variants,
-    /// exit not tracked, could not arm) or lost it after arming (the ring
-    /// consumers did not start). Also unarms the kernel side and empties the
-    /// map, so every hook takes its cheapest exit and nothing is left to
-    /// honour whatever the deadline says.
-    pub(super) fn withdraw_fast_path(&mut self) {
-        if let Some(fast) = self.fast.take() {
-            // Unarm the kernel side too, not only empty the map. The maps are
-            // pinned, so a daemon that crashed while armed leaves
-            // `FAST_ALLOW_MARK` set; a successor started with the fast path
-            // *off* used to leave it that way, and every TCP `connect()` on the
-            // machine then paid a `getsockopt` and two map reads to strip a
-            // mark nobody would ever set - for as long as that daemon ran. With
-            // `UNARMED` written, `mark_decision` returns at its first array
-            // read, and the exec/exit programs skip their grant delete as well.
-            if let Err(e) = fast.until.lock().set(0, 0u64, 0) {
-                warn!("could not zero FAST_ALLOW_UNTIL while withdrawing the fast path: {e}");
-            }
-            if let Err(e) = fast
-                .mark
-                .lock()
-                .set(0, cfc_ebpf_common::fast_allow::UNARMED, 0)
-            {
-                warn!("could not unarm FAST_ALLOW_MARK while withdrawing the fast path: {e}");
-            }
-            let mut map = fast.map.lock();
-            let pids: Vec<u32> = map.keys().flatten().collect();
-            for pid in pids {
-                let _ = map.remove(&pid);
-            }
-        }
-    }
-
-    /// The grant decision for one process: the shared rule for every writer.
-    fn grant_for(&self, proc: &Process) -> Grant {
-        // Abstain wherever a uid-scoped rule could apply. This decider and the
-        // packet path read different uids for a process that dropped
-        // privileges, and a grant is process-wide - see
-        // `Engine::uid_scoped_may_apply`, which explains why the answer is to
-        // step aside rather than to pick a uid.
-        if self.engine.uid_scoped_may_apply(&proc.exe) {
-            return Grant::No;
-        }
-        match self.engine.process_wide_verdict(proc) {
-            Some(v) if v.fast_allow_eligible() => Grant::Yes(v.rule_id),
-            _ => Grant::No,
-        }
-    }
-
-    /// Applies a grant decision to the kernel map, under the caller's lock.
-    /// `judged_at` is the start time a `Yes` was decided against; a `No` does
-    /// not need one.
-    fn apply_grant(
-        fast: &FastAllowMaps,
-        map: &mut BpfHashMap<MapData, u32, u32>,
-        pid: u32,
-        grant: Grant,
-        judged_at: Option<u64>,
-    ) {
-        match grant {
-            Grant::Yes(rule) => {
-                if let Err(e) = map.insert(pid, cfc_ebpf_common::fast_allow::GRANTED, 0) {
-                    warn!(pid, "could not write a fast-allow grant: {e}");
-                    return;
-                }
-                fast.granted_by.lock().insert(
-                    pid,
-                    Granted {
-                        rule,
-                        starttime: judged_at,
-                    },
-                );
-            }
-            Grant::No => {
-                // Absent is the common case and not an error: see `clear`.
-                let _ = clear(map, pid);
-                fast.granted_by.lock().remove(&pid);
-            }
-        }
-    }
-
-    /// Recomputes the grant for one process, from any writer.
-    ///
-    /// `judged_at` is the start time the caller read `proc` at - see
-    /// [`grant_if_still`](Self::grant_if_still) for why a grant needs it and a
-    /// withdrawal does not.
-    fn regrant(&self, pid: u32, judged_at: Option<u64>, proc: &Process) {
-        self.grant_if_still(pid, proc, judged_at, self.grant_for(proc));
-    }
-
-    /// Withdraws any grant for `pid`, unconditionally.
-    ///
-    /// The counterpart to `grant_if_still`, and deliberately unguarded:
-    /// removing a grant from a pid whose owner changed is harmless, because
-    /// the new owner has not earned one yet and its own exec flow will grant
-    /// it if a rule says so. Withdrawing is always the safe direction.
-    fn drop_grant(&self, pid: u32) {
-        if let Some(fast) = self.fast.as_ref() {
-            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No, None);
-        }
-    }
-
-    /// Applies a grant decision, but writes a *grant* only if `pid` still holds
-    /// the process the caller judged.
-    ///
-    /// Between the /proc read that produced the decision and this write there
-    /// is real work - the read itself, the engine call, and this lock - while
-    /// `on_exec` and the pinned exec program keep running. The pid can be
-    /// recycled in that window, and a grant landing on its new owner is a
-    /// marked socket that owner never earned: the fail-open direction, on a
-    /// process that may match no rule at all.
-    ///
-    /// The deny side has had this guard since the orphan sweep was written -
-    /// `doomed` carries the start time each pid was judged at - and the grant
-    /// side, which needs it more, did not have it.
-    fn grant_if_still(&self, pid: u32, judged: &Process, judged_at: Option<u64>, grant: Grant) {
-        let Some(fast) = self.fast.as_ref() else {
-            return;
-        };
-        if !matches!(grant, Grant::Yes(_)) {
-            Self::apply_grant(fast, &mut fast.map.lock(), pid, grant, None);
-            return;
-        }
-
-        // `None` is not a start time, it is the absence of a process, and
-        // comparing it directly let a grant through on exactly the case that
-        // must refuse. `proc_view` reads the exe, then the uid, then the start
-        // time; a process that exits in between yields a full view with
-        // `judged_at = None`, and `None != None` is false, so the guard fell
-        // through and wrote a grant for a pid with no process. Nothing would
-        // have cleared it either: the kernel's exec and exit clears both
-        // belong to a process that has already gone, and a pid recycled by a
-        // fork that never execs would inherit the mark.
-        let Some(judged_at) = judged_at else {
-            debug!(pid, "not granting: no start time, so no process to grant");
-            return;
-        };
-        if proc_starttime(pid) != Some(judged_at) {
-            debug!(
-                pid,
-                "not granting: the pid changed hands while it was judged"
-            );
-            return;
-        }
-
-        // Before the write, so an execve that has already happened is not paid
-        // for with a real marked flow.
-        if proc_exe(pid).as_deref() != Some(judged.exe.as_path()) {
-            debug!(
-                pid,
-                "not granting: the program changed while the grant was decided"
-            );
-            return;
-        }
-
-        Self::apply_grant(fast, &mut fast.map.lock(), pid, grant, Some(judged_at));
-
-        // And once more, on the program rather than the pid - after the write,
-        // deliberately.
-        //
-        // `execve` keeps the start time (field 22 of /proc/<pid>/stat is when
-        // the *process* began, not when it last exec'd), so the guard above
-        // cannot see one. That matters because the kernel's exec program
-        // removes this pid's grant on every execve: a process judged as an
-        // allowed binary, exec'ing into a denied one while this function was
-        // deciding, would have its grant correctly cleared by the kernel and
-        // then reinstated here, for a program nothing granted.
-        //
-        // Checked before the write as well as after - and neither makes this
-        // race-free, which the comment here used to claim.
-        //
-        // What remains is the interval between the pre-check and the insert.
-        // An execve landing there has its grant cleared by the kernel and then
-        // re-added by this write, and the post-write check removes it again
-        // only after a `read_link`. A `connect()` inside *that* window finds
-        // the entry present and marks the socket, and removing the map entry
-        // afterwards does not unmark it. So the exposure is one flow rather
-        // than none. It is bounded, and no standing refusal is skipped -
-        // `VERDICTS` is consulted before `mark_decision` - but "narrower" is
-        // the honest word and "race-free" was not.
-        if proc_exe(pid).as_deref() != Some(judged.exe.as_path()) {
-            debug!(
-                pid,
-                "withdrawing: the program changed while the grant was decided"
-            );
-            Self::apply_grant(fast, &mut fast.map.lock(), pid, Grant::No, None);
-        }
-    }
-
-    /// The rule that granted `pid`, for crediting an `ALLOW_EVENTS` record.
-    pub(super) fn granted_by(&self, pid: u32) -> Option<uuid::Uuid> {
-        self.fast
-            .as_ref()
-            .and_then(|f| f.granted_by.lock().get(&pid).map(|g| g.rule))
-    }
-
-    /// Drops every grant whose pid no longer holds the process it was judged
-    /// for, and returns how many.
-    ///
-    /// For a kernel whose `sched_process_exit` record has no readable
-    /// `group_dead`. There the exit program evicts on thread-group *leader*
-    /// exit, so a process whose leader exits first and dies later is never
-    /// evicted - while this daemon is alive and refreshing the deadline, which
-    /// therefore bounds nothing. This is the bound instead: called on every
-    /// heartbeat, it compares each granted pid's current start time with the
-    /// one recorded when it was granted; a mismatch, or no process at all, is
-    /// a grant for whoever owns the pid next. The exposure that remains is a
-    /// pid recycled *and* connecting within one heartbeat, without an exec in
-    /// between (an exec clears the grant in the kernel).
-    ///
-    /// Snapshot first, then read /proc with no lock held: `on_exec` and
-    /// `on_exit` take `granted_by` from the ring consumers.
-    pub(super) fn sweep_stale_grants(&self) -> usize {
-        let Some(fast) = self.fast.as_ref() else {
-            return 0;
-        };
-        let snapshot: Vec<(u32, Option<u64>)> = fast
-            .granted_by
-            .lock()
-            .iter()
-            .map(|(pid, g)| (*pid, g.starttime))
-            .collect();
-        let mut dropped = 0usize;
-        for (pid, recorded) in snapshot {
-            if !grant_is_stale(recorded, proc_starttime(pid)) {
-                continue;
-            }
-            // Re-read what is recorded *now*, not what the snapshot said. In
-            // the window since the snapshot this pid may have died, been
-            // recycled, exec'd, and been granted afresh by `on_exec` with its
-            // own start time - and dropping that grant on the strength of the
-            // old one would take a legitimate grant from a legitimate process
-            // until the next rule change. If the record moved, it is someone
-            // else's decision and stands.
-            let recorded_now = fast.granted_by.lock().get(&pid).map(|g| g.starttime);
-            if recorded_now != Some(recorded) {
-                continue;
-            }
-            self.drop_grant(pid);
-            dropped += 1;
-        }
-        dropped
-    }
-
-    /// Empties `FAST_ALLOW`. At every start, before anything is granted: the
-    /// map is pinned, so it holds the previous daemon's grants, made under the
-    /// previous daemon's rules. Returns how many were dropped, for the log.
-    pub(super) fn flush_fast_allow(&self) -> usize {
-        let Some(fast) = self.fast.as_ref() else {
-            return 0;
-        };
-        let mut map = fast.map.lock();
-        let pids: Vec<u32> = map.keys().flatten().collect();
-        let n = pids.len();
-        for pid in pids {
-            let _ = map.remove(&pid);
-        }
-        fast.granted_by.lock().clear();
-        n
-    }
-
-    /// Writes the mark value the kernel side will set, arming the path.
-    ///
-    /// The deadline is zeroed first, and by this function rather than by
-    /// assumption. Callers used to say "the deadline is still zero until the
-    /// first `beat`, so nothing is honoured before the heartbeat runs", which
-    /// is not a property the code had: `FAST_ALLOW_UNTIL` is a *pinned* map,
-    /// so after an unclean death it holds whatever deadline the previous
-    /// daemon last wrote - up to a minute into the future. Nothing was
-    /// actually honoured on the strength of it, because the grant map is
-    /// flushed at start and the nft set holds no mark yet, but the sentence
-    /// was load-bearing in two comments and true in neither. One `set` makes
-    /// it true.
-    ///
-    /// Order matters: zero the deadline, then write the mark. Between the two
-    /// the kernel reads an armed mark against a lapsed deadline, counts a
-    /// `STALE`, and marks nothing.
-    pub(super) fn arm(&self, mark: u32) -> anyhow::Result<()> {
-        let fast = self
-            .fast
-            .as_ref()
-            .ok_or_else(|| anyhow!("no fast path to arm"))?;
-        fast.until
-            .lock()
-            .set(0, 0u64, 0)
-            .context("zeroing FAST_ALLOW_UNTIL")?;
-        fast.mark
-            .lock()
-            .set(0, mark, 0)
-            .context("writing FAST_ALLOW_MARK")?;
-        Ok(())
-    }
-
-    /// Pushes the deadline out to now + `deadline_secs` on `CLOCK_BOOTTIME`,
-    /// the clock `bpf_ktime_get_boot_ns` reads. Called every `HEARTBEAT_SECS`
-    /// by the runtime; if it ever stops being called, the kernel side stops
-    /// honouring grants within one deadline - by design, not by accident.
-    pub(super) fn beat(&self, deadline_secs: u64) -> anyhow::Result<()> {
-        let Some(fast) = self.fast.as_ref() else {
-            return Ok(());
-        };
-        let until = boottime_ns()? + deadline_secs * 1_000_000_000;
-        fast.until
-            .lock()
-            .set(0, until, 0)
-            .context("writing FAST_ALLOW_UNTIL")?;
-        Ok(())
-    }
-
-    /// Disarms immediately: zero deadline, unarmed mark, empty map. For a
-    /// clean shutdown, so the marks stop now rather than when the deadline
-    /// this daemon last wrote runs out. Best effort in every step - a daemon on its way out has
-    /// nowhere to report a failure but the log.
-    pub(super) fn disarm(&self) {
-        let Some(fast) = self.fast.as_ref() else {
-            return;
-        };
-        if let Err(e) = fast.until.lock().set(0, 0u64, 0) {
-            warn!("could not zero FAST_ALLOW_UNTIL on shutdown: {e}");
-        }
-        if let Err(e) = fast
-            .mark
-            .lock()
-            .set(0, cfc_ebpf_common::fast_allow::UNARMED, 0)
-        {
-            warn!("could not unarm FAST_ALLOW_MARK on shutdown: {e}");
-        }
-        self.flush_fast_allow();
     }
 
     /// Recomputes every live process's verdict.
@@ -655,12 +236,11 @@ impl VerdictSink {
     /// (`source="rule"`) and the kernel counters never moved.
     ///
     /// Cost, since it is no longer only map operations: a handful of small
-    /// /proc reads per process - three for the view, one to re-date it before
-    /// the deny write, and up to three more inside `grant_if_still` when the
-    /// answer is a grant - for every recently-exec'd process and every orphan,
-    /// and one walk of /proc for `sweep_fast_allow` at the end. All of it on whichever
-    /// thread changed the rules - an IPC handler or startup, never the packet
-    /// path - and only when a human or the CLI actually changed something.
+    /// /proc reads per process - three for the view and one to re-date it
+    /// before the deny write - for every recently-exec'd process and every
+    /// orphan. All of it on whichever thread changed the rules - an IPC
+    /// handler or startup, never the packet path - and only when a human or
+    /// the CLI actually changed something.
     ///
     /// None of those reads happen while a map lock is held. That is a
     /// constraint, not an accident: `on_exec` and `on_exit` block on the
@@ -698,43 +278,18 @@ impl VerdictSink {
             .iter()
             .filter_map(|proc| {
                 // From /proc, like every other decider - not from the exec
-                // record.
+                // record. The record carries the execve *string*, which is
+                // neither absolute for `./foo` nor resolved through a
+                // symlink, and the uid at exec, which a process that dropped
+                // privileges no longer holds; the orphan sweep below reads
+                // /proc, and two deciders that disagree about one process is
+                // the defect.
                 //
-                // Both loops in this function ask one question about one
-                // process, and for a long time they asked it of different
-                // inputs: this one of the `ExecEvent` (the execve *string*,
-                // and the uid the process had when it exec'd), the orphan
-                // sweep below of /proc. Two deciders that disagree about the
-                // same process is the defect, and all three ways it showed up
-                // were fail-open:
-                //
-                // * `execve("./foo")` records no absolute path, so
-                //   `absolute_exe` answered None and this loop skipped the pid
-                //   whole. Deleting the rule that granted such a process, or
-                //   replacing it with a Block, left the grant standing in the
-                //   kernel: a marked socket past the queue for a program no
-                //   rule allowed any more.
-                // * the execve string is what the caller typed, not what ran.
-                //   A rule naming a symlink - or `/bin/curl` on a merged-usr
-                //   system - granted here what `on_exec` and the packet path,
-                //   both of which resolve, refuse.
-                // * the recorded uid is the uid at exec. A process that
-                //   dropped privileges kept a uid-scoped grant it had stopped
-                //   qualifying for until its next execve, and absent one,
-                //   forever.
-                match proc_view(proc.pid) {
-                    Some((view, judged_at)) => Some((proc.pid, view, judged_at)),
-                    None => {
-                        // Gone, or /proc unreadable. Do not fall back to the
-                        // exec record - that is the guess this comment exists
-                        // to refuse. Withdraw the grant (a grant kept in doubt
-                        // is a marked socket) and leave the deny to the exit
-                        // tracepoint, which owns eviction and can tell
-                        // "exited" from "unreadable".
-                        self.drop_grant(proc.pid);
-                        None
-                    }
-                }
+                // Gone, or /proc unreadable: no fallback to the exec record,
+                // which is the guess this comment exists to refuse. The deny
+                // is left to the exit tracepoint, which owns eviction and can
+                // tell "exited" from "unreadable".
+                proc_view(proc.pid).map(|(view, judged_at)| (proc.pid, view, judged_at))
             })
             .collect();
 
@@ -800,18 +355,6 @@ impl VerdictSink {
         }
         drop(map);
 
-        // The grant side, with the verdict lock released: `grant_if_still`
-        // takes the grant map's own mutex, and holding both at once would put
-        // an ordering constraint on two locks that otherwise never nest.
-        //
-        // No tri-state here: the same engine answer either says "allow,
-        // lasting" or the entry goes. In particular an abstention - which
-        // keeps a deny above - removes a grant, because a grant kept in doubt
-        // is a marked socket past the queue.
-        for (pid, as_process, judged_at) in &views {
-            self.grant_if_still(*pid, as_process, *judged_at, self.grant_for(as_process));
-        }
-
         // And the entries the live list does not cover.
         //
         // `live_processes` only returns pids the proc table has seen exec
@@ -829,31 +372,12 @@ impl VerdictSink {
         // dropped record, which is a process with no in-kernel verdict.
         let known: std::collections::HashSet<u32> = live.iter().map(|p| p.pid).collect();
         let map = self.map.lock();
-        let mut orphans: Vec<u32> = map
+        let orphans: Vec<u32> = map
             .keys()
             .flatten()
             .filter(|pid| !known.contains(pid))
             .collect();
         drop(map);
-        // Grants have orphans too - a long-running allowed process drops off
-        // the live list on the same TTL - and a grant whose rule is gone must
-        // go with it. Walk the grant map's own keys; the loop below re-decides
-        // each pid from /proc and applies the grant answer alongside the deny
-        // answer, so the two maps never disagree about one process.
-        if let Some(fast) = self.fast.as_ref() {
-            let granted: Vec<u32> = fast
-                .map
-                .lock()
-                .keys()
-                .flatten()
-                .filter(|pid| !known.contains(pid))
-                .collect();
-            for pid in granted {
-                if !orphans.contains(&pid) {
-                    orphans.push(pid);
-                }
-            }
-        }
 
         // Each doomed pid carries the start time it was judged at, so the
         // final pass can tell "still the process I judged" from "the kernel
@@ -870,10 +394,8 @@ impl VerdictSink {
             // a uid-scoped allow - so guessing would clear a denial the allow
             // was never meant to lift, which is the fail-open direction.
             let Some((proc, judged_at)) = proc_view(pid) else {
-                // Gone. Clear, or a recycled pid inherits its answer - and a
-                // grant even more so.
+                // Gone. Clear, or a recycled pid inherits its answer.
                 doomed.push((pid, None));
-                self.drop_grant(pid);
                 continue;
             };
             // `None` is two opposite answers and they must not be conflated.
@@ -895,12 +417,6 @@ impl VerdictSink {
                     }
                 }
             }
-            // The grant answer for the same process, from the same /proc
-            // read - with the real uid, so a process that dropped privileges
-            // loses a uid-scoped grant here rather than keeping what it
-            // earned as root - and against the same start time, so it cannot
-            // land on a pid the kernel recycled while this loop was working.
-            self.grant_if_still(pid, &proc, judged_at, self.grant_for(&proc));
         }
 
         if !doomed.is_empty() {
@@ -935,80 +451,6 @@ impl VerdictSink {
             processes = live.len(),
             denied, "resynced in-kernel verdicts after a rule change"
         );
-
-        // And the processes neither loop above can reach.
-        self.sweep_fast_allow();
-    }
-
-    /// Grants every process on the machine that a lasting rule allows.
-    ///
-    /// Every other writer of the grant map needs an *event*: `on_exec` needs an
-    /// execve, and the two loops above walk the proc table's recent execs and
-    /// the maps' own keys. None of them reaches a process that was already
-    /// running - which is exactly the population this feature exists for. It
-    /// showed up two ways, and in both the path reported `live` while doing
-    /// nothing at all:
-    ///
-    /// * after `systemctl restart colony-firewalld`. The pinned map is flushed
-    ///   at start (those grants were made under the previous daemon's rules)
-    ///   and the proc table starts empty, so the browser, the mail client -
-    ///   everything long-lived - was never granted again for the rest of that
-    ///   daemon's life. The restart is the common case: an upgrade, a crash, a
-    ///   config reload.
-    /// * `allow --exe .../firefox always` on a browser started three hours ago.
-    ///   The proc table's entries expire on a one-hour TTL, so the live loop
-    ///   never saw it either. The feature only ever worked for a process that
-    ///   exec'd *after* the daemon and less than an hour before its rule.
-    ///
-    /// So this walks /proc. O(processes), three small reads each and up to
-    /// three more for the ones a rule grants, on whichever thread changed the
-    /// rules - an IPC handler or startup, never
-    /// the packet path - and rule changes are paced by a human or the CLI.
-    ///
-    /// It only ever *adds*. Withdrawal is already covered and must stay where
-    /// it is: every pid holding a grant is re-decided by the live loop or the
-    /// orphan sweep above, and those two also handle pids that have left /proc
-    /// entirely, which this walk by construction cannot see.
-    pub(super) fn sweep_fast_allow(&self) {
-        if self.fast.is_none() {
-            return;
-        }
-        // A rule set that cannot grant anyone - only denies, only timed or
-        // flow-scoped allows - makes the walk below a few hundred /proc reads
-        // and engine calls for an answer already known. That is the common
-        // shape of a rule set with the fast path switched on, and this runs on
-        // every rule change.
-        if !self.engine.any_fast_allow_rule() {
-            debug!("no rule could grant the fast path; not walking /proc");
-            return;
-        }
-        let entries = match std::fs::read_dir("/proc") {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("could not read /proc to seed fast-allow grants: {e}");
-                return;
-            }
-        };
-        let (mut seen, mut granted) = (0usize, 0usize);
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|s| s.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            seen += 1;
-            let Some((proc, judged_at)) = proc_view(pid) else {
-                continue;
-            };
-            let grant = self.grant_for(&proc);
-            if matches!(grant, Grant::Yes(_)) {
-                granted += 1;
-                self.grant_if_still(pid, &proc, judged_at, grant);
-            }
-        }
-        debug!(seen, granted, "swept /proc for fast-allow grants");
     }
 
     /// Decides whether this newly-exec'd process gets an in-kernel answer.
@@ -1017,14 +459,10 @@ impl VerdictSink {
     /// process depends on a destination. Two things follow from that, both
     /// deliberate:
     ///
-    /// * **an allow is never written *here*.** `VERDICTS` holds denials only.
-    ///   Allows that buy something - a lasting, process-wide one - go to the
-    ///   fast-allow map through [`regrant`](Self::regrant) at the end of this
-    ///   function, under rules of their own: cleared by the kernel on exec and
-    ///   exit, honoured only while the daemon's heartbeat keeps the deadline
-    ///   ahead of now, and re-earned per execve. A stale allow after pid reuse
-    ///   is a security problem rather than an inconvenience, which is why the
-    ///   two maps do not share a sweep.
+    /// * **an allow is never written.** `VERDICTS` holds denials only; an
+    ///   allowed process keeps the packet path, which re-checks every flow. A
+    ///   stale allow after pid reuse would be a security problem rather than an
+    ///   inconvenience, which is why there is none to go stale.
     /// * **a stale entry is always cleared**, even when the answer is "no
     ///   answer". A pid that re-execs into a different binary must not inherit
     ///   the verdict written for the one before it.
@@ -1053,8 +491,6 @@ impl VerdictSink {
                     None => exe,
                 }
             });
-        // Dates the read above, for the grant at the end of this function.
-        let judged_at = resolved.is_some().then(|| proc_starttime(pid)).flatten();
         // The uid here stays the event's, not a fresh read: at the moment of an
         // execve that *is* the process's uid, and a drop of privileges between
         // the kernel's tracepoint and this consumer is both vanishingly narrow
@@ -1062,10 +498,9 @@ impl VerdictSink {
         // both. Mixing a live path with an event-time uid is worth naming
         // rather than leaving for a reader to find.
         // When /proc is unreadable, retain the unknown executable supplied by
-        // the event consumer. The execve argument cannot attest a mapped image.
-        // Missing identity keeps grants absent and leaves packet policy to
-        // NFQUEUE; it must not satisfy an executable-scoped rule.
-        let readable = resolved.is_some();
+        // the event consumer. The execve argument cannot attest a mapped image,
+        // so missing identity leaves packet policy to NFQUEUE; it must not
+        // satisfy an executable-scoped rule.
         let corrected = match resolved {
             Some(exe) if exe != proc.exe => Some(Process {
                 exe,
@@ -1097,22 +532,6 @@ impl VerdictSink {
             debug!(pid, exe = %as_process.exe.display(), "in-kernel deny installed");
         }
         drop(map);
-
-        // The grant, re-earned for this exec. The kernel already removed the
-        // predecessor's entry on the exec path, so this is the daemon's only
-        // role in the fast path: say yes for the new binary, or say nothing.
-        // The engine is asked once more rather than reusing `deny` because
-        // the answer that matters here is "allow, from a rule that lasts",
-        // which the deny decision above did not compute.
-        if readable {
-            self.regrant(pid, judged_at, as_process);
-        } else {
-            // Nothing to grant for a pid we could not read. The kernel's exec
-            // path already removed the predecessor's entry, so this only
-            // clears the daemon-side bookkeeping that would otherwise credit
-            // an allow event to a rule for a process that no longer exists.
-            self.drop_grant(pid);
-        }
     }
 
     /// Compiles the process-wide rules into the kernel's own table.
@@ -1226,54 +645,10 @@ impl VerdictSink {
         if let Err(e) = clear(&mut self.map.lock(), pid) {
             warn!(pid, "could not evict the in-kernel verdict: {e}");
         }
-        // The kernel evicted the grant itself on the exit path; this drops
-        // the credit record so a recycled pid is never credited to a rule
-        // that granted its predecessor.
-        if let Some(fast) = self.fast.as_ref() {
-            let _ = clear(&mut fast.map.lock(), pid);
-            fast.granted_by.lock().remove(&pid);
-        }
-    }
-}
-
-/// `CLOCK_BOOTTIME` in nanoseconds - the clock `bpf_ktime_get_boot_ns`
-/// reads, which counts through suspend. The deadline it feeds must be sixty
-/// wall-clock seconds, not sixty awake ones.
-fn boottime_ns() -> anyhow::Result<u64> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: a valid pointer to a timespec on our own stack; the call writes
-    // it and nothing else.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("clock_gettime(CLOCK_BOOTTIME)");
-    }
-    Ok(u64::try_from(ts.tv_sec).unwrap_or(0) * 1_000_000_000
-        + u64::try_from(ts.tv_nsec).unwrap_or(0))
-}
-
-/// Whether a grant judged at `recorded` still belongs to the process now
-/// holding its pid, given the start time read `now`.
-///
-/// Only an exact match keeps a grant. `None` on either side is "no process":
-/// a grant recorded without a start time cannot happen (`grant_if_still`
-/// refuses it) but is treated as stale rather than trusted, and a pid with no
-/// process now is a grant for whoever gets the pid next. Two live processes
-/// never share a (pid, start time) pair within a boot.
-fn grant_is_stale(recorded: Option<u64>, now: Option<u64>) -> bool {
-    match (recorded, now) {
-        (Some(a), Some(b)) => a != b,
-        _ => true,
     }
 }
 
 /// `/proc/<pid>/exe`, with the kernel's `" (deleted)"` suffix stripped.
-///
-/// One reader, because three callers want the same normalisation and two of
-/// them are a guard and its counter-check - a difference between those two
-/// would be a grant kept or withdrawn for a reason nobody wrote down.
 fn proc_exe(pid: u32) -> Option<std::path::PathBuf> {
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     let s = exe.to_string_lossy();
@@ -1295,7 +670,7 @@ fn proc_exe(pid: u32) -> Option<std::path::PathBuf> {
 /// abstain and keeps the tri-state the sweep depends on.
 ///
 /// `None` means the process is gone or its /proc is unreadable, which callers
-/// must treat as "no grant" rather than falling back to a guess.
+/// must treat as "no answer" rather than falling back to a guess.
 fn proc_view(pid: u32) -> Option<(Process, Option<u64>)> {
     // `proc_exe` strips the kernel's " (deleted)" suffix - a package upgrade
     // under a running program, which process_resolve calls Tuesday on a rolling
@@ -1351,9 +726,9 @@ fn proc_starttime(pid: u32) -> Option<u64> {
     // Same reason as `proc_uid`, and it matters more here: the kernel writes
     // comm unescaped into this file, and every guard built on this function
     // treats `None` as "no process". A program named with non-UTF-8 bytes was
-    // therefore never granted the fast path, and - once the deny pass started
-    // filtering on the start time - never given an in-kernel deny either,
-    // which is resync's whole job. Permanently, not transiently.
+    // therefore - once the deny pass started filtering on the start time -
+    // never given an in-kernel deny, which is resync's whole job.
+    // Permanently, not transiently.
     let stat =
         String::from_utf8_lossy(&std::fs::read(format!("/proc/{pid}/stat")).ok()?).into_owned();
     // The comm field is parenthesised and may itself contain spaces and
@@ -1399,22 +774,17 @@ fn is_absent(err: &aya::maps::MapError) -> bool {
 }
 
 /// Per-CPU counters, summed. See [`enforce_stat`].
+///
+/// Only the slots the daemon still reports. The kernel also counts the
+/// legacy Fast Allow outcomes, and the slot layout stays as it is.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct EnforceStats {
-    /// `connect()` calls allowed because the map held an allow.
-    pub allowed: u64,
     /// `connect()` calls refused in-kernel, before a packet existed.
     pub denied: u64,
     /// `connect()` calls with no entry, which went on to the packet path.
     pub unknown: u64,
-    /// Grants the kernel saw but did not honour because the deadline had
-    /// lapsed - a daemon that stopped heartbeating, seen from the kernel.
-    pub stale: u64,
-    /// Grants not applied because the socket carried a foreign mark - a VPN
-    /// or proxy marking its own sockets, left alone on purpose.
-    pub foreign_mark: u64,
     /// Decisions the kernel made and could not report, because the ring was
-    /// full. Non-zero means the daemon's view of the fast path undercounts.
+    /// full.
     pub report_dropped: u64,
 }
 
@@ -1464,6 +834,7 @@ pub(super) fn prepare() -> anyhow::Result<PathBuf> {
     unpin_other_versions(&ns);
     let dir = pin_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    remove_legacy_pins(&dir);
     Ok(dir)
 }
 
@@ -1520,28 +891,85 @@ pub(super) fn already_attached(dir: &Path) -> bool {
     dir.join("connect4").exists() && dir.join("connect6").exists()
 }
 
-/// A directory `attach` creates beside the connect pins once *both* cookie
-/// connect variants have attached, and nothing else.
+/// Removes what a 0.4-0.6 daemon pinned for Fast Allow and nothing reads any
+/// more: the two sendmsg links and the cookie-variant marker directory.
 ///
-/// The inherited path needs to know which connect variant a previous daemon
-/// left running, and the pin names do not say: `connect4` is `connect4`
-/// whether it holds the cookie program or the basic twin. The sendmsg pins used
-/// to be the evidence - written only after the cookie variants took - which
-/// made a daemon that ran cookie variants *without* sendmsg (a kernel that
-/// refuses `bpf_getsockopt` there) look, to its successor, like a basic-connect
-/// daemon, and refuse the fast path on every restart. bpffs allows directories,
-/// so the evidence is now its own object and says one thing only.
-pub(super) const COOKIE_MARKER: &str = "cookie-variants";
-
-/// True when a previous daemon left the marker: the pinned connect programs
-/// are the cookie variants, which carry `mark_decision`.
-pub(super) fn cookie_variants_pinned(dir: &Path) -> bool {
-    dir.join(COOKIE_MARKER).is_dir()
+/// Removing a link pin drops the kernel's last reference and detaches the
+/// program, so this is also what takes an older daemon's inert sendmsg hooks
+/// off the cgroup, on the inherited path as much as on a fresh attach. Absent
+/// is the ordinary case and says nothing. The legacy *maps* stay pinned: the
+/// connect programs still read them, and [`disarm_legacy_fast_allow`] needs
+/// to reach the pinned copies.
+fn remove_legacy_pins(dir: &Path) {
+    for name in [LINK_SENDMSG4, LINK_SENDMSG6] {
+        let pin = dir.join(name);
+        match std::fs::remove_file(&pin) {
+            Ok(()) => debug!("removed the legacy {name} pin at {}", pin.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                "could not remove the legacy {name} pin at {}: {e}",
+                pin.display()
+            ),
+        }
+    }
+    let marker = dir.join(LEGACY_COOKIE_MARKER);
+    match std::fs::remove_dir(&marker) {
+        Ok(()) => debug!("removed the legacy marker at {}", marker.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            "could not remove the legacy marker at {}: {e}",
+            marker.display()
+        ),
+    }
 }
 
-/// True when a previous daemon left both sendmsg programs pinned.
-pub(super) fn sendmsg_pinned(dir: &Path) -> bool {
-    dir.join(LINK_SENDMSG4).exists() && dir.join(LINK_SENDMSG6).exists()
+/// Withdraws whatever Fast Allow state the pinned maps still hold: a zero
+/// deadline, the unarmed mark, and no grants.
+///
+/// The daemon no longer grants, but the kernel object still carries the maps
+/// (ABI v4) and the connect programs still consult them. They are pinned, so
+/// a 0.4-0.6 daemon that died while armed left a mark the hooks would go on
+/// setting across any number of restarts - a mark that can collide with the
+/// fwmark selectors of kube-proxy, Tailscale or wg-quick. With `UNARMED`
+/// written, `mark_decision` returns at its first array read. Best effort: a
+/// map that is missing or will not take the write is logged and skipped.
+pub(super) fn disarm_legacy_fast_allow(bpf: &mut Ebpf) {
+    if let Some(m) = bpf.map_mut(MAP_FAST_ALLOW_UNTIL) {
+        match aya::maps::Array::<_, u64>::try_from(m) {
+            Ok(mut until) => {
+                if let Err(e) = until.set(0, 0u64, 0) {
+                    warn!("could not zero the legacy {MAP_FAST_ALLOW_UNTIL}: {e}");
+                }
+            }
+            Err(e) => warn!("{MAP_FAST_ALLOW_UNTIL} is not an array: {e}"),
+        }
+    }
+    if let Some(m) = bpf.map_mut(MAP_FAST_ALLOW_MARK) {
+        match aya::maps::Array::<_, u32>::try_from(m) {
+            Ok(mut mark) => {
+                if let Err(e) = mark.set(0, cfc_ebpf_common::fast_allow::UNARMED, 0) {
+                    warn!("could not unarm the legacy {MAP_FAST_ALLOW_MARK}: {e}");
+                }
+            }
+            Err(e) => warn!("{MAP_FAST_ALLOW_MARK} is not an array: {e}"),
+        }
+    }
+    if let Some(m) = bpf.map_mut(MAP_FAST_ALLOW) {
+        match BpfHashMap::<_, u32, u32>::try_from(m) {
+            Ok(mut grants) => {
+                let pids: Vec<u32> = grants.keys().flatten().collect();
+                for pid in pids {
+                    match grants.remove(&pid) {
+                        Err(e) if !is_absent(&e) => {
+                            warn!(pid, "could not drop a legacy {MAP_FAST_ALLOW} grant: {e}")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => warn!("{MAP_FAST_ALLOW} is not a hash map: {e}"),
+        }
+    }
 }
 
 /// Unpins any lone connect-link leftovers so a fresh attach starts clean.
@@ -1552,19 +980,7 @@ pub(super) fn sendmsg_pinned(dir: &Path) -> bool {
 /// the packet path like any other unenforced moment - is the price of not
 /// being wedged forever.
 fn drop_half_attached(dir: &Path) {
-    // The marker goes with the pins it describes; a marker outliving them
-    // would tell the next daemon the cookie variants are running when nothing
-    // is.
-    let marker = dir.join(COOKIE_MARKER);
-    if marker.is_dir() {
-        if let Err(e) = std::fs::remove_dir(&marker) {
-            warn!(
-                "could not remove the stale cookie marker at {}: {e}",
-                marker.display()
-            );
-        }
-    }
-    for name in ["connect4", "connect6", LINK_SENDMSG4, LINK_SENDMSG6] {
+    for name in ["connect4", "connect6"] {
         let pin = dir.join(name);
         if !pin.exists() {
             continue;
@@ -1639,56 +1055,17 @@ fn attach_one(
     Ok(insns)
 }
 
-/// What [`attach`] managed to put in place.
-pub(super) struct AttachedPrograms {
-    /// Every program attached, with its verified instruction count.
-    pub programs: Vec<(String, Option<u32>)>,
-    /// Whether the kernel side of the fast path is in place, and if not, the
-    /// one sentence that says why - two different kernels give two different
-    /// answers, and reporting the wrong one sent a reader to the wrong
-    /// kernel version.
-    pub fast_path: FastPathCapability,
-}
-
-// Defined in `ebpf.rs`, where the `Report` that carries it lives in every
-// build; re-exported so the paths this module's callers use keep resolving.
-pub(super) use super::FastPathCapability;
-
-impl FastPathCapability {
-    /// The one reason the fast path cannot run at all, or `None`.
-    pub(super) fn refusal(self) -> Option<&'static str> {
-        match self {
-            Self::BasicConnect => Some(
-                "the connect hooks fell back to the basic variants, which carry no mark \
-                 decision (usually no bpf_get_socket_cookie / bpf_setsockopt on sock_addr \
-                 programs; the log line beside this one has the kernel's actual answer)",
-            ),
-            Self::SendmsgUnavailable => Some("fast-allow requires both UDP sendmsg hooks"),
-            Self::Ready => None,
-        }
-    }
-
-    /// A guarantee the path runs without, for the report, or `None`.
-    pub(super) fn caveat(self) -> Option<&'static str> {
-        match self {
-            Self::SendmsgUnavailable => Some(
-                "the cgroup/sendmsg hooks did not load or attach, so a mark forged onto an \
-                 unconnected UDP socket is not stripped (usually this kernel's verifier: \
-                 bpf_getsockopt/setsockopt on sendmsg needs a newer kernel than on connect - \
-                 5.10 refuses, 6.12 accepts; the log line beside this one has the actual answer)",
-            ),
-            Self::Ready | Self::BasicConnect => None,
-        }
-    }
-}
-
 /// Attaches both connect programs, pinning them under `dir` when it is
-/// `Some`, then the sendmsg pair when the cookie variants took.
+/// `Some`, and returns every program attached with its verified instruction
+/// count.
 ///
 /// `dir` is `None` when [`prepare`] failed: the programs still attach and still
 /// enforce, they just stop when this process does. That is strictly better than
 /// not attaching, and worse than pinning, so the caller says which happened.
-pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<AttachedPrograms> {
+pub(super) fn attach(
+    bpf: &mut Ebpf,
+    dir: Option<&Path>,
+) -> anyhow::Result<Vec<(String, Option<u32>)>> {
     let root = super::cgroup::v2_root()
         .ok_or_else(|| anyhow!("no cgroup2 mount in /proc/mounts (unified hierarchy required)"))?;
     // Read-only, for the same reason as the DNS attach: the kernel wants the
@@ -1705,7 +1082,6 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
 
     let mut out = Vec::with_capacity(4);
     let mut pinned: Vec<std::path::PathBuf> = Vec::with_capacity(4);
-    let mut cookie_variants = 0usize;
     for (name, basic, pin_name) in [
         (PROG_CONNECT4, PROG_CONNECT4_BASIC, "connect4"),
         (PROG_CONNECT6, PROG_CONNECT6_BASIC, "connect6"),
@@ -1723,7 +1099,6 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
                 if let Some(p) = &pin {
                     pinned.push(p.clone());
                 }
-                cookie_variants += 1;
                 out.push((name.to_string(), i));
                 continue;
             }
@@ -1734,8 +1109,8 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
                 // program bug where there was a state bug.
                 warn!(
                     "{name} could not load or attach ({first:#}); attaching \
-                     {basic} - enforcement is unaffected; O(1) attribution and \
-                     the fast path are unavailable"
+                     {basic} - enforcement is unaffected; O(1) attribution is \
+                     unavailable"
                 );
                 match attach_one(bpf, basic, &cgroup, pin.as_deref()) {
                     Ok(i) => i,
@@ -1753,63 +1128,7 @@ pub(super) fn attach(bpf: &mut Ebpf, dir: Option<&Path>) -> anyhow::Result<Attac
         }
         out.push((basic.to_string(), insns));
     }
-
-    // The fast path's programs, only behind cookie variants: a kernel that
-    // verifies the cookie connect programs verifies bpf_setsockopt in the
-    // same hooks, and a kernel on the basic twins has no fast path to serve.
-    // A failure here costs the fast path, never enforcement - so it is a
-    // note, not an error, and never unwinds the connect pins.
-    let mut fast_path = if cookie_variants == 2 {
-        FastPathCapability::Ready
-    } else {
-        FastPathCapability::BasicConnect
-    };
-    if fast_path == FastPathCapability::Ready {
-        // Evidence for the next daemon: see COOKIE_MARKER. Best effort - a
-        // failure here costs a restart its knowledge of which variant runs,
-        // and it will say so, but attaches nothing differently.
-        if let Some(d) = dir {
-            let marker = d.join(COOKIE_MARKER);
-            if let Err(e) = std::fs::create_dir(&marker) {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    warn!(
-                        "could not leave the cookie-variant marker at {}: {e}; a restart will \
-                         not know which connect variant is running and will fall back to the \
-                         packet path",
-                        marker.display()
-                    );
-                }
-            }
-        }
-        for (name, pin_name) in [
-            (PROG_SENDMSG4, LINK_SENDMSG4),
-            (PROG_SENDMSG6, LINK_SENDMSG6),
-        ] {
-            let pin = dir.map(|d| d.join(pin_name));
-            match attach_one(bpf, name, &cgroup, pin.as_deref()) {
-                Ok(i) => out.push((name.to_string(), i)),
-                Err(e) => {
-                    warn!(
-                        "{name} could not load or attach ({e:#}); the fast path runs without the sendmsg hooks - a mark forged onto an unconnected UDP socket is not stripped on this kernel"
-                    );
-                    fast_path = FastPathCapability::SendmsgUnavailable;
-                    break;
-                }
-            }
-        }
-        if fast_path != FastPathCapability::Ready {
-            // Leave no lone sendmsg pin behind for the next start to trip on.
-            if let Some(d) = dir {
-                for p in [LINK_SENDMSG4, LINK_SENDMSG6] {
-                    let _ = std::fs::remove_file(d.join(p));
-                }
-            }
-        }
-    }
-    Ok(AttachedPrograms {
-        programs: out,
-        fast_path,
-    })
+    Ok(out)
 }
 
 /// Removes entries for pids that no longer exist.
@@ -1863,11 +1182,8 @@ pub(super) fn stats(map: &PerCpuArray<&MapData, u64>) -> anyhow::Result<EnforceS
         }
     };
     Ok(EnforceStats {
-        allowed: read(enforce_stat::ALLOWED)?,
         denied: read(enforce_stat::DENIED)?,
         unknown: read(enforce_stat::UNKNOWN)?,
-        stale: read(enforce_stat::STALE)?,
-        foreign_mark: read(enforce_stat::FOREIGN_MARK)?,
         report_dropped: read(enforce_stat::REPORT_DROPPED)?,
     })
 }
@@ -1889,8 +1205,7 @@ mod tests {
         assert!(
             proc.exe.is_absolute(),
             "a resolved path is absolute even when argv[0] was relative - the \
-             property the live loop lacked, which made it skip such a process \
-             and leave its grant standing after the rule was deleted"
+             property the live loop lacked, which made it skip such a process"
         );
 
         // SAFETY: getuid(2) cannot fail and touches no memory.
@@ -1904,45 +1219,13 @@ mod tests {
     }
 
     /// A view that cannot be read must not become a guess: both callers turn
-    /// `None` into "no grant", and the fallback to the exec record is exactly
+    /// `None` into "no answer", and the fallback to the exec record is exactly
     /// the bug this replaced.
     #[test]
     fn proc_view_of_a_pid_that_cannot_exist_is_none() {
         // Above /proc/sys/kernel/pid_max on every configuration; no process
         // can hold it, so this is "gone", not "unreadable by us".
         assert!(proc_view(u32::MAX).is_none());
-    }
-
-    /// The predicate the heartbeat sweep rests on, over its whole input space.
-    /// Only an exact match keeps a grant; every other shape is "not the
-    /// process that was granted" and goes.
-    #[test]
-    fn only_a_matching_start_time_keeps_a_grant() {
-        assert!(!grant_is_stale(Some(100), Some(100)), "same process, keep");
-        assert!(grant_is_stale(Some(100), Some(101)), "recycled pid, drop");
-        assert!(grant_is_stale(Some(100), None), "process gone, drop");
-        // A grant recorded without a start time cannot be written - but if it
-        // ever were, trusting it would be the fail-open direction.
-        assert!(grant_is_stale(None, Some(100)), "unknown at grant, drop");
-        assert!(grant_is_stale(None, None), "unknown both ways, drop");
-    }
-
-    /// The marker is a directory because bpffs allows directories and nothing
-    /// else that is not a BPF object; a plain tmpdir stands in for bpffs here
-    /// since only the shape is under test.
-    #[test]
-    fn the_cookie_marker_is_read_as_a_directory_and_nothing_else() {
-        let dir = tempfile::tempdir().expect("tmpdir");
-        assert!(!cookie_variants_pinned(dir.path()), "absent is absent");
-        std::fs::write(dir.path().join(COOKIE_MARKER), b"").expect("write");
-        assert!(
-            !cookie_variants_pinned(dir.path()),
-            "a file with the right name is not the marker: only attach makes it, and \
-             attach makes a directory"
-        );
-        std::fs::remove_file(dir.path().join(COOKIE_MARKER)).expect("rm");
-        std::fs::create_dir(dir.path().join(COOKIE_MARKER)).expect("mkdir");
-        assert!(cookie_variants_pinned(dir.path()));
     }
 
     #[test]
@@ -2022,9 +1305,6 @@ mod tests {
             super::super::proc_table::KernelProcTable::new(),
             None,
             super::super::loader::Trust::Warn,
-            tokio::sync::broadcast::channel(8).0,
-            crate::stats::Stats::new(),
-            Default::default(),
         )
         .expect("load");
         assert_eq!(
@@ -2146,9 +1426,6 @@ mod tests {
             super::super::proc_table::KernelProcTable::new(),
             None,
             super::super::loader::Trust::Warn,
-            tokio::sync::broadcast::channel(8).0,
-            crate::stats::Stats::new(),
-            Default::default(),
         )
         .expect("load");
         assert_eq!(
@@ -2261,9 +1538,6 @@ mod tests {
                 super::super::proc_table::KernelProcTable::new(),
                 engine,
                 super::super::loader::Trust::Warn,
-                tokio::sync::broadcast::channel(8).0,
-                crate::stats::Stats::new(),
-                Default::default(),
             )
             .expect("load");
             assert!(

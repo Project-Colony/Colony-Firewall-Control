@@ -41,8 +41,8 @@ const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// moved.
 /// How often to ask nftables whether the table that feeds NFQUEUE is loaded.
 ///
-/// One minute, matching the fast-allow set check: both are a fork and an exec,
-/// and both bound how long `cfc status` may be stale by the same amount.
+/// One minute: it is a fork and an exec, and it bounds how long `cfc status`
+/// may be stale.
 const NFT_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 const PROVENANCE_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
@@ -289,10 +289,8 @@ async fn run() -> anyhow::Result<()> {
     // A packet counter cannot tell "nothing is filtered" from "nothing is
     // happening" - an idle laptop looks identical to an unprotected one. So
     // ask nftables instead. Once a minute, on the blocking pool because it is
-    // a fork and an exec, which is the same cadence and the same reasoning as
-    // the fast-allow set check that already runs there. An error leaves the
-    // previous answer standing: "could not ask" must never render as "the
-    // firewall is gone".
+    // a fork and an exec. An error leaves the previous answer standing: "could
+    // not ask" must never render as "the firewall is gone".
     {
         let stats = stats.clone();
         tokio::spawn(async move {
@@ -365,12 +363,12 @@ async fn run() -> anyhow::Result<()> {
     // sock_diag + /proc alone, which is exactly what the daemon does when the
     // layer is unavailable anyway.
     //
-    // The loader flushes a predecessor's fast-allow mark at the top of every
-    // load. With the layer switched off in the config that flush is never
-    // reached, and the nftables set outlives daemons - so it is done here for
-    // exactly that case. Not under --dry-run, which touches nothing.
-    if !args.dry_run && !cfg.ebpf.enabled.wants_load() {
-        ebpf::flush_stale_fast_allow();
+    // Flush the legacy fast_allow nftables set before the layer comes up,
+    // whatever its mode and whether or not it is compiled in: a mark an older
+    // daemon left there would otherwise stay accepted. Not under --dry-run,
+    // which touches nothing.
+    if !args.dry_run {
+        ebpf::flush_legacy_fast_allow_set();
     }
 
     // Held for the daemon's lifetime: dropping it detaches the programs.
@@ -395,8 +393,6 @@ async fn run() -> anyhow::Result<()> {
         // direction of the dependency the same as everywhere else: the eBPF
         // layer is handed what it may read, and owns nothing the daemon needs.
         Some(engine.clone()),
-        observed_tx.clone(),
-        stats.clone(),
     );
     _ebpf.report.log();
     // Publish it so `cfc status` can say where enforcement lives without anyone

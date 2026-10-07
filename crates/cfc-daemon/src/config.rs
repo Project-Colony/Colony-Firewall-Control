@@ -318,22 +318,13 @@ pub struct EbpfConfig {
     /// Where the BPF object built by `cargo xtask build-ebpf` was installed.
     /// `None` means `crate::ebpf::DEFAULT_OBJECT_PATH`.
     pub object_path: Option<PathBuf>,
-    /// Compatibility setting, currently ignored: Fast Allow is disabled for
-    /// every configuration because socket marks cannot attest the sender.
-    /// Ordinary traffic uses NFQUEUE; the startup report explains the refusal.
+    /// Legacy key from the removed Fast Allow path. Ignored; a warning is
+    /// logged. Still parsed rather than rejected: a parse error stops the
+    /// daemon while the fail-closed nftables table stays loaded, so an
+    /// upgrade would take the host offline.
     pub fast_allow: bool,
-    /// The `SO_MARK` value the fast path uses, when the machine needs a
-    /// specific one.
-    ///
-    /// `None` - the default - draws one at random at each start, which is what
-    /// keeps it from being a forgeable token. Set it only to resolve a
-    /// collision: the mark space is shared with the whole machine, and a
-    /// consumer that selects on a *mask* will match a random value with a
-    /// probability its mask decides. See `ebpf::loader::pick_mark` for the
-    /// selectors CFC already avoids, and `docs/TROUBLESHOOTING.md` for how to
-    /// find the one it does not know about.
-    ///
-    /// Zero is refused: it is the mark of every socket nothing has marked.
+    /// Legacy key from the removed Fast Allow path. Ignored; a warning is
+    /// logged.
     pub fast_allow_mark: Option<u32>,
 }
 
@@ -671,42 +662,15 @@ enabled = " Auto ""#
         assert_eq!(cfg.ebpf.enabled, EbpfMode::Auto);
     }
 
-    /// `daemon.toml.sample` documents the mark in hex, so hex has to parse.
-    /// A sample that shows a spelling the parser rejects is worse than no
-    /// sample: the operator only finds out when the daemon refuses to start.
+    /// The removed Fast Allow keys must keep parsing: rejecting them would
+    /// stop the daemon on upgrade with the fail-closed table still loaded.
     #[test]
-    fn the_fast_allow_mark_parses_in_the_spelling_the_sample_documents() {
-        let mark = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.fast_allow_mark;
-        assert_eq!(mark(""), None, "absent means draw one");
-        assert_eq!(
-            mark("[ebpf]\nfast_allow_mark = 0x00033331\n"),
-            Some(0x0003_3331)
-        );
-        assert_eq!(mark("[ebpf]\nfast_allow_mark = 209713\n"), Some(209_713));
-        // The whole word must fit: the mark is a u32, and the top bit is as
-        // legitimate a mark bit as any other.
-        assert_eq!(
-            mark("[ebpf]\nfast_allow_mark = 0xffffffff\n"),
-            Some(u32::MAX)
-        );
-    }
-
-    /// The fast path is opt-in: nothing short of `fast_allow = true` turns it
-    /// on, and the layer's own eligibility checks still get the last word.
-    #[test]
-    fn ebpf_fast_allow_is_off_unless_asked_for() {
-        let fast_allow = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.fast_allow;
-
-        assert!(!fast_allow(""), "absent means off");
-        assert!(
-            !fast_allow("[ebpf]\n"),
-            "an empty section keeps the default"
-        );
-        assert!(!fast_allow("[ebpf]\nfast_allow = false\n"));
-        assert!(fast_allow("[ebpf]\nfast_allow = true\n"));
-        // Parsed independently of `enabled`: the switch says what was asked
-        // for, and the layer decides whether it can honour it.
-        assert!(fast_allow("[ebpf]\nenabled = false\nfast_allow = true\n"));
+    fn the_legacy_fast_allow_keys_still_parse() {
+        let cfg =
+            Config::from_toml_str("[ebpf]\nfast_allow = true\nfast_allow_mark = 0x00033331\n")
+                .expect("legacy keys must not abort startup");
+        assert!(cfg.ebpf.fast_allow);
+        assert_eq!(cfg.ebpf.fast_allow_mark, Some(0x0003_3331));
     }
 
     #[test]
@@ -903,8 +867,8 @@ enabled = " Auto ""#
              config resolves to the automatic default"
         );
         assert!(
-            !cfg.ebpf.fast_allow,
-            "a shipped config must not take allows off the packet path"
+            !cfg.ebpf.fast_allow && cfg.ebpf.fast_allow_mark.is_none(),
+            "a shipped config must not set the legacy Fast Allow keys"
         );
         assert_eq!(
             cfg.storage.path,

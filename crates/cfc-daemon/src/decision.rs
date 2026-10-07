@@ -44,33 +44,6 @@ struct EngineInner {
     on_change: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
-/// What [`Engine::process_wide_verdict`] found: the action that holds for a
-/// process wherever it connects, and the rule that says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessWideVerdict {
-    pub action: cfc_core::Action,
-    pub rule_id: uuid::Uuid,
-    pub duration: cfc_core::Duration,
-}
-
-impl ProcessWideVerdict {
-    /// Whether this verdict may be handed to the in-kernel fast path.
-    ///
-    /// An allow, from a rule that lasts. `Once` never reaches here (it is
-    /// not stored), and a timed rule is excluded on purpose: the fast path
-    /// re-checks grants only on flow starts and rule changes, so a timed
-    /// allow would keep marking sockets until the next flush noticed its
-    /// deadline - up to thirty seconds past the moment the user chose.
-    /// Denies never qualify either way; they have their own map.
-    pub fn fast_allow_eligible(&self) -> bool {
-        self.action == cfc_core::Action::Allow
-            && matches!(
-                self.duration,
-                cfc_core::Duration::Always | cfc_core::Duration::UntilRestart
-            )
-    }
-}
-
 pub enum Decision {
     /// A persistent rule matched. Return the verdict immediately.
     Resolved(Verdict),
@@ -137,14 +110,6 @@ impl Engine {
         self.notify_changed();
     }
 
-    /// Credits a hit to `rule_id` for a flow the packet path never saw - a
-    /// fast-allowed connection reported by the kernel. The same counter
-    /// `evaluate` bumps, so the busiest allow rule stops reading as dead the
-    /// day its traffic skips the queue.
-    pub fn record_hit(&self, rule_id: uuid::Uuid) {
-        *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
-    }
-
     fn notify_changed(&self) {
         if let Some(f) = self.inner.on_change.read().as_ref() {
             f();
@@ -209,15 +174,6 @@ impl Engine {
     /// `None` means "ask the packet path", which is always a safe answer: it
     /// is what happened before this existed.
     pub fn process_wide_action(&self, proc: &Process) -> Option<cfc_core::Action> {
-        self.process_wide_verdict(proc).map(|v| v.action)
-    }
-
-    /// [`process_wide_action`](Self::process_wide_action) with the rule that
-    /// answered: its id, for crediting a hit the packet path will never see,
-    /// and its duration, because the fast path is offered only to rules that
-    /// last. A timed allow (`--for 1h`) keeps the packet path, so its expiry
-    /// is exact rather than "within the next flush tick".
-    pub fn process_wide_verdict(&self, proc: &Process) -> Option<ProcessWideVerdict> {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
         for rule in rules
@@ -247,41 +203,9 @@ impl Engine {
             if !rule.scope.matches_process(proc) {
                 continue;
             }
-            return (!rule.scope.constrains_destination()).then_some(ProcessWideVerdict {
-                action: rule.action,
-                rule_id: rule.id,
-                duration: rule.duration,
-            });
+            return (!rule.scope.constrains_destination()).then_some(rule.action);
         }
         None
-    }
-
-    /// Whether any enabled rule could grant the fast path to *some* process.
-    ///
-    /// The same predicate `process_wide_verdict` applies per process, asked of
-    /// the rule set as a whole: outbound, not flow-scoped, and eligible - an
-    /// `Allow` that lasts. Reuses [`ProcessWideVerdict::fast_allow_eligible`]
-    /// rather than restating it, so there is one definition of "could grant".
-    ///
-    /// For `sweep_fast_allow`, which otherwise walks /proc on every rule
-    /// change to reach a conclusion this answers in a few comparisons.
-    pub fn any_fast_allow_rule(&self) -> bool {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let rules = self.inner.rules.read();
-        rules
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
-            .filter(|r| !r.scope.constrains_destination())
-            .any(|r| {
-                ProcessWideVerdict {
-                    action: r.action,
-                    rule_id: r.id,
-                    duration: r.duration,
-                }
-                .fast_allow_eligible()
-            })
     }
 
     /// Whether some resolution of the rules this caller cannot decide would
@@ -412,42 +336,6 @@ impl Engine {
                 .cloned()
                 .collect(),
         )
-    }
-
-    /// Whether any live rule scoped to a uid could apply to `exe`.
-    ///
-    /// The mirror of [`Self::compilable_exe_paths`], for the grant map rather
-    /// than the deny map, and it exists for the same reason turned around.
-    ///
-    /// The two deciders do not read the same uid. The packet path takes the
-    /// uid from the kernel's exec record when it has one - the uid at
-    /// `execve` - and does not read `/proc/<pid>/status` at all. The grant
-    /// path resolves through `/proc` and gets the uid the process holds
-    /// *now*. For a program that drops privileges after exec - `named`,
-    /// `postfix`, a browser entering its sandbox - those are different, so
-    /// `deny --exe X --uid 0` above `allow --exe X` can be answered "deny" by
-    /// the packet path and "allow" by the grant path. A grant is process-wide
-    /// and destination-blind, so that disagreement is not a slower answer, it
-    /// is the deny never being applied at all.
-    ///
-    /// Rather than decide which uid is the right one - a semantic change to
-    /// what every existing uid-scoped rule means - the fast path simply
-    /// abstains wherever a uid could matter. Those flows take the queue,
-    /// where the uid question has one answer and it is the packet path's.
-    /// Hosts with no uid-scoped rule, which is nearly all of them, pay
-    /// nothing: the walk stops at the first predicate.
-    pub fn uid_scoped_may_apply(&self, exe: &std::path::Path) -> bool {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        self.inner
-            .rules
-            .read()
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter(|r| r.scope.uid.is_some())
-            // A uid-scoped rule that names no executable can apply to any
-            // program, exactly as in `compilable_exe_paths`.
-            .any(|r| r.scope.exe_path.as_deref().is_none_or(|p| p == exe))
     }
 
     /// What an inbound flow gets when no rule matches.
@@ -665,83 +553,6 @@ mod tests {
         Engine::new(RuleSet { rules }, shared(dp_deny()))
     }
 
-    // --- the uid guard on the grant path --------------------------------
-
-    #[test]
-    fn a_uid_scoped_rule_takes_its_program_off_the_fast_path() {
-        let exe = std::path::Path::new("/usr/sbin/named");
-        let other = std::path::Path::new("/usr/bin/curl");
-
-        // The shape that made the fast path grant what the packet path denies:
-        // the program execs as root and drops to its own uid, so the grant
-        // path reads 53 and the packet path reads 0, and only one of them
-        // sees the deny.
-        let mut denied_as_root = RuleScope::any();
-        denied_as_root.exe_path = Some(PathBuf::from(exe));
-        denied_as_root.uid = Some(0);
-        let mut allowed = RuleScope::any();
-        allowed.exe_path = Some(PathBuf::from(exe));
-        let engine = engine_with(vec![
-            Rule::new("deny-as-root".to_string(), Action::Deny, denied_as_root),
-            Rule::new("allow".to_string(), Action::Allow, allowed),
-        ]);
-        assert!(
-            engine.uid_scoped_may_apply(exe),
-            "a uid-scoped rule names this program, so the fast path must stand aside"
-        );
-        assert!(
-            !engine.uid_scoped_may_apply(other),
-            "a program no uid-scoped rule names is unaffected"
-        );
-
-        // A rule set with no uid predicate at all costs nothing: this is the
-        // common case and it must not be taken off the fast path.
-        let mut plain = RuleScope::any();
-        plain.exe_path = Some(PathBuf::from(exe));
-        let engine = engine_with(vec![Rule::new("a".to_string(), Action::Allow, plain)]);
-        assert!(!engine.uid_scoped_may_apply(exe));
-    }
-
-    #[test]
-    fn a_uid_rule_naming_no_program_takes_everything_off_the_fast_path() {
-        // It could apply to anything, and nothing here can tell whether it
-        // would - the same reasoning `compilable_exe_paths` uses to return
-        // `None` rather than a list.
-        let mut any_program = RuleScope::any();
-        any_program.uid = Some(1000);
-        let engine = engine_with(vec![Rule::new(
-            "per-user".to_string(),
-            Action::Deny,
-            any_program,
-        )]);
-        for exe in ["/usr/bin/curl", "/usr/sbin/named", "/opt/whatever"] {
-            assert!(
-                engine.uid_scoped_may_apply(std::path::Path::new(exe)),
-                "{exe} must not be granted while a uid rule can reach any program"
-            );
-        }
-    }
-
-    #[test]
-    fn a_disabled_or_expired_uid_rule_does_not_hold_the_fast_path_back() {
-        let exe = std::path::Path::new("/usr/sbin/named");
-        let mut scope = RuleScope::any();
-        scope.exe_path = Some(PathBuf::from(exe));
-        scope.uid = Some(0);
-
-        let mut disabled = Rule::new("off".to_string(), Action::Deny, scope.clone());
-        disabled.enabled = false;
-        assert!(!engine_with(vec![disabled]).uid_scoped_may_apply(exe));
-
-        let mut expired = Rule::new("gone".to_string(), Action::Deny, scope);
-        expired.duration = cfc_core::Duration::Seconds(1);
-        expired.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
-        assert!(
-            !engine_with(vec![expired]).uid_scoped_may_apply(exe),
-            "an expired rule constrains nothing"
-        );
-    }
-
     // --- process_wide_action -------------------------------------------
     //
     // This is what the `cgroup/connect4|6` programs are steered by, and it
@@ -869,186 +680,29 @@ mod tests {
         assert_eq!(engine.process_wide_action(&without), None);
     }
 
-    /// The eligibility predicate, reached the way the daemon reaches it: through
-    /// `process_wide_verdict` on a real engine with a real rule, one case per
-    /// shape of answer.
+    /// A rule that says anything about the flow must never become a
+    /// process-wide answer.
     ///
-    /// The exhaustive version further down tests the predicate on its own over
-    /// the whole Action x Duration space; this one is the through-the-engine
-    /// complement, and the pair is deliberate. (The doc comment that used to
-    /// sit here described a rule-expiry test that lives elsewhere - a leftover
-    /// from a move, and a reader looking for the expiry test would have been
-    /// sent to the wrong function.)
+    /// `deny --dst-port 443` means "this program may not reach 443", and an
+    /// in-kernel verdict means "every `connect()` this program makes is
+    /// refused". Conflating them would refuse everything the rule never
+    /// named, so each predicate that makes a rule flow-scoped is checked on
+    /// its own - a missing one would only show up as a rule type that quietly
+    /// denies everything.
     #[test]
-    fn only_lasting_allows_are_fast_allow_eligible() {
-        // The fast path re-checks grants on flow starts and rule changes, not
-        // on a clock, so a timed allow would outlive its deadline by up to a
-        // flush tick. Denies have their own map and never qualify.
-        let mut scope = RuleScope::any();
-        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
-        let eligible = |action: Action, duration: cfc_core::Duration| {
-            let mut rule = Rule::new("r".to_string(), action, scope.clone());
-            rule.duration = duration;
-            let engine = engine_with(vec![rule]);
-            let proc = Process {
-                exe: PathBuf::from("/usr/bin/curl"),
-                ..Process::unknown(1)
-            };
-            engine
-                .process_wide_verdict(&proc)
-                .map(|v| v.fast_allow_eligible())
-        };
-        assert_eq!(
-            eligible(Action::Allow, cfc_core::Duration::Always),
-            Some(true)
-        );
-        assert_eq!(
-            eligible(Action::Allow, cfc_core::Duration::UntilRestart),
-            Some(true)
-        );
-        assert_eq!(
-            eligible(Action::Allow, cfc_core::Duration::Seconds(3600)),
-            Some(false),
-            "a timed allow keeps the packet path so its expiry is exact"
-        );
-        assert_eq!(
-            eligible(Action::Deny, cfc_core::Duration::Always),
-            Some(false)
-        );
-        assert_eq!(
-            eligible(Action::Reject, cfc_core::Duration::Always),
-            Some(false)
-        );
-    }
-
-    /// The rule-set-wide question `sweep_fast_allow` asks before walking /proc:
-    /// one case per way a rule set can fail to grant anyone, and one that can.
-    #[test]
-    fn a_rule_set_that_cannot_grant_anyone_says_so() {
-        use cfc_core::Duration;
-        let exe = || Some(PathBuf::from("/usr/bin/curl"));
-        let rule = |action: Action, duration: Duration, f: fn(&mut RuleScope)| {
-            let mut scope = RuleScope::any();
-            scope.exe_path = exe();
-            f(&mut scope);
-            let mut r = Rule::new("r".to_string(), action, scope);
-            r.duration = duration;
-            r
-        };
-        let none = |_: &mut RuleScope| {};
-
-        assert!(!engine_with(vec![]).any_fast_allow_rule(), "no rules");
-        assert!(
-            !engine_with(vec![rule(Action::Deny, Duration::Always, none)]).any_fast_allow_rule(),
-            "only denies"
-        );
-        assert!(
-            !engine_with(vec![rule(Action::Allow, Duration::Seconds(3600), none)])
-                .any_fast_allow_rule(),
-            "only a timed allow"
-        );
-        assert!(
-            !engine_with(vec![rule(Action::Allow, Duration::Always, |s| s
-                .dst_port =
-                Some(443))])
-            .any_fast_allow_rule(),
-            "only a flow-scoped allow"
-        );
-        let mut disabled = rule(Action::Allow, Duration::Always, none);
-        disabled.enabled = false;
-        assert!(
-            !engine_with(vec![disabled]).any_fast_allow_rule(),
-            "only a disabled allow"
-        );
-
-        assert!(
-            engine_with(vec![
-                rule(Action::Deny, Duration::Always, none),
-                rule(Action::Allow, Duration::Always, none),
-            ])
-            .any_fast_allow_rule(),
-            "one lasting outright allow among denies is enough"
-        );
-    }
-
-    /// The one predicate the fast path's safety rests on, over its whole
-    /// input space rather than a sample: three actions and four durations is
-    /// all of it.
-    ///
-    /// The expected answers are a table, not the implementation's own
-    /// expression rewritten - a test that recomputes what it is checking
-    /// passes for a wrong implementation too. Adding a variant to either enum
-    /// breaks this test, which is the point: a new action or a new duration is
-    /// a decision about whether it may mark a socket, and it should not be
-    /// possible to make it by accident.
-    #[test]
-    fn only_a_lasting_allow_may_ever_mark_a_socket() {
-        use cfc_core::{Action, Duration};
-
-        // Everything that may. Everything else may not.
-        let may_mark = [
-            (Action::Allow, Duration::Always),
-            (Action::Allow, Duration::UntilRestart),
-        ];
-
-        let every_action = [Action::Allow, Action::Deny, Action::Reject];
-        let every_duration = [
-            Duration::Once,
-            Duration::UntilRestart,
-            Duration::Always,
-            // Both ends of the timed range: a timed allow must never mark,
-            // because the mark outlives the second it expires on - nothing
-            // re-passes a hook just because a clock ticked.
-            Duration::Seconds(0),
-            Duration::Seconds(u32::MAX),
-        ];
-
-        for action in every_action {
-            for duration in every_duration {
-                let verdict = ProcessWideVerdict {
-                    action,
-                    rule_id: uuid::Uuid::nil(),
-                    duration,
-                };
-                let expected = may_mark.contains(&(action, duration));
-                assert_eq!(
-                    verdict.fast_allow_eligible(),
-                    expected,
-                    "{action:?} + {duration:?} must {} be fast-allow eligible",
-                    if expected { "" } else { "not" }
-                );
-            }
-        }
-    }
-
-    /// A rule that says anything about the flow must never become a blanket
-    /// mark on a process's sockets.
-    ///
-    /// `allow --dst-port 443` means "this program may reach 443", and a mark
-    /// means "every packet this program sends skips the queue". Conflating
-    /// them would be the widest possible failure of this feature, so each
-    /// predicate that makes a rule flow-scoped is checked on its own - a
-    /// missing one would only show up as a rule type that quietly grants
-    /// everything.
-    #[test]
-    fn a_flow_scoped_allow_never_grants_the_fast_path() {
+    fn a_flow_scoped_rule_never_yields_a_process_wide_action() {
         let exe = PathBuf::from("/usr/bin/curl");
         let proc = Process {
             exe: exe.clone(),
             ..Process::unknown(1)
         };
 
-        // The unconstrained rule does grant - otherwise the cases below would
+        // The unconstrained rule does answer - otherwise the cases below would
         // pass for the wrong reason.
         let mut open = RuleScope::any();
         open.exe_path = Some(exe.clone());
-        let engine = engine_with(vec![Rule::new("open".to_string(), Action::Allow, open)]);
-        assert!(
-            engine
-                .process_wide_verdict(&proc)
-                .is_some_and(|v| v.fast_allow_eligible()),
-            "an exe-only allow is the case this feature exists for"
-        );
+        let engine = engine_with(vec![Rule::new("open".to_string(), Action::Deny, open)]);
+        assert_eq!(engine.process_wide_action(&proc), Some(Action::Deny));
 
         // Named, because clippy is right that the bare tuple is a mouthful -
         // and because the name says what the table is: one way each of making
@@ -1074,34 +728,13 @@ mod tests {
             let mut scope = RuleScope::any();
             scope.exe_path = Some(exe.clone());
             constrain(&mut scope);
-            let engine = engine_with(vec![Rule::new(what.to_string(), Action::Allow, scope)]);
-            let granted = engine
-                .process_wide_verdict(&proc)
-                .is_some_and(|v| v.fast_allow_eligible());
-            assert!(
-                !granted,
-                "an allow scoped by {what} must not mark every socket this process opens"
+            let engine = engine_with(vec![Rule::new(what.to_string(), Action::Deny, scope)]);
+            assert_eq!(
+                engine.process_wide_action(&proc),
+                None,
+                "a deny scoped by {what} must not refuse every connect() this process makes"
             );
         }
-    }
-
-    #[test]
-    fn process_wide_verdict_names_the_rule_that_answered() {
-        // The allow consumer credits hits by this id; the wrong id would
-        // credit the wrong rule, which is worse than crediting none.
-        let mut scope = RuleScope::any();
-        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
-        let rule = Rule::new("mine".to_string(), Action::Allow, scope);
-        let id = rule.id;
-        let engine = engine_with(vec![rule]);
-        let proc = Process {
-            exe: PathBuf::from("/usr/bin/curl"),
-            ..Process::unknown(1)
-        };
-        let v = engine.process_wide_verdict(&proc).expect("a verdict");
-        assert_eq!(v.rule_id, id);
-        assert_eq!(v.action, Action::Allow);
-        assert_eq!(engine.process_wide_action(&proc), Some(Action::Allow));
     }
 
     /// An expired rule must drop out of what gets compiled into the kernel.
@@ -1522,7 +1155,7 @@ mod tests {
         let original = allow_port_rule(80);
         let id = original.id;
         let engine = engine_with(vec![original]);
-        engine.record_hit(id);
+        engine.evaluate(&conn(80), &proc("/usr/bin/curl"));
         let mut batch = engine.snapshot().rules;
         batch.push(allow_port_rule(443));
         engine.replace_rules(batch);
