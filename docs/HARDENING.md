@@ -187,7 +187,10 @@ is a separate launch mode.
 - **Local relays and DNS**: while the daemon runs, explicit rules apply to
   new direct loopback flows and unmatched local IPC is allowed without
   prompting. While no daemon listens on the queue, new loopback flows are
-  allowed unfiltered (`bypass` on the `lo` rule only). An authorized local
+  allowed unfiltered (`bypass` on the `lo` rule only): an explicit loopback
+  Deny or Reject rule is not enforced in that window, nothing records those
+  flows, and a loopback connection opened then keeps its authorization once
+  the daemon is back. An authorized local
   resolver or proxy can relay remote traffic, which is attributed to that
   service. CFC cannot establish the originating application's identity from
   remote flows delegated through AF_UNIX or D-Bus brokers. Existing local

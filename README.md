@@ -278,7 +278,8 @@ A current descriptor holder does not prove which process sent a packet.
 While the daemon runs, new direct loopback flows follow explicit rules;
 unmatched local IPC is allowed without prompting. While no daemon listens on
 the queue, new loopback flows are allowed (`queue ... bypass` on `lo` only), so
-the systemd-resolved stub and other local services keep working. An allowed local resolver or proxy can still relay remote
+local services keep working; resolving names that are not cached still needs
+the daemon. An allowed local resolver or proxy can still relay remote
 traffic. CFC cannot establish the originating application's identity from
 remote flows delegated through local brokers, including AF_UNIX and D-Bus.
 

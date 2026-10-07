@@ -253,15 +253,17 @@ ct state new queue num 0
 While the daemon runs, it judges them like any other flow: explicit rules
 apply, and unmatched local IPC (the stub resolver, CUPS, a local dev
 server) is allowed without prompting. While nothing listens on the queue,
-`bypass` makes the kernel accept them, so local DNS and IPC keep working
-when the daemon is down. Every non-loopback new flow still meets the
-fail-closed rule.
+`bypass` makes the kernel accept them, so local IPC keeps working when the
+daemon is down. That includes the stub resolver's socket, but only for names
+it can answer from its cache or local records: its queries to the upstream
+servers are new non-loopback flows, so resolving anything else still needs
+the daemon. Every non-loopback new flow still meets the fail-closed rule.
 
-If DNS is slow, flaky, or dead while direct-by-IP connections work, check
-for an older copy of the snippet in your own `/etc/nftables.conf`: one
-without the loopback rule drops the stub resolver whenever the daemon is
-down, and one with an explicit `oifname lo accept` skips the daemon for
-loopback entirely.
+If you carry an older copy of the snippet in your own `/etc/nftables.conf`,
+compare it with the shipped one: a copy without the loopback rule drops
+every new loopback flow whenever the daemon is down, and one with an
+explicit `oifname lo accept` skips the daemon for loopback entirely, so
+loopback rules never apply.
 
 Note the daemon already exempts its *own* reverse-DNS lookups internally
 (they would otherwise deadlock the queue); the loopback rule is about
