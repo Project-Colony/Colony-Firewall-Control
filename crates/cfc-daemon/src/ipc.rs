@@ -665,8 +665,9 @@ impl Firewall for FirewallService {
         // prompt was gone - so a click on a card whose prompt had already timed
         // out created a permanent rule while every client said "too late". For
         // "Allow always" that is standing network access granted by a click the
-        // user was told did nothing, and prompt ids restart at 1 on every daemon
-        // start, so a stale card can carry a live id. A verdict that reached
+        // user was told did nothing. Prompt ids start from a random seed each
+        // session (`nfqueue::prompt_session_seed`), which makes a stale card
+        // naming a live id unlikely, not impossible. A verdict that reached
         // nothing should leave nothing behind.
         let binding = self.router.submit(&req.prompt_id, verdict);
         let accepted = binding.is_some();

@@ -1288,6 +1288,13 @@ mod tests {
 
     const IPPROTO_TCP: u8 = 6;
 
+    /// A card left over from an earlier session must not name the id this
+    /// session hands out first, so ids do not restart at a fixed value.
+    #[test]
+    fn each_session_starts_prompt_ids_from_a_fresh_seed() {
+        assert_ne!(prompt_session_seed(), prompt_session_seed());
+    }
+
     /// Minimal IPv4/TCP packet: 1.2.3.4:5555 -> 5.6.7.8:`dst_port`.
     fn tcp_packet(dst_port: u16) -> Vec<u8> {
         let mut pkt = vec![0u8; 40];
