@@ -19,9 +19,10 @@ run `systemctl daemon-reload`, then `systemctl reenable colony-firewalld
 colony-firewall-nft` (and the inbound unit only if already enabled), and
 `systemctl reload colony-firewall-nft` (and the inbound unit if active) before
 relying on the new rules. Reenable installs the native network-manager
-requirements on existing deployments. A startup error saying
-previous Fast Allow state could not be disabled means old acceptance may still
-exist; resolve that error and inspect the loaded table. The nft units load
+requirements on existing deployments. A startup error saying the
+legacy fast_allow nftables set could not be flushed means a mark left by an
+older release may still be accepted; resolve that error and inspect the loaded
+table. The nft units load
 before the daemon. Failed daemon initialization leaves filtering installed;
 a failed nft load blocks the daemon and the enabled NetworkManager or
 systemd-networkd requirements. This covers those managers' startup after

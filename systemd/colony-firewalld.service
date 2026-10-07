@@ -210,10 +210,11 @@ MemoryDenyWriteExecute=true
 # else about this unit is compatible with that child - ProtectSystem=strict
 # leaves /var/lib/rpm readable, and rpm needs no writable-executable memory. If
 # it ever is not compatible, the failure is a warning and an empty provenance
-# index, never a failure to filter. The other child is nft(8), run at start
-# and at stop to flush legacy Fast Allow state. The same fork/execve and
-# CAP_NET_ADMIN netlink operations are needed. Failed cleanup is reported
-# explicitly because an older installed ruleset may still accept old marks.
+# index, never a failure to filter. The other child is nft(8), run once at
+# start to flush the legacy Fast Allow set and once a minute to probe the
+# table. The same fork/execve and CAP_NET_ADMIN netlink operations are needed.
+# A failed flush is reported explicitly because an older installed ruleset
+# may still accept old marks.
 SystemCallFilter=@system-service
 SystemCallFilter=bpf perf_event_open
 SystemCallErrorNumber=EPERM

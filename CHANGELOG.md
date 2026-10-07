@@ -6,6 +6,16 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- The Fast Allow userspace path, disabled since 0.7.0 because a socket mark
+  cannot prove which process sends and so opened bypasses. `cfc --json status`
+  no longer has a `fast_allow` key, `StatusResponse` field 16 is reserved, and
+  the `[ebpf] fast_allow` and `fast_allow_mark` keys are ignored with a
+  warning. For hosts upgrading from 0.4-0.6, startup still flushes the legacy
+  nftables set, disarms the legacy pinned maps and removes the old sendmsg
+  link pins.
+
 ## [0.7.0] - 2026-09-30
 
 ### Added

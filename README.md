@@ -279,8 +279,9 @@ Applications with `CAP_NET_RAW` can use AF_PACKET outside the `inet OUTPUT`
 hook. Raw IP packets can also coincide with another socket's tuple; socket
 attribution does not prove their origin. Use explicit application confinement
 or OS containment for those cases.
-Fast Allow is disabled even when `fast_allow = true` is configured; allowed
-flows use the normal NFQUEUE path.
+Fast Allow was removed: a socket mark cannot prove which process sends, so it
+opened bypasses. The old `[ebpf] fast_allow` and `fast_allow_mark` keys are
+ignored with a warning, and allowed flows use the normal NFQUEUE path.
 
 Then confirm it is really filtering:
 

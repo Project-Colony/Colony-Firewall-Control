@@ -59,7 +59,7 @@ Install one - `cargo xtask build-ebpf`, dropped at
 /usr/lib/colony-firewall/cfc-ebpf.o, in the directory this package creates for
 it - and the daemon adds process attribution, DNS display enrichment, and
 in-kernel connect(2) denial. Pinned denials survive a daemon crash. Fast Allow
-is disabled; allowed connections continue through NFQUEUE.
+was removed; allowed connections go through NFQUEUE.
 
 The ruleset is fail-closed. If the daemon is not running, new outbound
 connections are dropped rather than allowed.
@@ -79,7 +79,7 @@ SELinux policy module for Colony Firewall Control.
 Confines the daemon to what it actually needs: netlink_netfilter and raw
 sockets, bpf() and perf_event_open(), the bpffs pin directory, other domains'
 /proc entries for attribution, a read-only rpm query for package provenance,
-and running nft(8) to clear Fast Allow state left by older installations. CAP_SYS_ADMIN is deliberately not granted; that it is
+and running nft(8) to probe the table and flush the legacy Fast Allow set. CAP_SYS_ADMIN is deliberately not granted; that it is
 unnecessary is covered by a test rather than assumed.
 
 %prep

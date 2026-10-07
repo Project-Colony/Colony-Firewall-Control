@@ -2,10 +2,9 @@
 # Why does a queued flow cost what it costs, and does that cost depend on load?
 #
 # The first full run said 17.8 ms per queued flow at 3000 flows and 5.5 ms at
-# 40, with the two rounds 15.0 and 20.7 ms apart - and the state that does
-# strictly MORE work (`armed`: the fast path live but the rule ineligible) came
-# out faster than the one that does less. None of that is a per-packet
-# constant. Two candidate explanations, and this run separates them:
+# 40, with the two rounds 15.0 and 20.7 ms apart - and a state that did
+# strictly MORE work came out faster than one that did less. None of that is a
+# per-packet constant. Two candidate explanations, and this run separates them:
 #
 #   1. a fixed cost per flow, dominated by RECV_POLL_INTERVAL (5 ms), the beat
 #      the NFQUEUE worker idles on. Testable by changing the constant: the same
@@ -56,7 +55,6 @@ enabled = false
 [ebpf]
 enabled = "on"
 object_path = "/cfc-ebpf.o"
-fast_allow = $1
 EOF
 }
 
@@ -84,31 +82,30 @@ stop_daemon() {
 
 probe_layer() {
     say "what the in-kernel layer comes up as here"
-    write_cfg true
+    write_cfg
     start_daemon /usr/bin/colony-firewalld info || return 1
     nft -f "$SNIPPET"; write_rules
     cfc --socket "$SOCK" rules import --replace /tmp/rules.json >/dev/null 2>&1
     sleep 4
-    for k in ring0 enforcement degrade fast_path exec_tracking exit_tracking dns_capture ppid_from_btf; do
+    for k in ring0 enforcement degrade exec_tracking exit_tracking dns_capture ppid_from_btf; do
         v="$(grep -oE "$k=[A-Za-z_-]+" "$LOG" | tail -1)"
         [ -n "$v" ] && ctx "layer $v"
     done
-    ctx "layer $(cfc --socket "$SOCK" status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print("status_fast_allow=%s status_enforcing=%s" % (d["fast_allow"], d["enforcing"]))')"
+    ctx "layer $(cfc --socket "$SOCK" status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print("status_enforcing=%s" % d["enforcing"])')"
     stop_daemon
 }
 
-measure() {  # $1 label  $2 n  $3 mode(none|queue|fast)  $4 binary
+measure() {  # $1 label  $2 n  $3 mode(none|queue)  $4 binary
     local label="$1" n="$2" mode="$3" bin="${4:-/usr/bin/colony-firewalld}" q0 q1
     say "state: $label  n=$n  mode=$mode  daemon=$(basename "$bin")"
     if [ "$mode" != none ]; then
         [ -x "$bin" ] || { echo "SKIP $label: $bin is not in this image"; return 0; }
-        if [ "$mode" = fast ]; then write_cfg true; else write_cfg false; fi
+        write_cfg
         start_daemon "$bin" || { echo "FAIL $label"; return 1; }
         nft -f "$SNIPPET" || { echo "FAIL $label nft"; stop_daemon; return 1; }
         write_rules
         cfc --socket "$SOCK" rules import --replace /tmp/rules.json >/dev/null 2>&1
         sleep 4
-        ctx "$label fast_allow=$(cfc --socket "$SOCK" status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("fast_allow","?"))' 2>/dev/null || echo unreachable)"
     fi
     ctx "$label before sockets=$(sockets) conntrack=$(ctcount)"
     q0="$(qseq)"
@@ -136,9 +133,6 @@ for n in $SWEEP; do
 done
 for n in "$SMALL" "$LARGE"; do
     drain; measure "poll200us-$n" "$n" queue /usr/bin/colony-firewalld-alt
-done
-for n in "$SMALL" "$LARGE"; do
-    drain; measure "fast-$n" "$n" fast /usr/bin/colony-firewalld
 done
 [ "$SMALL" != "$LARGE" ] && { drain; measure "floor-$LARGE" "$LARGE" none; }
 say "done"

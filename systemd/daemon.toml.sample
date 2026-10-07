@@ -206,10 +206,9 @@ enabled = true
 # #
 # # WHAT IT DOES NOT DO
 # # A process-wide Deny can refuse connect() in the kernel. Allow decisions and
-# # conditional rules still use NFQUEUE. Fast Allow is disabled in every
-# # configuration because a socket mark cannot identify the current sender.
-# # Neither this layer nor NFQUEUE confines inherited sockets, local relays or
-# # packet-layer traffic with CAP_NET_RAW.
+# # conditional rules still use NFQUEUE. Neither this layer nor NFQUEUE
+# # confines inherited sockets, local relays or packet-layer traffic with
+# # CAP_NET_RAW.
 # #
 # # REQUIREMENTS - all of which degrade to a warning, never to a failure to
 # # start. If any of this is missing the daemon logs what it could not do and
@@ -238,12 +237,8 @@ enabled = true
 # # /usr/lib/colony-firewall/cfc-ebpf.o. Point it at
 # # `cargo xtask ebpf-path` output when working on the programs themselves.
 # object_path = "/usr/lib/colony-firewall/cfc-ebpf.o"
-# # Compatibility settings retained for existing configuration files.
-# # Fast Allow is disabled. Setting true logs a warning and creates no grants;
-# # allowed connections continue through NFQUEUE. Keep this false.
-# fast_allow = false
-# # An old configured mark has no runtime effect while Fast Allow is disabled.
-# fast_allow_mark = 0x00033331
+# # fast_allow and fast_allow_mark are legacy keys from the removed Fast Allow
+# # path: ignored, and a warning is logged if either is set. Delete them.
 
 # Needs a restart (the socket is secured once, right after bind).
 [ipc]

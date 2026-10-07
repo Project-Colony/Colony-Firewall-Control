@@ -20,15 +20,17 @@ longer lifts anything; `nft delete table` no longer lifts the denies it holds.
 Two pieces of it are deliberately not done, and both are real work rather than
 oversights:
 
-**1a. Fast Allow is disabled.** Socket marks do not attest the current sender,
-and grants can outlive their intended executable or rule. Every configuration,
-including `fast_allow = true`, uses NFQUEUE for allowed flows. The nft snippet
-no longer accepts the legacy set, startup clears old state, and upgrades reload
-active nft units atomically. Reintroducing an in-kernel Allow requires a design
-that verifies current socket ownership and revocation; the old mark protocol is
-not a supported security boundary.
+**1a. Fast Allow was removed.** It let a process a lasting Allow covered skip
+NFQUEUE by marking its sockets. A socket mark does not attest the current
+sender, and grants could outlive their intended executable or rule, so it
+opened bypasses. It was disabled in 0.7.0 and its userspace side has since been
+removed; allowed flows use NFQUEUE. The nft snippet no longer accepts the
+legacy set, startup flushes it and disarms the legacy pinned maps the kernel
+object still carries until an ABI bump, and upgrades reload active nft units
+atomically. Reintroducing an in-kernel Allow needs sender attestation: a design
+that verifies current socket ownership and revocation.
 
-The previous latency measurements describe the disabled implementation. The
+The previous latency measurements describe the removed implementation. The
 remaining NFQUEUE cost still warrants measurement and optimization, with the
 same application-policy semantics.
 
@@ -45,14 +47,12 @@ be resolved to addresses in advance.
 
 Mostly done in `8db949b` and `b05eefc`: the SELinux module, the RPM provenance
 backend, the `.spec`, and a 5.10 entry in the kernel matrix that sits *below*
-RHEL 9's backported 5.14. The fast-allow branch adds 5.15 above it, so the pair
+RHEL 9's backported 5.14. The matrix also carries 5.15 above it, so the pair
 brackets the RHEL kernel: what both allow, 5.14 allows unless Red Hat took it
 out; what only 5.15 allows, 5.14 has only if they backported it; what both
 refuse, 5.14 may still have through a backport. Where the two disagree is the
-list of things to check on a Rocky host rather than assume. The first 5.15 run
-named one such thing: 5.15 already accepts `bpf_getsockopt` on the sendmsg hooks
-that 5.10 refuses, so whether RHEL 9's 5.14 does is exactly what a Rocky host
-has to answer; neither kernel has `group_dead`.
+list of things to check on a Rocky host rather than assume. Neither kernel has
+`group_dead`.
 
 What remains needs a real enforcing machine - except 2b, which turned out to
 be doable from CI after all:

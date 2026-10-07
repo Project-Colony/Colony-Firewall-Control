@@ -115,7 +115,7 @@ lands just after the worker committed to a fresh wait. `scripts/vm-bench`
 attributes it - 4.90 ms of 5.67 at 300 flows, 5.24 ms of 7.61 at 3000, by
 building the same daemon with the constant at 200 us and measuring both in one
 boot. These are historical measurements, not a current performance guarantee.
-Fast Allow is disabled, so allowed flows also pay the queue round trip.
+Fast Allow was removed, so allowed flows also pay the queue round trip.
 
 **Prompt deduplication** requires the same UID, executable path, image digest,
 destination IP, destination port and protocol. Source address and port are
@@ -392,19 +392,23 @@ inert as one built with `--no-default-features`.
 | `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts only on confirmed thread-group death |
 | `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads for diagnostics, never policy identity |
 | `cgroup/connect4`, `cgroup/connect6` | cgroup v2 root, link **pinned** | refuse `connect()` for pids the daemon has denied outright, before a packet exists |
-| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | legacy mark-clearing support; Fast Allow stays disabled |
 
 **In-kernel denials.** The connect hooks refuse an executable denied
 process-wide with `EPERM`. Pinned denials outlive the daemon. Conditional rules,
 prompts and Allow decisions remain on the normal NFQUEUE path.
 
-**Fast Allow is disabled in every runtime configuration.** A socket mark cannot
+**Fast Allow was removed.** It marked the sockets of a process a lasting Allow
+covered so that nftables accepted them ahead of the queue. A socket mark cannot
 prove the current sender's identity, and lifecycle checks do not repair that
-property. `fast_allow = true` produces a warning and no grants or heartbeat.
-The nft snippet has no mark-set accept rule. Startup flushes legacy accepted
-marks, and package upgrades reload active nft units with one atomic transaction
-to remove old acceptance rules. A failed cleanup emits an error and requires
-operator action before filtering can be relied upon.
+property, so it opened bypasses; it was disabled in 0.7.0 and its userspace
+side is gone. The `[ebpf] fast_allow` keys still parse and only log a warning.
+The kernel object still carries the Fast Allow maps until an ABI bump, so
+startup flushes the legacy nft set once, disarms the pinned maps (unarmed mark,
+zero deadline, no grants) and removes the old `sendmsg4`/`sendmsg6` link pins,
+which detaches those hooks. The nft snippet has no mark-set accept rule, and
+package upgrades reload active nft units with one atomic transaction. A failed
+flush emits an error and requires operator action before filtering can be
+relied upon.
 
 **Compatibility exit handling.** When `sched_process_exit` exposes `group_dead`,
 the kernel evicts only on confirmed process death. Without that field, it
