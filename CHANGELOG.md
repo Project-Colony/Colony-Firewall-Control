@@ -68,6 +68,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no digest, so every queued packet from them, each retransmit and parallel
   connection, opened its own prompt. On a root-sealed path they now share one
   prompt per destination like any other program.
+- The package-index warmer held the index's write lock for a whole rebuild,
+  so the packet thread blocked behind it on the first flow from any newly
+  seen binary: about 120 ms with pacman, up to 10 s with rpm during a `dnf`
+  transaction. The packet thread now skips a busy or stale index, and that
+  "not ready" answer is no longer cached for an hour as "not from a package";
+  it shows as unknown until the index is ready.
 
 ## [0.7.0] - 2026-09-30
 

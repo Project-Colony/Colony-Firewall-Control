@@ -609,10 +609,11 @@ impl<Q: PacketQueue> Worker<Q> {
 
         // This thread is the datapath, and it is the only one. Saying so once
         // here covers everything reached from it, however deep: in particular
-        // a provenance lookup that finds the package index stale now answers
-        // "no package" rather than rebuilding it, which reads every installed
-        // package's file list. Measured cold on the owner's machine, that
-        // rebuild took 123 ms - and since this loop is a single thread, that
+        // a provenance lookup that finds the package index stale or being
+        // rebuilt answers "not ready" rather than rebuilding it or waiting
+        // for the rebuild, which reads every installed package's file list.
+        // Measured cold on the owner's machine, that rebuild took 123 ms -
+        // and since this loop is a single thread, that
         // is not one slow packet, it is every flow on the machine stopping
         // together. `provenance::warm` does the build off this thread.
         crate::provenance::mark_datapath_thread();

@@ -264,9 +264,9 @@ async fn run() -> anyhow::Result<()> {
     // is immediate so a fresh daemon has provenance within a second; after
     // that it is a poll, because the trigger is the package database's mtime
     // changing under us and there is no cheap way to be told about that. Two
-    // minutes is chosen against what it costs to be wrong: a package installed
-    // just now shows as unpackaged for at most that long, in a field that
-    // decorates an event and decides nothing.
+    // minutes is chosen against what it costs to be wrong: a binary first seen
+    // after a package transaction shows provenance unknown for at most that
+    // long, in a field that decorates an event and decides nothing.
     tokio::spawn(async {
         let mut tick = tokio::time::interval(PROVENANCE_WARM_INTERVAL);
         loop {
