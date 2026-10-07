@@ -528,7 +528,21 @@ journalctl -u colony-firewalld -g 'failed to deserialize'
 ```
 
 If you need the rule back now and cannot upgrade, delete the offending
-row by id and re-create it with `cfc rules add`.
+row with `cfc rules remove <id>`, giving the full id from the journal, and
+re-create it with `cfc rules add`.
+
+The same warning counts **quarantined** rows: rules an older version
+accepted that the daemon now refuses (for example one scoped only on a
+parent executable, which would match every process). They are not
+applied, not listed, and preserved on disk. The journal names each one
+and why:
+
+```sh
+journalctl -u colony-firewalld -g 'fails the API boundary'
+```
+
+Remove it with `cfc rules remove <id>` (the full id) and re-create it in
+a form the daemon accepts. `cfc rules import --replace` also deletes such rows.
 
 ## Where things live
 

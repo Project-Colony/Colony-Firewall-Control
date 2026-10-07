@@ -232,26 +232,28 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
 }
 
 pub async fn remove(client: &mut Client, needle: &str, format: OutputFormat) -> CliResult {
-    let rule = resolve_via_daemon(client, needle).await?;
-    let deleted = client.delete_rule(&rule.id).await?;
+    let (id, name) = match resolve_via_daemon(client, needle).await {
+        Ok(rule) => (rule.id, rule.name),
+        // A quarantined or unreadable row is never listed, so nothing
+        // resolves to it, but the daemon deletes it by the full id the
+        // journal names.
+        Err(CliError::NotFound(_)) if uuid::Uuid::parse_str(needle).is_ok() => {
+            (needle.to_string(), String::new())
+        }
+        Err(e) => return Err(e),
+    };
+    let deleted = client.delete_rule(&id).await?;
     if !deleted {
-        // The rule was listed a moment ago, so this is a race with another
-        // client rather than a typo - still "not found" for the caller.
-        return Err(CliError::not_found(format!(
-            "rule {} disappeared before it could be deleted",
-            rule.id
-        )));
+        // Either a race with another client or an id that was never there:
+        // "not found" for the caller either way.
+        return Err(CliError::not_found(format!("no rule with id {id}")));
     }
     if format.is_json() {
         return output::print_json(&serde_json::json!({
-            "deleted": true, "id": rule.id, "name": rule.name,
+            "deleted": true, "id": id, "name": name,
         }));
     }
-    println!(
-        "deleted {} ({})",
-        rule.id,
-        output::terminal_safe(&rule.name)
-    );
+    println!("deleted {} ({})", id, output::terminal_safe(&name));
     Ok(())
 }
 

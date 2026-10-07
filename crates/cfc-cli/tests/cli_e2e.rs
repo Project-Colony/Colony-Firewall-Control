@@ -1075,6 +1075,33 @@ async fn removing_a_bundle_preserves_a_manual_rule_with_the_same_name() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_by_full_id_reaches_a_rule_the_daemon_does_not_list() {
+    // A quarantined row is not in ListRules; the journal names its id.
+    let socket = socket_path("remove-unlisted");
+    let fake = FakeDaemon::default();
+    let calls = fake.calls.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let id = "33333333-3333-4333-8333-333333333333";
+    let out = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &["--socket", &socket_arg, "rules", "remove", id],
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(*calls.lock().unwrap(), vec![Call::Delete(id.into())]);
+    server.abort();
+    let _ = std::fs::remove_file(socket);
+}
+
 #[tokio::test]
 async fn a_partial_opensnitch_replace_changes_nothing() {
     let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));

@@ -102,9 +102,9 @@ fn heal_legacy_protocol(rule: &mut Rule) -> bool {
 ///
 /// A rule caught here is quarantined, not deleted: the row is the operator's,
 /// and `cfc rules list` is not where a firewall should silently lose things.
-/// It is also not loaded disabled-but-present - the engine snapshot holds
-/// only enabled rules - so "not applied, named in the log, preserved on
-/// disk" is the whole contract. Applying it is the bug, and most of these
+/// It is also not loaded disabled-but-present - a quarantined row is kept
+/// out of the engine altogether - so "not applied, named in the log,
+/// preserved on disk" is the whole contract. Applying it is the bug, and most of these
 /// shapes cannot even be edited away: every client edit is a
 /// read-modify-write that sends the refused scope straight back to a daemon
 /// that now rejects it.
@@ -212,11 +212,14 @@ impl RuleStore {
 
     pub fn snapshot(&self) -> anyhow::Result<RuleSet> {
         let conn = self.conn.lock();
+        // Disabled rules load too: every engine lookup skips them, and the
+        // engine keeps them after a runtime disable, so a restart must not
+        // hide a paused rule from `cfc rules list` and from re-enabling.
+        //
         // Deterministic load order. `created_at` lives inside the JSON blob
         // (the table has no timestamp column), so order by `id`: stable
         // across restarts, and the in-memory sort handles priority ordering.
-        let mut stmt =
-            conn.prepare("SELECT id, data FROM rules WHERE enabled = 1 ORDER BY id ASC")?;
+        let mut stmt = conn.prepare("SELECT id, data FROM rules ORDER BY id ASC")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let json: String = row.get(1)?;
@@ -286,14 +289,16 @@ impl RuleStore {
                 healed_ids.len()
             );
         }
-        self.skipped.store(skipped_ids.len(), Ordering::Relaxed);
+        self.skipped
+            .store(skipped_ids.len() + quarantined, Ordering::Relaxed);
         Ok(RuleSet { rules })
     }
 
     /// Number of rule rows the most recent [`snapshot`](Self::snapshot) call
-    /// skipped because their JSON failed to deserialize. Rows are never
-    /// deleted for failing to parse; this count lets callers surface the
-    /// problem (e.g. in `status`) instead of losing data silently.
+    /// did not load: their JSON failed to deserialize, or they were
+    /// quarantined. Such rows are never deleted; this count lets callers
+    /// surface the problem (e.g. in `status`) instead of losing data
+    /// silently.
     pub fn skipped_rules(&self) -> usize {
         self.skipped.load(Ordering::Relaxed)
     }
@@ -816,6 +821,7 @@ mod tests {
             "a parent_exe rule matches every process and must not load: {names:?}"
         );
         assert!(names.contains(&"curl".to_string()), "{names:?}");
+        assert_eq!(reopened.skipped_rules(), 1, "status must report it");
 
         // Quarantined, never deleted: the row is the operator's.
         let rows: i64 = reopened
@@ -987,12 +993,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_rules_excluded_from_snapshot() {
-        let store = RuleStore::open_in_memory().unwrap();
+    fn disabled_rules_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.db");
         let mut rule = sample_rule("curl");
         rule.enabled = false;
-        store.upsert(&rule).unwrap();
-        assert!(store.snapshot().unwrap().rules.is_empty());
+        RuleStore::open(&path).unwrap().upsert(&rule).unwrap();
+        let reopened = RuleStore::open(&path).unwrap().snapshot().unwrap();
+        assert_eq!(reopened.rules, vec![rule]);
     }
 
     #[test]

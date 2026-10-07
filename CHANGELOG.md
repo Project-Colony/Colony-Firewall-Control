@@ -36,6 +36,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dropped all new connections until systemd restarted it. Refusals are now
   queued after their verdict to the same bounded batch writer as Allow rows.
   Rows it cannot take are counted and logged instead of stopping anything.
+- A disabled rule vanished from `cfc rules list` and the GUI after a daemon
+  restart, so it could not be re-enabled or removed. Disabled rules now load
+  at startup; lookups already skip them.
+- Rules quarantined at load were reported only in the journal. `cfc status`
+  and the GUI now count them with the rows that could not be loaded, and
+  `cfc rules remove <id>` with the full id deletes such an unlisted row.
 
 ## [0.7.0] - 2026-09-30
 

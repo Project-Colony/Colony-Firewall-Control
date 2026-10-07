@@ -227,8 +227,10 @@ message StatusResponse {
   Action no_ui_action = 11;
   uint32 prompt_timeout_secs = 12;
 
-  // Rule rows the last storage load could not deserialize. Non-zero means
-  // rules exist on disk that are NOT being enforced.
+  // Rule rows the last storage load did not load: they could not be
+  // deserialized, or they fail the API's own rule checks and were
+  // quarantined. Non-zero means rules exist on disk that are NOT being
+  // enforced.
   uint64 skipped_rules = 13;
 
   // Best-effort "packets are actually reaching us" signal. False means the
