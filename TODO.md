@@ -98,21 +98,26 @@ index - but "should be fine" is not "was observed".
 
 ## 3. Executable paths: what resolution does and does not fix
 
-Rules now resolve their `exe_path` to the form `/proc/<pid>/exe` reports, at
-every place a path is entered (`cfc_core::exe_path`). Three properties of that
-are worth stating rather than discovering:
+Rules must name the form `/proc/<pid>/exe` reports (`cfc_core::exe_path`):
+every place a new or changed path is entered refuses an alias and asks for
+the canonical target. Three properties of that are worth stating rather than
+discovering:
 
-- **Forward-only.** Rules already on disk are never re-resolved. An install
-  that wrote `/bin/curl` before this existed keeps an inert rule after
-  upgrading. The repair is one round trip - `cfc rules export > r.json &&
-  cfc rules import --replace r.json` - because upsert resolves.
-- **A versioned symlink resolves to a version.** `/usr/bin/python ->
-  python3.13` stores `python3.13` and stops applying when the symlink moves.
-  Not a regression (the unresolved rule never matched either), but a new
-  *time-dependent* failure, and worse for a Deny than an Allow.
-- **It follows symlinks the path's owner controls.** A rule for
-  `/home/bob/tool` pointing at `/usr/bin/curl` becomes a rule about curl. The
-  CLI prints what it stored and the daemon warns; nothing pins the inode.
+- **Stored rules keep their target.** Nothing re-resolves a rule on disk. An
+  install that wrote `/bin/curl` before validation existed keeps an inert
+  rule after upgrading, and so does a rule whose target a package update later
+  turned into a symlink. Sending the stored path back unchanged (enable,
+  disable, rename, `cfc rules export` then `import --replace`) is accepted;
+  the repair is to edit the rule to name `/usr/bin/curl`.
+- **A versioned target is a version.** `/usr/bin/python -> python3.13` has to
+  be written as `python3.13`, and stops applying when the symlink moves. Not a
+  regression (the alias never matched either), but a *time-dependent* failure,
+  and worse for a Deny than an Allow.
+- **The daemon cannot see every alias.** It runs with `ProtectHome=true` and
+  `PrivateTmp=true`, so `/home/bob/tool -> /usr/bin/curl` looks like a target
+  that is not installed yet and is accepted. The CLI and GUI check in the
+  caller's own namespace first; a raw gRPC client is not stopped. Such a rule
+  names a path the user controls and matches only that path, never curl.
 
 Process resolution now rereads policy identity for every packet lookup; pid
 and start time do not identify an executable across exec. Its path and digest

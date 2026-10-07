@@ -269,15 +269,10 @@ pub async fn set_enabled(
     let was = rule.enabled;
     let want = target.unwrap_or(!was);
 
+    // No executable validation here: the path is the stored one, sent back
+    // unchanged, and the daemon validates only new or changed paths. Checking
+    // it again refused to disable a rule whose target became an alias.
     if want != was {
-        if let Some(scope) = rule
-            .scope
-            .as_ref()
-            .filter(|scope| !scope.exe_path.is_empty())
-        {
-            cfc_core::exe_path::resolve_policy(std::path::Path::new(&scope.exe_path))
-                .map_err(CliError::runtime)?;
-        }
         rule.enabled = want;
         client.upsert_rule(rule.clone()).await?;
     }

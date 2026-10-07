@@ -81,6 +81,12 @@ use tracing::{info, warn};
 ///
 /// Missing canonical targets support preinstallation; aliases, other lookup
 /// failures and worker failures refuse the policy write.
+///
+/// Advisory for paths the unit's sandbox hides: under `ProtectHome` and
+/// `PrivateTmp` an alias in `/home` or `/tmp` looks like a target that is not
+/// installed yet and is accepted. The CLI and GUI run the same check in the
+/// caller's namespace first. The stored path is still matched literally, so
+/// such a rule never applies to the alias's target.
 async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) -> Result<(), Status> {
     let Some(current) = scope.exe_path.clone() else {
         return Ok(());
@@ -98,6 +104,22 @@ async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) -> Result<(), S
     }
     scope.exe_path = Some(outcome.into_path());
     Ok(())
+}
+
+/// Whether `rule` sends back the executable path already stored under its id.
+///
+/// That path was validated when it was written, or predates validation, and
+/// sending it back changes nothing about what the rule matches. Validating it
+/// again refused every edit of a rule whose target had since become an alias
+/// (a package update turned it into a symlink, or a legacy `/bin/curl`), so
+/// disabling, renaming or re-importing it failed and only delete was left. A
+/// new rule or a changed path is still validated.
+fn keeps_stored_exe(stored: &cfc_core::RuleSet, rule: &cfc_core::Rule) -> bool {
+    rule.scope.exe_path.is_some()
+        && stored
+            .rules
+            .iter()
+            .any(|old| old.id == rule.id && old.scope.exe_path == rule.scope.exe_path)
 }
 
 /// Logs a rule write the daemon refused, with its reason.
@@ -464,7 +486,9 @@ impl FirewallService {
         convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
         // Every caller must select the canonical mapped target explicitly.
         // Missing targets with unchanged ancestry remain valid for preinstallation.
-        resolve_exe_off_thread(&mut rule.scope).await?;
+        if !keeps_stored_exe(&self.engine.snapshot(), &rule) {
+            resolve_exe_off_thread(&mut rule.scope).await?;
+        }
         // hit_count and created_at belong to the daemon: a client editing a
         // rule must not be able to rewrite its history, deliberately or (as
         // every read-modify-write client did) by echoing back a count that
@@ -510,6 +534,7 @@ impl FirewallService {
         }
         let mut pending = Vec::with_capacity(req.rules.len());
         let mut ids = HashSet::new();
+        let stored = self.engine.snapshot();
         for proto in req.rules {
             let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
             convert::reject_unpersistable_duration(rule.duration)
@@ -517,7 +542,9 @@ impl FirewallService {
             if !ids.insert(rule.id) {
                 return Err(Status::invalid_argument("duplicate rule id"));
             }
-            resolve_exe_off_thread(&mut rule.scope).await?;
+            if !keeps_stored_exe(&stored, &rule) {
+                resolve_exe_off_thread(&mut rule.scope).await?;
+            }
             pending.push(rule);
         }
         let _mutation = self.mutations.lock();
@@ -1447,6 +1474,25 @@ mod tests {
         scope.exe_path = Some(target.clone());
         resolve_exe_off_thread(&mut scope).await.unwrap();
         assert_eq!(scope.exe_path, Some(target));
+    }
+
+    #[test]
+    fn only_an_unchanged_stored_exe_skips_validation() {
+        let mut scope = cfc_core::RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/bin/curl"));
+        let old = cfc_core::Rule::new("legacy", cfc_core::Action::Deny, scope);
+        let stored = cfc_core::RuleSet {
+            rules: vec![old.clone()],
+        };
+        let mut toggled = old.clone();
+        toggled.enabled = false;
+        assert!(keeps_stored_exe(&stored, &toggled));
+        let mut moved = old.clone();
+        moved.scope.exe_path = Some(PathBuf::from("/bin/wget"));
+        assert!(!keeps_stored_exe(&stored, &moved));
+        let mut fresh = old.clone();
+        fresh.id = uuid::Uuid::new_v4();
+        assert!(!keeps_stored_exe(&stored, &fresh));
     }
 
     // -- authorization ------------------------------------------------------
