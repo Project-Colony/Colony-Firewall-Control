@@ -21,6 +21,9 @@ jobs:
 
       - name: Resolve version and verify it matches the tag
         id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
           if [ -z "${VERSION}" ]; then
@@ -30,8 +33,8 @@ jobs:
           # The release is named after the tag, but every asset filename is
           # built from the Cargo version. A mismatch publishes "v0.3.0"
           # containing colony-firewall-control-0.2.0-*.tar.zst. Refuse.
-          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "v${VERSION}" ]; then
-            echo "::error::tag ${{ github.ref_name }} does not match Cargo.toml [workspace.package] version ${VERSION} (expected tag v${VERSION}). Bump Cargo.toml or retag."
+          if [ "${REF_TYPE}" = "tag" ] && [ "${REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag ${REF_NAME} does not match Cargo.toml [workspace.package] version ${VERSION} (expected tag v${VERSION}). Bump Cargo.toml or retag."
             exit 1
           fi
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
@@ -189,7 +192,7 @@ jobs:
             crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o \
             "${STAGE}/"
 
-          # Docs, for parity with what the AUR package puts in
+          # Docs, for parity with what pkg/PKGBUILD puts in
           # /usr/share/doc. `cfc status` points users at TROUBLESHOOTING.md
           # by name, so it has to actually ship.
           install -m644 \
@@ -236,8 +239,9 @@ jobs:
             SHA256SUMS
             RELEASE_BODY.md
 
-  # Build pkg/PKGBUILD for real against the freshly pushed tag, and produce
-  # the AUR-submittable artifacts (PKGBUILD with real checksums + .SRCINFO).
+  # Build pkg/PKGBUILD for real against the freshly pushed tag, and attach
+  # the Arch packaging recipe (PKGBUILD with real checksums + .SRCINFO) to
+  # the release. The project is not published on the AUR.
   #
   # Hard gate, no continue-on-error: at tag time the source= URL
   # (.../archive/v$pkgver.tar.gz) resolves, because GitHub generates the
@@ -275,10 +279,12 @@ jobs:
           chown -R builder: .
 
       - name: Verify pkgver matches the tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           PKGVER="$(sed -n 's/^pkgver=//p' pkg/PKGBUILD | head -n1)"
-          if [ "${{ github.ref_name }}" != "v${PKGVER}" ]; then
-            echo "::error::pkg/PKGBUILD pkgver=${PKGVER} does not match tag ${{ github.ref_name }}"
+          if [ "${REF_NAME}" != "v${PKGVER}" ]; then
+            echo "::error::pkg/PKGBUILD pkgver=${PKGVER} does not match tag ${REF_NAME}"
             exit 1
           fi
 
@@ -287,7 +293,7 @@ jobs:
         run: |
           runuser -u builder -- updpkgsums PKGBUILD
           # A remote (non-VCS) source with sha256sums=('SKIP') is not
-          # acceptable AUR practice: it disables integrity checking of the
+          # acceptable Arch packaging practice: it disables integrity checking of the
           # release tarball entirely.
           if grep -qE "^sha256sums=\(.*'SKIP'" PKGBUILD; then
             echo "::error::pkg/PKGBUILD still has a SKIP checksum after updpkgsums"
@@ -308,8 +314,8 @@ jobs:
           # An undotted copy is what gets attached: GitHub renames dot-leading
           # asset filenames (`.SRCINFO` became `default.SRCINFO`), so the
           # published name never matched what the README told people to
-          # download. Ship a name GitHub keeps; the AUR checkout renames it
-          # back to `.SRCINFO` locally.
+          # download. Ship a name GitHub keeps; whoever builds from it renames
+          # it back to `.SRCINFO` locally.
           cp .SRCINFO SRCINFO
 
       - name: namcap the PKGBUILD
@@ -359,7 +365,7 @@ jobs:
             exit 1
           fi
 
-      - name: Upload AUR artifacts
+      - name: Upload Arch packaging artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aur-assets
@@ -394,7 +400,7 @@ jobs:
           files: |
             release-assets/colony-firewall-control-*.tar.zst
             release-assets/SHA256SUMS
-      - name: Attach AUR artifacts
+      - name: Attach Arch packaging artifacts
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:

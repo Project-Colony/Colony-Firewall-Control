@@ -1,10 +1,14 @@
 # Security Policy
 
-Colony Firewall Control is **alpha software**. It runs a daemon as root with
+Colony Firewall Control is **beta software**. It runs a daemon as root with
 `CAP_NET_ADMIN` and makes allow/deny decisions about your network traffic, so
 security reports are taken seriously -- but expectations should match the
-project's maturity: there has been no external audit, and interfaces may
-change without notice.
+project's maturity: **there has been no external security audit yet**, and
+interfaces may change without notice.
+
+The explicit application confinement mode (`cfc applications run`, new in
+0.7.0) is **experimental**, and its interface and platform requirements may
+change.
 
 ## Supported Versions
 

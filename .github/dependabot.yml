@@ -4,8 +4,19 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Transitive crates too: a root daemon parsing untrusted packets is only
+    # as current as its whole dependency tree.
+    allow:
+      - dependency-type: all
+    groups:
+      # Minor and patch bumps arrive as one PR; majors stay separate.
+      cargo-minor:
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

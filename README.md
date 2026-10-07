@@ -68,17 +68,22 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 +--------------------------------------------------+
 ```
 
-Seven workspace crates:
+Ten crates: nine workspace members, plus the kernel-side `cfc-ebpf`, which
+is its own workspace (pinned nightly + bpf-linker, built by `cargo xtask
+build-ebpf`) so stable builds never see it:
 
-| Crate         | Role                                                     |
-|---------------|----------------------------------------------------------|
-| `cfc-core`    | Shared types: `Rule`, `Verdict`, `Connection`, `Process` |
-| `cfc-proto`   | gRPC schema (tonic + tonic-prost)                        |
-| `cfc-client`  | Shared UDS gRPC client wrapper                           |
-| `cfc-daemon`  | Privileged daemon                                        |
-| `cfc-ui`      | iced GUI                                                 |
-| `cfc-cli`     | Terminal control tool                                    |
-| `cfc-tray`    | System-tray companion (StatusNotifierItem)               |
+| Crate             | Role                                                                       |
+|-------------------|----------------------------------------------------------------------------|
+| `cfc-core`        | Shared types and rule matching: `Rule`, `Verdict`, `Connection`, `Process` |
+| `cfc-proto`       | gRPC schema (tonic + tonic-prost)                                          |
+| `cfc-client`      | Shared UDS gRPC client wrapper                                             |
+| `cfc-daemon`      | Privileged daemon                                                          |
+| `cfc-ui`          | iced GUI                                                                   |
+| `cfc-cli`         | Terminal control tool                                                      |
+| `cfc-tray`        | System-tray companion (StatusNotifierItem)                                 |
+| `cfc-ebpf-common` | POD types and pure parsers shared by eBPF and userspace                    |
+| `cfc-ebpf`        | Kernel-side programs of the optional eBPF backend                          |
+| `xtask`           | Build automation (eBPF object build)                                       |
 
 More docs:
 
@@ -298,6 +303,9 @@ cfc status     # "enforcing yes", and it warns on stderr when it is not
 > enforcement remotely.
 
 ### Explicit application confinement
+
+**Experimental.** This mode is new in 0.7.0, has not been externally
+audited, and its interface and platform requirements may change.
 
 `cfc applications run` starts a separate, headless application tree with an
 empty network permission list. Administrators may approve exact numeric peer
