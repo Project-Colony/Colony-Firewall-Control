@@ -238,10 +238,11 @@ fn main() {
             (Some(id), None) => confinement::gate(id),
             _ => Err(anyhow::anyhow!("invalid application gate invocation")),
         };
+        // The unit sends this stream to the journal; the launcher points there.
         if let Err(error) = result {
-            eprintln!("cfc: {}", output::terminal_safe(&error.to_string()));
+            eprintln!("cfc: {}", output::terminal_safe(&format!("{error:#}")));
         }
-        std::process::exit(error::EXIT_RUNTIME);
+        std::process::exit(confinement::GATE_REFUSED);
     }
     cli_main();
 }

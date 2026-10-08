@@ -326,7 +326,8 @@ The initial supported platform is x86_64 Linux with cgroup v2, systemd 262 or
 newer, a working system D-Bus, Bubblewrap 0.13.0 or newer, and libbpf-backed
 interface filtering. CFC verifies actual IP/interface BPF attachments, their
 policy maps and synthetic decisions before starting the application. Missing
-support or failed verification refuses the launch. Local routes through `lo`
+support or failed verification refuses the launch: the launcher reports
+status 125 and the reason is in `journalctl -u cfc-app-ID.service`. Local routes through `lo`
 remain blocked even when an approved address later belongs to the host.
 
 Prepare an administrator-owned runtime containing the executable and all its

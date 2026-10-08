@@ -252,7 +252,7 @@ mod platform {
             ("NetworkNamespacePath", ""),
             ("StandardInput", "null"),
             ("StandardOutput", "null"),
-            ("StandardError", "null"),
+            ("StandardError", "journal"),
             ("KillMode", "control-group"),
             ("Restart", "no"),
             ("NotifyAccess", "none"),
