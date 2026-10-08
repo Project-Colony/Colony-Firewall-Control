@@ -10,6 +10,7 @@ use anyhow::Context;
 use cfc_core::{Duration as RuleDuration, Rule, RuleSet};
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -176,9 +177,30 @@ fn tune(conn: &Connection, durable: bool) -> anyhow::Result<()> {
 
 impl RuleStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            path != Path::new(":memory:"),
+            "durable storage requires a database file"
+        );
+        // Explicit modes: a daemon started by hand inherits the shell's umask,
+        // and SQLite creates the database as 0666 minus that umask, with the
+        // -wal and -shm files copying the database's mode. The rules and other
+        // users' command lines in it are root's alone. The packaged unit's
+        // UMask=0077 gives the same result.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .ok();
         }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
         let conn = Connection::open(path).context("opening sqlite")?;
         let store = Self::from_conn(conn, true)?;
 
@@ -650,6 +672,22 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
         assert!(timeout > 0 && timeout <= 500, "busy timeout = {timeout}");
+    }
+
+    #[test]
+    fn store_files_are_private_whatever_the_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let path = state.join("rules.db");
+        drop(RuleStore::open(&path).unwrap());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&path), 0o600);
+
+        // A database left world-writable by an earlier run is tightened too.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        drop(RuleStore::open(&path).unwrap());
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]
