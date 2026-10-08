@@ -36,6 +36,8 @@ struct FakeDaemon {
     /// tested. Without this the fake daemon has no failure mode at all and the
     /// central atomicity claim goes unexercised.
     upsert_fails_for: Arc<Mutex<Vec<String>>>,
+    /// Set when a prompt subscriber goes away.
+    unsubscribed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One mutation seen by the fake daemon.
@@ -55,6 +57,7 @@ impl Firewall for FakeDaemon {
         _req: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let unsubscribed = self.unsubscribed.clone();
         tokio::spawn(async move {
             let ev = pb::PromptEvent {
                 prompt_id: "42".into(),
@@ -89,7 +92,10 @@ impl Firewall for FakeDaemon {
             let _ = tx.send(Ok(ev)).await;
             // Hold the stream open; the CLI is expected to leave on its own
             // once --count is satisfied.
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::select! {
+                _ = tx.closed() => unsubscribed.store(true, std::sync::atomic::Ordering::SeqCst),
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -1229,4 +1235,35 @@ async fn an_opensnitch_import_with_unconvertible_rules_needs_consent() {
     assert_eq!(calls.lock().unwrap().len(), 1);
     server.abort();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// A front end that drops its subscription (the GUI does on every disconnect)
+// must unsubscribe at once. The pump used to notice only when the next event
+// failed to send, so the daemon held that prompt for an absent listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_prompt_stream_unsubscribes_at_once() {
+    use futures::StreamExt as _;
+    let socket = socket_path("unsubscribe");
+    let fake = FakeDaemon::default();
+    let unsubscribed = fake.unsubscribed.clone();
+    let server = serve(socket.clone(), fake).await;
+    let mut stream = Box::pin(cfc_client::stream_prompts_resilient(&socket, "test".into()));
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+            Ok(Some(cfc_client::StreamItem::Event(_))) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("no prompt arrived: {other:?}"),
+        }
+    }
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !unsubscribed.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the subscription outlived its consumer"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    server.abort();
+    let _ = std::fs::remove_file(socket);
 }

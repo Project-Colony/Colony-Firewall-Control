@@ -415,7 +415,14 @@ async fn pump_once<T: ResilientSubscription>(
         return PumpOutcome::ConsumerGone;
     }
     loop {
-        match stream.message().await {
+        // Watch the consumer too: a dropped stream must unsubscribe now, not
+        // when the next event fails to send. Until then the daemon counts it
+        // as a listener and holds a prompt for it for the full timeout.
+        let message = tokio::select! {
+            _ = tx.closed() => return PumpOutcome::ConsumerGone,
+            message = stream.message() => message,
+        };
+        match message {
             Ok(Some(ev)) => {
                 if tx.send(StreamItem::Event(ev)).await.is_err() {
                     return PumpOutcome::ConsumerGone;
