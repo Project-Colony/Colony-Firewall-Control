@@ -733,6 +733,10 @@ pub struct ExportedRule {
     pub duration: String,
     #[serde(default)]
     pub duration_seconds: u32,
+    /// When a `seconds` rule runs out. Without it a restored backup started
+    /// the full lifetime again, so an expired temporary Allow came back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
     #[serde(default)]
     pub scope: ExportedScope,
 }
@@ -853,6 +857,19 @@ impl ExportedRule {
                 "rule `{name}`: duration_seconds requires duration `seconds`"
             ));
         }
+        // The daemon keeps a past creation time, so the rule ends when the
+        // exported one did; one already past is stored expired.
+        let created_at_unix_ms = match self.expires_at_unix_ms {
+            None => 0,
+            Some(_) if duration != proto::Duration::Seconds => {
+                return Err(format!(
+                    "rule `{name}`: expires_at_unix_ms requires duration `seconds`"
+                ))
+            }
+            Some(at) => at
+                .saturating_sub(i64::from(self.duration_seconds) * 1000)
+                .max(1),
+        };
         let direction_idx = match self.scope.direction.as_deref() {
             None => None,
             Some(d) => Some(match d.to_ascii_lowercase().as_str() {
@@ -1006,7 +1023,7 @@ impl ExportedRule {
             duration: duration as i32,
             duration_seconds: self.duration_seconds,
             scope: Some(scope),
-            created_at_unix_ms: 0,
+            created_at_unix_ms,
             hit_count: 0,
         })
     }
@@ -1028,6 +1045,9 @@ pub fn exported_rule(r: &proto::RuleInfo) -> ExportedRule {
         action: convert::action_label(r.action).to_string(),
         duration: convert::duration_label(r.duration).to_string(),
         duration_seconds: r.duration_seconds,
+        expires_at_unix_ms: (r.duration == proto::Duration::Seconds as i32
+            && r.created_at_unix_ms > 0)
+            .then(|| r.created_at_unix_ms + i64::from(r.duration_seconds) * 1000),
         scope: ExportedScope {
             exe_path: scope.and_then(|s| opt_string(&s.exe_path)),
             exe_sha256: scope.and_then(|s| opt_string(&s.exe_sha256)),
@@ -2493,6 +2513,25 @@ mod json_tests {
         assert!(rule.try_into_proto().is_err());
     }
 
+    // A restored backup used to start a timed Allow's lifetime again.
+    #[test]
+    fn a_timed_rule_keeps_its_deadline_through_export_and_import() {
+        let mut rule = exported("allow").try_into_proto().unwrap();
+        rule.duration = proto::Duration::Seconds as i32;
+        rule.duration_seconds = 3600;
+        rule.created_at_unix_ms = 1_000_000;
+        let back = exported_rule(&rule);
+        assert_eq!(back.expires_at_unix_ms, Some(4_600_000));
+        assert_eq!(back.try_into_proto().unwrap().created_at_unix_ms, 1_000_000);
+        let mut always = exported("allow");
+        always.expires_at_unix_ms = Some(4_600_000);
+        assert!(always.try_into_proto().is_err());
+        assert_eq!(
+            exported_rule(&exported("allow").try_into_proto().unwrap()).expires_at_unix_ms,
+            None
+        );
+    }
+
     fn exported(action: &str) -> ExportedRule {
         ExportedRule {
             id: String::new(),
@@ -2501,6 +2540,7 @@ mod json_tests {
             action: action.into(),
             duration: "always".into(),
             duration_seconds: 0,
+            expires_at_unix_ms: None,
             scope: ExportedScope {
                 exe_path: Some("/usr/bin/curl".into()),
                 exe_sha256: None,
