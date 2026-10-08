@@ -72,9 +72,11 @@ use cfc_core::exe_path::{dir_is_sealed as dir_is_safe, file_is_sealed as file_is
 /// directory some ordinary user can rename, is a short path from "unprivileged
 /// local account" to "decides what the firewall believes".
 ///
-/// Returns the offending path so the note can name it. Symlinks are resolved
-/// first: vetting the link and loading the target would check the wrong file.
-fn vet_object(path: &Path) -> anyhow::Result<()> {
+/// The error names the offending path so the note can name it. Symlinks are
+/// resolved first and the vetted target is returned for the caller to read:
+/// vetting the target and reading through the link again would let whoever
+/// controls a link along the way swap the file in between.
+fn vet_object(path: &Path) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
 
     let real =
@@ -107,7 +109,7 @@ fn vet_object(path: &Path) -> anyhow::Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(real)
 }
 
 /// Classifies a failure from `EbpfLoader::load` - parsing the ELF, creating
@@ -221,38 +223,42 @@ pub(super) fn load_and_attach(
     // Vet before read, so a file we would refuse is never even pulled into
     // memory, and so the "not there at all" case is distinguishable from the
     // "there but not ours" one.
-    if let Err(e) = vet_object(object_path) {
-        // `NotFound` from canonicalize is the ordinary "no object installed"
-        // case, not a trust failure, and it must stay that way: under an
-        // automatic default it is the single most common outcome on earth and
-        // logging it as a security event would be noise.
-        let missing = errno_of(&e) == Some(libc::ENOENT);
-        if missing {
-            return Err(LoadError::new(
-                Degrade::ObjectMissing,
-                e.context(format!(
-                    "no BPF object at {} (build it with `cargo xtask build-ebpf` \
+    let read_path = match vet_object(object_path) {
+        Ok(real) => real,
+        Err(e) => {
+            // `NotFound` from canonicalize is the ordinary "no object installed"
+            // case, not a trust failure, and it must stay that way: under an
+            // automatic default it is the single most common outcome on earth and
+            // logging it as a security event would be noise.
+            let missing = errno_of(&e) == Some(libc::ENOENT);
+            if missing {
+                return Err(LoadError::new(
+                    Degrade::ObjectMissing,
+                    e.context(format!(
+                        "no BPF object at {} (build it with `cargo xtask build-ebpf` \
                      and install it there, or set [ebpf] object_path)",
-                    object_path.display()
-                )),
-            ));
-        }
-        match trust {
-            Trust::Refuse => {
-                return Err(LoadError::new(Degrade::ObjectUntrusted, e));
+                        object_path.display()
+                    )),
+                ));
             }
-            // Somebody pointed the daemon at this file on purpose. Say what is
-            // wrong with it and do as asked.
-            Trust::Warn => {
-                warn!("loading an unvetted BPF object because it was configured explicitly: {e:#}");
-                report
-                    .notes
-                    .push(format!("BPF object failed its ownership check: {e:#}"));
+            match trust {
+                Trust::Refuse => {
+                    return Err(LoadError::new(Degrade::ObjectUntrusted, e));
+                }
+                // Somebody pointed the daemon at this file on purpose. Say what is
+                // wrong with it and do as asked.
+                Trust::Warn => {
+                    warn!("loading an unvetted BPF object because it was configured explicitly: {e:#}");
+                    report
+                        .notes
+                        .push(format!("BPF object failed its ownership check: {e:#}"));
+                }
             }
+            object_path.to_path_buf()
         }
-    }
+    };
 
-    let object = std::fs::read(object_path).map_err(|e| {
+    let object = std::fs::read(&read_path).map_err(|e| {
         let degrade = if e.kind() == std::io::ErrorKind::NotFound {
             Degrade::ObjectMissing
         } else {
@@ -1497,6 +1503,21 @@ mod tests {
             Degrade::ObjectUntrusted,
             "Trust::Warn must have let it past the ownership check"
         );
+    }
+
+    #[test]
+    fn the_vetted_target_is_what_gets_read() {
+        // Any root-sealed file stands in for an installed object.
+        let Ok(real) = vet_object(Path::new("/usr/bin/env")) else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("cfc-ebpf.o");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        // The link sits in a directory its owner can rewrite; the path handed
+        // back is the target, so swapping the link after vetting changes
+        // nothing that is read.
+        assert_eq!(vet_object(&link).expect("vetted"), real);
     }
 
     #[test]
