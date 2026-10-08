@@ -370,6 +370,12 @@ edited. Stop the tree to revoke its permissions. Approving a peer approves
 that endpoint, including any remote relay it provides. Trusted host root,
 the operating system and kernel vulnerabilities are outside this boundary.
 
+The tree shares the host network namespace. An approved peer may also
+connect in to anything the tree listens on, a listener takes the port from
+the whole host, and `/proc/net` shows the host's sockets and connections.
+Nor is the tree resource-isolated: memory, including its tmpfs directories,
+is not capped, and only systemd's default `TasksMax` bounds its processes.
+
 ## Quick start
 
 Open the GUI:
