@@ -5,9 +5,11 @@
 //! the daemon asks polkit's `CheckAuthorization` for the calling process,
 //! with user interaction allowed, and the user's polkit agent shows its
 //! password dialog. The shipped policy
-//! (`pkg/org.projectcolony.firewall.policy`) asks for `auth_admin_keep`, so
-//! one password covers a few minutes. Root never gets here, and neither do
-//! prompt answers or single-rule edits.
+//! (`pkg/org.projectcolony.firewall.policy`) asks every time for pause and
+//! resume (`auth_admin`: any same-user program can click the tray's menu
+//! over D-Bus, so a kept authorization would let it pause unseen) and keeps
+//! an import authorization a few minutes (`auth_admin_keep`). Root never
+//! gets here, and neither do prompt answers or single-rule edits.
 //!
 //! One fresh system-bus connection per call: these calls are rare, and a
 //! connection kept open would be one more thing to babysit across D-Bus
@@ -144,6 +146,31 @@ fn call_error(e: &zbus::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `<defaults>` the shipped policy file gives `action`.
+    fn shipped_defaults(action: &str) -> Vec<&'static str> {
+        const POLICY: &str = include_str!("../../../pkg/org.projectcolony.firewall.policy");
+        let block = POLICY
+            .split("<action id=\"")
+            .find(|block| block.starts_with(&format!("{action}\"")))
+            .unwrap_or_else(|| panic!("{action} is not in the shipped policy"));
+        ["allow_any", "allow_inactive", "allow_active"]
+            .iter()
+            .map(|key| {
+                block
+                    .split(&format!("<{key}>"))
+                    .nth(1)
+                    .and_then(|rest| rest.split('<').next())
+                    .unwrap_or_else(|| panic!("{action} has no {key}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pause_asks_every_time_and_an_import_is_kept() {
+        assert_eq!(shipped_defaults(PAUSE), ["auth_admin"; 3]);
+        assert_eq!(shipped_defaults(IMPORT_RULES), ["auth_admin_keep"; 3]);
+    }
 
     #[test]
     fn outcome_mapping() {

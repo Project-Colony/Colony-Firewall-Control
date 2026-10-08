@@ -325,8 +325,8 @@ journalctl -u colony-firewalld -g 'refusing a firewall change'
 ## Pause, resume or import asks for a password, or fails
 
 Pause, resume and rule import change the whole firewall at once, so the app
-and tray need an administrator password for them (polkit, kept for a few
-minutes). Root (`sudo cfc pause`) is never asked. What the refusals mean:
+and tray need an administrator password for them (polkit: every time for
+pause and resume, kept a few minutes for an import). Root (`sudo cfc pause`) is never asked. What the refusals mean:
 
 - **"authorization dialog dismissed"**: you cancelled it.
 - **"no polkit authentication agent answered in your session"**: nothing in

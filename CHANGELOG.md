@@ -118,8 +118,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   act on it, so a program could press "Always allow app" on its own prompt.
 - **Breaking: pause, resume and rule import from the app or tray ask for an
   administrator password** through polkit
-  (`org.projectcolony.firewall.pause`, `org.projectcolony.firewall.import-rules`,
-  `auth_admin_keep`). The policy file is installed by every package; polkit
+  (`org.projectcolony.firewall.pause`, asked every time, and
+  `org.projectcolony.firewall.import-rules`, kept a few minutes). Pause is
+  not kept because any program of the user can click the tray's menu over
+  D-Bus. The policy file is installed by every package; polkit
   is an optional dependency. Root is never asked, and answering a prompt or
   editing a rule never asks. The tray no longer blocks its prompt
   notifications while the dialog is open.

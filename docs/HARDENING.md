@@ -373,9 +373,14 @@ and tray only; it never makes anything else writable.
 **polkit for whole-firewall changes.** Pause, resume and rule import change
 everything at once, so even the app and tray need an administrator password
 for them: the daemon asks polkit (`org.projectcolony.firewall.pause`,
-`org.projectcolony.firewall.import-rules`, both `auth_admin_keep`, so one
-password covers a few minutes) and your session's polkit agent shows the
-dialog. Without an agent (start one, e.g. `hyprpolkitagent` or
+`auth_admin`, a password every time; `org.projectcolony.firewall.import-rules`,
+`auth_admin_keep`, one password covers a few minutes) and your session's
+polkit agent shows the dialog. Pause is never kept because the tray's menu
+is a D-Bus object any program of yours can click (`com.canonical.dbusmenu`
+`Event`): polkit, not the tray, is what stands between such a click and a
+pause, and a kept authorization would have let it through for five minutes
+after your last pause or resume. Such a click still raises a genuine
+password dialog you did not ask for; cancel it. Without an agent (start one, e.g. `hyprpolkitagent` or
 `polkit-gnome`) or without polkit, the request is refused with that reason
 and `sudo cfc pause` still works. The daemon waits 120 s for an answer, then
 cancels the dialog. Answering a prompt and editing one rule never ask.

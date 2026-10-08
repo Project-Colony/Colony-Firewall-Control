@@ -45,7 +45,7 @@ Key design points:
   programs or from `sudo cfc`.
 - **`org.projectcolony.firewall.policy`** declares the polkit actions the
   daemon asks about when the app or tray pauses, resumes or imports rules
-  (`auth_admin_keep`). Installed to `/usr/share/polkit-1/actions/`; polkit
+  (`auth_admin` for pause and resume, `auth_admin_keep` for imports). Installed to `/usr/share/polkit-1/actions/`; polkit
   is an optional dependency, and without it only `sudo cfc` can do those.
 - **XDG autostart** launches the GUI in every desktop session so prompts
   actually reach the user. Per-user opt-out: copy the file to
