@@ -104,6 +104,20 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   attestation; `SECURITY.md` explains how to verify it and what
   `SHA256SUMS` and the attached `PKGBUILD` checksum do not prove.
 
+- A running program whose file was literally named `curl (deleted)`, for
+  instance in a user's own mount namespace, matched the rules for `curl`:
+  the kernel's `" (deleted)"` suffix was dropped by text alone. It is now
+  dropped only from an image with no link left.
+- A daemon started by hand created its rule store with the shell's umask, so
+  rules and other users' command lines were world-readable (or writable
+  under umask 000). The store directory is now created 0700 and the database
+  0600.
+- The BPF object was vetted through its symlinks and then read through them
+  again, so whoever controlled a link could swap it in between. The vetted
+  target is what gets read now.
+- The Arch build recipes and the prompt demo used fixed `/tmp` directories
+  another local user could create first; they use `mktemp -d` now.
+
 ### Removed
 
 - The Fast Allow userspace path, disabled since 0.7.0 because a socket mark
@@ -242,6 +256,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `bpf-linker --version` does not print, so it never fired; it now runs the
   same checks as `ebpf.yml`. A dispatched release's draft now tags the commit
   it was built from.
+
+- A process's arguments were read whole, up to several MiB, and copied into
+  every prompt, observation and client message. At most 4 KiB is kept now;
+  a cut argument ends in `...`.
+- GUI: saving a rule trimmed its executable path, retargeting a rule for a
+  file whose name ends in a space.
+- HARDENING.md says that with inbound filtering off a program outbound rules
+  deny still answers inbound connections, that a deleted image is matched by
+  its former path, and what a readable FUSE filesystem controls.
 
 ## [0.7.0] - 2026-09-30
 
