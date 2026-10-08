@@ -1607,6 +1607,13 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let link = format!("/proc/{pid}/exe");
+        // spawn() can return before the child has exec'd sh; until then its
+        // image is this test binary.
+        let me = std::env::current_exe().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_link(&link).unwrap() == me && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let before = resolve(pid);
         assert_eq!(before.exe, fs::read_link(&link).unwrap());
 
