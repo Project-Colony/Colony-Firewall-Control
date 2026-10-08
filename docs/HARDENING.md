@@ -401,9 +401,11 @@ to shrink what a code-execution bug could reach:
 | `SystemCallArchitectures=native`   | Closes the 32-bit-syscall bypass of that filter |
 | `MemoryDenyWriteExecute`           | Nothing here JITs; no W+X memory |
 | `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths` | Read-only filesystem apart from the state, runtime and log directories |
-| `RestrictAddressFamilies`          | AF_UNIX, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET only |
+| `PrivateDevices`                   | Private `/dev` with only pseudo devices: uid 0 cannot open the block devices and write underneath `ProtectSystem` |
+| `RestrictAddressFamilies`          | AF_UNIX, AF_INET, AF_INET6, AF_NETLINK only; no packet sockets |
 | `RestrictNamespaces`, `LockPersonality`, `RestrictRealtime`, `RestrictSUIDSGID` | Namespace and personality lockdown |
-| `ProtectKernelTunables`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname` | No writing kernel state |
+| `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname` | No writing kernel state |
+| `ReadOnlyPaths` (in place of `ProtectKernelTunables`) | The `/proc` and `/sys` entries `ProtectKernelTunables` covers, listed by hand so `/sys/fs/bpf` stays writable for the pinned links. An entry missing from the list stays writable |
 | `UMask=0077`                       | Closes the window between `bind` and the explicit chmod of the control socket |
 | `PrivateTmp`                       | No shared `/tmp`                |
 

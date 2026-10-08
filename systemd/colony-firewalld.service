@@ -109,6 +109,11 @@ LogsDirectory=colony-firewall
 
 # Sandboxing
 PrivateTmp=true
+# The daemon opens no device node. Without this, uid 0 owns the block devices
+# through plain DAC (root:disk 0660) and could write the disks underneath
+# ProtectSystem. It also drops CAP_MKNOD, CAP_SYS_RAWIO and @raw-io. The nft
+# and rpm children only need /dev/null, which the private /dev keeps.
+PrivateDevices=true
 # ProtectKernelTunables is deliberately OFF, and replaced by hand below.
 #
 # It does the right thing and one wrong thing: it remounts /sys read-only
@@ -130,9 +135,9 @@ PrivateTmp=true
 # read-only, /sys/kernel is read-only, and /sys/kernel/btf and
 # /sys/kernel/tracing remain readable - which the eBPF loader needs.
 #
-# A new top-level directory in a future kernel's sysfs would be writable to
-# this unit until it is added here. That is the cost of the trade, and it is
-# smaller than losing the pin.
+# A new top-level directory in a future kernel's sysfs, or a /sys/fs or /proc
+# entry not listed here, would be writable to this unit until it is added
+# here. That is the cost of the trade, and it is smaller than losing the pin.
 #
 # EVERY path is prefixed with "-", and that is not defensive tidiness. Without
 # it, systemd treats a missing path as a fatal error and the unit dies at
@@ -152,10 +157,13 @@ PrivateTmp=true
 # is the half that was missed.
 ProtectKernelTunables=false
 ReadOnlyPaths=-/proc/sys -/proc/sysrq-trigger -/proc/irq -/proc/acpi -/proc/fs
+ReadOnlyPaths=-/proc/apm -/proc/asound -/proc/bus -/proc/latency_stats -/proc/mtrr
+ReadOnlyPaths=-/proc/scsi -/proc/timer_list -/proc/timer_stats
 ReadOnlyPaths=-/sys/block -/sys/bus -/sys/class -/sys/dev -/sys/devices -/sys/firmware
 ReadOnlyPaths=-/sys/hypervisor -/sys/kernel -/sys/module -/sys/power
 ReadOnlyPaths=-/sys/fs/btrfs -/sys/fs/cgroup -/sys/fs/ext4 -/sys/fs/fuse
 ReadOnlyPaths=-/sys/fs/pstore -/sys/fs/resctrl -/sys/fs/tmpfs -/sys/fs/virtiofs
+ReadOnlyPaths=-/sys/fs/erofs -/sys/fs/f2fs -/sys/fs/selinux -/sys/fs/xfs
 ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictNamespaces=true
@@ -224,8 +232,10 @@ SystemCallArchitectures=native
 # (root:colony-firewall 0660); a tight umask closes the pre-chmod window.
 UMask=0077
 
-# Required for NFQUEUE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+# AF_NETLINK carries NFQUEUE, sock_diag and nftables; AF_INET/AF_INET6 the
+# Reject raw sockets; AF_UNIX the control socket. Nothing opens a packet
+# socket, and AF_PACKET with CAP_NET_RAW would sniff or inject below netfilter.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
