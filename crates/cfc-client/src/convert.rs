@@ -10,12 +10,15 @@ use cfc_proto::v1 as pb;
 /// chosen by the program being judged, or by whoever named its file, and DNS
 /// names by whoever answers the query: a U+202E in a directory name reverses
 /// the rest of a Path row, and an embedded newline adds a fake line to a
-/// prompt. Only for display; rules and copies keep the raw value.
+/// prompt. The backslash is escaped too, so a literal `\n` in a name cannot
+/// pass for an escaped newline. Escape once: a second pass doubles every
+/// backslash. Only for display; rules and copies keep the raw value.
 pub fn display_safe(value: &str) -> String {
     value
         .chars()
         .flat_map(|character| {
             if character.is_control()
+                || character == '\\'
                 || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
             {
                 character.escape_default().collect::<Vec<_>>()
@@ -271,6 +274,7 @@ mod tests {
     #[test]
     fn display_safe_escapes_controls_and_bidi_only() {
         assert_eq!(display_safe("line\nnext\tcell"), "line\\nnext\\tcell");
+        assert_eq!(display_safe("x\\n"), "x\\\\n");
         assert!(display_safe("\u{202e}\u{2066}").is_ascii());
         assert_eq!(display_safe("/usr/bin/caf\u{e9}"), "/usr/bin/caf\u{e9}");
         let p = pb::ProcessInfo {

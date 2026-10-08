@@ -217,8 +217,9 @@ fn manager(args: &[&str]) -> Result<String> {
         .context("calling systemd")?;
     ensure!(
         result.status.success(),
+        // main() escapes the whole error once.
         "systemd rejected the application operation: {}",
-        crate::output::terminal_safe(&String::from_utf8_lossy(&result.stderr))
+        String::from_utf8_lossy(&result.stderr)
     );
     Ok(String::from_utf8(result.stdout)?.trim().to_owned())
 }

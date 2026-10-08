@@ -139,7 +139,8 @@ pub async fn list(client: &mut Client, format: OutputFormat) -> CliResult {
             convert::rule_duration_label(r),
             r.hit_count,
             output::truncate(&r.name, name_w),
-            output::terminal_safe(&convert::rule_summary(r))
+            // Already display-safe.
+            convert::rule_summary(r)
         );
     }
     Ok(())
@@ -172,10 +173,7 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
         }
     );
     println!("hits         {}", rule.hit_count);
-    println!(
-        "summary      {}",
-        output::terminal_safe(&convert::rule_summary(&rule))
-    );
+    println!("summary      {}", convert::rule_summary(&rule));
     println!("scope:");
     // Not dashed when unset: an absent direction is not "unconstrained", it
     // means outbound (the matcher's contract - unset kept the meaning every

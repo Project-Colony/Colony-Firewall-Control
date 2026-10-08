@@ -69,11 +69,14 @@ pub fn rfc3339(unix_ms: i64) -> Option<String> {
 /// Render untrusted values as one terminal-safe line. JSON keeps raw values.
 pub use cfc_client::convert::display_safe as terminal_safe;
 
-/// Clips a cell to `width` characters, marking the cut with `~` so a
-/// truncated path is never mistaken for a real one.
+/// Escapes an untrusted cell, then clips it like [`clip`].
 pub fn truncate(s: &str, width: usize) -> String {
-    let escaped = terminal_safe(s);
-    let s = escaped.as_str();
+    clip(&terminal_safe(s), width)
+}
+
+/// Clips an already display-safe cell to `width` characters, marking the cut
+/// with `~` so a truncated path is never mistaken for a real one.
+pub fn clip(s: &str, width: usize) -> String {
     if s.chars().count() <= width || width == 0 {
         return s.to_string();
     }

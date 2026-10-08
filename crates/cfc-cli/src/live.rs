@@ -185,7 +185,8 @@ fn print_row(ev: &proto::ConnectionEvent, conn: &proto::ConnectionInfo) {
         format!("{time:<8}").if_supports_color(Stdout, |s| s.dimmed()),
         convert::protocol_label(conn.protocol),
         pid,
-        output::truncate(&app, 18),
+        // process_display already escaped it.
+        output::clip(&app, 18),
         src,
         dst.if_supports_color(Stdout, |s| s.cyan()),
         verdict,
