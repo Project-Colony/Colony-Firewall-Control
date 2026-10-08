@@ -40,7 +40,7 @@ rule's name.";
 )]
 struct Cli {
     #[arg(long, global = true, default_value = cfc_proto::DEFAULT_SOCKET_PATH)]
-    socket: Option<PathBuf>,
+    socket: PathBuf,
 
     /// Output format. `json` is machine-readable; streaming commands emit
     /// NDJSON (one object per line).
@@ -62,12 +62,6 @@ impl Cli {
         } else {
             self.output.unwrap_or(OutputFormat::Human)
         }
-    }
-
-    fn socket(&self) -> PathBuf {
-        self.socket
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH))
     }
 }
 
@@ -118,7 +112,7 @@ enum Command {
         /// How long to stay paused, e.g. 30m, 2h. Omitted means the
         /// daemon's configured default; the daemon clamps the maximum.
         #[arg(long = "for", value_name = "DURATION",
-              value_parser = humantime::parse_duration_arg)]
+              value_parser = humantime::parse_duration)]
         duration: Option<std::time::Duration>,
     },
     /// Resume normal filtering immediately.
@@ -311,7 +305,7 @@ async fn cli_main() {
 
 async fn run(cli: Cli) -> CliResult {
     let format = cli.format();
-    let socket = cli.socket();
+    let socket = cli.socket;
 
     match cli.cmd {
         Command::Applications { cmd } => confinement::run(cmd, format).await.map_err(Into::into),
@@ -636,7 +630,7 @@ mod tests {
     fn global_flags_work_after_the_subcommand() {
         let cli = Cli::parse_from(["cfc", "rules", "list", "--json", "--socket", "/tmp/x.sock"]);
         assert!(cli.format().is_json());
-        assert_eq!(cli.socket(), PathBuf::from("/tmp/x.sock"));
+        assert_eq!(cli.socket, PathBuf::from("/tmp/x.sock"));
     }
 
     #[test]
@@ -684,7 +678,7 @@ mod tests {
     #[test]
     fn socket_defaults_to_the_shared_constant() {
         let cli = Cli::parse_from(["cfc", "status"]);
-        assert_eq!(cli.socket(), PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH));
+        assert_eq!(cli.socket, PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH));
     }
 
     #[test]

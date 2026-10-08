@@ -1982,14 +1982,36 @@ fn plan(bundle: &Bundle) -> Planned {
 /// install path uses. When this was inlined, the call site passed `None` for
 /// two of the fields and nothing noticed until a rule was read back off disk.
 fn proto_for(spec: &BundleRule, exe: &str) -> proto::RuleInfo {
-    allow_rule(
-        spec.name,
-        exe,
-        spec.dst_port,
-        spec.protocol,
-        spec.direction,
-        spec.src_net,
-    )
+    // `direction`/`src_net` are what an inbound bundle entry needs; every
+    // outbound one leaves them unset.
+    proto::RuleInfo {
+        duration_seconds: 0,
+        id: String::new(),
+        name: spec.name.to_string(),
+        enabled: true,
+        action: proto::Action::Allow as i32,
+        duration: proto::Duration::Always as i32,
+        scope: Some(proto::RuleScope {
+            exe_path: exe.to_string(),
+            exe_sha256: String::new(),
+            parent_exe: String::new(),
+            uid: 0,
+            has_uid: false,
+            dst_host: String::new(),
+            dst_net: String::new(),
+            dst_port: spec.dst_port.map(u32::from).unwrap_or(0),
+            has_dst_port: spec.dst_port.is_some(),
+            protocol: spec.protocol.map(|p| p as i32).unwrap_or(0),
+            has_protocol: spec.protocol.is_some(),
+            direction: spec.direction.map(|d| d as i32).unwrap_or(0),
+            has_direction: spec.direction.is_some(),
+            src_net: spec.src_net.unwrap_or_default().to_string(),
+            src_port: 0,
+            has_src_port: false,
+        }),
+        created_at_unix_ms: 0,
+        hit_count: 0,
+    }
 }
 
 /// Whether `rule` grants exactly what `wanted` would: same action, duration and
@@ -2032,46 +2054,6 @@ fn bundle_rule_id(bundle: &str, name: &str) -> String {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     uuid::Uuid::from_bytes(bytes).to_string()
-}
-
-/// `direction`/`src_net` are what an inbound bundle entry needs; every
-/// outbound one leaves them unset.
-fn allow_rule(
-    name: &str,
-    exe: &str,
-    port: Option<u16>,
-    proto_: Option<proto::Protocol>,
-    direction: Option<proto::Direction>,
-    src_net: Option<&str>,
-) -> proto::RuleInfo {
-    proto::RuleInfo {
-        duration_seconds: 0,
-        id: String::new(),
-        name: name.to_string(),
-        enabled: true,
-        action: proto::Action::Allow as i32,
-        duration: proto::Duration::Always as i32,
-        scope: Some(proto::RuleScope {
-            exe_path: exe.to_string(),
-            exe_sha256: String::new(),
-            parent_exe: String::new(),
-            uid: 0,
-            has_uid: false,
-            dst_host: String::new(),
-            dst_net: String::new(),
-            dst_port: port.map(u32::from).unwrap_or(0),
-            has_dst_port: port.is_some(),
-            protocol: proto_.map(|p| p as i32).unwrap_or(0),
-            has_protocol: proto_.is_some(),
-            direction: direction.map(|d| d as i32).unwrap_or(0),
-            has_direction: direction.is_some(),
-            src_net: src_net.unwrap_or_default().to_string(),
-            src_port: 0,
-            has_src_port: false,
-        }),
-        created_at_unix_ms: 0,
-        hit_count: 0,
-    }
 }
 
 /// `cfc rules bundle list`

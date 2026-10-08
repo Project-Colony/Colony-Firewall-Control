@@ -77,19 +77,8 @@ fn program_set(direct: &[u32], effective: &[u32]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn verify(unit: &str, user: &str, allow: &[IpAddr]) -> Result<(u32, u32)> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        platform::verify(unit, user, allow)
-    }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    {
-        let _ = (unit, user, allow);
-        bail!("application confinement requires x86_64 Linux")
-    }
-}
+pub(super) use platform::verify;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod platform {
     use super::*;
     use serde_json::{json, Map};
@@ -1044,7 +1033,11 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn verify(unit: &str, user: &str, allow: &[IpAddr]) -> Result<(u32, u32)> {
+    pub(in crate::confinement) fn verify(
+        unit: &str,
+        user: &str,
+        allow: &[IpAddr],
+    ) -> Result<(u32, u32)> {
         ensure!(
             unsafe { libc::getuid() } == 0 && unsafe { libc::geteuid() } == 0,
             "native gate requires real and effective root"

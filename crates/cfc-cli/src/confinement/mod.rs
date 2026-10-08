@@ -553,84 +553,81 @@ pub(super) fn gate(id: &str) -> Result<()> {
     check_runtime(&manifest.runtime, &manifest.command)?;
     let bwrap = trusted_binary(Path::new("/usr/bin/bwrap"))?;
     let (uid, gid) = native::verify(&unit(id), &user(id), &manifest.allow)?;
-    #[cfg(target_arch = "x86_64")]
-    {
-        let seccomp = filter::sealed_filter()?;
-        drop_privileges(uid, gid)?;
-        let mut launch = Command::new(bwrap);
-        launch
-            .env_clear()
-            .args([
-                "--unshare-user",
-                "--unshare-pid",
-                // Keep setup helpers outside the payload's PID view, including before seccomp.
-                "--as-pid-1",
-                "--unshare-ipc",
-                "--unshare-uts",
-                "--unshare-cgroup",
-                "--disable-userns",
-                "--assert-userns-disabled",
-                "--uid",
-                "65534",
-                "--gid",
-                "65534",
-                "--cap-drop",
-                "ALL",
-                "--new-session",
-                "--die-with-parent",
-                "--clearenv",
-                "--setenv",
-                "HOME",
-                "/home/cfc",
-                "--setenv",
-                "PATH",
-                "/usr/bin:/bin",
-                "--chdir",
-                "/home/cfc",
-                "--ro-bind",
-            ])
-            .arg(&manifest.runtime)
-            .arg("/")
-            .args([
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--tmpfs",
-                "/tmp",
-                "--tmpfs",
-                "/run",
-                "--tmpfs",
-                "/home",
-                "--dir",
-                "/home/cfc",
-                "--seccomp",
-                "3",
-                "--",
-            ])
-            .args(&manifest.command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let fd = seccomp.as_raw_fd();
-        // pre_exec uses only async-signal-safe syscalls, and the gate has no runtime threads.
-        unsafe {
-            launch.pre_exec(move || {
-                if fd != 3 && libc::dup2(fd, 3) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let error = launch.exec();
-        bail!("mandatory application isolation failed: {error}");
+    let seccomp = filter::sealed_filter()?;
+    drop_privileges(uid, gid)?;
+    let mut launch = Command::new(bwrap);
+    launch
+        .env_clear()
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            // Keep setup helpers outside the payload's PID view, including before seccomp.
+            "--as-pid-1",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--disable-userns",
+            "--assert-userns-disabled",
+            "--uid",
+            "65534",
+            "--gid",
+            "65534",
+            "--cap-drop",
+            "ALL",
+            "--new-session",
+            "--die-with-parent",
+            "--clearenv",
+            "--setenv",
+            "HOME",
+            "/home/cfc",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--chdir",
+            "/home/cfc",
+            "--ro-bind",
+        ])
+        .arg(&manifest.runtime)
+        .arg("/")
+        .args([
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/run",
+            "--tmpfs",
+            "/home",
+            "--dir",
+            "/home/cfc",
+            "--seccomp",
+            "3",
+            "--",
+        ])
+        .args(&manifest.command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let fd = seccomp.as_raw_fd();
+    // pre_exec uses only async-signal-safe syscalls, and the gate has no runtime threads.
+    unsafe {
+        launch.pre_exec(move || {
+            if fd != 3 && libc::dup2(fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
+    let error = launch.exec();
+    bail!("mandatory application isolation failed: {error}");
 }
 
 #[cfg(not(target_arch = "x86_64"))]
