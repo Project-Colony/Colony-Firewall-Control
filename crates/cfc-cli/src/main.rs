@@ -171,12 +171,20 @@ enum RulesCmd {
         replace: bool,
     },
     /// Import rules from an opensnitch rules directory or single JSON file.
+    ///
+    /// Rules with no faithful equivalent here (hostnames, regexps, unknown
+    /// operands) cannot be converted. By default one of them stops the import
+    /// before anything changes, because dropping a narrow deny while importing
+    /// a broad allow imports a wider policy than the source.
     ImportOpensnitch {
         /// Path to opensnitch rules dir (e.g. /etc/opensnitchd/rules) or a single .json.
         path: PathBuf,
         /// Replace mode: make the rule set match the source in one atomic batch. Every source rule must validate before anything changes.
         #[arg(long)]
         replace: bool,
+        /// Import the rules that convert and skip, with a reason, those that do not.
+        #[arg(long, conflicts_with = "replace")]
+        skip_unconvertible: bool,
     },
     /// Install a small set of sensible starter rules: system DNS, NTP
     /// (timesyncd/chrony), DHCP clients (dhcpcd/NetworkManager/networkd),
@@ -362,9 +370,11 @@ async fn dispatch(
             RulesCmd::Import { file, replace } => {
                 rules::import(client, file, replace, format).await
             }
-            RulesCmd::ImportOpensnitch { path, replace } => {
-                rules::import_opensnitch(client, path, replace, format).await
-            }
+            RulesCmd::ImportOpensnitch {
+                path,
+                replace,
+                skip_unconvertible,
+            } => rules::import_opensnitch(client, path, replace, skip_unconvertible, format).await,
             RulesCmd::Bundle { cmd } => match cmd {
                 BundleCmd::List => rules::bundle_list(client, format).await,
                 BundleCmd::Add { name, dry_run } => {

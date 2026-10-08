@@ -419,7 +419,8 @@ cfc resume
 # Back up rules
 cfc rules export --out rules.json
 
-# Migrate from an existing opensnitch install
+# Migrate from an existing opensnitch install. A rule with no equivalent
+# here (hostname, regexp) stops it; --skip-unconvertible imports the rest.
 cfc rules import-opensnitch /etc/opensnitchd/rules
 ```
 

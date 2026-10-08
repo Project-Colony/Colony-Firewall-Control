@@ -1184,3 +1184,49 @@ async fn a_partial_opensnitch_replace_changes_nothing() {
     server.abort();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// An additive import used to drop the unconvertible deny, apply the allow and
+// exit 0, so the imported policy was wider than the source.
+#[tokio::test]
+async fn an_opensnitch_import_with_unconvertible_rules_needs_consent() {
+    let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let source = dir.join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("allow.json"), r#"{"name":"scoped","action":"allow","duration":"always","operator":{"type":"simple","operand":"dest.port","data":"443"}}"#).unwrap();
+    std::fs::write(source.join("deny.json"), r#"{"name":"tracker","action":"deny","duration":"always","operator":{"type":"simple","operand":"dest.host","data":"tracker.example"}}"#).unwrap();
+    let socket = dir.join("cli.sock");
+    let fake = FakeDaemon::default();
+    let calls = fake.calls.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let source_arg = source.to_string_lossy().into_owned();
+    let run = |extra: &'static [&'static str]| {
+        let socket_arg = socket_arg.clone();
+        let source_arg = source_arg.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec![
+                "--socket",
+                &socket_arg,
+                "rules",
+                "import-opensnitch",
+                &source_arg,
+            ];
+            args.extend_from_slice(extra);
+            run_cli(&args, Duration::from_secs(5))
+        })
+    };
+    let out = run(&[]).await.unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was changed"));
+    assert!(calls.lock().unwrap().is_empty());
+    let out = run(&["--skip-unconvertible"]).await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}

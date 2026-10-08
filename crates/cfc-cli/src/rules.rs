@@ -1101,6 +1101,7 @@ pub async fn import_opensnitch(
     client: &mut Client,
     path: PathBuf,
     replace: bool,
+    skip_unconvertible: bool,
     format: OutputFormat,
 ) -> CliResult {
     let mut files: Vec<PathBuf> = if path.is_dir() {
@@ -1124,7 +1125,9 @@ pub async fn import_opensnitch(
         )));
     }
 
-    // Unsupported rules may be skipped only for additive imports.
+    // Unsupported rules may be skipped only when asked, and never in replace
+    // mode: a skipped deny next to an imported allow is a wider policy than
+    // the source, and the skip count alone did not say so.
     let mut pending = Vec::new();
     let mut skipped = 0u32;
     for file in &files {
@@ -1154,6 +1157,14 @@ pub async fn import_opensnitch(
     }
     if replace && skipped > 0 {
         return Err(anyhow::anyhow!("refusing --replace: {skipped} source rules could not be converted; nothing was changed").into());
+    }
+    if skipped > 0 && !skip_unconvertible {
+        return Err(anyhow::anyhow!(
+            "refusing to import: {skipped} source rules could not be converted, and \
+             importing the rest would drop their restrictions; nothing was changed. \
+             Rewrite them, or pass --skip-unconvertible to import the rest anyway"
+        )
+        .into());
     }
     if replace && pending.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1185,8 +1196,9 @@ fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<pr
     // unrecognised or missing action must never become an Allow. This one is
     // reachable from the migration path the README advertises, so a foreign
     // file's vocabulary decides what gets allowed - the worst possible input to
-    // trust. A rule that cannot be converted is skipped and counted, which is
-    // already how this command handles anything it does not understand.
+    // trust. A rule that cannot be converted stops the import, or is skipped
+    // and named under --skip-unconvertible, like anything else it does not
+    // understand.
     let action = match osn.action.to_ascii_lowercase().as_str() {
         "allow" | "accept" => proto::Action::Allow,
         "deny" | "drop" => proto::Action::Deny,
