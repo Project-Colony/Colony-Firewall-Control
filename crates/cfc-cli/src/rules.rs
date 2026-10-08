@@ -1956,6 +1956,15 @@ fn proto_for(spec: &BundleRule, exe: &str) -> proto::RuleInfo {
     )
 }
 
+/// Whether `rule` grants exactly what `wanted` would: same action, duration and
+/// scope. Name, id and enabled state are not policy.
+fn same_policy(rule: &proto::RuleInfo, wanted: &proto::RuleInfo) -> bool {
+    rule.action == wanted.action
+        && rule.duration == wanted.duration
+        && rule.duration_seconds == wanted.duration_seconds
+        && rule.scope == wanted.scope
+}
+
 fn bundle_rule_id(bundle: &str, name: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("colony-firewall-bundle\0{bundle}\0{name}"));
@@ -2133,19 +2142,47 @@ pub async fn bundle_add(
     let planned = plan(&bundle);
     let mut added = Vec::new();
     let mut skipped_present = 0u32;
-    for (rule_name, _) in &planned.present {
+    // A rule with an entry's name but another id was not installed by this
+    // bundle. One identical to the entry is that entry as seeded before 0.7.0
+    // gave bundle rules their own ids, and counts as present; any other one
+    // stops the command before it changes anything.
+    let mut legacy = std::collections::HashSet::new();
+    for (rule_name, exe) in &planned.present {
         let id = bundle_rule_id(bundle.name, rule_name);
-        if existing
+        let wanted = proto_for(by_name[*rule_name], &exe.to_string_lossy());
+        for rule in existing
             .iter()
-            .any(|rule| rule.name == *rule_name && rule.id != id)
+            .filter(|rule| rule.name == *rule_name && rule.id != id)
         {
-            return Err(CliError::runtime(format!("bundle rule `{rule_name}` collides with a rule outside this bundle; nothing was changed")));
+            if same_policy(rule, &wanted) {
+                legacy.insert(*rule_name);
+            } else {
+                return Err(CliError::runtime(format!(
+                    "bundle rule `{rule_name}` collides with rule {} of the same name, which this \
+                     bundle did not install and which differs from it; rename or remove that rule \
+                     and retry. Nothing was changed",
+                    short_id(&rule.id)
+                )));
+            }
         }
     }
 
     for (rule_name, exe) in &planned.present {
         let id = bundle_rule_id(bundle.name, rule_name);
-        if existing.iter().any(|rule| rule.id == id) {
+        if let Some(rule) = existing.iter().find(|rule| rule.id == id) {
+            let stored = rule.scope.as_ref().map_or("", |s| s.exe_path.as_str());
+            if !format.is_json() && std::path::Path::new(stored) != exe.as_path() {
+                println!(
+                    "kept: {rule_name} pins {}, but this bundle now names {}; \
+                     `bundle remove` and `bundle add` replace it",
+                    output::terminal_safe(stored),
+                    output::terminal_safe(&exe.to_string_lossy())
+                );
+            }
+            skipped_present += 1;
+            continue;
+        }
+        if legacy.contains(rule_name) {
             skipped_present += 1;
             continue;
         }
@@ -2650,6 +2687,24 @@ mod json_tests {
 #[cfg(test)]
 mod bundle_tests {
     use super::*;
+
+    // Hosts seeded before 0.7.0 hold the bundle's rules under random ids.
+    // An identical copy counts as present; an edited one still blocks.
+    #[test]
+    fn a_pre_0_7_copy_of_a_bundle_rule_counts_only_while_unchanged() {
+        let bundle = find_bundle("inbound").unwrap();
+        let wanted = proto_for(&bundle.rules[0], "");
+        let mut legacy = wanted.clone();
+        legacy.id = "11111111-1111-4111-8111-111111111111".into();
+        legacy.enabled = false;
+        assert!(same_policy(&legacy, &wanted));
+        let mut deny = legacy.clone();
+        deny.action = proto::Action::Deny as i32;
+        assert!(!same_policy(&deny, &wanted));
+        let mut wider = legacy.clone();
+        wider.scope.as_mut().unwrap().src_net.clear();
+        assert!(!same_policy(&wider, &wanted));
+    }
 
     // `/usr/bin/firefox` on Arch is `exec /usr/lib/firefox/firefox`, and
     // `/usr/bin/cargo` under rustup is the rustup proxy. Neither is ever

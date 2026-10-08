@@ -90,7 +90,9 @@ You can install the system service rules with one command:
 cfc rules bootstrap-defaults
 ```
 
-This is idempotent: it skips rules already present by name.
+This is idempotent: it skips the rules it installed earlier and identical
+same-named rules seeded before 0.7.0. A different rule with one of its names
+stops it before anything changes.
 
 ## What to *deny* first
 
