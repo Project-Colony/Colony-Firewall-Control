@@ -82,8 +82,9 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for another program. They now answer the marked top card, only on the
   Prompts tab and without those modifiers. The keys are disarmed for one
   second whenever their target changes, and a card's buttons for one second
-  after it appears, so input already on its way when the window was raised
-  or a card moved does not answer it.
+  after it appears or moves up, so input already on its way when the window
+  was raised or a card moved, such as the second click of a double-click on
+  the card above, does not answer it.
 - GUI and tray: executable paths, command lines, working directories and DNS
   names were shown raw, so bidi and control characters could reorder or add
   lines to a prompt, and the tray's notification body was parsed as markup

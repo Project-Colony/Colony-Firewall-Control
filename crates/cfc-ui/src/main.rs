@@ -332,7 +332,8 @@ pub struct PromptCard {
     /// `deadline_unix_ms` is the wall clock at which the daemon answers this
     /// prompt itself; 0 means it attached no deadline.
     pub event: proto::PromptEvent,
-    /// Wall clock before which the verdict buttons stay disabled.
+    /// Wall clock before which the verdict buttons stay disabled: a second
+    /// after the card arrives, and again after it moves up.
     pub armed_at_ms: i64,
     /// A verdict for it is on its way to the daemon. The card stays until
     /// the daemon confirms, so a verdict that never arrived can be given
@@ -631,7 +632,7 @@ impl App {
 
         let now = self.now_ms;
         let mut expired: Vec<String> = Vec::new();
-        self.prompts.retain(|p| {
+        self.retire_cards(|p| {
             if format::is_expired(p.event.deadline_unix_ms, now) {
                 expired.push(prompt_label(&p.event));
                 false
@@ -695,12 +696,35 @@ impl App {
         }
     }
 
+    /// Drops the cards `keep` rejects and disarms, for [`PROMPT_ARM_MS`],
+    /// every card that moved up to take a dropped card's place.
+    ///
+    /// A card's buttons are otherwise armed from its arrival, so the second
+    /// click of a double-click on one card, or a click on a card that
+    /// expired under the cursor, landed on the button of the program below
+    /// that just moved into the same spot.
+    fn retire_cards(&mut self, mut keep: impl FnMut(&PromptCard) -> bool) {
+        let rearm_at = self.now_ms.saturating_add(PROMPT_ARM_MS);
+        let mut moved = false;
+        self.prompts.retain_mut(|card| {
+            if !keep(card) {
+                moved = true;
+                return false;
+            }
+            if moved {
+                card.armed_at_ms = card.armed_at_ms.max(rearm_at);
+            }
+            true
+        });
+    }
+
     /// Settles the card a verdict was sent for: gone once the daemon has
     /// applied an answer, answerable again when nothing was applied.
     fn settle_card(&mut self, prompt_id: &str, applied: bool) {
+        // The arming window below counts from now, not from the last tick.
+        self.now_ms = now_ms();
         if applied {
-            self.prompts
-                .retain(|card| card.event.prompt_id != prompt_id);
+            self.retire_cards(|card| card.event.prompt_id != prompt_id);
         } else if let Some(card) = self
             .prompts
             .iter_mut()
@@ -2445,6 +2469,32 @@ mod tests {
                 .units(),
             0
         );
+    }
+
+    #[test]
+    fn a_card_that_moves_up_is_disarmed_again() {
+        let (mut app, _) = App::new();
+        app.prompts.push(PromptCard::new(
+            prompt("top", "/usr/lib/firefox/firefox"),
+            0,
+        ));
+        app.prompts.push(PromptCard::new(
+            prompt("below", "/home/u/.cache/x/updater"),
+            0,
+        ));
+        assert!(app.prompts[1].armed(app.now_ms));
+        let _ = app.update(Message::SubmitVerdict {
+            prompt_id: "top".into(),
+            action: proto::Action::Allow,
+            scope: None,
+            duration: proto::Duration::Always,
+        });
+        let _ = app.update(Message::VerdictSubmitted(Ok(("top".into(), true, None))));
+        // The second click of a double-click lands on the card that took
+        // the answered one's place.
+        assert_eq!(app.prompts[0].event.prompt_id, "below");
+        assert!(!app.prompts[0].armed(app.now_ms));
+        assert!(app.prompts[0].armed(app.now_ms + PROMPT_ARM_MS));
     }
 
     #[test]
