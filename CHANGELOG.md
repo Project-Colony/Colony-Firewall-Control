@@ -23,9 +23,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scope `cfc rules add --exe --dst-port --protocol` builds, instead of
   pinning the one address seen, which left the app denied on its next
   address (#46). A row without an identified program pins the address and
-  never seeds `<unknown>`; an inbound row keeps its direction. "Customize"
-  on a prompt seeds the same way. A saved rule logs the scope it stored, and
-  a rule the editor refuses is also reported in the footer.
+  never seeds `<unknown>`; an inbound row keeps its direction and is scoped
+  on the peer seen and the local port, since the daemon refuses our own
+  address as an inbound destination. "Customize" on a prompt seeds the same
+  way. A saved rule logs the scope it stored, and a rule the editor refuses
+  is also reported in the footer.
 - GUI: a prompt arriving while others are pending no longer switches to the
   Prompts tab; only the first one does, and raises the window.
 - `cfc rules import-opensnitch` stops before changing anything when a source

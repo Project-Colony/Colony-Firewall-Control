@@ -239,6 +239,7 @@ fn live_row(ev: &proto::ConnectionEvent) -> Element<'_, Message> {
             .padding([1, 6])
             .on_press(Message::MakeRuleFromEvent {
                 exe: proc.map(|p| p.exe.clone()).unwrap_or_default(),
+                src_ip: c.src_ip.clone(),
                 dst_ip: c.dst_ip.clone(),
                 dst_port: c.dst_port,
                 protocol: c.protocol,

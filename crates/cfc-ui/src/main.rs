@@ -254,11 +254,17 @@ impl RuleEditor {
             .as_ref()
             .map(|p| p.exe.as_str())
             .unwrap_or_default();
-        let (dst_ip, dst_port, protocol, direction) = match ev.connection.as_ref() {
-            Some(c) => (c.dst_ip.as_str(), c.dst_port, c.protocol, c.direction),
-            None => ("", 0, 0, 0),
+        let (src_ip, dst_ip, dst_port, protocol, direction) = match ev.connection.as_ref() {
+            Some(c) => (
+                c.src_ip.as_str(),
+                c.dst_ip.as_str(),
+                c.dst_port,
+                c.protocol,
+                c.direction,
+            ),
+            None => ("", "", 0, 0, 0),
         };
-        let mut editor = Self::from_observed(exe, dst_ip, dst_port, protocol, direction);
+        let mut editor = Self::from_observed(exe, src_ip, dst_ip, dst_port, protocol, direction);
         editor.prompt_id = Some(ev.prompt_id.clone());
         editor.prompt_hash_required = ev.binds_to_hash;
         if ev.binds_to_hash {
@@ -285,10 +291,17 @@ impl RuleEditor {
     /// Otherwise the placeholder for an unidentified process is never
     /// seeded, since a rule on it is refused, and the numeric endpoint is
     /// pinned instead so the rule does not cover the whole port. DNS names
-    /// stay diagnostic. An inbound flow keeps its direction: without it the
-    /// rule would be an outbound one to our own address.
+    /// stay diagnostic.
+    ///
+    /// An inbound flow keeps its direction (without it the rule would be an
+    /// outbound one to our own address) and pins the one peer seen as its
+    /// source. Inbound, the destination is this machine, which the daemon
+    /// refuses as a scope, and the editor has no source field: a seed on our
+    /// own address could not be saved, and clearing it opened the port to
+    /// every peer.
     pub fn from_observed(
         exe: &str,
+        src_ip: &str,
         dst_ip: &str,
         dst_port: u32,
         protocol: i32,
@@ -297,8 +310,9 @@ impl RuleEditor {
         let protocol = proto::Protocol::try_from(protocol)
             .ok()
             .filter(|p| !matches!(p, proto::Protocol::Unspecified));
-        let scopable = cfc_client::convert::exe_is_rule_scopable(exe);
         let inbound = direction == proto::Direction::Inbound as i32;
+        // Inbound flows are never attributed to a program.
+        let scopable = !inbound && cfc_client::convert::exe_is_rule_scopable(exe);
         Self {
             name: String::new(),
             exe: if scopable {
@@ -307,7 +321,7 @@ impl RuleEditor {
                 String::new()
             },
             dst_host: String::new(),
-            dst_net: if scopable {
+            dst_net: if scopable || inbound {
                 String::new()
             } else {
                 format::host_cidr(dst_ip)
@@ -321,6 +335,11 @@ impl RuleEditor {
             carried_scope: proto::RuleScope {
                 direction: if inbound { direction } else { 0 },
                 has_direction: inbound,
+                src_net: if inbound {
+                    format::host_cidr(src_ip)
+                } else {
+                    String::new()
+                },
                 ..Default::default()
             },
             ..Self::default()
@@ -472,6 +491,7 @@ pub enum Message {
     /// Opens the rule editor pre-filled from an observed connection.
     MakeRuleFromEvent {
         exe: String,
+        src_ip: String,
         dst_ip: String,
         dst_port: u32,
         protocol: i32,
@@ -1029,13 +1049,14 @@ impl App {
             }
             Message::MakeRuleFromEvent {
                 exe,
+                src_ip,
                 dst_ip,
                 dst_port,
                 protocol,
                 direction,
             } => {
                 self.editor = Some(RuleEditor::from_observed(
-                    &exe, &dst_ip, dst_port, protocol, direction,
+                    &exe, &src_ip, &dst_ip, dst_port, protocol, direction,
                 ));
                 self.tab = Tab::Rules;
                 Task::none()
@@ -1981,7 +2002,7 @@ mod tests {
 
     #[test]
     fn observed_seed_scopes_by_program_or_pins_the_endpoint_without_one() {
-        let ed = RuleEditor::from_observed("/bin/x", "1.2.3.4", 443, 1, 0);
+        let ed = RuleEditor::from_observed("/bin/x", "", "1.2.3.4", 443, 1, 0);
         assert_eq!(ed.exe, "/bin/x");
         assert!(ed.dst_host.is_empty());
         assert!(
@@ -1991,18 +2012,31 @@ mod tests {
         assert_eq!(ed.dst_port, "443");
 
         for exe in [cfc_client::convert::UNKNOWN_EXE, ""] {
-            let ed = RuleEditor::from_observed(exe, "2001:db8::1", 0, 0, 0);
+            let ed = RuleEditor::from_observed(exe, "", "2001:db8::1", 0, 0, 0);
             assert!(ed.exe.is_empty(), "{exe:?} is never seeded");
             assert_eq!(ed.dst_net, "2001:db8::1/128");
             assert!(ed.dst_port.is_empty());
             assert!(ed.protocol.is_none());
         }
 
+        // Inbound: the peer seen, never our own address, which the daemon
+        // refuses as an inbound scope.
         let inbound = proto::Direction::Inbound as i32;
-        let ed =
-            RuleEditor::from_observed(cfc_client::convert::UNKNOWN_EXE, "10.0.0.2", 22, 1, inbound);
-        assert!(ed.carried_scope.has_direction);
-        assert_eq!(ed.carried_scope.direction, inbound);
+        let ed = RuleEditor::from_observed(
+            cfc_client::convert::UNKNOWN_EXE,
+            "192.168.1.20",
+            "10.0.0.2",
+            8384,
+            1,
+            inbound,
+        );
+        let scope = build_rule_from_editor(&ed).unwrap().scope.unwrap();
+        assert!(scope.has_direction);
+        assert_eq!(scope.direction, inbound);
+        assert_eq!(scope.src_net, "192.168.1.20/32");
+        assert!(scope.dst_net.is_empty());
+        assert!(scope.exe_path.is_empty());
+        assert_eq!(scope.dst_port, 8384);
     }
 
     /// Issue #46: "make rule" on a LIVE row must either send the rule or say
@@ -2030,6 +2064,7 @@ mod tests {
             let (mut app, _) = App::new();
             let _ = app.update(Message::MakeRuleFromEvent {
                 exe: exe.into(),
+                src_ip: "10.0.0.2".into(),
                 dst_ip: dst_ip.into(),
                 dst_port,
                 protocol: protocol as i32,
@@ -2214,7 +2249,7 @@ mod tests {
 
     #[test]
     fn a_rule_seeded_from_an_observed_flow_is_new() {
-        let ed = RuleEditor::from_observed("/bin/x", "1.2.3.4", 443, 1, 0);
+        let ed = RuleEditor::from_observed("/bin/x", "", "1.2.3.4", 443, 1, 0);
         assert_eq!(ed.created_at_unix_ms, 0);
         assert_eq!(ed.hit_count, 0);
         assert!(ed.enabled);
