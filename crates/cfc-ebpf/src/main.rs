@@ -1,6 +1,6 @@
 //! Colony Firewall Control - kernel-side eBPF programs.
 //!
-//! Nine programs, of which at most seven are attached at once - the two
+//! Seven programs, of which at most five are attached at once - the two
 //! `_basic` connect variants are the fallback for a kernel that will not
 //! verify the cookie ones, never loaded alongside them (see `README.md` for
 //! attach points and capability requirements):
@@ -11,7 +11,6 @@
 //! | `tracepoint/sched/sched_process_exit` | evict dead pids from `PROCS` + `EXIT_EVENTS`     |
 //! | `cgroup_skb/ingress`                 | copy DNS response payloads into `DNS_PACKETS`    |
 //! | `cgroup/connect4`, `cgroup/connect6` | refuse `connect()` for already-denied pids, and mark the sockets of fast-allowed ones |
-//! | `cgroup/sendmsg4`, `cgroup/sendmsg6` | the mark decision again, for UDP sends that carry a destination |
 //!
 //! The first three *observe*. The rest **decide**, and are the only part of
 //! CFC that enforces without a userspace round trip: their link is pinned to
@@ -140,7 +139,7 @@ static DENY_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 /// Processes the daemon has ruled allowed *process-wide* - no destination, port
 /// or protocol in the rule, and a rule that lasts (`always` / until restart).
-/// Read on the `connect()` and `sendmsg()` paths, where a hit marks the socket
+/// Read on the `connect()` path, where a hit marks the socket
 /// so nftables accepts its packets ahead of the queue.
 ///
 /// A set, not a verdict map: the deny map next door is consulted first, and an
@@ -174,7 +173,7 @@ static FAST_ALLOW_UNTIL: Array<u64> = Array::with_max_entries(1, 0);
 #[map]
 static FAST_ALLOW_MARK: Array<u32> = Array::with_max_entries(1, 0);
 
-/// One record per fast-allowed `connect()`/`sendmsg()`, the `ConnectReport`
+/// One record per fast-allowed `connect()`, the `ConnectReport`
 /// shape shared with `DENY_EVENTS`. A marked flow never reaches NFQUEUE, so
 /// without this the live feed, the rule hit counts and the "enforcing" heuristic
 /// would all go quiet on exactly the traffic the firewall handles best.
@@ -1109,7 +1108,7 @@ const SOL_SOCKET: i32 = 1;
 const SO_MARK: i32 = 36;
 
 /// The fast path: decide, on every flow-initiating call, whether this socket
-/// carries the daemon's mark. Shared by the connect and sendmsg hooks.
+/// carries the daemon's mark. Called by the cookie connect hooks.
 ///
 /// **Re-decided at every hook that runs, never left in place.** `SO_MARK`
 /// lives on the socket for as long as the socket does, and the socket may
@@ -1120,9 +1119,8 @@ const SO_MARK: i32 = 36;
 /// every time one of these hooks runs.
 ///
 /// Which is not the same as "at every flow start", and the difference is why
-/// only TCP is ever marked. `cgroup/connect{4,6}` runs at `connect()`;
-/// `cgroup/sendmsg{4,6}` runs for a send that carries a destination. A
-/// **connected UDP socket** passes neither again, so a mark given to one could
+/// only TCP is ever marked. `cgroup/connect{4,6}` runs at `connect()`, and a
+/// **connected UDP socket** never passes it again, so a mark given to one could
 /// never be taken back - and unreplied UDP is conntrack-NEW on every datagram
 /// (see `nfqueue.rs`), so that mark would carry every datagram past the queue
 /// for as long as the socket lived. The body below is the allowlist that
@@ -1154,13 +1152,12 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     // Two narrower guards were tried before this one and both leaked, which is
     // why this is an allowlist and not a list of protocols to exclude:
     //
-    // * refusing UDP only at `connect()` left the sendmsg hooks free to mark a
-    //   socket that was *already* connected - `sendto` with an explicit
+    // * refusing UDP only at `connect()` left the sendmsg hooks this object
+    //   carried until 0.7 free to mark a socket that was *already* connected - `sendto` with an explicit
     //   address is legal on a connected UDP socket, and `udp_sendmsg` runs the
     //   hook whenever `msg_name` is supplied. Closed one door, left the other.
     // * naming UDP at all only covers what someone thought to name. UDP-Lite,
-    //   DCCP and SCTP connect the same way and have no sendmsg hook here
-    //   either.
+    //   DCCP and SCTP connect the same way.
     //
     // The cost is small and lands where it does least harm. The ruleset queues
     // `ct state new`; a UDP peer that answers makes the flow
@@ -1213,10 +1210,9 @@ fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
     // order, which is not cosmetic.
     //
     // `&&` short-circuits, so the cheaper test goes first: reading a context
-    // field against comparing a hash-map key. The sendmsg hooks see only UDP
-    // and now never grant, so with the map lookup first every `sendto` on the
-    // machine - every DNS query - paid a hash lookup to reach a conclusion the
-    // protocol alone settles. Reversed, they pay a load and a compare.
+    // field against comparing a hash-map key. With the map lookup first, every
+    // UDP `connect()` on the machine paid a hash lookup to reach a conclusion
+    // the protocol alone settles. Reversed, it pays a load and a compare.
     //
     // The protocol test folds in here instead of standing beside `want` as its
     // own flag. Two booleans live across the tail made the verifier walk the
@@ -1311,48 +1307,6 @@ pub fn cfc_connect4_basic(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(connect6)]
 pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
     connect_verdict(&ctx, 6, false)
-}
-
-/// The mark decision for UDP that never calls `connect()`.
-///
-/// `sendto()` on an unconnected socket starts a new flow without ever passing
-/// the connect hooks. These hooks run the same `mark_decision` there. No
-/// refusal here - the in-kernel deny is a `connect()` thing, and unconnected
-/// UDP has always been the packet path's to refuse.
-///
-/// **Not "on every datagram send"**, which is what this comment used to claim
-/// and what the design was reviewed against. `cgroup/sendmsg{4,6}` runs for a
-/// send that carries a destination; a `send()` or `write()` on a socket that
-/// has already been `connect()`ed does not pass it, so such a socket would
-/// keep whatever mark it was given at `connect()` for as long as it is open -
-/// past a revocation, past the deadline, past the daemon's death.
-///
-/// That is why `mark_decision` never marks a UDP socket at all, from either
-/// hook - see the allowlist there. What these hooks still do for UDP is the
-/// other half of the decision: a socket that carries our mark without having
-/// been granted it - forged by a process that learned the value and was then
-/// revoked - has it stripped on its next addressed send. Defence in depth, per
-/// datagram, on the one socket type the connect hook cannot reach again. Two
-/// earlier versions of this paragraph described designs that had already been
-/// replaced; the test in `cargo xtask ebpf-check` that the kernel never writes
-/// the grant map is what this one rests on.
-///
-/// No `_basic` twins: these exist only for the fast path, which the basic
-/// variants do not have, so on a kernel that verifies only the basic connect
-/// programs these are simply not attached.
-#[cgroup_sock_addr(sendmsg4)]
-pub fn cfc_sendmsg4(ctx: SockAddrContext) -> i32 {
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    mark_decision(&ctx, tgid, 4);
-    CONNECT_PROCEED
-}
-
-/// See [`cfc_sendmsg4`].
-#[cgroup_sock_addr(sendmsg6)]
-pub fn cfc_sendmsg6(ctx: SockAddrContext) -> i32 {
-    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    mark_decision(&ctx, tgid, 6);
-    CONNECT_PROCEED
 }
 
 // ---------------------------------------------------------------------------
