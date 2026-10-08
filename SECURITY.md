@@ -28,6 +28,14 @@ Please do **not** open a public issue for anything you believe is exploitable
 (privilege escalation via the daemon, rule-bypass of the NFQUEUE filter,
 crafted-packet parsing crashes, socket permission problems, etc.).
 
+Out of scope: the limits documented in
+[What this firewall does not protect against](docs/HARDENING.md#what-this-firewall-does-not-protect-against),
+such as root processes, established or inherited flows, replies on
+inbound-initiated connections while inbound filtering is off, local relays,
+AF_PACKET and raw sockets, and code running as an allowed program's user.
+A way around the firewall that this list does not describe, or a
+description that turns out to be wrong, is in scope.
+
 What to expect:
 
 - This is a single-maintainer hobby project; acknowledgement is best-effort,

@@ -94,9 +94,10 @@ NoNewPrivileges=true
 # Filesystem
 ProtectSystem=strict
 ProtectHome=true
-# /sys/fs/bpf is listed because ProtectKernelTunables below remounts /sys
-# read-only, and the enforcement links are *pinned* into the bpffs mounted
-# there. Without this line the pin fails with EROFS, the daemon falls back to
+# /sys/fs/bpf must stay writable: the enforcement links are *pinned* into the
+# bpffs mounted there. This line alone does not achieve that against
+# ProtectKernelTunables, which is why that setting is replaced by hand below.
+# A read-only bpffs fails the pin with EROFS, the daemon falls back to
 # process-lifetime links, and `kill -9` on this unit lifts every in-kernel deny
 # it holds - which is the one thing that layer exists to prevent. The daemon
 # only ever creates /sys/fs/bpf/colony-firewall/; it writes nothing else there.

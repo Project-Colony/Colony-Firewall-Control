@@ -299,7 +299,17 @@ remote flows delegated through local brokers, including AF_UNIX and D-Bus.
 Applications with `CAP_NET_RAW` can use AF_PACKET outside the `inet OUTPUT`
 hook. Raw IP packets can also coincide with another socket's tuple; socket
 attribution does not prove their origin. Use explicit application confinement
-or OS containment for those cases.
+or OS containment for those cases. Docker grants `CAP_NET_RAW` to containers
+by default, so a `--network=host` container has it; drop it with
+`--cap-drop NET_RAW` for workloads CFC should govern.
+
+Executables over 64 MiB (Chromium, Electron apps, VS Code) are never hashed.
+A hash-pinned rule naming one refuses its flows, and outside a root-owned
+path an "Allow always" for one cannot be saved, so it prompts for every new
+flow. See [docs/HARDENING.md](docs/HARDENING.md#rule-design-principles).
+The complete list of non-goals is in
+[docs/HARDENING.md](docs/HARDENING.md#what-this-firewall-does-not-protect-against).
+
 Fast Allow was removed: a socket mark cannot prove which process sends, so it
 opened bypasses. The old `[ebpf] fast_allow` and `fast_allow_mark` keys are
 ignored with a warning, and allowed flows use the normal NFQUEUE path.

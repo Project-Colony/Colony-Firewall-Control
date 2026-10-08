@@ -178,6 +178,23 @@ with zero hits after weeks of use is probably obsolete or wrong.
 different binary after an interpreter upgrade. When in doubt, target the
 real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
 
+**Executables over 64 MiB have no digest.** The daemon does not hash an
+image larger than 64 MiB, and Chromium, Electron apps and VS Code are
+usually past it. For such a program:
+
+- `cfc rules add --pin-hash` refuses the file. A digest supplied another way
+  (`--sha256`, an import) is stored but can never be compared, so a rule
+  carrying one, Allow or Deny, refuses the program's flows wherever its other
+  fields match, and no rule below it can allow them.
+- On a root-sealed path (root-owned, with root-owned ancestors, as a package
+  installs it) nothing else changes: "Allow always" saves a path-only rule.
+- On any other path (under a home directory, a user-writable `/opt`
+  tree), an Allow cannot be bound to the image, so "Allow always" applies
+  once and saves no rule (the UI says why), and every new flow, each
+  retransmit included, opens its own prompt. A hand-written path-only rule
+  (`cfc rules add --exe <path>`) works, but whoever can write that file
+  inherits it. Installing the program root-owned is the better fix.
+
 ## What this firewall does *not* protect against
 
 Normal mode follows the desktop application firewall model of OpenSnitch and
@@ -231,6 +248,9 @@ is a separate launch mode.
   outside the shipped `inet OUTPUT` hook. Raw IP packets can coincide with
   another socket's tuple even when TCP matching is strict. Tuple and inode
   checks do not prove raw packet provenance or provide layer-2 containment.
+  Docker grants `CAP_NET_RAW` to containers by default, so a
+  `--network=host` container can send frames on the host's interfaces this
+  way; run workloads CFC should govern with `--cap-drop NET_RAW`.
 - **DNS-over-HTTPS embedded in browsers**: the firewall sees the outer HTTPS
   flow. Domain isolation requires an application-aware proxy or separate containment.
 - **Container traffic**: Docker / Podman / LXC route through their own
@@ -488,8 +508,10 @@ uses it only on the loopback rule (`oifname "lo"`).
 
 Order of operations:
 
-1. Switch profile back to `balanced` so the daemon stops actively denying
-   things while you debug.
+1. `cfc pause --for 15m`: unmatched outbound flows pass instead of being
+   denied while you debug, explicit rules still apply, and it resumes on its
+   own. Every profile denies unmatched flows, so switching profile changes
+   nothing.
 2. `cfc live` and reproduce the failure - the deny verdict will show in
    real time.
 3. `cfc rules list | grep <app>` - is the rule too narrow?
