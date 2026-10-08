@@ -1,6 +1,13 @@
 # Keep the fail-closed NFQUEUE table installed across daemon restarts and stops.
-# Stop this unit explicitly to remove filtering, or uninstall the package.
 # Load before the daemon, including when its initialization fails.
+#
+# To remove filtering, `systemctl disable --now colony-firewall-nft` (add
+# colony-firewalld to keep it off: starting the daemon loads the table again).
+# disable drops the network managers' Requires= before the stop. A plain stop
+# or restart propagates through that Requires= to NetworkManager and
+# systemd-networkd, and restart also leaves a moment without the table:
+# refresh the rules with reload. To load a local copy of the snippet, override
+# both ExecStart= and ExecReload= in a drop-in (docs/TROUBLESHOOTING.md).
 
 [Unit]
 Description=Colony Firewall nftables NFQUEUE rules
@@ -26,4 +33,6 @@ ExecStop=/usr/bin/nft delete table inet colony_firewall
 WantedBy=multi-user.target
 # Native .requires links make nft load failure prevent manager startup.
 # They exist only after enforcement is enabled and are removed on disable.
+# Requires= also carries an explicit stop or restart of this unit to the
+# managers; see the header for the supported way to lift filtering.
 RequiredBy=NetworkManager.service systemd-networkd.service

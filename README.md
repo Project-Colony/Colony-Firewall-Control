@@ -264,8 +264,9 @@ distribution's `nftables.service` when it is in the same boot transaction.
 Enabling enforcement creates native requirements from those two network
 managers: a failed nft load blocks their startup. A failed daemon start leaves
 the loaded tables dropping new flows. The daemon also requires the outbound
-table before initialization. Tables survive daemon stops and restarts; stop
-the nft unit explicitly to remove its table. Inbound stays opt-in. Its lockout
+table before initialization. Tables survive daemon stops and restarts; to
+remove one, `sudo systemctl disable --now` its nft unit (a plain stop also
+stops the network managers that require it). Inbound stays opt-in. Its lockout
 guard reads saved SQLite rules without a running daemon. With inbound
 enabled, ping and other ICMP requests need a rule like any other inbound
 flow, so allow your monitoring hosts:

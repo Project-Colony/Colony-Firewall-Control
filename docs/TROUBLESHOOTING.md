@@ -9,14 +9,30 @@ before enabling enforcement on any machine you reach over SSH.
 
 Once loaded, both nft tables survive daemon stops and restarts. With no queue
 listener, new tracked flows drop; established and related traffic retains its
-authorization. To intentionally remove filtering, stop the corresponding nft
-unit. An active network manager that requires this unit also stops; disabling
-enforcement removes its requirement for subsequent starts. Uninstall removes
-both tables and Colony's pinned BPF directory.
+authorization. To intentionally remove filtering, disable the corresponding
+nft unit with `--now`:
+
+```sh
+sudo systemctl disable --now colony-firewall-nft colony-firewalld
+sudo systemctl disable --now colony-firewall-nft-inbound
+```
+
+`disable` removes the network managers' requirement on the unit and reloads
+systemd before stopping it. A plain `systemctl stop` keeps that requirement
+loaded, so an active NetworkManager or systemd-networkd stops with the unit,
+and starting the manager again loads the table again. Disable the daemon too
+if filtering should stay off: starting it loads the outbound table. Uninstall
+removes both tables and Colony's pinned BPF directory.
+
+Never `restart` an nft unit, including from configuration management: it
+deletes the table before loading it again, which leaves new flows unfiltered
+for a moment, and it restarts the daemon and the network managers that
+require the unit. `reload` replaces the table in one transaction.
 
 Package upgrades reload active nft units atomically. After a manual upgrade,
-run `systemctl daemon-reload`, then `systemctl reenable colony-firewalld
-colony-firewall-nft` (and the inbound unit only if already enabled), and
+run `systemctl daemon-reload`, then `systemctl reenable colony-firewall-nft`
+(and the inbound unit only if already enabled; never the daemon, whose
+`Also=` would enable a disabled nft unit), and
 `systemctl reload colony-firewall-nft` (and the inbound unit if active) before
 relying on the new rules. Reenable installs the native network-manager
 requirements on existing deployments. A startup error saying the
@@ -49,17 +65,15 @@ you cannot open a new one.
 
 Three layers of protection, use all of them the first time:
 
-**1. Allow SSH above the queue rule.** Edit your copy of the snippet so
-port 22 never reaches NFQUEUE at all:
+**1. Allow SSH above the queue rule.** In a local copy of the snippet
+(see [Changing the shipped ruleset](#changing-the-shipped-ruleset)), add one
+line above the two queue rules of `chain output` so port 22 never reaches
+NFQUEUE at all:
 
 ```
-table inet colony_firewall {
-    chain output {
-        type filter hook output priority 0; policy accept;
         tcp dport 22 accept
+        oifname "lo" ct state new queue num 0 bypass
         ct state new queue num 0
-    }
-}
 ```
 
 (This exempts *outbound* SSH from filtering - for a remote machine you
@@ -73,9 +87,9 @@ shell that survives your SSH session:
 sudo setsid sh -c 'sleep 300 && nft delete table inet colony_firewall' &
 ```
 
-Then apply the snippet. If you still have connectivity after testing,
-cancel the timer (`sudo pkill -f 'nft delete table'`, or just re-apply the
-snippet after the timer fires). If you locked yourself out, wait out the
+Then enable enforcement. If you still have connectivity after testing,
+cancel the timer (`sudo pkill -f 'nft delete table'`, or just
+`sudo systemctl reload colony-firewall-nft` after the timer fires). If you locked yourself out, wait out the
 five minutes and the table deletes itself.
 
 **3. Know the console recovery.** From a local console, serial console, or
@@ -115,8 +129,8 @@ If this errors with "No such file or directory", nothing is being
 enqueued - the daemon runs but enforces *nothing*, silently. This is the
 usual state after a reboot if you only ever applied the snippet manually
 with `nft -f`: nftables rules do not persist across reboots on their own.
-Enable the companion unit (`colony-firewall-nft.service`) or merge the
-snippet into `/etc/nftables.conf` so the rule comes back at boot.
+Enable the companion unit (`colony-firewall-nft.service`) so the rule comes
+back at boot.
 
 **Do the queue numbers match?** The snippet says `queue num 0`; the daemon
 binds the queue from `[nfqueue] queue_num` in `daemon.toml` (default 0).
@@ -125,7 +139,8 @@ as a dead daemon.
 
 **The fail-open alternative.** If you would rather lose filtering than
 lose the network when the daemon is down, add the `bypass` keyword to the
-final queue rule too:
+final queue rule of a local copy of the snippet (see
+[Changing the shipped ruleset](#changing-the-shipped-ruleset)):
 
 ```
 ct state new queue num 0 bypass
@@ -283,11 +298,11 @@ hashed, for instance) leaves new loopback flows, local DNS included,
 waiting in the same queue; once it fills they drop until the watchdog
 restarts the daemon, which takes up to about 90 seconds.
 
-If you carry an older copy of the snippet in your own `/etc/nftables.conf`,
-compare it with the shipped one: a copy without the loopback rule drops
-every new loopback flow whenever the daemon is down, and one with an
-explicit `oifname lo accept` skips the daemon for loopback entirely, so
-loopback rules never apply.
+If you load a local copy of the snippet, compare it with the shipped one
+after every upgrade: a copy without the loopback rule drops every new
+loopback flow whenever the daemon is down, and one with an explicit
+`oifname lo accept` skips the daemon for loopback entirely, so loopback
+rules never apply.
 
 Note the daemon already exempts its *own* reverse-DNS lookups internally
 (they would otherwise deadlock the queue); the loopback rule is about
@@ -308,8 +323,42 @@ Two kinds of packet are settled in the kernel instead:
   explicit `notrack` rule touched (a busy DNS or NTP server's tuning, for
   instance). An `accept` in another table does not override this chain's
   `policy drop`. To keep such flows, load a local copy of the snippet with
-  an accept for them above the queue rules, and point the unit at it with
-  a drop-in.
+  an accept for them above the queue rules (see
+  [Changing the shipped ruleset](#changing-the-shipped-ruleset)).
+
+## Changing the shipped ruleset
+
+`colony-firewall-nft.service` loads
+`/usr/share/colony-firewall/nftables-snippet.conf`, and that file starts by
+deleting any `table inet colony_firewall` already loaded. A table of that name
+from `/etc/nftables.conf` or a manual `nft -f` is therefore replaced at boot,
+whenever the daemon starts (it requires the unit) and on every package
+upgrade (which reloads the unit). Carry changes as a local copy that the unit
+loads instead:
+
+```sh
+sudo install -Dm644 /usr/share/colony-firewall/nftables-snippet.conf \
+     /etc/colony-firewall/nftables-snippet.conf
+sudoedit /etc/colony-firewall/nftables-snippet.conf
+sudo systemctl edit colony-firewall-nft
+```
+
+and in the drop-in, override both commands (upgrades reload, so
+`ExecReload=` matters as much as `ExecStart=`):
+
+```
+[Service]
+ExecStart=
+ExecStart=/usr/bin/nft -f /etc/colony-firewall/nftables-snippet.conf
+ExecReload=
+ExecReload=/usr/bin/nft -f /etc/colony-firewall/nftables-snippet.conf
+```
+
+Then `sudo systemctl reload colony-firewall-nft`. Keep the `add table` and
+`delete table` lines at the top of the copy: they are what lets a reload
+replace the table in one transaction. Upgrades do not touch the copy, so
+compare it with the shipped file after each one. The inbound unit takes the
+same drop-in with `nftables-inbound.conf`.
 
 ## Fail-open vs fail-closed matrix
 

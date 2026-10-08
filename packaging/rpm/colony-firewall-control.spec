@@ -172,8 +172,10 @@ cargo test --workspace --locked --no-fail-fast
 %sysusers_create_compat %{_sysusersdir}/colony-firewall.conf
 if [ $1 -gt 1 ]; then
     # Reload active nft units atomically before the daemon restart in postun.
+    # Reenable only enabled nft units: the daemon's Also= would enable an nft
+    # unit the admin disabled.
     systemctl daemon-reload
-    for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do
+    for unit in colony-firewall-nft.service colony-firewall-nft-inbound.service; do
         if systemctl is-enabled --quiet "$unit"; then
             systemctl reenable "$unit" || exit 1
         fi
@@ -185,6 +187,13 @@ if [ $1 -gt 1 ]; then
 fi
 
 %preun
+if [ $1 -eq 0 ]; then
+    # Disable with a daemon reload before the stop. %systemd_preun stops with
+    # --no-reload, so the network managers' Requires= on the nft units is
+    # still loaded and the stop would take NetworkManager or systemd-networkd
+    # down with them, with nothing to start them again.
+    systemctl disable --now colony-firewall-nft-inbound.service colony-firewall-nft.service colony-firewalld.service >/dev/null 2>&1 || :
+fi
 %systemd_preun colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service
 
 %postun

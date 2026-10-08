@@ -5,6 +5,7 @@ import configparser
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -27,6 +28,17 @@ assert "colony-firewall-nft.service" in daemon["Unit"].get("Requires", "").split
 assert "colony-firewall-nft.service" in daemon["Unit"].get("After", "").split()
 assert "colony-firewalld.service" not in outbound["Unit"].get("After", "").split()
 assert "colony-firewalld.service" not in outbound["Unit"].get("Requires", "").split()
+
+# %systemd_preun stops with --no-reload, under the managers' loaded Requires=,
+# which would stop NetworkManager on erase. A reload-first disable must run
+# before it.
+spec = (ROOT / "packaging/rpm/colony-firewall-control.spec").read_text()
+preun = spec.split("\n%preun\n", 1)[1].split("\n%postun", 1)[0]
+before_macro = preun.split("\n%systemd_preun", 1)[0]
+disable = [line for line in before_macro.splitlines() if "systemctl disable --now" in line]
+assert disable and "--no-reload" not in disable[0] and all(
+    name in disable[0] for name in ("colony-firewall-nft.service", "colony-firewall-nft-inbound.service")), \
+    "RPM erase must disable the nft units with a reload before %systemd_preun stops them"
 
 with tempfile.TemporaryDirectory(prefix="cfc-startup-check-") as directory:
     stage = Path(directory)
@@ -60,6 +72,31 @@ with tempfile.TemporaryDirectory(prefix="cfc-startup-check-") as directory:
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         for manager in MANAGERS:
             assert not (stage / "etc/systemd/system" / (manager + ".requires") / name).is_symlink()
+
+    # An upgrade must not re-enable an nft unit the admin disabled: reenabling
+    # the daemon would bring it back through Also=.
+    shim = stage / "shim"
+    shim.mkdir()
+    (shim / "systemctl").write_text(
+        "#!/bin/sh\ncase \"$1\" in daemon-reload|try-reload-or-restart) exit 0 ;; esac\n"
+        f"exec {shlex.quote(shutil.which('systemctl'))} --root {shlex.quote(str(stage))} \"$@\"\n")
+    (shim / "systemctl").chmod(0o755)
+    subprocess.run(["systemctl", "--root", str(stage), "enable", "colony-firewalld.service"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    subprocess.run(["systemctl", "--root", str(stage), "disable", "colony-firewall-nft.service"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    subprocess.run(["bash", "-c", '. "$1" && post_upgrade >/dev/null', "post_upgrade",
+                    str(ROOT / "pkg/colony-firewall-control.install")],
+                   env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"), check=True)
+    for manager in MANAGERS:
+        assert not (stage / "etc/systemd/system" / (manager + ".requires") /
+                    "colony-firewall-nft.service").is_symlink(), "upgrade re-enabled a disabled nft unit"
+    loop = "for unit in colony-firewall-nft.service colony-firewall-nft-inbound.service; do"
+    for recipe in ("pkg/colony-firewall-control.install", "packaging/rpm/colony-firewall-control.spec",
+                   "pkg/colony.json"):
+        assert loop in (ROOT / recipe).read_text(), f"{recipe} must reenable only enabled nft units"
+    subprocess.run(["systemctl", "--root", str(stage), "disable", "colony-firewalld.service"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     binaries = stage / "bin"
     binaries.mkdir()
