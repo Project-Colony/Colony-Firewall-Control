@@ -239,8 +239,12 @@ is a separate launch mode.
   user can also borrow an allowed program's identity by running it with
   chosen arguments or with `LD_PRELOAD`, which a hash pin does not prevent.
   An image deleted while it runs is matched by the path it had (an upgraded
-  program keeps its rules), which the daemon cannot check against anything,
-  so a mount namespace can present a path that way too. Digests and the
+  program keeps its rules), which the daemon cannot check against anything.
+  Only a process in the daemon's own user namespace gets that path; one in
+  another user namespace (`unshare -U`, a rootless container) keeps the
+  `" (deleted)"` suffix, so its rules stop matching until it restarts. A
+  setuid mount helper such as setuid `bwrap` lets a user present a path
+  that way too. Digests and the
   root-sealed test trust what the filesystem reports: on a FUSE filesystem
   the daemon can read (`user_allow_other` in `/etc/fuse.conf`), the user who
   mounted it controls both.

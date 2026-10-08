@@ -215,7 +215,10 @@ fn resolve_inner(
         }
     };
 
-    let image = image.and_then(|image| image.finish(&proc_exe_path));
+    // Read before the start time check, so a recycled pid cannot answer.
+    let image = image
+        .and_then(|image| image.finish(&proc_exe_path))
+        .map(|(exe, sha256, unlinked)| (exe, sha256, unlinked && in_our_user_namespace(pid)));
     let image = image.filter(|_| read_starttime(pid) == starttime);
     let (exe, sha256, unlinked) = match image {
         Some(identity) => identity,
@@ -254,6 +257,13 @@ fn resolve_inner(
     //
     // Only an image with no link left is stripped (`policy_exe_path`): a file
     // literally named "curl (deleted)" must not pass for "curl".
+    //
+    // Nor is it stripped for a process in another user namespace. Such a
+    // process can mount its own bytes at /usr/bin/curl, run them and remove
+    // them; the former path then names no file to compare the image with
+    // (`path_names_image`), and stripping would hand it the host curl's
+    // rules. In our user namespace only root, or a setuid helper root
+    // installed, sets up mounts.
     let exe_for_provenance = exe.clone();
     let exe = policy_exe_path(exe, unlinked);
 
@@ -893,6 +903,18 @@ impl MappedImage {
 /// " (deleted)" name) names nothing here and is left as is.
 fn path_names_image(path: &Path, key: &ImageKey) -> bool {
     fs::metadata(path).map_or(true, |m| (m.dev(), m.ino()) == (key.0, key.1))
+}
+
+/// Whether `pid` runs in the daemon's user namespace. False when either link
+/// cannot be read.
+fn in_our_user_namespace(pid: u32) -> bool {
+    match (
+        fs::read_link(format!("/proc/{pid}/ns/user")),
+        fs::read_link("/proc/self/ns/user"),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs == ours,
+        _ => false,
+    }
 }
 
 fn image_key(meta: &fs::Metadata) -> ImageKey {
@@ -1631,6 +1653,77 @@ mod tests {
         }
         assert_eq!(after.exe, mapped);
         assert_ne!(after.sha256, before.sha256);
+    }
+
+    /// Runs a fresh copy of `sleep` under `wrapper`, deletes the copy once it
+    /// is mapped and resolves the process. `None` when it never got mapped.
+    fn resolve_deleted_image(sleep: &Path, image: &Path, wrapper: &[&str]) -> Option<PathBuf> {
+        fs::copy(sleep, image).unwrap();
+        let mut command = match wrapper.split_first() {
+            Some((program, args)) => {
+                let mut c = std::process::Command::new(program);
+                c.args(args).arg(image);
+                c
+            }
+            None => std::process::Command::new(image),
+        };
+        command.arg("30");
+        // Another test thread's fork() can briefly hold the new copy open for
+        // writing.
+        let mut child = (0..20)
+            .find_map(|_| match command.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    None
+                }
+                other => Some(other),
+            })?
+            .ok()?;
+        let link = format!("/proc/{}/exe", child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mapped = loop {
+            if fs::read_link(&link).ok().as_deref() == Some(image) {
+                break true;
+            }
+            if Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        fs::remove_file(image).unwrap();
+        let exe = mapped.then(|| resolve(child.id()).exe);
+        let _ = child.kill();
+        let _ = child.wait();
+        exe
+    }
+
+    #[test]
+    fn a_deleted_image_keeps_its_suffix_in_another_user_namespace() {
+        // In its own user and mount namespace a process can mount its bytes
+        // at /usr/bin/curl, run them and delete them. Without the suffix the
+        // path would be the host curl's; a temporary copy stands in for it.
+        let Some(sleep) = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("sleep");
+
+        // Here, an upgraded program keeps the path its rules name.
+        assert_eq!(
+            resolve_deleted_image(sleep, &image, &[]).as_deref(),
+            Some(image.as_path())
+        );
+
+        let Some(exe) = resolve_deleted_image(sleep, &image, &["unshare", "--user"]) else {
+            return; // no unprivileged user namespaces here
+        };
+        let mut deleted = image.into_os_string();
+        deleted.push(DELETED_SUFFIX);
+        assert_eq!(exe.as_os_str(), deleted);
     }
 
     #[test]
