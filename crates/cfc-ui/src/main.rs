@@ -1746,9 +1746,14 @@ async fn fetch_rules(path: PathBuf) -> Result<Vec<proto::RuleInfo>, String> {
 /// or changed, and the enable toggle sends the stored path back unchanged,
 /// which the daemon accepts as is. Checking it again refused to toggle a rule
 /// whose target had since become an alias.
+///
+/// An Allow that names no program waits on an administrator password: the
+/// daemon asks polkit first.
 async fn upsert_rule(path: PathBuf, rule: proto::RuleInfo) -> Result<String, String> {
     let line = saved_rule_line(&rule);
-    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let mut client = Client::connect_interactive(&path)
+        .await
+        .map_err(|e| e.to_string())?;
     client.upsert_rule(rule).await.map_err(|e| e.to_string())?;
     Ok(line)
 }
@@ -1912,9 +1917,14 @@ async fn submit_verdict(
         applied,
         message,
     };
-    let mut client = Client::connect(&path)
-        .await
-        .map_err(|e| fail(false, e.to_string()))?;
+    // A customized rule may be an Allow for every program, which waits on an
+    // administrator password before it is stored.
+    let connected = if require_confirmed_rule {
+        Client::connect_interactive(&path).await
+    } else {
+        Client::connect(&path).await
+    };
+    let mut client = connected.map_err(|e| fail(false, e.to_string()))?;
     let outcome = client
         .submit_verdict(&prompt_id, action, duration, scope)
         .await

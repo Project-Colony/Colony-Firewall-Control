@@ -1,15 +1,17 @@
 //! Administrator authorization through polkit.
 //!
-//! Pause, resume and rule import change the whole firewall at once, so even
-//! the official app and tray must have them confirmed by an administrator:
+//! Pause, resume and rule import change the whole firewall at once, and an
+//! Allow rule that names no program opens it for every program, so even the
+//! official app and tray must have them confirmed by an administrator:
 //! the daemon asks polkit's `CheckAuthorization` for the calling process,
 //! with user interaction allowed, and the user's polkit agent shows its
 //! password dialog. The shipped policy
 //! (`pkg/org.projectcolony.firewall.policy`) asks every time for pause and
 //! resume (`auth_admin`: any same-user program can click the tray's menu
 //! over D-Bus, so a kept authorization would let it pause unseen) and keeps
-//! an import authorization a few minutes (`auth_admin_keep`). Root never
-//! gets here, and neither do prompt answers or single-rule edits.
+//! an import or allow-every-program authorization a few minutes
+//! (`auth_admin_keep`). Root never gets here, and neither do prompt answers
+//! or edits of rules that name a program or deny.
 //!
 //! One fresh system-bus connection per call: these calls are rare, and a
 //! connection kept open would be one more thing to babysit across D-Bus
@@ -25,6 +27,9 @@ use zbus::zvariant::Value;
 pub const PAUSE: &str = "org.projectcolony.firewall.pause";
 /// Import, replace or bundle-install rules (`ApplyRules`).
 pub const IMPORT_RULES: &str = "org.projectcolony.firewall.import-rules";
+/// Store an enabled Allow rule that names no program (`UpsertRule`, or a
+/// prompt answer customized into one), which lets every program through.
+pub const GENERIC_ALLOW: &str = "org.projectcolony.firewall.allow-every-program";
 /// How long the daemon waits for the user to answer the dialog. Clients wait
 /// longer (`cfc_client::INTERACTIVE_TIMEOUT`), so this answer reaches them.
 pub const TIMEOUT: Duration = Duration::from_secs(120);
@@ -64,7 +69,7 @@ pub async fn check(peer: PeerId, action: &'static str) -> Result<(), String> {
     let unreachable = |e: zbus::Error| {
         format!(
             "this needs administrator authorization, but the system D-Bus is unreachable \
-             ({e}); use sudo cfc pause, resume or rules import"
+             ({e}); use sudo cfc instead"
         )
     };
     let bus = zbus::connection::Builder::system()
@@ -137,7 +142,7 @@ fn call_error(e: &zbus::Error) -> String {
         _ => false,
     };
     if unknown {
-        "polkit is not installed or not running; use sudo cfc pause, resume or rules import".into()
+        "polkit is not installed or not running; use sudo cfc instead".into()
     } else {
         format!("polkit check failed: {e}")
     }
@@ -170,6 +175,7 @@ mod tests {
     fn pause_asks_every_time_and_an_import_is_kept() {
         assert_eq!(shipped_defaults(PAUSE), ["auth_admin"; 3]);
         assert_eq!(shipped_defaults(IMPORT_RULES), ["auth_admin_keep"; 3]);
+        assert_eq!(shipped_defaults(GENERIC_ALLOW), ["auth_admin_keep"; 3]);
     }
 
     #[test]

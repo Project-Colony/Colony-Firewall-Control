@@ -322,11 +322,14 @@ The journal names the caller and the reason for every refusal:
 journalctl -u colony-firewalld -g 'refusing a firewall change'
 ```
 
-## Pause, resume or import asks for a password, or fails
+## Pause, resume, import or an Allow rule asks for a password, or fails
 
-Pause, resume and rule import change the whole firewall at once, so the app
-and tray need an administrator password for them (polkit: every time for
-pause and resume, kept a few minutes for an import). Root (`sudo cfc pause`) is never asked. What the refusals mean:
+Pause, resume and rule import change the whole firewall at once, and an
+Allow rule that names no program lets every program through, so the app and
+tray need an administrator password for them (polkit: every time for pause
+and resume, kept a few minutes for the others). Root (`sudo cfc`) is never
+asked. Rules that name a program, and Deny rules, never ask. What the
+refusals mean:
 
 - **"authorization dialog dismissed"**: you cancelled it.
 - **"no polkit authentication agent answered in your session"**: nothing in
@@ -336,8 +339,8 @@ pause and resume, kept a few minutes for an import). Root (`sudo cfc pause`) is 
 - **"polkit is not installed or not running"** or **"the system D-Bus is
   unreachable"**: install polkit, or use `sudo cfc`.
 - **"not authorized by polkit policy"**: a local polkit rule denies
-  `org.projectcolony.firewall.pause` or `org.projectcolony.firewall.import-rules`
-  for you. `pkaction --verbose --action-id org.projectcolony.firewall.pause`
+  `org.projectcolony.firewall.pause`, `org.projectcolony.firewall.import-rules`
+  or `org.projectcolony.firewall.allow-every-program` for you. `pkaction --verbose --action-id org.projectcolony.firewall.pause`
   shows the defaults; a missing action means the policy file is not
   installed in `/usr/share/polkit-1/actions/`.
 - **"authorization timed out after 120 s"**: the dialog was left open; the

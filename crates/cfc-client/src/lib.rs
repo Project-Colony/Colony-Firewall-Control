@@ -190,7 +190,8 @@ impl Client {
     }
 
     /// Connects for a request that may wait on an administrator password
-    /// (pause, resume): the daemon asks polkit and polkit asks the user.
+    /// (pause, resume, import, an Allow rule for every program): the daemon
+    /// asks polkit and polkit asks the user.
     pub async fn connect_interactive(socket_path: impl AsRef<Path>) -> Result<Self, ClientError> {
         Self::connect_with_timeout(socket_path, INTERACTIVE_TIMEOUT).await
     }

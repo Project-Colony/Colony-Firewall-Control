@@ -36,4 +36,14 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+
+  <action id="org.projectcolony.firewall.allow-every-program">
+    <description>Allow Colony Firewall traffic for every program</description>
+    <message>Authentication is required to let every program through the firewall</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
 </policyconfig>

@@ -28,10 +28,11 @@
 //!      file from outside sealed directories. `require_group = false` waives the group proof for
 //!      official clients only.
 //!
-//!    Pause, resume and `ApplyRules` change the whole firewall at once, so
-//!    an official client also needs a polkit authorization for them
-//!    ([`crate::polkit`]); root does not. Answering a prompt and editing one
-//!    rule never ask for a password.
+//!    Pause, resume and `ApplyRules` change the whole firewall at once, and
+//!    an Allow rule that names no program opens it for every program, so an
+//!    official client also needs a polkit authorization for them
+//!    ([`crate::polkit`]); root does not. Answering a prompt and editing a
+//!    rule that names a program (or denies) never ask for a password.
 //!
 //!    Every other peer is read-only: its change RPCs get PERMISSION_DENIED
 //!    with the reason, its prompt subscription does not count as a UI (so
@@ -156,6 +157,13 @@ fn log_refusal(rpc: &'static str, peer: PeerId, status: &Status) {
         outcome = "refused",
         "rule write refused"
     );
+}
+
+/// An enabled Allow that names no program: wherever it matches, every
+/// program gets through without a prompt, which is a pause for that much of
+/// the traffic. One `allow --protocol tcp` is most of one.
+fn opens_for_every_program(rule: &cfc_core::Rule) -> bool {
+    rule.enabled && rule.action == cfc_core::Action::Allow && !rule.scope.names_program()
 }
 
 fn bind_prompt_allow(
@@ -604,6 +612,9 @@ impl FirewallService {
             .ok_or_else(|| Status::invalid_argument("rule required"))?;
         let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
         convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
+        self.confirm_generic_allow(peer, &rule)
+            .await
+            .map_err(Status::permission_denied)?;
         // Every caller must select the canonical mapped target explicitly.
         // Missing targets with unchanged ancestry remain valid for preinstallation.
         if !keeps_stored_exe(&self.engine.snapshot(), &rule) {
@@ -711,6 +722,24 @@ impl FirewallService {
             ids: assigned,
             removed: u32::try_from(removed).unwrap_or(u32::MAX),
         })
+    }
+
+    /// From the app or tray, an Allow that applies to every program needs
+    /// polkit's [`crate::polkit::GENERIC_ALLOW`]; root never does. `Err` is
+    /// the reason to show.
+    async fn confirm_generic_allow(
+        &self,
+        peer: PeerId,
+        rule: &cfc_core::Rule,
+    ) -> Result<(), String> {
+        if !opens_for_every_program(rule) || gate(peer.uid, self.own_uid, true) == Gate::Privileged
+        {
+            return Ok(());
+        }
+        let action = crate::polkit::GENERIC_ALLOW;
+        (self.polkit)(peer, action)
+            .await
+            .map_err(|reason| format!("{reason} (polkit action {action})"))
     }
 
     fn policy(&self) -> crate::config::DefaultPolicy {
@@ -873,6 +902,18 @@ impl Firewall for FirewallService {
                 Ok(rule)
             }) {
                 Ok(mut rule) => {
+                    // "Customize" in the app can turn the answer into a rule
+                    // for every program; that needs what UpsertRule needs.
+                    if let Err(error) = self.confirm_generic_allow(peer, &rule).await {
+                        persist_error = format!("the verdict was applied, but the standing rule could not be saved: {error}");
+                        return Ok(Response::new(VerdictResponse {
+                            accepted,
+                            persisted_rule_id: String::new(),
+                            persist_error,
+                            persist_note,
+                            error: String::new(),
+                        }));
+                    }
                     // Persist only an explicit mapped target. The one-time
                     // verdict is already applied, so report a rejected standing
                     // policy through persist_error rather than retrying it.
@@ -2072,6 +2113,87 @@ mod tests {
             },
             peer,
         )
+    }
+
+    /// `allow dst_port 443` for every program, or for `exe` when given.
+    fn allow_pb(exe: Option<&str>, enabled: bool) -> RuleInfo {
+        let mut rule = cfc_core::Rule::new(
+            "https",
+            cfc_core::Action::Allow,
+            cfc_core::RuleScope {
+                dst_port: Some(443),
+                exe_sha256: exe.map(str::to_string),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        rule.enabled = enabled;
+        convert::rule_to_pb(&rule)
+    }
+
+    async fn upsert(svc: &FirewallService, rule: RuleInfo, who: PeerId) -> Result<(), Status> {
+        svc.upsert_rule(request(UpsertRuleRequest { rule: Some(rule) }, who))
+            .await
+            .map(drop)
+    }
+
+    #[test]
+    fn only_an_enabled_allow_naming_no_program_opens_for_every_program() {
+        let rule = |pb: RuleInfo| convert::rule_from_pb(&pb).unwrap();
+        assert!(opens_for_every_program(&rule(allow_pb(None, true))));
+        assert!(!opens_for_every_program(&rule(allow_pb(None, false))));
+        let hash = "a".repeat(64);
+        assert!(!opens_for_every_program(&rule(allow_pb(Some(&hash), true))));
+        assert!(!opens_for_every_program(&rule(rule_pb())), "a Deny");
+    }
+
+    #[tokio::test]
+    async fn an_allow_for_every_program_needs_polkit_from_the_app() {
+        let official = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let svc = service_with(true, polkit_denies);
+        let status = upsert(&svc, allow_pb(None, true), official)
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            status.message().contains(crate::polkit::GENERIC_ALLOW),
+            "{}",
+            status.message()
+        );
+        assert_eq!(svc.engine.rule_count(), 0, "nothing was stored");
+
+        // Granted, it is stored; a disabled one, a program's Allow and a
+        // Deny never ask, and neither does root.
+        let svc = service_with(true, polkit_allows);
+        upsert(&svc, allow_pb(None, true), official).await.unwrap();
+        let svc = service_with(true, polkit_must_not_be_asked);
+        let hash = "a".repeat(64);
+        upsert(&svc, allow_pb(None, false), official).await.unwrap();
+        upsert(&svc, allow_pb(Some(&hash), true), official)
+            .await
+            .unwrap();
+        upsert(&svc, rule_pb(), official).await.unwrap();
+        upsert(&svc, allow_pb(None, true), peer(0, 0, 1))
+            .await
+            .unwrap();
+        assert_eq!(svc.engine.rule_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_answer_customized_to_every_program_needs_polkit() {
+        let svc = service_with(true, polkit_denies);
+        let _ui = pending_prompt(&svc).await;
+        let mut req = answer(peer(1000, GROUP_GID, OFFICIAL_PID));
+        req.get_mut().duration = cfc_proto::v1::Duration::Always as i32;
+        req.get_mut().persist_scope = allow_pb(None, true).scope;
+        let reply = svc.submit_verdict(req).await.unwrap().into_inner();
+        assert!(reply.accepted, "the answer itself still applies");
+        assert!(reply.persisted_rule_id.is_empty());
+        assert!(
+            reply.persist_error.contains(crate::polkit::GENERIC_ALLOW),
+            "{}",
+            reply.persist_error
+        );
+        assert_eq!(svc.engine.rule_count(), 0);
     }
 
     #[tokio::test]

@@ -451,10 +451,10 @@ sudo cfc rules import-opensnitch /etc/opensnitchd/rules
 
 ### Who can change what
 
-| who | read status, rules, logs, live view, prompts | answer prompts, add/edit/delete rules | pause, resume, import rules |
+| who | read status, rules, logs, live view, prompts | answer prompts, add/edit/delete rules | pause, resume, import rules, Allow rules that name no program |
 |---|---|---|---|
 | root (`sudo cfc`) | yes | yes | yes |
-| the installed Colony Firewall app and tray, run by a `colony-firewall` group member | yes | yes | after an administrator password (polkit; asked for every pause or resume, kept a few minutes for imports) |
+| the installed Colony Firewall app and tray, run by a `colony-firewall` group member | yes | yes | after an administrator password (polkit; asked for every pause or resume, kept a few minutes for the others) |
 | any other program of a group member, including `cfc` without sudo | yes | no | no |
 
 The daemon recognises the app and tray by the running image: it must be the

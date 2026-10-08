@@ -121,9 +121,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`org.projectcolony.firewall.pause`, asked every time, and
   `org.projectcolony.firewall.import-rules`, kept a few minutes). Pause is
   not kept because any program of the user can click the tray's menu over
-  D-Bus. The policy file is installed by every package; polkit
-  is an optional dependency. Root is never asked, and answering a prompt or
-  editing a rule never asks. The tray no longer blocks its prompt
+  D-Bus. Storing an enabled Allow rule that names no program
+  (`allow --protocol tcp`), from the rule editor or a customized prompt
+  answer, asks too (`org.projectcolony.firewall.allow-every-program`, kept a
+  few minutes): it lets every program through, which is what a pause does,
+  and it was the way around the pause password. The policy file is
+  installed by every package; polkit is an optional dependency. Root is
+  never asked, and answering a prompt or editing a rule that names a
+  program, or a Deny, never asks. The tray no longer blocks its prompt
   notifications while the dialog is open.
 
   Upgrading from 0.7.0:

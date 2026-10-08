@@ -378,9 +378,12 @@ the entire attack surface. Two layers:
    binaries by device and inode, holds this connection's client end itself
    (`UNIX_DIAG` names it) and mapped no executable file from outside sealed
    directories. The check runs on the blocking pool.
-3. **polkit.** `SetPaused` (pause and resume) and `ApplyRules` from the app
-   or tray also need `CheckAuthorization` for
-   `org.projectcolony.firewall.pause` or `org.projectcolony.firewall.import-rules`
+3. **polkit.** `SetPaused` (pause and resume), `ApplyRules`, and an
+   `UpsertRule` (or a customized prompt answer) storing an enabled Allow that
+   names no program, from the app or tray, also need `CheckAuthorization`
+   for `org.projectcolony.firewall.pause`,
+   `org.projectcolony.firewall.import-rules` or
+   `org.projectcolony.firewall.allow-every-program`
    (`polkit.rs`, one system-bus connection per call, 120 s timeout, the
    dialog cancelled on expiry). Root is never asked.
 

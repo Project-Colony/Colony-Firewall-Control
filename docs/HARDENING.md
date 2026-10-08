@@ -322,7 +322,7 @@ and the daemon checks the caller per RPC:
 |-----|-------------------|-----------------------|-------------------|
 | `ListRules`, `GetStatus`, `ListEvents`, `StreamConnections` | yes | yes | yes |
 | `StreamPrompts` | yes, counts as a UI | yes, counts as a UI | sees its prompts, does **not** count as a UI |
-| `SubmitVerdict`, `UpsertRule`, `DeleteRule` | yes | yes, no password | refused |
+| `SubmitVerdict`, `UpsertRule`, `DeleteRule` | yes | yes, no password (an Allow that names no program: after polkit authorization) | refused |
 | `SetPaused` (pause **and** resume), `ApplyRules` (import, replace, bundles) | yes, no password | after polkit authorization | refused |
 
 There is no RPC that changes `[default_policy]`: that is root editing
@@ -371,19 +371,30 @@ by a proved group member. `require_group = false` waives that for the app
 and tray only; it never makes anything else writable.
 
 **polkit for whole-firewall changes.** Pause, resume and rule import change
-everything at once, so even the app and tray need an administrator password
-for them: the daemon asks polkit (`org.projectcolony.firewall.pause`,
-`auth_admin`, a password every time; `org.projectcolony.firewall.import-rules`,
-`auth_admin_keep`, one password covers a few minutes) and your session's
-polkit agent shows the dialog. Pause is never kept because the tray's menu
-is a D-Bus object any program of yours can click (`com.canonical.dbusmenu`
-`Event`): polkit, not the tray, is what stands between such a click and a
-pause, and a kept authorization would have let it through for five minutes
-after your last pause or resume. Such a click still raises a genuine
-password dialog you did not ask for; cancel it. Without an agent (start one, e.g. `hyprpolkitagent` or
-`polkit-gnome`) or without polkit, the request is refused with that reason
-and `sudo cfc pause` still works. The daemon waits 120 s for an answer, then
-cancels the dialog. Answering a prompt and editing one rule never ask.
+everything at once, and an Allow rule that names no program (no `exe_path`
+or `exe_sha256`: `allow --protocol tcp`, `allow --dst-port 443`) lets every
+program through wherever it matches, which is a pause for that traffic. So
+even the app and tray need an administrator password for them. The daemon
+asks polkit and your session's polkit agent shows the dialog:
+
+| action | for | default |
+|--------|-----|---------|
+| `org.projectcolony.firewall.pause` | `SetPaused`, pause and resume | `auth_admin`, a password every time |
+| `org.projectcolony.firewall.import-rules` | `ApplyRules` (import, replace, bundles) | `auth_admin_keep`, one password covers a few minutes |
+| `org.projectcolony.firewall.allow-every-program` | `UpsertRule` storing an enabled Allow that names no program, or a prompt answer customized into one | `auth_admin_keep` |
+
+Pause is never kept because the tray's menu is a D-Bus object any program of
+yours can click (`com.canonical.dbusmenu` `Event`): polkit, not the tray,
+stands between such a click and a pause, and a kept authorization would let
+it through for five minutes after your last pause or resume. Such a click
+still raises a genuine password dialog you did not ask for; cancel it.
+
+Without an agent (start one, e.g. `hyprpolkitagent` or `polkit-gnome`) or
+without polkit, the request is refused with that reason and `sudo cfc` still
+works. The daemon waits 120 s for an answer, then cancels the dialog.
+Answering a prompt and editing a rule that names a program, or a Deny,
+never ask. A customized prompt answer that polkit refuses still applies
+once; only its standing rule is not saved.
 
 **What this still trusts.** The check is about the *process*, so code that
 runs inside the installed app is the app:
@@ -410,7 +421,11 @@ runs inside the installed app is the app:
   `org.freedesktop.Notifications` (a button signal any other program emits
   is ignored), but a same-user program that stops the notification daemon
   and takes that name answers for you, "Always allow app" included;
-- synthetic input into the GUI under X11 or XWayland can click its buttons;
+- synthetic input into the GUI can click its buttons: under X11 or
+  XWayland, and on Wayland compositors that offer the virtual-keyboard
+  protocol to every client (Hyprland and sway do; `wtype` uses it). That
+  reaches every rule a program-scoped edit can make, not the polkit-guarded
+  ones above;
 - a socket handed back into the app: a same-user program that started the
   app itself (connect first, then exec the installed binary, keeping a copy
   of the connection in a child) can pass that copy into the sealed app as a
