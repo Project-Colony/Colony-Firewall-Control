@@ -13,8 +13,9 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no longer has a `fast_allow` key, `StatusResponse` field 16 is reserved, and
   the `[ebpf] fast_allow` and `fast_allow_mark` keys are ignored with a
   warning. For hosts upgrading from 0.4-0.6, startup still flushes the legacy
-  nftables set, disarms the legacy pinned maps and removes the old sendmsg
-  link pins.
+  nftables set. When the eBPF layer loads, it also disarms the legacy pinned
+  maps and removes the old sendmsg link pins; with the layer off, without the
+  object or after a failed load, those stay until reboot.
 
 ### Fixed
 

@@ -597,8 +597,8 @@ pub fn nft_table_loaded() -> anyhow::Result<bool> {
 /// crashed while armed can have left its mark in a set that a ruleset not yet
 /// reloaded still accepts. Called from `main` in every build, whatever the
 /// layer's mode, and never under `--dry-run`, which touches nothing. A table
-/// or set that is not loaded is nothing to flush: at boot the nft unit is
-/// ordered after the daemon.
+/// or set that is not loaded is nothing to flush. At boot the nft unit is
+/// ordered before the daemon, so the flush normally finds the table loaded.
 pub fn flush_legacy_fast_allow_set() {
     if let Err(e) = nft_set::flush() {
         tracing::error!("could not flush the legacy fast_allow nftables set: {e:#}; a mark left by an older daemon may still bypass filtering; run systemctl reload colony-firewall-nft and inspect the journal before relying on filtering");

@@ -593,8 +593,11 @@ pub(super) fn load_and_attach(
 
     // Fast Allow is gone from the daemon, but the kernel object still carries
     // its maps (ABI v4) and they are pinned, so a 0.4-0.6 daemon that died
-    // while armed left a mark the connect hooks would go on setting, past any
-    // restart. Disarm before anything attaches, whatever else comes up.
+    // while armed left its mark armed. Past the deadline the connect hooks no
+    // longer set it, but they go on stripping that value from any socket that
+    // carries it, past any restart. Disarm before anything attaches, whatever
+    // else comes up. Only on this path: a daemon that does not load the object
+    // leaves the old pins alone until reboot.
     enforce::disarm_legacy_fast_allow(&mut bpf);
 
     // --- attach, each independently ------------------------------------

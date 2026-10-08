@@ -419,9 +419,12 @@ prove the current sender's identity, and lifecycle checks do not repair that
 property, so it opened bypasses; it was disabled in 0.7.0 and its userspace
 side is gone. The `[ebpf] fast_allow` keys still parse and only log a warning.
 The kernel object still carries the Fast Allow maps until an ABI bump, so
-startup flushes the legacy nft set once, disarms the pinned maps (unarmed mark,
-zero deadline, no grants) and removes the old `sendmsg4`/`sendmsg6` link pins,
-which detaches those hooks. The nft snippet has no mark-set accept rule, and
+startup flushes the legacy nft set once and, when the eBPF layer loads,
+disarms the pinned maps (unarmed mark, zero deadline, no grants) and removes
+the old `sendmsg4`/`sendmsg6` link pins, which detaches those hooks. With the
+layer off, without the object or after a failed load, the old pins stay until
+reboot; they can strip a socket mark equal to the old random value, but the
+snippet accepts no packet on an application-set mark, so they open nothing. The nft snippet has no mark-set accept rule, and
 package upgrades reload active nft units with one atomic transaction. A failed
 flush emits an error and requires operator action before filtering can be
 relied upon.

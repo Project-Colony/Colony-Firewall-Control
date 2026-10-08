@@ -79,8 +79,9 @@ pub(super) fn table_loaded() -> anyhow::Result<bool> {
 /// there is accepted by the ruleset.
 ///
 /// A missing table or a missing set is success: there is nothing in either
-/// that could accept a mark. At boot the table is normally not loaded yet,
-/// because `colony-firewall-nft.service` is ordered after the daemon.
+/// that could accept a mark. At boot `colony-firewall-nft.service` is ordered
+/// before the daemon, so the table is normally loaded and this empties the set
+/// it still declares.
 pub(super) fn flush() -> anyhow::Result<()> {
     match run(Op::FlushSet) {
         Ok(()) => {

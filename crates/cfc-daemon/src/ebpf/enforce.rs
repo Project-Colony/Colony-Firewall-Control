@@ -936,9 +936,11 @@ fn remove_legacy_pins(dir: &Path) {
 ///
 /// The daemon no longer grants, but the kernel object still carries the maps
 /// (ABI v4) and the connect programs still consult them. They are pinned, so
-/// a 0.4-0.6 daemon that died while armed left a mark the hooks would go on
-/// setting across any number of restarts - a mark that can collide with the
-/// fwmark selectors of kube-proxy, Tailscale or wg-quick. With `UNARMED`
+/// a 0.4-0.6 daemon that died while armed left its mark armed across any
+/// number of restarts. The hooks stop setting it once the deadline passes, but
+/// they go on stripping that value from every socket carrying it, and a random
+/// mark can collide with the fwmark selectors of kube-proxy, Tailscale or
+/// wg-quick. With `UNARMED`
 /// written, `mark_decision` returns at its first array read. Best effort: a
 /// map that is missing or will not take the write is logged and skipped.
 pub(super) fn disarm_legacy_fast_allow(bpf: &mut Ebpf) {
