@@ -1720,15 +1720,9 @@ fn saved_rule_line(rule: &proto::RuleInfo) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let protocol = rule
-        .scope
-        .as_ref()
-        .filter(|s| s.has_protocol)
-        .map(|s| format!(" {}", convert::protocol_label(s.protocol)))
-        .unwrap_or_default();
     let disabled = if rule.enabled { "" } else { ", disabled" };
     format!(
-        "rule saved: {summary}{protocol}, {}{disabled}",
+        "rule saved: {summary}, {}{disabled}",
         convert::rule_duration_label(rule)
     )
 }

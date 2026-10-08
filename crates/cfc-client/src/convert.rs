@@ -185,10 +185,26 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
             }
         })
         .unwrap_or_else(|| "*".into());
-    let port = scope
-        .and_then(|s| s.has_dst_port.then_some(s.dst_port))
-        .map(|p| format!(":{p}"))
-        .unwrap_or_default();
+    // Protocol, uid and a pinned digest narrow the rule too; left out, a
+    // `deny uid 1000 udp/53` read as DNS blocked for everyone.
+    let port = scope.map_or_else(String::new, |s| {
+        let mut port = if s.has_dst_port {
+            format!(":{}", s.dst_port)
+        } else {
+            String::new()
+        };
+        if s.has_protocol {
+            port.push(' ');
+            port.push_str(protocol_label(s.protocol));
+        }
+        if s.has_uid {
+            port.push_str(&format!(" uid={}", s.uid));
+        }
+        if !s.exe_sha256.is_empty() {
+            port.push_str(" [pinned]");
+        }
+        port
+    });
     let exe = scope
         .and_then(|s| {
             if s.exe_path.is_empty() {
@@ -371,6 +387,21 @@ mod tests {
         assert!(s.contains("in "), "{s}");
         assert!(s.contains("192.168.0.0/16"), "{s}");
         assert!(s.contains(":22"), "{s}");
+    }
+
+    #[test]
+    fn protocol_uid_and_pinned_digest_are_not_hidden() {
+        let s = rule_summary(&rule(pb::RuleScope {
+            exe_sha256: "ab".repeat(32),
+            uid: 1000,
+            has_uid: true,
+            protocol: pb::Protocol::Udp as i32,
+            has_protocol: true,
+            dst_port: 53,
+            has_dst_port: true,
+            ..Default::default()
+        }));
+        assert_eq!(s, "allow   * -> *:53 udp uid=1000 [pinned]");
     }
 
     #[test]
