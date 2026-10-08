@@ -132,6 +132,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nftables set. When the eBPF layer loads, it also disarms the legacy pinned
   maps and removes the old sendmsg link pins; with the layer off, without the
   object or after a failed load, those stay until reboot.
+- The `cfc_sendmsg4`/`cfc_sendmsg6` programs, which nothing had attached since
+  the Fast Allow userspace path went. The eBPF ABI is unchanged.
+- `LogsDirectory=colony-firewall` and the `/var/log/colony-firewall` write
+  access in the unit and the SELinux module (the `colony_firewall_log_t` type
+  and the `colony_firewall_read_log` interface). The daemon logs to the
+  journal and never wrote there. An existing directory is left in place.
+- Unused library items: `cfc_core::CoreError`, `cfc_core::Result`,
+  `cfc_core::ResolvedExe`, `exe_path::resolve_scope` and `Resolved::path`,
+  together with dependencies no crate used.
 
 ### Fixed
 
