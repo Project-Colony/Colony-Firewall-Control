@@ -219,8 +219,9 @@ enum BundleCmd {
     },
     /// Remove the rules a bundle installed.
     ///
-    /// Matches the bundle's exact rule names, never a prefix, so a rule you
-    /// wrote yourself is never caught by it.
+    /// Matches the ids the bundle gave its rules, never a name or a prefix,
+    /// so a rule you wrote yourself is never caught by it. A bundle rule you
+    /// edited into a deny or reject is kept.
     Remove {
         /// Bundle name (see `cfc rules bundle list`).
         name: String,

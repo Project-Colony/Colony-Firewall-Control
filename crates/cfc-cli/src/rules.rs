@@ -2274,7 +2274,22 @@ pub async fn bundle_remove(
 
     let existing = client.list_rules().await?;
     let mut removed = Vec::new();
+    let mut kept = Vec::new();
     for r in existing.iter().filter(|r| owned.contains(&r.id)) {
+        // Bundles install only Allows. An editor keeps the id, so one that is
+        // now a Deny or Reject is the user's decision, and deleting it would
+        // let the traffic it stops through to the prompt or the default.
+        if r.action != proto::Action::Allow as i32 {
+            if !format.is_json() {
+                println!(
+                    "kept: {} ({}) was changed from allow; remove it by id if it should go",
+                    short_id(&r.id),
+                    output::terminal_safe(&r.name)
+                );
+            }
+            kept.push(r.name.clone());
+            continue;
+        }
         if !dry_run {
             client.delete_rule(&r.id).await?;
         }
@@ -2295,6 +2310,7 @@ pub async fn bundle_remove(
             "dry_run": dry_run,
             "removed": removed.len(),
             "rules": removed,
+            "kept": kept,
         }));
     }
     println!(

@@ -1075,6 +1075,49 @@ async fn removing_a_bundle_preserves_a_manual_rule_with_the_same_name() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+// The GUI editor keeps a rule's id, so a bundle rule turned into a Deny still
+// carries the bundle's id. Removing the bundle must not delete that Deny.
+#[tokio::test]
+async fn removing_a_bundle_keeps_its_rule_edited_into_a_deny() {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest("colony-firewall-bundle\0inbound\0inbound-ssh-lan");
+    let id = uuid::Uuid::from_bytes(digest[..16].try_into().unwrap()).to_string();
+    let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let socket = dir.join("cli.sock");
+    let mut edited = stub_rule(&id, "inbound-ssh-lan");
+    edited.action = pb::Action::Deny as i32;
+    let fake = FakeDaemon::default();
+    fake.existing.lock().unwrap().push(edited);
+    let calls = fake.calls.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &[
+                "--socket",
+                &socket_arg,
+                "rules",
+                "bundle",
+                "remove",
+                "inbound",
+            ],
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("kept"));
+    assert!(calls.lock().unwrap().is_empty());
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remove_by_full_id_reaches_a_rule_the_daemon_does_not_list() {
     // A quarantined row is not in ListRules; the journal names its id.
