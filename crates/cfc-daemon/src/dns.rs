@@ -148,9 +148,11 @@ impl DnsCache {
     /// Records an `A`/`AAAA` record lifted out of a DNS response this host
     /// received, with `ttl` in seconds as the record carried it.
     ///
-    /// This is first-hand evidence (see the module docs) and outranks any PTR
-    /// result for the same address, present or future. Called from the
-    /// `DNS_PACKETS` ring-buffer consumer, never from the packet path.
+    /// Display only, never policy identity: the record is not tied to a
+    /// resolver transaction (see the module docs). It fills the diagnostic
+    /// cache alone; the policy cache keeps only forward-confirmed PTR names.
+    /// Called from the `DNS_PACKETS` ring-buffer consumer, never from the
+    /// packet path.
     pub fn observe_answer(&self, ip: IpAddr, name: &str, ttl: u32) {
         self.observe_answer_at(ip, name, ttl, Instant::now());
     }

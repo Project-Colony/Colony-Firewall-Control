@@ -103,11 +103,10 @@ fn main() -> anyhow::Result<()> {
         // would be a much worse bug than the one this fixes.
         .worker_threads(4)
         // And a ceiling on the blocking pool, which tokio leaves at 512.
-        // `dns.rs` hands it one `getaddrinfo` per new destination address, and
-        // a stalled resolver blocks each for the resolv.conf default of two
-        // five-second attempts. At the worker's flow rate that queues
-        // thousands of lookups and spawns threads to match: 512 x 2 MiB of
-        // stack reservation, plus an arena apiece. Sixteen is plenty - the
+        // `dns.rs` runs its blocking resolver calls here, at most eight at
+        // once (`LOOKUP_MAX_IN_FLIGHT`), and rule validation and provenance
+        // use the same pool. Nothing should ever need 512 threads at 2 MiB of
+        // stack reservation plus an arena apiece. Sixteen is plenty - the
         // packet worker permanently occupies one of them - and excess calls
         // then queue instead of spawning.
         .max_blocking_threads(16)
