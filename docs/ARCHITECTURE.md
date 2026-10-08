@@ -279,9 +279,12 @@ its place with the same action (it is credited with the hit, since it is what
 keeps a lower program Deny from winning). The
 relation is not a total order (program Allow 3 > program Deny 2 > generic
 Allow 5 > generic Deny 4 > program Allow 3), so no sort key could express
-it. The in-kernel precompute (`Engine::process_wide_action` and
-`deny_still_possible_for`) walks the same way, so the connect hooks and the
-packet path agree.
+it. The in-kernel precompute (`Engine::process_wide_action`) walks the same
+way, and every kernel writer (exec, both resync sweeps, the exe table) asks
+`Engine::denies_process_wide`, so the connect hooks refuse a process only when
+the packet path would refuse every flow of it. When the walk abstains (a rule
+the hash-blind kernel side cannot decide), the kernel entry is cleared and
+the packet path decides, prompting if the identity stays incomplete.
 
 **Incomplete identity is asked, not refused.** When the process's
 executable, uid or digest is unknown (an unattributed socket, a binary over

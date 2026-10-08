@@ -270,73 +270,22 @@ impl Engine {
         None
     }
 
-    /// Whether some resolution of the rules this caller cannot decide would
-    /// still deny this process outright - the question that separates the two
-    /// meanings of `process_wide_action`'s `None`.
+    /// Whether the kernel should refuse every `connect()` of this process:
+    /// exactly when [`Self::process_wide_action`] answers Deny or Reject.
     ///
-    /// The in-kernel sweeps turn on this distinction. `None` covers two
-    /// opposite situations: an abstention (a hash-scoped rule the caller
-    /// cannot decide) and a rule that was simply *deleted* (nobody replaces a
-    /// deny with an explicit allow, they delete it - and keeping the entry
-    /// then means the kernel goes on refusing a program no rule denies).
-    ///
-    /// An earlier version of this answered "is any rule undecidable?", which
-    /// conflates a third case: when the only undecidable rule is an *allow*,
-    /// both resolutions of the ambiguity end without a deny (the hash
-    /// matches and the process is allowed, or it does not and no rule
-    /// speaks), yet the old answer kept a standing kernel DENY on the
-    /// strength of a rule that could never justify one. So this walks the
-    /// rules in precedence order, the same filters as `process_wide_action`
-    /// (the inbound skip included, so the two cannot disagree about which
-    /// rules are in play), and answers whether a deny is still *reachable*:
-    ///
-    /// * an undecidable deny that constrains no destination: reachable - the
-    ///   matching resolution denies process-wide. Answer yes.
-    /// * an undecidable allow, or an undecidable rule the packet path would
-    ///   own anyway (destination-scoped): the deny-reachable resolution is
-    ///   the one where it does not match. Walk on.
-    /// * a decidable match ends the walk exactly as `process_wide_action`
-    ///   does: its action (or the packet path, for a destination-scoped
-    ///   rule) is the whole answer, and nothing below it can matter.
-    /// * a decidable Allow that names no program does not end it: a program
-    ///   Deny below it still wins in `lookup`, so from there on only rules
-    ///   that name a program are looked at.
-    pub fn deny_still_possible_for(&self, proc: &Process) -> bool {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let rules = self.inner.rules.read();
-        let mut saw_generic_allow = false;
-        for rule in rules
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
-        {
-            if saw_generic_allow && !rule.scope.names_program() {
-                continue;
-            }
-            if rule.scope.undecidable_for(proc) {
-                if matches!(
-                    rule.action,
-                    cfc_core::Action::Deny | cfc_core::Action::Reject
-                ) && !rule.scope.constrains_destination()
-                {
-                    return true;
-                }
-                continue;
-            }
-            if !rule.scope.matches_process(proc) {
-                continue;
-            }
-            if is_generic_allow(rule) {
-                saw_generic_allow = true;
-                continue;
-            }
-            return matches!(
-                rule.action,
-                cfc_core::Action::Deny | cfc_core::Action::Reject
-            ) && !rule.scope.constrains_destination();
-        }
-        false
+    /// The one question every in-kernel writer asks (exec, both resync
+    /// sweeps, the exe table), so they cannot disagree. An abstention is not
+    /// a refusal: the packet path decides that flow, with the digest in hand
+    /// when it can hash the image, and prompts when the identity stays
+    /// incomplete. Keeping a kernel entry there instead (what the sweeps did
+    /// until 0.8.0) refused in silence, with EPERM at `connect()`, a flow the
+    /// packet path would have asked about, so the prompt never came. A rule
+    /// that was deleted reads the same way and clears too.
+    pub fn denies_process_wide(&self, proc: &Process) -> bool {
+        matches!(
+            self.process_wide_action(proc),
+            Some(cfc_core::Action::Deny | cfc_core::Action::Reject)
+        )
     }
 
     /// How many rules are loaded, without copying any of them.
@@ -635,74 +584,68 @@ mod tests {
     // never get to revise?
 
     #[test]
-    fn a_deleted_rule_is_distinguishable_from_an_abstention() {
-        // The two meanings of `None`, which the orphan sweep must not conflate.
+    fn the_kernel_refuses_only_what_process_wide_action_denies() {
+        // A hash-scoped deny the caller cannot decide abstains, and an
+        // abstention installs no kernel entry: the packet path decides it.
         let mut hashed = RuleScope::any();
         hashed.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         hashed.exe_sha256 = Some("aa".repeat(32));
         let engine = engine_with(vec![Rule::new("h".to_string(), Action::Deny, hashed)]);
-
-        let no_hash = Process {
-            exe: PathBuf::from("/usr/bin/curl"),
-            ..Process::unknown(1)
-        };
-        // Abstention on a deny: the matching resolution refuses, so a
-        // standing kernel entry must survive. Keep.
+        let no_hash = proc("/usr/bin/curl");
         assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(engine.deny_still_possible_for(&no_hash));
+        assert!(!engine.denies_process_wide(&no_hash));
 
-        // The same rule pinned to a DIFFERENT binary is decidable for this
-        // process, so it must not block the sweep from clearing.
-        let other = Process {
-            exe: PathBuf::from("/usr/bin/wget"),
-            ..Process::unknown(1)
-        };
-        assert_eq!(engine.process_wide_action(&other), None);
-        assert!(!engine.deny_still_possible_for(&other));
-
-        // And a rule set with nothing in it - the deleted-rule case - is the
-        // one the sweep exists for: None, no deny reachable, clear.
-        let empty = engine_with(vec![]);
-        assert_eq!(empty.process_wide_action(&no_hash), None);
-        assert!(!empty.deny_still_possible_for(&no_hash));
+        // A decidable program deny does reach the kernel, Reject included.
+        for action in [Action::Deny, Action::Reject] {
+            let engine = engine_with(vec![exe_rule("d", "/usr/bin/curl", action)]);
+            assert!(engine.denies_process_wide(&no_hash), "{action:?}");
+        }
+        // And an empty rule set (the deleted-rule case) refuses nothing.
+        assert!(!engine_with(vec![]).denies_process_wide(&no_hash));
     }
 
     #[test]
-    fn an_undecidable_allow_cannot_prop_up_a_kernel_deny() {
-        // The case the old any-undecidable answer got backwards: the only
-        // rule naming this exe is a hash-scoped ALLOW. Whichever way the
-        // unknown hash resolves - it matches and the process is allowed, or
-        // it does not and no rule speaks - no deny is reachable, so a
-        // standing kernel DENY (from a deny rule since deleted) must clear.
+    fn deleting_a_program_deny_lifts_the_kernel_refusal_under_a_digest_deny() {
+        // `deny --exe slack` plus a digest-only blocklist rule. The sweep
+        // reads no digest, so the blocklist rule is undecidable for slack.
+        let slack = "/usr/lib/slack/slack";
+        let mut digest = RuleScope::any();
+        digest.exe_sha256 = Some("bb".repeat(32));
+        let deny_slack = exe_rule("deny-slack", slack, Action::Deny);
+        let mut blocklist = Rule::new("blocklist".to_string(), Action::Deny, digest);
+        // Imported later, so the program deny ranks first and answers.
+        blocklist.created_at = deny_slack.created_at + chrono::Duration::seconds(1);
+        let engine = engine_with(vec![deny_slack.clone(), blocklist.clone()]);
+        let p = proc(slack);
+        assert!(engine.denies_process_wide(&p));
+
+        // Once the program deny is gone, the kernel must stop refusing:
+        // the packet path asks about this flow instead, naming the rule it
+        // could not decide, and a standing kernel DENY would refuse the
+        // connect() before the queue ever saw it.
+        engine.remove_rule(deny_slack.id);
+        assert!(!engine.denies_process_wide(&p));
+        assert!(matches!(
+            engine.peek(&conn(443), &p),
+            Decision::NeedsPrompt { undecided: Some(id), .. } if id == blocklist.id
+        ));
+    }
+
+    #[test]
+    fn an_undecidable_allow_over_a_deny_installs_no_kernel_refusal() {
+        // Whether the deny below fires depends on a digest the sweep does
+        // not read, so the packet path owns the flow (it hashes the image,
+        // or prompts when it cannot).
         let mut hashed_allow = RuleScope::any();
         hashed_allow.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         hashed_allow.exe_sha256 = Some("aa".repeat(32));
-        let engine = engine_with(vec![Rule::new(
-            "pin".to_string(),
-            Action::Allow,
-            hashed_allow.clone(),
-        )]);
-
-        let no_hash = Process {
-            exe: PathBuf::from("/usr/bin/curl"),
-            ..Process::unknown(1)
-        };
-        assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(
-            !engine.deny_still_possible_for(&no_hash),
-            "an allow-only abstention pinned a stale deny"
-        );
-
-        // But the same allow layered over a plain deny is the textbook
-        // reason to keep: if the hash does not match, the deny below fires.
-        let mut plain_deny = RuleScope::any();
-        plain_deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         let engine = engine_with(vec![
             Rule::new("pin".to_string(), Action::Allow, hashed_allow),
-            Rule::new("deny".to_string(), Action::Deny, plain_deny),
+            exe_rule("deny", "/usr/bin/curl", Action::Deny),
         ]);
+        let no_hash = proc("/usr/bin/curl");
         assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(engine.deny_still_possible_for(&no_hash));
+        assert!(!engine.denies_process_wide(&no_hash));
     }
 
     #[test]
@@ -959,7 +902,7 @@ mod tests {
         ]);
         let x = proc("/usr/bin/x");
         assert_eq!(engine.process_wide_action(&x), Some(Action::Deny));
-        assert!(engine.deny_still_possible_for(&x));
+        assert!(engine.denies_process_wide(&x));
         assert!(matches!(
             engine.peek(&conn(443), &x),
             Decision::Resolved(v) if v.action == Action::Deny
@@ -967,27 +910,7 @@ mod tests {
 
         let y = proc("/usr/bin/y");
         assert_eq!(engine.process_wide_action(&y), None);
-        assert!(!engine.deny_still_possible_for(&y));
-    }
-
-    #[test]
-    fn deny_still_possible_sees_a_program_deny_below_a_generic_allow() {
-        // The program Deny is pinned to a digest this process lacks: if it
-        // matches, it overrides the generic Allow ranked above it.
-        let mut hashed = RuleScope::any();
-        hashed.exe_path = Some(PathBuf::from("/usr/bin/x"));
-        hashed.exe_sha256 = Some("aa".repeat(32));
-        let mut generic = RuleScope::any();
-        generic.uid = Some(1000);
-        generic.protocol = Some(Protocol::Tcp);
-        generic.dst_port = Some(443);
-        let engine = engine_with(vec![
-            Rule::new("deny-x-pinned", Action::Deny, hashed),
-            Rule::new("allow-user-https", Action::Allow, generic),
-        ]);
-        let no_hash = proc("/usr/bin/x");
-        assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(engine.deny_still_possible_for(&no_hash));
+        assert!(!engine.denies_process_wide(&y));
     }
 
     #[test]
@@ -1003,7 +926,7 @@ mod tests {
         ]);
         let p = proc("/usr/bin/curl");
         assert_eq!(engine.process_wide_action(&p), None);
-        assert!(!engine.deny_still_possible_for(&p));
+        assert!(!engine.denies_process_wide(&p));
     }
 
     #[test]
@@ -1014,7 +937,7 @@ mod tests {
         ]);
         let x = proc("/usr/bin/x");
         assert_eq!(engine.process_wide_action(&x), None);
-        assert!(!engine.deny_still_possible_for(&x));
+        assert!(!engine.denies_process_wide(&x));
     }
 
     #[test]

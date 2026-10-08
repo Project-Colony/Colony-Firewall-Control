@@ -62,7 +62,7 @@ use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuArray};
 use aya::programs::links::FdLink;
 use aya::programs::{CgroupAttachMode, CgroupSockAddr};
 use aya::Ebpf;
-use cfc_core::{Action, Process};
+use cfc_core::Process;
 use cfc_ebpf_common::{enforce_stat, ABI_VERSION};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
@@ -315,12 +315,7 @@ impl VerdictSink {
         //
         // Both the read and the decision happen out here, so the lock covers
         // map operations and nothing else.
-        enum DenyOp {
-            Deny,
-            Clear,
-            Keep,
-        }
-        let deny_work: Vec<(u32, DenyOp)> = views
+        let deny_work: Vec<(u32, bool)> = views
             .iter()
             .filter(|(pid, _, judged_at)| {
                 // A pid with no start time now, or a different one, is not the
@@ -328,34 +323,16 @@ impl VerdictSink {
                 // process was already gone when it was read.
                 judged_at.is_some() && proc_starttime(*pid) == *judged_at
             })
-            .map(|(pid, as_process, _)| {
-                // The same three-way answer as the orphan branch below,
-                // because these are the same question at different ages. This
-                // loop used to collapse it to deny-or-clear, so a hash-scoped
-                // rule that made the engine abstain *cleared* a standing
-                // kernel deny for a recently-exec'd process while the orphan
-                // branch kept it for an old one - identical binary, identical
-                // rules, opposite enforcement, selected by exec age.
-                let op = match self.engine.process_wide_action(as_process) {
-                    Some(Action::Deny | Action::Reject) => DenyOp::Deny,
-                    Some(_) => DenyOp::Clear,
-                    None if self.engine.deny_still_possible_for(as_process) => DenyOp::Keep,
-                    None => DenyOp::Clear,
-                };
-                (*pid, op)
-            })
+            .map(|(pid, as_process, _)| (*pid, self.engine.denies_process_wide(as_process)))
             .collect();
 
         let mut map = self.map.lock();
-        for (pid, op) in &deny_work {
-            let pid = *pid;
-            let r = match op {
-                DenyOp::Deny => {
-                    denied += 1;
-                    map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
-                }
-                DenyOp::Clear => clear(&mut map, pid),
-                DenyOp::Keep => Ok(()),
+        for &(pid, deny) in &deny_work {
+            let r = if deny {
+                denied += 1;
+                map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
+            } else {
+                clear(&mut map, pid)
             };
             if let Err(e) = r {
                 warn!(pid, "verdict resync failed: {e}");
@@ -406,24 +383,11 @@ impl VerdictSink {
                 doomed.push((pid, None));
                 continue;
             };
-            // `None` is two opposite answers and they must not be conflated.
-            // An abstention that could still resolve to a refusal - a
-            // hash-scoped deny the sweep cannot decide - keeps the entry:
-            // clearing would lift a refusal nobody replaced. But "no rule
-            // matched at all" is the *deleted rule*, and that is the case
-            // this sweep exists for - nobody replaces a deny with an explicit
-            // allow, they delete it. Reading `None` as "keep" made the sweep
-            // fail at its one job whenever a rule was removed; reading every
-            // abstention as "keep" then pinned stale denies on the strength
-            // of allow rules that could never justify one.
-            match self.engine.process_wide_action(&proc) {
-                Some(Action::Deny | Action::Reject) => {}
-                Some(_) => doomed.push((pid, judged_at)),
-                None => {
-                    if !self.engine.deny_still_possible_for(&proc) {
-                        doomed.push((pid, judged_at));
-                    }
-                }
+            // Anything short of a process-wide refusal clears, an abstention
+            // included: the packet path decides that flow (and prompts when
+            // the identity stays incomplete), as it does after `on_exec`.
+            if !self.engine.denies_process_wide(&proc) {
+                doomed.push((pid, judged_at));
             }
         }
 
@@ -509,18 +473,11 @@ impl VerdictSink {
             _ => None,
         };
         let as_process = corrected.as_ref().unwrap_or(proc);
-        let deny = matches!(
-            self.engine.process_wide_action(as_process),
-            Some(Action::Deny | Action::Reject)
-        );
+        let deny = self.engine.denies_process_wide(as_process);
         let mut map = self.map.lock();
-        // Two-way, not three-way like resync: an abstention here still
-        // clears. The difference is principled, not an oversight - any
-        // existing entry for this pid was written for the binary it just
-        // exec'd AWAY from, so there is no standing refusal for the current
-        // binary to preserve; keeping it would enforce the predecessor's
-        // verdict on its successor. The packet path decides the ambiguous
-        // case with the real hash in hand.
+        // An abstention clears, like in resync: any existing entry for this
+        // pid was written for the binary it just exec'd away from, and the
+        // packet path decides the ambiguous case with the real hash in hand.
         let r = if deny {
             map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
         } else {
@@ -578,10 +535,7 @@ impl VerdictSink {
                 exe: exe.clone(),
                 ..Process::unknown(0)
             };
-            if matches!(
-                self.engine.process_wide_action(&proc),
-                Some(Action::Deny | Action::Reject)
-            ) {
+            if self.engine.denies_process_wide(&proc) {
                 let key = cfc_ebpf_common::hash_exe_path(exe.as_os_str().as_encoded_bytes());
                 wanted.insert(key, cfc_ebpf_common::verdict::DENY);
             }
@@ -664,8 +618,8 @@ fn proc_exe(pid: u32) -> Option<std::path::PathBuf> {
 /// This is *the* decider for both loops in `resync`. `matches_process` looks at
 /// three things - the executable path, its hash, and the uid - so a view built
 /// from the resolved path and the live uid is the whole decision surface; the
-/// hash stays `None` here on purpose, which is what makes a hash-scoped rule
-/// abstain and keeps the tri-state the sweep depends on.
+/// hash stays `None` here on purpose: a hash-scoped rule then abstains, the
+/// sweep clears, and the packet path, which reads the hash, decides.
 ///
 /// `None` means the process is gone or its /proc is unreadable, which callers
 /// must treat as "no answer" rather than falling back to a guess.
@@ -1191,6 +1145,7 @@ pub(super) fn stats(map: &PerCpuArray<&MapData, u64>) -> anyhow::Result<EnforceS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cfc_core::Action;
 
     /// The whole point of `proc_view` is that it reads the *resolved* path and
     /// the *current* uid, which is what separates it from the exec record the
@@ -1212,8 +1167,8 @@ mod tests {
         assert_eq!(proc.uid, Some(unsafe { libc::getuid() }));
         assert_eq!(
             proc.sha256, None,
-            "the hash stays unread here on purpose: it is what makes a \
-             hash-scoped rule abstain, and the sweep's tri-state depends on it"
+            "the hash stays unread here on purpose: a hash-scoped rule \
+             abstains and the packet path, which reads it, decides"
         );
         assert!(starttime.is_some(), "a live pid has a start time");
     }

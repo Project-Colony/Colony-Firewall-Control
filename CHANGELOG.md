@@ -29,8 +29,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the app, tray and `cfc prompts` show the program as unknown. With no UI
   connected the flow takes `no_ui_action` (Deny on every shipped profile),
   and prompt caps send overflow there too; pause and the loopback allowance
-  no longer let such flows through without asking. One "allow this program"
-  rule no longer blocks every unattributed flow that a generic rule allows.
+  no longer let such flows through without asking. The in-kernel connect
+  hooks follow: a running program whose only remaining refusal depends on a
+  digest the kernel side does not read (a `deny --sha256` rule, once a
+  `deny --exe` for that program is deleted or expires) no longer keeps a
+  kernel refusal that failed its `connect()` with no prompt; the packet
+  path decides it. One "allow
+  this program" rule no longer blocks every unattributed flow that a
+  generic rule allows.
   The reverse holds: once any program Deny or Reject exists, a flow whose
   program is unknown no longer passes a generic Allow it matches (that Deny
   may be about it), and no Allow rule can settle it; scope the Deny to
