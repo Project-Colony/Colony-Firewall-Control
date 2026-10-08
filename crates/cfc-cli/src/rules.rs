@@ -1378,6 +1378,16 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
 /// The first candidate that **exists on this machine** is used; if none does,
 /// the entry is skipped and said out loud, so "installed 4 of 7, skipped 3 not
 /// present" is a normal, legible outcome rather than a silent partial success.
+///
+/// # Candidates name the program that connects
+///
+/// The daemon matches `/proc/<pid>/exe`, the image that was mapped. A launcher
+/// script (`/usr/bin/firefox` on Arch), a proxy that execs another binary
+/// (rustup's `cargo`) or a front end whose helper does the fetching (`git`,
+/// `apt-get`) never appears there, so a rule pinned to it never fires. Real
+/// binaries come first, and launchers are skipped (see [`is_launcher`]).
+/// Tools where only an interpreter connects (npm, pip) are not bundled at all:
+/// allowing `/usr/bin/node` to reach 443 would allow every Node program.
 struct BundleRule {
     name: &'static str,
     /// Absolute paths to try, in order. First one that exists wins.
@@ -1411,9 +1421,24 @@ impl BundleRule {
         self.exe_candidates
             .iter()
             .copied()
-            .find(|p| std::path::Path::new(p).is_file())
+            .filter(|p| std::path::Path::new(p).is_file())
             .map(|p| cfc_core::exe_path::resolve(std::path::Path::new(p)).into_path())
+            .find(|p| !is_launcher(p))
     }
+}
+
+/// True for a file that execs another image instead of connecting itself: a
+/// `#!` script, or the rustup proxy every toolchain binary links to.
+fn is_launcher(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    if path.file_name() == Some(std::ffi::OsStr::new("rustup")) {
+        return true;
+    }
+    let mut head = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok()
+        && head == *b"#!"
 }
 
 /// A named, selectable set of rules.
@@ -1561,9 +1586,10 @@ fn bundles() -> Vec<Bundle> {
             name: "updates",
             summary: "package managers beyond pacman/paru, which are in `system`",
             rules: vec![
+                // apt-get hands the fetch to its method helpers.
                 BundleRule {
                     name: "updates-apt-https",
-                    exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/https"],
+                    exe_candidates: &["/usr/lib/apt/methods/https"],
                     dst_port: Some(443),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1573,7 +1599,7 @@ fn bundles() -> Vec<Bundle> {
                 // are signed, so the transport is not what protects them.
                 BundleRule {
                     name: "updates-apt-http",
-                    exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/http"],
+                    exe_candidates: &["/usr/lib/apt/methods/http"],
                     dst_port: Some(80),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1614,10 +1640,14 @@ fn bundles() -> Vec<Bundle> {
             name: "dev",
             summary: "the tools that fetch code and dependencies",
             rules: vec![
-                // git speaks both: HTTPS remotes and ssh:// remotes.
+                // git speaks both, but through helpers: git-remote-https for
+                // HTTPS remotes and ssh for ssh:// remotes.
                 BundleRule {
                     name: "dev-git-https",
-                    exe_candidates: &["/usr/bin/git"],
+                    exe_candidates: &[
+                        "/usr/lib/git-core/git-remote-https",
+                        "/usr/libexec/git-core/git-remote-https",
+                    ],
                     dst_port: Some(443),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1625,7 +1655,7 @@ fn bundles() -> Vec<Bundle> {
                 },
                 BundleRule {
                     name: "dev-git-ssh",
-                    exe_candidates: &["/usr/bin/git"],
+                    exe_candidates: &["/usr/bin/ssh"],
                     dst_port: Some(22),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1634,22 +1664,6 @@ fn bundles() -> Vec<Bundle> {
                 BundleRule {
                     name: "dev-cargo-https",
                     exe_candidates: &["/usr/bin/cargo"],
-                    dst_port: Some(443),
-                    protocol: Some(Tcp),
-                    direction: None,
-                    src_net: None,
-                },
-                BundleRule {
-                    name: "dev-npm-https",
-                    exe_candidates: &["/usr/bin/npm", "/usr/bin/node"],
-                    dst_port: Some(443),
-                    protocol: Some(Tcp),
-                    direction: None,
-                    src_net: None,
-                },
-                BundleRule {
-                    name: "dev-pip-https",
-                    exe_candidates: &["/usr/bin/pip", "/usr/bin/pip3"],
                     dst_port: Some(443),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1843,16 +1857,28 @@ fn bundles() -> Vec<Bundle> {
 fn browser_rules() -> Vec<BundleRule> {
     /// `(rule stem, candidate paths)`.
     const BROWSERS: &[(&str, &[&str])] = &[
-        ("firefox", &["/usr/bin/firefox", "/usr/lib/firefox/firefox"]),
-        ("librewolf", &["/usr/bin/librewolf"]),
+        (
+            "firefox",
+            &[
+                "/usr/lib/firefox/firefox",
+                "/usr/lib64/firefox/firefox",
+                "/usr/bin/firefox",
+            ],
+        ),
+        (
+            "librewolf",
+            &["/usr/lib/librewolf/librewolf", "/usr/bin/librewolf"],
+        ),
         (
             "chromium",
-            &["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
+            &["/usr/lib/chromium/chromium", "/usr/bin/chromium"],
         ),
-        ("chrome", &["/usr/bin/google-chrome-stable"]),
-        ("brave", &["/usr/bin/brave"]),
-        ("vivaldi", &["/usr/bin/vivaldi-stable"]),
-        ("epiphany", &["/usr/bin/epiphany"]),
+        ("chrome", &["/opt/google/chrome/chrome"]),
+        (
+            "brave",
+            &["/opt/brave.com/brave/brave", "/opt/brave-bin/brave"],
+        ),
+        ("vivaldi", &["/opt/vivaldi/vivaldi-bin"]),
     ];
 
     // `&'static str` names are needed by `BundleRule`, and these are built at
@@ -1898,7 +1924,7 @@ struct Planned {
     /// Entries whose program is installed here, with the path as /proc will
     /// report it - not necessarily the candidate that matched.
     present: Vec<(&'static str, PathBuf)>,
-    /// Entries skipped because no candidate path exists.
+    /// Entries skipped because no candidate exists, or only a launcher does.
     absent: Vec<&'static str>,
 }
 
@@ -2159,7 +2185,7 @@ pub async fn bundle_add(
     // network.
     if !planned.absent.is_empty() {
         println!(
-            "\nnot installed on this machine, so skipped ({}):",
+            "\nno program here that a rule can match (not installed, or only a launcher), so skipped ({}):",
             planned.absent.len()
         );
         for n in &planned.absent {
@@ -2175,6 +2201,17 @@ pub async fn bundle_add(
     Ok(())
 }
 
+/// Entries a later version dropped because their rule could never fire:
+/// Epiphany fetches through the WebKit network process every WebKitGTK app
+/// shares, and npm and pip connect as their interpreter. `bundle remove`
+/// still removes what older versions installed under these names.
+const RETIRED_BUNDLE_RULES: &[(&str, &str)] = &[
+    ("web", "web-epiphany-https"),
+    ("web", "web-epiphany-http"),
+    ("dev", "dev-npm-https"),
+    ("dev", "dev-pip-https"),
+];
+
 /// `cfc rules bundle remove <name>`
 ///
 /// Removes only deterministic IDs created by this bundle. Existing rules
@@ -2186,10 +2223,16 @@ pub async fn bundle_remove(
     format: OutputFormat,
 ) -> CliResult {
     let bundle = find_bundle(name)?;
+    let retired = RETIRED_BUNDLE_RULES
+        .iter()
+        .filter(|(b, _)| *b == bundle.name)
+        .map(|(_, name)| *name);
     let owned: std::collections::HashSet<String> = bundle
         .rules
         .iter()
-        .map(|r| bundle_rule_id(bundle.name, r.name))
+        .map(|r| r.name)
+        .chain(retired)
+        .map(|name| bundle_rule_id(bundle.name, name))
         .collect();
 
     let existing = client.list_rules().await?;
@@ -2607,6 +2650,40 @@ mod json_tests {
 #[cfg(test)]
 mod bundle_tests {
     use super::*;
+
+    // `/usr/bin/firefox` on Arch is `exec /usr/lib/firefox/firefox`, and
+    // `/usr/bin/cargo` under rustup is the rustup proxy. Neither is ever
+    // /proc/<pid>/exe, so a rule pinned to one never fires.
+    #[test]
+    fn launchers_are_skipped_for_the_binary_that_connects() {
+        let dir = std::env::temp_dir().join(format!("cfc-bundle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("firefox");
+        let real = dir.join("firefox-bin");
+        let proxy = dir.join("rustup");
+        std::fs::write(&script, "#!/bin/sh\nexec firefox-bin \"$@\"\n").unwrap();
+        std::fs::write(&real, b"\x7fELF").unwrap();
+        std::fs::write(&proxy, b"\x7fELF").unwrap();
+        let leak = |p: &std::path::Path| -> &'static str {
+            Box::leak(p.to_str().unwrap().to_owned().into_boxed_str())
+        };
+        let entry = |candidates: Vec<&'static str>| BundleRule {
+            name: "test",
+            exe_candidates: Box::leak(candidates.into_boxed_slice()),
+            dst_port: Some(443),
+            protocol: None,
+            direction: None,
+            src_net: None,
+        };
+        let resolved = entry(vec![leak(&script), leak(&real)]).resolve();
+        assert_eq!(
+            resolved,
+            Some(cfc_core::exe_path::resolve(&real).into_path())
+        );
+        assert_eq!(entry(vec![leak(&script)]).resolve(), None);
+        assert_eq!(entry(vec![leak(&proxy)]).resolve(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The invariant the whole feature rests on.
     ///

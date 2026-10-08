@@ -220,7 +220,7 @@ For everything else, there are bundles:
 cfc rules bundle list                 # what there is, and what applies here
 cfc rules bundle add web --dry-run    # preview
 sudo cfc rules bundle add web         # installed browsers -> 443 and 80
-sudo cfc rules bundle add dev         # git, cargo, npm, pip, docker
+sudo cfc rules bundle add dev         # git, ssh, cargo, docker/podman
 sudo cfc rules bundle add updates     # apt, dnf, flatpak, yay
 sudo cfc rules bundle remove web      # exactly the rules that bundle owns
 ```
@@ -229,8 +229,10 @@ Two properties worth knowing. **Every rule names an executable** - there
 is no way to write "allow tcp/443" here, because a payload phoning home
 uses 443 exactly like a browser does and a port-shaped rule cannot tell
 them apart. And entries whose program is not installed on this machine
-are **skipped and reported**, so "4 added, 10 skipped" is the normal
-outcome of `bundle add web` on a box with two browsers.
+are **skipped and reported**, so "4 added, 8 skipped" is the normal
+outcome of `bundle add web` on a box with two browsers. Each rule names the
+binary that actually connects, never a launcher script, so tools where only
+an interpreter connects (npm, pip) have no bundle entry.
 
 **3. Give prompts somewhere to go.** On a desktop, launch the GUI:
 
