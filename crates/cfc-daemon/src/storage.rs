@@ -256,6 +256,20 @@ impl RuleStore {
                         quarantined += 1;
                         continue;
                     }
+                    if rule.enabled && rule.scope.dst_host.is_some() {
+                        // Its refusals are recorded as the default policy,
+                        // not as this rule, so without this line nothing
+                        // points at the rule behind them.
+                        tracing::warn!(
+                            rule_id = %id,
+                            rule_name = %rule.name,
+                            "legacy hostname rule: flows its other predicates \
+                             match are refused and logged as the default \
+                             policy; it cannot be disabled, so replace it with \
+                             an executable or numeric scope, or delete it with \
+                             `cfc rules remove {id}`"
+                        );
+                    }
                     rules.push(rule);
                 }
                 Err(e) => {

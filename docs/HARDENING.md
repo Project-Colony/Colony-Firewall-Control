@@ -110,6 +110,10 @@ predicates are compatible, their uncertainty refuses the flow before a lower
 Allow, pause or prompt can admit it. Replace these rules explicitly with
 executable or numeric scopes; a legacy hostname Allow no longer grants access.
 The editor requires the old hostname to be removed before saving a replacement.
+Such a rule cannot be disabled either, since a toggle sends the hostname back
+and the daemon refuses it: edit or delete it (`cfc rules remove <id>`). Its
+refusals are logged as the default policy, so the daemon names every enabled
+legacy hostname rule in a warning at startup.
 
 CLI and GUI destination presets use the observed numeric endpoint, as `/32`
 for IPv4 or `/128` for IPv6, and label it as an IP. They do not turn a domain

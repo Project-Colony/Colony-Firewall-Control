@@ -340,7 +340,7 @@ pub fn reject_unscoped(scope: &RuleScope) -> Result<(), String> {
         return Err(
             "rule scope constrains nothing, so it would match every process and \
              every destination; scope it to at least one of exe_path, uid, \
-             dst_host, dst_net, dst_port or protocol"
+             dst_net, dst_port or protocol"
                 .to_string(),
         );
     }
