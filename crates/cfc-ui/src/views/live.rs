@@ -239,10 +239,10 @@ fn live_row(e: &LiveEntry) -> Element<'_, Message> {
             .padding([1, 6])
             .on_press(Message::MakeRuleFromEvent {
                 exe: proc.map(|p| p.exe.clone()).unwrap_or_default(),
-                dst_host: c.dst_host.clone(),
                 dst_ip: c.dst_ip.clone(),
                 dst_port: c.dst_port,
                 protocol: c.protocol,
+                direction: c.direction,
             })
             .style(crate::theme::subtle_icon)
             .into(),
