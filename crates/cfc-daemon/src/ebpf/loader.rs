@@ -897,8 +897,15 @@ pub(super) fn load_and_attach(
             let Some(ev) = decode::<ConnectReport>(bytes) else {
                 return;
             };
+            // Verified against the live process's start time where there is
+            // one. Without it an entry left by a dead process names whatever
+            // ran under this pid before, and the admin chases the wrong program.
             let who = t
-                .get(ev.pid, None, Instant::now())
+                .get(
+                    ev.pid,
+                    crate::process_resolve::read_starttime(ev.pid),
+                    Instant::now(),
+                )
                 .map(|p| p.comm)
                 .unwrap_or_else(|| "?".to_string());
             tracing::info!(
