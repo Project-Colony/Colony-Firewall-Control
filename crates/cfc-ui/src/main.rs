@@ -91,9 +91,10 @@ pub struct App {
     pub status_ticks: u32,
     /// Failed reconnect attempts, feeding the backoff.
     pub retry_attempts: u32,
-    /// When the last handshake succeeded. Pause stays disabled for
-    /// [`PROMPT_ARM_MS`] after it (see [`App::pause_armed`]).
-    pub connected_at_ms: i64,
+    /// When Pause last took its header slot: a handshake (it replaces
+    /// Reconnect) or enforcement resuming (it replaces Resume). Pause stays
+    /// disabled for [`PROMPT_ARM_MS`] after it (see [`App::pause_armed`]).
+    pub pause_shown_at_ms: i64,
     pub retry_at_ms: Option<i64>,
     /// Set when a gRPC stream drops; the badge shows "reconnecting" instead
     /// of the footer being rewritten every two seconds.
@@ -557,7 +558,7 @@ impl App {
             status_ticks: 0,
             retry_attempts: 0,
             retry_at_ms: None,
-            connected_at_ms: 0,
+            pause_shown_at_ms: 0,
             stream_trouble: false,
             now_ms: now_ms(),
         };
@@ -577,11 +578,12 @@ impl App {
     }
 
     /// Pause takes the place of Reconnect, at the right end of the header,
-    /// as soon as a handshake lands. The second click of a double-click on
-    /// Reconnect would otherwise switch enforcement off with no
+    /// as soon as a handshake lands, and the place of Resume as soon as
+    /// enforcement resumes. The second click of a double-click on Reconnect
+    /// or Resume would otherwise switch enforcement off with no
     /// confirmation.
     fn pause_armed(&self) -> bool {
-        self.now_ms >= self.connected_at_ms.saturating_add(PROMPT_ARM_MS)
+        self.now_ms >= self.pause_shown_at_ms.saturating_add(PROMPT_ARM_MS)
     }
 
     fn connect_task(&mut self) -> Task<Message> {
@@ -747,7 +749,7 @@ impl App {
             }
             Message::HandshakeDone(Ok(data)) => {
                 self.now_ms = now_ms();
-                self.connected_at_ms = self.now_ms;
+                self.pause_shown_at_ms = self.now_ms;
                 self.daemon = DaemonState::Connected;
                 self.status = Some(data.status);
                 self.rules = data.rules;
@@ -801,6 +803,10 @@ impl App {
                 Task::none()
             }
             Message::StatusLoaded(Ok(s)) => {
+                // A timed pause ran out, or another client resumed.
+                if self.status.as_ref().is_some_and(|old| old.paused) && !s.paused {
+                    self.pause_shown_at_ms = self.now_ms;
+                }
                 self.status = Some(s);
                 self.status_failures = 0;
                 self.stream_trouble = false;
@@ -1056,6 +1062,10 @@ impl App {
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
             Message::PausedSet(Ok((paused, resume_at_unix_ms))) => {
+                if !paused {
+                    self.now_ms = now_ms();
+                    self.pause_shown_at_ms = self.now_ms;
+                }
                 if let Some(s) = &mut self.status {
                     s.paused = paused;
                     s.resume_at_unix_ms = resume_at_unix_ms;
@@ -2495,6 +2505,20 @@ mod tests {
         assert_eq!(app.prompts[0].event.prompt_id, "below");
         assert!(!app.prompts[0].armed(app.now_ms));
         assert!(app.prompts[0].armed(app.now_ms + PROMPT_ARM_MS));
+    }
+
+    #[test]
+    fn pause_ignores_a_click_right_after_resuming() {
+        let (mut app, _) = App::new();
+        app.status = Some(proto::StatusResponse {
+            paused: true,
+            ..Default::default()
+        });
+        assert_eq!(app.update(Message::TogglePaused).units(), 1, "Resume");
+        let _ = app.update(Message::PausedSet(Ok((false, 0))));
+        assert_eq!(app.update(Message::TogglePaused).units(), 0);
+        app.now_ms += PROMPT_ARM_MS;
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
     }
 
     #[test]

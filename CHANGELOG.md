@@ -246,8 +246,9 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   expired was closed with the user's edits; it now stays open as a new rule.
   Footer errors are no longer pushed out by a burst of warnings.
 - GUI: Pause replaced Reconnect under the cursor as soon as the daemon came
-  back, so a double-click on Reconnect paused enforcement. Pause now stays
-  disabled for one second after connecting.
+  back, and Resume as soon as enforcement resumed, so a double-click on
+  either paused enforcement. Pause now stays disabled for one second after
+  connecting and after resuming.
 - Tray: on GNOME, three expired prompt bubbles held every actionable slot,
   so later prompts only reached the overflow bubble, which cannot answer
   them. Slots are freed once their prompt's deadline has passed, and the
