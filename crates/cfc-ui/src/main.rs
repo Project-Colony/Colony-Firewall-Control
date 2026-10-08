@@ -40,10 +40,11 @@ const DELETE_CONFIRM_MS: i64 = 3_000;
 const DEADLINE_TICK_MS: u64 = 400;
 
 /// How long a prompt's verdict controls stay disabled after the card
-/// appears, and how long the keyboard target stays disarmed after it
-/// changes. A click or key press already on its way when the layout changed
-/// (the window was raised, a card arrived, the card above expired) must not
-/// land on a verdict the user never saw.
+/// appears, how long the keyboard target stays disarmed after it changes,
+/// and how long Pause stays disabled after a reconnect. A click or key press
+/// already on its way when the layout changed (the window was raised, a card
+/// arrived, the card above expired, Pause replaced Reconnect) must not land
+/// on a control the user never saw.
 const PROMPT_ARM_MS: i64 = 1_000;
 
 fn main() -> iced::Result {
@@ -90,6 +91,9 @@ pub struct App {
     pub status_ticks: u32,
     /// Failed reconnect attempts, feeding the backoff.
     pub retry_attempts: u32,
+    /// When the last handshake succeeded. Pause stays disabled for
+    /// [`PROMPT_ARM_MS`] after it (see [`App::pause_armed`]).
+    pub connected_at_ms: i64,
     pub retry_at_ms: Option<i64>,
     /// Set when a gRPC stream drops; the badge shows "reconnecting" instead
     /// of the footer being rewritten every two seconds.
@@ -593,6 +597,7 @@ impl App {
             status_ticks: 0,
             retry_attempts: 0,
             retry_at_ms: None,
+            connected_at_ms: 0,
             stream_trouble: false,
             now_ms: now_ms(),
         };
@@ -609,6 +614,14 @@ impl App {
 
     fn connected(&self) -> bool {
         matches!(self.daemon, DaemonState::Connected)
+    }
+
+    /// Pause takes the place of Reconnect, at the right end of the header,
+    /// as soon as a handshake lands. The second click of a double-click on
+    /// Reconnect would otherwise switch enforcement off with no
+    /// confirmation.
+    fn pause_armed(&self) -> bool {
+        self.now_ms >= self.connected_at_ms.saturating_add(PROMPT_ARM_MS)
     }
 
     fn connect_task(&mut self) -> Task<Message> {
@@ -750,6 +763,8 @@ impl App {
                 self.connect_task()
             }
             Message::HandshakeDone(Ok(data)) => {
+                self.now_ms = now_ms();
+                self.connected_at_ms = self.now_ms;
                 self.daemon = DaemonState::Connected;
                 self.status = Some(data.status);
                 self.rules = data.rules;
@@ -1051,6 +1066,9 @@ impl App {
             }
             Message::TogglePaused => {
                 let current = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
+                if !current && !self.pause_armed() {
+                    return Task::none();
+                }
                 let socket = self.socket_path.clone();
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
@@ -1503,7 +1521,7 @@ impl App {
             } else {
                 button(text("Pause").size(12))
                     .padding([4, 14])
-                    .on_press(Message::TogglePaused)
+                    .on_press_maybe(self.pause_armed().then_some(Message::TogglePaused))
                     .style(iced::widget::button::secondary)
                     .into()
             }
@@ -2457,6 +2475,18 @@ mod tests {
                 .units(),
             0
         );
+    }
+
+    #[test]
+    fn pause_ignores_a_click_right_after_reconnecting() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::HandshakeDone(Ok(HandshakeData {
+            status: proto::StatusResponse::default(),
+            rules: Vec::new(),
+        })));
+        assert_eq!(app.update(Message::TogglePaused).units(), 0);
+        app.now_ms += PROMPT_ARM_MS;
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
     }
 
     #[test]
