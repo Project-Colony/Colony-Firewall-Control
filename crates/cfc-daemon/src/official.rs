@@ -531,6 +531,15 @@ mod tests {
                 .unwrap(),
         );
         let proc = PathBuf::from(format!("/proc/{}", child.0.id()));
+        // A vfork parent wakes inside execve before the child's close-on-exec
+        // descriptors are closed, so for a moment the child still holds our
+        // copy above stderr. comm is renamed after that close: wait for it.
+        for _ in 0..500 {
+            if std::fs::read_to_string(proc.join("comm")).is_ok_and(|c| c.trim() == "sleep") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         // Its fds are inspected by the test as the same user; the socket is
         // still ours, so ask about our end.
         let error = holds_connection(&proc, inode(ours.as_raw_fd())).unwrap_err();
