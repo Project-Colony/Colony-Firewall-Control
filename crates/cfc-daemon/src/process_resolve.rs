@@ -258,12 +258,13 @@ fn resolve_inner(
     // Only an image with no link left is stripped (`policy_exe_path`): a file
     // literally named "curl (deleted)" must not pass for "curl".
     //
-    // Nor is it stripped for a process in another user namespace. Such a
-    // process can mount its own bytes at /usr/bin/curl, run them and remove
-    // them; the former path then names no file to compare the image with
-    // (`path_names_image`), and stripping would hand it the host curl's
-    // rules. In our user namespace only root, or a setuid helper root
-    // installed, sets up mounts.
+    // Nor is it stripped for a process in another user namespace, or for an
+    // image on a mount outside the process's own namespace (`finish`). A user
+    // can mount their own bytes at /usr/bin/curl in a namespace of their own,
+    // run them from there and remove them; the former path then names no file
+    // to compare the image with (`path_names_image`), and stripping would hand
+    // it the host curl's rules. In our user namespace only root, or a setuid
+    // helper root installed, sets up mounts.
     let exe_for_provenance = exe.clone();
     let exe = policy_exe_path(exe, unlinked);
 
@@ -867,7 +868,7 @@ impl MappedImage {
     }
 
     /// The image's path as `/proc` renders it, its digest, and whether it has
-    /// no link left.
+    /// no link left. `link` is `/proc/<pid>/exe`.
     fn finish(self, link: &Path) -> Option<(PathBuf, Option<String>, bool)> {
         let meta = self.file.metadata().ok()?;
         if image_key(&meta) != self.key {
@@ -877,6 +878,12 @@ impl MappedImage {
             trace!(path = %self.path.display(), "exe path names another file here");
             return None;
         }
+        // A process can run an image from another namespace's mount (through
+        // /proc/<pid>/root or a passed descriptor), and the link then reads
+        // that mount's path. So only an image on a mount of the process's own
+        // namespace counts as unlinked.
+        let unlinked =
+            meta.nlink() == 0 && mounted_in(&self.file, &link.with_file_name("mountinfo"));
         if meta.len() > SHA256_MAX_LEN {
             trace!(len = meta.len(), "exe too large to hash; skipping");
         }
@@ -886,8 +893,24 @@ impl MappedImage {
         {
             return None;
         }
-        Some((self.path, sha256, meta.nlink() == 0))
+        Some((self.path, sha256, unlinked))
     }
+}
+
+/// Whether `file` was opened through a mount of the namespace whose
+/// `mountinfo` is given. The open file pins its mount, so the id cannot be
+/// reused while it is checked. False when either cannot be read.
+fn mounted_in(file: &fs::File, mountinfo: &Path) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()));
+    let Some(id) = fdinfo.ok().and_then(|info| {
+        info.lines()
+            .find_map(|l| l.strip_prefix("mnt_id:").map(|id| id.trim().to_owned()))
+    }) else {
+        return false;
+    };
+    fs::read_to_string(mountinfo)
+        .is_ok_and(|mounts| mounts.lines().any(|l| l.split(' ').next() == Some(&id)))
 }
 
 /// Whether `path`, read in the daemon's own mount namespace, can stand for
@@ -1721,6 +1744,57 @@ mod tests {
         let Some(exe) = resolve_deleted_image(sleep, &image, &["unshare", "--user"]) else {
             return; // no unprivileged user namespaces here
         };
+        let mut deleted = image.into_os_string();
+        deleted.push(DELETED_SUFFIX);
+        assert_eq!(exe.as_os_str(), deleted);
+    }
+
+    #[test]
+    fn a_deleted_image_from_another_namespace_mount_keeps_its_suffix() {
+        // The process itself stays in this user and mount namespace but runs
+        // bytes a child namespace mounted, through /proc/<child>/root.
+        use std::io::{BufRead as _, BufReader};
+        use std::process::{Command, Stdio};
+        let Some(sleep) = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut holder = Command::new("unshare")
+            .args(["-rm", "sh", "-c"])
+            .arg(r#"mount -t tmpfs tmpfs "$0" && cp "$1" "$0/sleep" && echo ready && read _"#)
+            .arg(dir.path())
+            .arg(sleep)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        let _ = BufReader::new(holder.stdout.take().unwrap()).read_line(&mut ready);
+        if ready.trim() != "ready" {
+            let _ = holder.wait();
+            return; // no unprivileged user namespaces here
+        }
+        let image = dir.path().join("sleep");
+        let via_child = PathBuf::from(format!("/proc/{}/root", holder.id()))
+            .join(image.strip_prefix("/").unwrap());
+        let mut child = Command::new(&via_child).arg("30").spawn().unwrap();
+        let link = format!("/proc/{}/exe", child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_link(&link).ok().as_deref() != Some(&image) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::remove_file(&via_child).unwrap();
+        let exe = resolve(child.id()).exe;
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(holder.stdin.take());
+        let _ = holder.wait();
+
         let mut deleted = image.into_os_string();
         deleted.push(DELETED_SUFFIX);
         assert_eq!(exe.as_os_str(), deleted);

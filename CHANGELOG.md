@@ -193,9 +193,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The same namespace could still borrow the host's path by deleting its
   bytes once running: the kernel's `" (deleted)"` suffix was dropped, and a
   deleted image names no file to compare with. The suffix is now dropped only
-  for a process in the daemon's user namespace, so a program in another one
-  (`unshare -U`, a rootless container) that runs across its own upgrade
-  matches its rules again only after a restart.
+  for a process in the daemon's user namespace whose image sits on a mount of
+  its own mount namespace, since a process can also run such bytes through
+  `/proc/<pid>/root` or a passed descriptor. A program in another user
+  namespace (`unshare -U`, a rootless container) that runs across its own
+  upgrade matches its rules again only after a restart.
 - Executables over 64 MiB, such as Chromium, Electron apps and VS Code, have
   no digest, so every queued packet from them, each retransmit and parallel
   connection, opened its own prompt. On a root-sealed path they now share one

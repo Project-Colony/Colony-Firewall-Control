@@ -243,14 +243,16 @@ is a separate launch mode.
   chosen arguments or with `LD_PRELOAD`, which a hash pin does not prevent.
   An image deleted while it runs is matched by the path it had (an upgraded
   program keeps its rules), which the daemon cannot check against anything.
-  Only a process in the daemon's own user namespace gets that path; one in
-  another user namespace (`unshare -U`, a rootless container) keeps the
-  `" (deleted)"` suffix, so its rules stop matching until it restarts. A
-  setuid mount helper such as setuid `bwrap` lets a user present a path
-  that way too. Digests and the
-  root-sealed test trust what the filesystem reports: on a FUSE filesystem
-  the daemon can read (`user_allow_other` in `/etc/fuse.conf`), the user who
-  mounted it controls both. An image the daemon cannot open at all, such as
+  Only a process in the daemon's own user namespace, running an image from a
+  mount of its own mount namespace, gets that path. One in another user
+  namespace (`unshare -U`, a rootless container), or one running an image
+  through another namespace's mount (`/proc/<pid>/root`, a passed
+  descriptor), keeps the `" (deleted)"` suffix, so its rules stop matching
+  until it restarts. A setuid mount helper such as setuid `bwrap` lets a
+  user present a path that way too. Digests and the root-sealed test trust
+  what the filesystem reports: on a FUSE filesystem the daemon can read
+  (`user_allow_other` in `/etc/fuse.conf`), the user who mounted it controls
+  both. An image the daemon cannot open at all, such as
   an AppImage or anything on a FUSE mount without `allow_other`, has no
   executable identity, so an Allow scoped to its path never applies to it.
 - **Raw and packet sockets**: applications with `CAP_NET_RAW` can use AF_PACKET

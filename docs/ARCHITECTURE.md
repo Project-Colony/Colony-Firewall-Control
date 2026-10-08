@@ -192,7 +192,8 @@ still agree before publishing executable identity. The link is rendered in
 the process's own mount namespace, so a path that names a different file in
 the daemon's view leaves the executable unknown. A deleted image's
 `" (deleted)"` suffix is dropped only for a process in the daemon's user
-namespace; elsewhere the former path cannot be checked. A digest is cached only
+namespace whose image sits on a mount of its own mount namespace; elsewhere
+the former path cannot be checked. A digest is cached only
 when the image's ctime was at least 2 seconds old as hashing began. Userspace
 cannot set ctime and any write moves it, so a changed image misses the cache;
 an unchanged one is never rehashed per packet on the single worker. The
