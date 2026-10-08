@@ -3,6 +3,7 @@
 //! tested without a daemon, a D-Bus session, or a clock.
 
 use cfc_client::{proto, ClientError};
+use std::collections::HashMap;
 
 /// At most one desktop notification per this many milliseconds, however
 /// fast prompts arrive. Only used by the generic (non-actionable)
@@ -12,6 +13,10 @@ pub const NOTIFY_MIN_INTERVAL_MS: i64 = 30_000;
 /// At most this many actionable prompt notifications on screen at once;
 /// prompts beyond the cap fold into one collapsed overflow notification.
 pub const MAX_ACTIONABLE_NOTIFICATIONS: usize = 3;
+
+/// How long after a prompt's deadline its bubble keeps its actionable slot,
+/// so a click made just before the deadline still reaches the daemon.
+pub const SLOT_GRACE_MS: i64 = 2_000;
 
 /// Floor for a prompt notification's expire timeout. A deadline that is
 /// already past still gets a brief, visible bubble rather than a 0ms
@@ -446,6 +451,37 @@ pub fn body_markup(body: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// One actionable prompt bubble the tray counts against
+/// [`MAX_ACTIONABLE_NOTIFICATIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    /// The prompt's deadline; 0 when the daemon attached none.
+    pub deadline_unix_ms: i64,
+    /// The notification server's id for the bubble, once it is shown.
+    pub server_id: Option<u32>,
+}
+
+/// Frees the slots of prompts the daemon has already decided, and returns
+/// the bubbles to close.
+///
+/// A slot used to be freed only by the bubble's own `ActionInvoked` or
+/// `NotificationClosed`. Servers that keep expired bubbles in a message
+/// list (GNOME Shell) send neither, so three expired prompts held every slot
+/// and every later prompt fell into the overflow bubble, which cannot answer
+/// it. Closing the bubble also ends the thread waiting on it.
+pub fn reclaim_expired(active: &mut HashMap<String, Slot>, now_unix_ms: i64) -> Vec<u32> {
+    let mut close = Vec::new();
+    active.retain(|_, slot| {
+        let expired = slot.deadline_unix_ms > 0
+            && now_unix_ms > slot.deadline_unix_ms.saturating_add(SLOT_GRACE_MS);
+        if expired {
+            close.extend(slot.server_id);
+        }
+        !expired
+    });
+    close
+}
+
 /// How a newly arrived prompt is surfaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptPresentation {
@@ -476,7 +512,10 @@ pub fn overflow_body(count: u64) -> String {
     } else {
         "connections"
     };
-    format!("{count} more {noun} waiting — open Colony Firewall")
+    // Not "open Colony Firewall to answer": a window opened now does not
+    // receive prompts that are already pending, only one already running
+    // has them.
+    format!("{count} more {noun} waiting. An open Colony Firewall window can answer them; otherwise the default applies when they time out.")
 }
 
 #[cfg(test)]
@@ -785,6 +824,30 @@ mod tests {
     }
 
     #[test]
+    fn expired_slots_are_freed_and_their_bubbles_closed() {
+        let slot = |deadline_unix_ms, server_id| Slot {
+            deadline_unix_ms,
+            server_id,
+        };
+        let mut active = HashMap::from([
+            ("expired".to_string(), slot(1_000, Some(7))),
+            ("expired-unshown".to_string(), slot(1_000, None)),
+            ("in-grace".to_string(), slot(5_000, Some(8))),
+            ("no-deadline".to_string(), slot(0, Some(9))),
+        ]);
+        let close = reclaim_expired(&mut active, 5_000 + SLOT_GRACE_MS);
+        assert_eq!(close, vec![7]);
+        let mut left: Vec<_> = active.keys().map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["in-grace", "no-deadline"]);
+        assert_eq!(
+            present_prompt(active.len(), 0),
+            PromptPresentation::Actionable,
+            "a freed slot takes the next prompt"
+        );
+    }
+
+    #[test]
     fn prompt_notification_cannot_be_restyled_or_reflowed_by_its_strings() {
         // A valid path whose segments are Pango markup, and a DNS name that
         // forges a second, "verified" destination line.
@@ -964,14 +1027,8 @@ mod tests {
 
     #[test]
     fn overflow_body_counts_and_pluralizes() {
-        assert_eq!(
-            overflow_body(1),
-            "1 more connection waiting — open Colony Firewall"
-        );
-        assert_eq!(
-            overflow_body(4),
-            "4 more connections waiting — open Colony Firewall"
-        );
+        assert!(overflow_body(1).starts_with("1 more connection waiting."));
+        assert!(overflow_body(4).starts_with("4 more connections waiting."));
     }
 
     // --- capability fallback -------------------------------------------------

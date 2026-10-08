@@ -17,7 +17,7 @@ use cfc_client::{proto, Client, StreamItem};
 use ksni::menu::{StandardItem, SubMenu};
 use ksni::{MenuItem, TrayMethods as _};
 use model::{DaemonView, NotifyGate, PauseControl, PromptChoice, PromptPresentation};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -105,6 +105,12 @@ enum Cmd {
         prompt_id: String,
         exe: String,
         key: String,
+    },
+    /// An actionable prompt notification was shown; `id` is the server id
+    /// needed to close it once its prompt is over.
+    PromptShown {
+        prompt_id: String,
+        id: u32,
     },
     /// The collapsed overflow notification was shown; `id` is the server
     /// id needed to update its count in place later.
@@ -511,8 +517,8 @@ enum OverflowBubble {
 /// Live actionable-notification bookkeeping, owned by the main loop.
 struct PromptNotifier {
     tx: mpsc::UnboundedSender<Cmd>,
-    /// Prompt ids with an actionable notification currently on screen.
-    active: HashSet<String>,
+    /// Prompts with an actionable notification currently on screen.
+    active: HashMap<String, model::Slot>,
     /// Prompts folded into the overflow bubble since it appeared.
     overflow_count: u64,
     bubble: OverflowBubble,
@@ -522,7 +528,7 @@ impl PromptNotifier {
     fn new(tx: mpsc::UnboundedSender<Cmd>) -> Self {
         Self {
             tx,
-            active: HashSet::new(),
+            active: HashMap::new(),
             overflow_count: 0,
             bubble: OverflowBubble::Down,
         }
@@ -531,6 +537,7 @@ impl PromptNotifier {
     /// One prompt arrived: its own actionable notification while a slot
     /// is free, otherwise folded into the single overflow bubble.
     fn on_prompt(&mut self, ev: &proto::PromptEvent) {
+        self.reclaim_expired();
         match model::present_prompt(self.active.len(), self.overflow_count) {
             PromptPresentation::Actionable => self.show_actionable(ev),
             PromptPresentation::Overflow { count } => {
@@ -543,7 +550,13 @@ impl PromptNotifier {
     fn show_actionable(&mut self, ev: &proto::PromptEvent) {
         let n = model::prompt_notification(ev, now_unix_ms());
         let prompt_id = ev.prompt_id.clone();
-        self.active.insert(prompt_id.clone());
+        self.active.insert(
+            prompt_id.clone(),
+            model::Slot {
+                deadline_unix_ms: ev.deadline_unix_ms,
+                server_id: None,
+            },
+        );
         let exe = ev
             .process
             .as_ref()
@@ -572,6 +585,8 @@ impl PromptNotifier {
                 notification.action(model::KEY_BLOCK, "Block app");
             }
             notification.action(model::KEY_DEFAULT, "Details");
+            let shown_id = prompt_id.clone();
+            let shown_tx = tx.clone();
             let done = move |key: &str| {
                 // Failing only means the main loop is gone; the process
                 // is on its way out.
@@ -582,7 +597,13 @@ impl PromptNotifier {
                 });
             };
             match notification.show() {
-                Ok(handle) => handle.wait_for_action(done),
+                Ok(handle) => {
+                    let _ = shown_tx.send(Cmd::PromptShown {
+                        prompt_id: shown_id,
+                        id: handle.id(),
+                    });
+                    handle.wait_for_action(done);
+                }
                 Err(e) => {
                     warn!("showing prompt notification: {e}");
                     // Free the slot; the daemon's timeout_action covers
@@ -657,6 +678,53 @@ impl PromptNotifier {
         self.active.clear();
         self.overflow_count = 0;
     }
+
+    /// Frees the slots of prompts past their deadline and closes their
+    /// bubbles (see [`model::reclaim_expired`]).
+    fn reclaim_expired(&mut self) {
+        close_notifications(model::reclaim_expired(&mut self.active, now_unix_ms()));
+    }
+
+    /// The bubble for `prompt_id` is on screen as `id`. If its slot was
+    /// already reclaimed, the prompt is over and the bubble goes too.
+    fn on_prompt_shown(&mut self, prompt_id: &str, id: u32) {
+        match self.active.get_mut(prompt_id) {
+            Some(slot) => slot.server_id = Some(id),
+            None => close_notifications(vec![id]),
+        }
+    }
+}
+
+/// Closes notification bubbles by server id, off the main loop.
+///
+/// The bubble's handle is consumed by the thread waiting on it, so this is
+/// the D-Bus `CloseNotification` call made directly. The server then emits
+/// `NotificationClosed`, which ends that wait.
+fn close_notifications(ids: Vec<u32>) {
+    if ids.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let close = async {
+            let conn = zbus::Connection::session().await?;
+            for id in ids {
+                conn.call_method(
+                    Some("org.freedesktop.Notifications"),
+                    "/org/freedesktop/Notifications",
+                    Some("org.freedesktop.Notifications"),
+                    "CloseNotification",
+                    &(id,),
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        match tokio::time::timeout(CAPABILITY_PROBE_TIMEOUT, close).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("closing an expired prompt notification: {e}"),
+            Err(_) => debug!("closing an expired prompt notification timed out"),
+        }
+    });
 }
 
 /// The collapsed "N more connections waiting" notification. Actionable
@@ -948,6 +1016,7 @@ async fn run() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                notifier.reclaim_expired();
                 if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
                     break;
                 }
@@ -992,7 +1061,7 @@ async fn run() -> anyhow::Result<()> {
                 Some(Cmd::PromptResult { prompt_id, exe, key }) => {
                     // Slot freed regardless of outcome. After a stream
                     // drop the id is already gone; remove is a no-op.
-                    let current = notifier.active.remove(&prompt_id);
+                    let current = notifier.active.remove(&prompt_id).is_some();
                     if key == model::KEY_DEFAULT {
                         open_gui();
                     } else if current {
@@ -1003,6 +1072,7 @@ async fn run() -> anyhow::Result<()> {
                     // KEY_CLOSED / anything else: dismissed or expired -
                     // the daemon's timeout_action covers it.
                 }
+                Some(Cmd::PromptShown { prompt_id, id }) => notifier.on_prompt_shown(&prompt_id, id),
                 Some(Cmd::OverflowShown { id }) => notifier.on_overflow_shown(id),
                 Some(Cmd::OverflowResult { key }) => {
                     notifier.on_overflow_result();
