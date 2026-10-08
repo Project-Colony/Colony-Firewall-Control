@@ -51,6 +51,17 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `journalctl -u cfc-app-ID.service`; it used to be discarded and reported
   as the application's status 1.
 
+- The release tarball ships `install.sh` and `uninstall.sh`, generated from
+  `pkg/colony.json`. No Colony app store client ever read that manifest or
+  ran its `postInstall`/`preRemove`, so the tarball had no installer and the
+  documented store channel did not exist; the docs now say so.
+- Lifting filtering is `systemctl disable --now colony-firewall-nft` (plus
+  `colony-firewalld` to keep it off), not a plain stop. A stop or restart
+  propagates through the network managers' `Requires=` to NetworkManager and
+  systemd-networkd. The docs now carry ruleset changes as a local copy loaded
+  through a unit drop-in: a same-named table from `/etc/nftables.conf` is
+  replaced at boot, on daemon start and on every upgrade.
+
 ### Security
 
 - `cfc prompts`: keys typed while no prompt was shown, such as an answer
@@ -83,6 +94,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`oifname "lo" ct state new queue num 0 bypass`), so local services keep
   working when the daemon is down. Loopback Deny rules are not enforced then.
   Every other new flow stays fail-closed.
+
+- The daemon unit sets `PrivateDevices=` (uid 0 could otherwise open block
+  devices and write underneath `ProtectSystem=`), drops `AF_PACKET`, which
+  nothing used, and lists more of the `/proc` and `/sys/fs` entries
+  `ProtectKernelTunables=` covers. `docs/HARDENING.md` no longer claims
+  `ProtectKernelTunables=` is set.
+- The release tarball carries a Sigstore-signed build provenance
+  attestation; `SECURITY.md` explains how to verify it and what
+  `SHA256SUMS` and the attached `PKGBUILD` checksum do not prove.
 
 ### Removed
 
@@ -209,6 +229,19 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without naming the file. They now fail their own file.
 - The GUI's prompt subscription stayed open after the GUI dropped it, so the
   daemon held the next prompt for an absent listener until it timed out.
+
+- RPM erase stopped NetworkManager: `%systemd_preun` stops the nft units
+  with `--no-reload`, under the managers' loaded `Requires=`. `%preun` now
+  disables them with a reload first.
+- Package upgrades re-enabled an nft unit the admin had disabled, because
+  reenabling the daemon follows its `Also=`. Only enabled nft units are
+  reenabled now (pacman, RPM and the tarball).
+- `pkg/PKGBUILD` refuses the `SKIP` checksum in `build()` too, so
+  `makepkg --noprepare` cannot build an unverified archive.
+- The release's LLVM pairing check compared against a version
+  `bpf-linker --version` does not print, so it never fired; it now runs the
+  same checks as `ebpf.yml`. A dispatched release's draft now tags the commit
+  it was built from.
 
 ## [0.7.0] - 2026-09-30
 
