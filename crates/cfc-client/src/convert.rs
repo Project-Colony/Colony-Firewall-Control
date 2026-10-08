@@ -2,6 +2,30 @@
 
 use cfc_proto::v1 as pb;
 
+/// Renders an untrusted value (a path, a command line, a DNS name) as one
+/// line that cannot rearrange what is around it.
+///
+/// Control characters (newlines included) and the bidi embedding, override
+/// and isolate characters are written as escapes. Process strings are
+/// chosen by the program being judged, or by whoever named its file, and DNS
+/// names by whoever answers the query: a U+202E in a directory name reverses
+/// the rest of a Path row, and an embedded newline adds a fake line to a
+/// prompt. Only for display; rules and copies keep the raw value.
+pub fn display_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if character.is_control()
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
 pub fn action_label(a: i32) -> &'static str {
     match pb::Action::try_from(a).unwrap_or(pb::Action::Unspecified) {
         pb::Action::Allow => "allow",
@@ -126,14 +150,15 @@ pub fn uid_label(uid: Option<u32>) -> String {
     }
 }
 
+/// The program's basename for display, made [`display_safe`].
 pub fn process_display(p: &pb::ProcessInfo) -> String {
     if p.exe.is_empty() {
         format!("pid:{}", p.pid)
     } else {
-        match std::path::Path::new(&p.exe).file_name() {
+        display_safe(&match std::path::Path::new(&p.exe).file_name() {
             Some(n) => n.to_string_lossy().into_owned(),
             None => p.exe.clone(),
-        }
+        })
     }
 }
 
@@ -149,7 +174,10 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
     let target = scope
         .and_then(|s| {
             if !s.dst_host.is_empty() {
-                Some(format!("{} [legacy hostname; uncertain]", s.dst_host))
+                Some(format!(
+                    "{} [legacy hostname; uncertain]",
+                    display_safe(&s.dst_host)
+                ))
             } else if !s.dst_net.is_empty() {
                 Some(s.dst_net.clone())
             } else {
@@ -166,7 +194,7 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
             if s.exe_path.is_empty() {
                 None
             } else {
-                Some(s.exe_path.clone())
+                Some(display_safe(&s.exe_path))
             }
         })
         .unwrap_or_else(|| "*".into());
@@ -223,6 +251,18 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_safe_escapes_controls_and_bidi_only() {
+        assert_eq!(display_safe("line\nnext\tcell"), "line\\nnext\\tcell");
+        assert!(display_safe("\u{202e}\u{2066}").is_ascii());
+        assert_eq!(display_safe("/usr/bin/caf\u{e9}"), "/usr/bin/caf\u{e9}");
+        let p = pb::ProcessInfo {
+            exe: "/tmp/\u{202e}gpj.sh".into(),
+            ..Default::default()
+        };
+        assert!(process_display(&p).is_ascii());
+    }
 
     fn proc(package: &str, provenance: pb::Provenance) -> pb::ProcessInfo {
         pb::ProcessInfo {

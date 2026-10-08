@@ -106,9 +106,11 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
     if let Some(p) = ev.process.as_ref() {
         if !p.exe.is_empty() {
             rows.push(plain(PROGRAM_LABEL, convert::process_display(p)));
+            // Display values go through `display_safe`; the copy keeps the
+            // raw string.
             rows.push(DetailRow {
                 label: "Path",
-                value: p.exe.clone(),
+                value: convert::display_safe(&p.exe),
                 note: "",
                 copy: Some(p.exe.clone()),
             });
@@ -121,7 +123,7 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         if !cmdline.is_empty() && cmdline != p.exe && cmdline != convert::process_display(p) {
             rows.push(DetailRow {
                 label: "Command line",
-                value: format::ellipsize(&cmdline, CMDLINE_MAX_CHARS),
+                value: format::ellipsize(&convert::display_safe(&cmdline), CMDLINE_MAX_CHARS),
                 note: "",
                 copy: Some(cmdline),
             });
@@ -138,7 +140,7 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         }
 
         if !p.cwd.is_empty() {
-            rows.push(plain("Working dir", p.cwd.clone()));
+            rows.push(plain("Working dir", convert::display_safe(&p.cwd)));
         }
 
         // Before the buttons, because it changes what Allow means here:
@@ -189,7 +191,18 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
 
         let remote = format::remote_display(&c.dst_host, &c.dst_ip, c.dst_port);
         if !remote.is_empty() {
-            rows.push(plain("Remote", remote));
+            // Same trust label as the tray bubble: a name from an observed
+            // DNS answer is whatever the answering server said.
+            rows.push(DetailRow {
+                label: "Remote",
+                value: remote,
+                note: match (c.dst_host.is_empty(), c.dst_host_verified) {
+                    (true, _) => "",
+                    (false, true) => "(verified name)",
+                    (false, false) => "(unverified name)",
+                },
+                copy: None,
+            });
         }
 
         if !matches!(
@@ -667,6 +680,42 @@ mod tests {
         assert_eq!(value_of(&ev, "Working dir").unwrap(), "/home/user");
         assert_eq!(value_of(&ev, "Source").unwrap(), "10.0.0.2:54321");
         assert_eq!(value_of(&ev, "Protocol").unwrap(), "tcp");
+    }
+
+    #[test]
+    fn untrusted_strings_render_on_one_line_without_bidi() {
+        let mut ev = event();
+        let p = ev.process.as_mut().unwrap();
+        p.exe = "/home/u/\u{202e}gpj.sh".into();
+        p.cmdline = vec!["x".into(), "\nPath   /usr/bin/firefox".into()];
+        p.cwd = "/tmp/\u{2066}a".into();
+        ev.connection.as_mut().unwrap().dst_host = "evil\n.example".into();
+        for row in detail_rows(&ev) {
+            assert!(!row.value.contains('\n'), "{}: {}", row.label, row.value);
+            assert!(
+                !row.value.contains(['\u{202e}', '\u{2066}']),
+                "{}: {}",
+                row.label,
+                row.value
+            );
+        }
+        let path = detail_rows(&ev)
+            .into_iter()
+            .find(|r| r.label == "Path")
+            .unwrap();
+        assert_eq!(
+            path.copy.unwrap(),
+            "/home/u/\u{202e}gpj.sh",
+            "the copy stays raw"
+        );
+        assert_eq!(
+            detail_rows(&ev)
+                .into_iter()
+                .find(|r| r.label == "Remote")
+                .unwrap()
+                .note,
+            "(unverified name)"
+        );
     }
 
     #[test]

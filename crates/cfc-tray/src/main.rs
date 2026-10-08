@@ -483,13 +483,14 @@ fn with_note(mut msg: String, note: &Option<String>) -> String {
 }
 
 /// A short, non-actionable follow-up ("rule created", "too late"). 5s,
-/// normal urgency.
+/// normal urgency. The body is escaped like a prompt's (see
+/// [`model::body_markup`]).
 fn notify_brief(body: String) {
     on_notification_thread(move || {
         let mut n = notify_rust::Notification::new();
         let _ = brand(&mut n)
             .summary("Colony Firewall")
-            .body(&body)
+            .body(&model::body_markup(&body))
             .timeout(notify_rust::Timeout::Milliseconds(5000))
             .show();
     });

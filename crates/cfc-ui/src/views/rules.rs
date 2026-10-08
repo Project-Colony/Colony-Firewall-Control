@@ -263,7 +263,7 @@ fn rule_row<'a>(
             text(if r.name.is_empty() {
                 "(unnamed)".to_string()
             } else {
-                r.name.clone()
+                convert::display_safe(&r.name)
             })
             .size(12),
             text(convert::rule_summary(r)).size(10),

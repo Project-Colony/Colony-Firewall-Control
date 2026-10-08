@@ -223,7 +223,8 @@ pub struct PromptNotification {
     /// first line of the bubble reads as a sentence on its own.
     pub summary: String,
     /// The destination on the first line and the full exe path on the
-    /// second, so the path never runs into the prose.
+    /// second, so the path never runs into the prose. Already escaped with
+    /// [`body_markup`].
     pub body: String,
     /// Remaining time until the prompt's deadline, clamped to at least
     /// [`MIN_PROMPT_TIMEOUT_MS`]. When it expires unanswered the daemon
@@ -258,7 +259,7 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
             } else {
                 format!(
                     "{} ({ip}; {} hostname)",
-                    c.dst_host,
+                    cfc_client::convert::display_safe(&c.dst_host),
                     if c.dst_host_verified {
                         "verified"
                     } else {
@@ -277,7 +278,7 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
     let mut body = target;
     if !exe.is_empty() {
         body.push('\n');
-        body.push_str(exe);
+        body.push_str(&cfc_client::convert::display_safe(exe));
     }
     if cfc_client::convert::exe_is_rule_scopable(exe) {
         body.push_str("\nAlways allow app covers all destinations until the rule is removed.");
@@ -300,7 +301,7 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
     let timeout_ms = remaining.clamp(i64::from(MIN_PROMPT_TIMEOUT_MS), i64::from(u32::MAX)) as u32;
     PromptNotification {
         summary,
-        body,
+        body: body_markup(&body),
         timeout_ms,
         offer_block: cfc_client::convert::exe_is_rule_scopable(exe),
     }
@@ -421,9 +422,28 @@ pub fn one_shot_fallback(choice: PromptChoice, exe: &str) -> String {
 
 /// The basename, for a message meant to be read at a glance.
 fn exe_display_name(exe: &str) -> String {
-    std::path::Path::new(exe)
-        .file_name()
-        .map_or_else(|| exe.to_string(), |n| n.to_string_lossy().into_owned())
+    cfc_client::convert::display_safe(
+        &std::path::Path::new(exe)
+            .file_name()
+            .map_or_else(|| exe.to_string(), |n| n.to_string_lossy().into_owned()),
+    )
+}
+
+/// Escapes a notification body for servers that parse it as markup.
+///
+/// The freedesktop spec lets a server that advertises `body-markup` read
+/// the body as a subset of HTML, and dunst and mako parse full Pango markup:
+/// a path segment like `<span alpha='1'>` hid the rest of the path right
+/// above "Always allow app". The summary is plain text by the spec and is
+/// left alone.
+///
+/// ponytail: escaped whether or not the server advertises `body-markup`, so
+/// a server without it shows `&amp;` for a literal `&`. Only names that
+/// carry `&`, `<` or `>` pay that; probe the capability if it ever matters.
+pub fn body_markup(body: &str) -> String {
+    body.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// How a newly arrived prompt is surfaced.
@@ -762,6 +782,31 @@ mod tests {
     fn prompt_notification_body_carries_the_full_exe_on_a_second_line() {
         let n = prompt_notification(&prompt_event("/usr/bin/curl", "example.com", "", 0), 0);
         assert_eq!(n.body, "example.com (unknown; unverified hostname):443 (tcp)\n/usr/bin/curl\nAlways allow app covers all destinations until the rule is removed.");
+    }
+
+    #[test]
+    fn prompt_notification_cannot_be_restyled_or_reflowed_by_its_strings() {
+        // A valid path whose segments are Pango markup, and a DNS name that
+        // forges a second, "verified" destination line.
+        let n = prompt_notification(
+            &prompt_event(
+                "/home/u/<span alpha='1'>.cache/evil</span>/firefox",
+                "google.com (1.2.3.4; verified hostname):443 (tcp)\n/usr/lib/firefox/firefox\n\n.x",
+                "6.6.6.6",
+                0,
+            ),
+            0,
+        );
+        assert!(!n.body.contains('<') && !n.body.contains('>'), "{}", n.body);
+        assert!(n.body.contains("&lt;span alpha='1'&gt;"), "{}", n.body);
+        assert_eq!(
+            n.body.lines().count(),
+            3,
+            "only the tray's own line breaks: {}",
+            n.body
+        );
+        let n = prompt_notification(&prompt_event("/tmp/\u{202e}fdp.sh", "", "1.2.3.4", 0), 0);
+        assert!(n.summary.is_ascii() && n.body.is_ascii(), "{}", n.body);
     }
 
     #[test]

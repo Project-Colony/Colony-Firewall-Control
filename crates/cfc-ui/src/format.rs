@@ -3,6 +3,7 @@
 //! Deliberately free of iced types so the fiddly arithmetic (deadlines,
 //! CIDR widths, truncation) can be unit-tested without a renderer.
 
+use cfc_client::convert::display_safe;
 use cfc_client::proto;
 
 /// Prompt lifetime assumed when the daemon does not report one, so the
@@ -80,7 +81,7 @@ pub fn dest_display(dst_host: &str, dst_ip: &str, dst_port: u32) -> String {
     if dst_host.is_empty() {
         format!("{ip}:{dst_port}")
     } else {
-        format!("{dst_host} ({ip}:{dst_port})")
+        format!("{} ({ip}:{dst_port})", display_safe(dst_host))
     }
 }
 
@@ -94,6 +95,7 @@ pub fn dest_display(dst_host: &str, dst_ip: &str, dst_port: u32) -> String {
 /// Empty when the daemon named neither a host nor an address, so the caller
 /// can drop the row rather than render `?:0`.
 pub fn remote_display(dst_host: &str, dst_ip: &str, dst_port: u32) -> String {
+    let dst_host = display_safe(dst_host);
     match (dst_host.is_empty(), dst_ip.is_empty()) {
         (true, true) => String::new(),
         (true, false) => format!("{dst_ip}:{dst_port}"),
@@ -133,7 +135,7 @@ pub fn dest_key(dst_host: &str, dst_ip: &str) -> String {
             dst_ip.to_string()
         }
     } else {
-        dst_host.to_string()
+        display_safe(dst_host)
     }
 }
 
