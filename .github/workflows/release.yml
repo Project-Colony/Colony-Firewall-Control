@@ -48,7 +48,7 @@ jobs:
       - name: Check release assets against pkg/colony.json
         run: ./scripts/check-release-assets.sh
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: stable
 
@@ -81,7 +81,7 @@ jobs:
           echo "linker=${LINKER}" >> "${GITHUB_OUTPUT}"
           echo "nightly=${NIGHTLY} bpf-linker=${LINKER}"
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ steps.bpfpins.outputs.nightly }}
           components: rust-src
