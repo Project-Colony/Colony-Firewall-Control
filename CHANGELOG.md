@@ -265,6 +265,18 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - HARDENING.md says that with inbound filtering off a program outbound rules
   deny still answers inbound connections, that a deleted image is matched by
   its former path, and what a readable FUSE filesystem controls.
+- TROUBLESHOOTING.md told remote administrators to add `tcp dport 22 accept`
+  to a `policy accept` copy of the outbound chain. That let every process
+  reach any host on port 22 unjudged, accepted INVALID and UNTRACKED traffic,
+  dropped the loopback rule, and did nothing for reaching the box, since
+  inbound SSH replies are never queued. The guide now names the real lockout
+  risks (the inbound table, network lookups the login makes) and its
+  dead-man's switch removes both tables.
+- The docs now say what the 64 MiB hashing limit costs (hash-pinned rules
+  refuse such a program; outside a root-owned path "Allow always" is not
+  saved), that Docker grants `CAP_NET_RAW` by default, and that `cfc pause`,
+  not a profile switch, lets unmatched flows through while debugging.
+  SECURITY.md links the documented non-goals.
 
 ## [0.7.0] - 2026-09-30
 
