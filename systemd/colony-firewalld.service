@@ -126,8 +126,8 @@ PrivateDevices=true
 # logged at info, on a machine that was perfectly capable of pinning - which is
 # to say the "denials survive kill -9" property was silently absent.
 #
-# The ReadOnlyPaths below reproduce what ProtectKernelTunables covers, minus
-# the one directory that has to be writable. Every entry of /sys is listed
+# The ReadOnlyPaths below reproduce what ProtectKernelTunables makes
+# read-only, minus the one directory that has to be writable. Every entry of /sys is listed
 # individually rather than /sys as a whole, because listing the parent and then
 # excepting the child is exactly what does not work: systemd makes the parent
 # writable to reach it.
@@ -139,6 +139,11 @@ PrivateDevices=true
 # A new top-level directory in a future kernel's sysfs, or a /sys/fs or /proc
 # entry not listed here, would be writable to this unit until it is added
 # here. That is the cost of the trade, and it is smaller than losing the pin.
+#
+# ProtectKernelTunables also hides /proc/kallsyms and /proc/kcore; this list
+# does not. Opening /proc/kcore needs CAP_SYS_RAWIO, which the bounding set
+# drops, and without CAP_SYSLOG /proc/kallsyms shows this unit addresses only
+# when it shows them to every process.
 #
 # EVERY path is prefixed with "-", and that is not defensive tidiness. Without
 # it, systemd treats a missing path as a fatal error and the unit dies at

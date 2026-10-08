@@ -292,6 +292,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   saved), that Docker grants `CAP_NET_RAW` by default, and that `cfc pause`,
   not a profile switch, lets unmatched flows through while debugging.
   SECURITY.md links the documented non-goals.
+- HARDENING.md no longer says the unit's hand-written `ReadOnlyPaths`
+  cover everything `ProtectKernelTunables` does: they leave `/proc/kallsyms`
+  and `/proc/kcore` visible and any `/sys/fs` filesystem they do not name
+  writable.
 
 ## [0.7.0] - 2026-09-30
 

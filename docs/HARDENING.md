@@ -444,7 +444,7 @@ to shrink what a code-execution bug could reach:
 | `RestrictAddressFamilies`          | AF_UNIX, AF_INET, AF_INET6, AF_NETLINK only; no packet sockets |
 | `RestrictNamespaces`, `LockPersonality`, `RestrictRealtime`, `RestrictSUIDSGID` | Namespace and personality lockdown |
 | `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname` | No writing kernel state |
-| `ReadOnlyPaths` (in place of `ProtectKernelTunables`) | The `/proc` and `/sys` entries `ProtectKernelTunables` covers, listed by hand so `/sys/fs/bpf` stays writable for the pinned links. An entry missing from the list stays writable |
+| `ReadOnlyPaths` (in place of `ProtectKernelTunables`) | The `/proc` and `/sys` entries `ProtectKernelTunables` makes read-only, listed by hand so `/sys/fs/bpf` stays writable for the pinned links. An entry missing from the list stays writable: a `/sys/fs` filesystem or `/proc` entry it does not name, or a new top-level `/sys` directory. `/proc/kallsyms` and `/proc/kcore` stay visible, which `ProtectKernelTunables` would hide; without `CAP_SYS_RAWIO` the daemon cannot open `/proc/kcore`, and without `CAP_SYSLOG` it sees kernel addresses in `/proc/kallsyms` only when every process does |
 | `UMask=0077`                       | Closes the window between `bind` and the explicit chmod of the control socket |
 | `PrivateTmp`                       | No shared `/tmp`                |
 
