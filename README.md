@@ -254,9 +254,12 @@ box, not a passing one, and answering it with an allow would mean those
 hosts had no outbound firewall whatsoever. Stored rules are what such a
 machine runs on; `cfc prompts` is how you add more without a GUI.
 
-This cannot lock you out of a remote machine: the ruleset hooks `output`
-on `ct state new` only, so an inbound SSH session's replies are
-`ct state established` and are never queued.
+This does not refuse inbound SSH: the ruleset hooks `output` on
+`ct state new` only, so an inbound SSH session's replies are
+`ct state established` and are never queued. Outbound lookups the login
+itself makes (reverse DNS, LDAP or Kerberos from `sshd`'s PAM stack) are
+new flows and are judged like any other; see
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out).
 
 **Boot behaviour.** The nft units load independently before the daemon,
 `network-pre.target`, NetworkManager and systemd-networkd, after the
@@ -310,11 +313,13 @@ cfc status     # "enforcing yes", and it warns on stderr when it is not
 > **WARNING - remote / SSH machines:** the shipped nftables snippet is
 > fail-closed for everything except new loopback flows, which are allowed
 > while no daemon listens. If the daemon is down while the rule is loaded,
-> **all new non-loopback outbound connections drop**, and a mistake can lock you out of a box you
-> only reach over SSH. Read
-> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - specifically the
-> SSH exemption and dead-man's-switch patterns - *before* enabling
-> enforcement remotely.
+> **all new non-loopback outbound connections drop**. Inbound SSH still
+> connects, but a login that needs the network (LDAP, Kerberos, reverse DNS)
+> can fail, and the opt-in inbound table drops new SSH sessions outright
+> while the daemon is down. Read
+> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out) -
+> specifically the dead-man's switch - *before* enabling enforcement
+> remotely.
 
 ### Explicit application confinement
 

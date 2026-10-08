@@ -2,8 +2,9 @@
 
 The failure modes of an outbound firewall are unusually punishing: when it
 breaks, *the network* breaks, and the tool you'd use to debug it may be on
-the other side of the connection it just dropped. Read the first section
-before enabling enforcement on any machine you reach over SSH.
+the other side of the connection it just dropped. Read
+[Testing over SSH](#testing-over-ssh-without-locking-yourself-out) before
+enabling enforcement on any machine you reach over SSH.
 
 ## Daemon restarts and rule upgrades
 
@@ -53,56 +54,64 @@ this check. `CFC_INBOUND_FORCE=1` remains the explicit console override.
 
 ## Testing over SSH without locking yourself out
 
-The shipped nftables snippet is **fail-closed for everything except new
-loopback flows, which are allowed while no daemon listens**: the final
-`queue num 0` without the `bypass` keyword means that if nothing is
-listening on NFQUEUE 0 (daemon stopped, crashed, or not yet started), the
-kernel drops every *new* non-loopback outbound connection. Only the rule
-just above it, `oifname "lo" ct state new queue num 0 bypass`, lets new
-loopback flows through in that state. Your established SSH session
-survives (`ct state new` only matches new flows), but the moment it drops
-you cannot open a new one.
+The outbound table cannot refuse a new inbound SSH session. It hooks
+`output` and queues only `ct state new`, and everything `sshd` sends your
+client is a reply on a connection the client opened, so it is
+`ct state established` and never queued. That holds while the daemon is
+down too. Two things can still cut you off:
 
-Three layers of protection, use all of them the first time:
+- **The inbound table** (`colony-firewall-nft-inbound`, opt-in). It queues
+  every new inbound connection, SSH included, and only an inbound Allow rule
+  admits one. Its final `queue num 0` has no `bypass`, so while no daemon
+  listens it drops every new inbound connection whatever the rules say. The
+  session you enabled it from survives; the next one does not. Its lockout
+  guard (see above) refuses to load the table when no inbound Allow rule
+  could admit an established session, but it does not check the rule's
+  source network, and no rule admits anything while the daemon is down.
+- **Outbound lookups your login makes.** `sshd` and its PAM and NSS stack
+  can open new outbound flows while you log in: reverse DNS with
+  `UseDNS yes`, an LDAP, Kerberos, SSSD or RADIUS server. They are root
+  processes, so with no root prompt subscriber they get `no_ui_action` at
+  once (a denial under every profile), and while the daemon is down they
+  drop. Accounts that resolve locally are unaffected. Find these flows with
+  `sudo cfc prompts` or `cfc log --action deny` and allow each one scoped to
+  its program and server, for example
+  `cfc rules add --exe <program> --dst-net <server> --dst-port <port> --protocol tcp --name login-ldap`.
 
-**1. Allow SSH above the queue rule.** In a local copy of the snippet
-(see [Changing the shipped ruleset](#changing-the-shipped-ruleset)), add one
-line above the two queue rules of `chain output` so port 22 never reaches
-NFQUEUE at all:
+Do not exempt port 22 in the outbound chain. It does nothing for reaching
+the box, and `tcp dport 22 accept` lets every process on the host, attributed
+or not, reach any address on that port without a verdict or a log line.
 
-```
-        tcp dport 22 accept
-        oifname "lo" ct state new queue num 0 bypass
-        ct state new queue num 0
-```
+Use both of these the first time:
 
-(This exempts *outbound* SSH from filtering - for a remote machine you
-manage, also make sure your *inbound* SSH path doesn't depend on any
-process this firewall could deny, e.g. a DNS lookup in `sshd`'s PAM stack.)
-
-**2. Arm a dead-man's switch BEFORE applying the rules.** In a detached
+**1. Arm a dead-man's switch BEFORE applying the rules.** In a detached
 shell that survives your SSH session:
 
 ```sh
-sudo setsid sh -c 'sleep 300 && nft delete table inet colony_firewall' &
+sudo setsid sh -c 'sleep 300; nft delete table inet colony_firewall_inbound; nft delete table inet colony_firewall' &
 ```
 
 Then enable enforcement. If you still have connectivity after testing,
-cancel the timer (`sudo pkill -f 'nft delete table'`, or just
-`sudo systemctl reload colony-firewall-nft` after the timer fires). If you locked yourself out, wait out the
-five minutes and the table deletes itself.
+cancel the timer (`sudo pkill -f '[n]ft delete table'`; the brackets keep
+the pattern from matching the `sudo` running it), or, after it fired,
+`sudo systemctl reload colony-firewall-nft` (and
+`colony-firewall-nft-inbound` if it is enabled) to load the tables again.
+If you locked yourself out, wait out the five minutes and both tables
+delete themselves. Deleting the inbound table fails harmlessly when it was
+never loaded.
 
-**3. Know the console recovery.** From a local console, serial console, or
+**2. Know the console recovery.** From a local console, serial console, or
 your VPS provider's emergency shell:
 
 ```sh
-nft delete table inet colony_firewall   # stop enqueueing entirely
+nft delete table inet colony_firewall_inbound   # admit inbound again
+nft delete table inet colony_firewall           # stop enqueueing outbound
 # or
-systemctl start colony-firewalld        # give the queue a consumer again
+systemctl start colony-firewalld                # give the queue a consumer again
 ```
 
-Either one restores traffic; the first disables enforcement, the second
-resumes it.
+Deleting the tables disables enforcement; starting the daemon resumes it,
+and with it any inbound Allow rule you wrote.
 
 ## No network after enabling
 
@@ -116,7 +125,8 @@ cfc status
 ```
 
 If `systemctl` shows the unit dead while the nftables rule is loaded, you
-are in the fail-closed state described above: non-loopback packets are
+are in the fail-closed state (see the
+[matrix](#fail-open-vs-fail-closed-matrix)): new non-loopback flows are
 queued to NFQUEUE 0 and nobody answers. Start the daemon or delete the table.
 
 **Is the nftables table actually loaded?**
@@ -436,9 +446,11 @@ cfc status
 # prompt policy    30s timeout -> Deny, no UI -> Deny
 ```
 
-Inbound SSH is unaffected — the ruleset hooks `output` on `ct state new`,
-and an established session's replies are never queued — so you always
-have a way back in to fix it.
+Inbound SSH is unaffected: the outbound ruleset never queues a session's
+replies, and the opt-in inbound table judges by your inbound rules and
+`inbound_action`, not `no_ui_action`. A login that needs the network (LDAP,
+Kerberos, reverse DNS) is the exception; see
+[Testing over SSH](#testing-over-ssh-without-locking-yourself-out).
 
 Then pick one of three fixes:
 

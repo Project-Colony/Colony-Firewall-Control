@@ -471,7 +471,9 @@ The other half of the security posture is the nftables side, not the
 daemon: whether the kernel drops or accepts new connections when nobody
 is answering the queue. The shipped snippet is fail-closed for everything
 except new loopback flows, which are allowed while no daemon listens. That
-is the safer default and also the one that can lock you out of a remote box.
+is the safer default, and also the one that cuts a box off from everything
+it reaches out to, including any network lookup an SSH login needs (the
+opt-in inbound table drops new SSH sessions outright while the daemon is down).
 The full matrix - daemon up or down, table loaded or not, with and
 without `bypass` - is in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#fail-open-vs-fail-closed-matrix).
