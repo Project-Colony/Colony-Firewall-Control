@@ -96,6 +96,31 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transaction. The packet thread now skips a busy or stale index, and that
   "not ready" answer is no longer cached for an hour as "not from a package";
   it shows as unknown until the index is ready.
+- A refused `UpsertRule` or `ApplyRules` left nothing in the journal unless
+  authorization refused it, so "never sent" and "sent and refused" looked the
+  same (#46). Every refusal now logs the RPC, the caller's uid and pid, the
+  status code and its message. Refusal messages no longer echo a client
+  value of unbounded length.
+- Rule hit counts drifted upward: a rule write between the 30 s flush's drain
+  and merge stored the drained hits twice, and releasing a prompt credited a
+  matching rule even when the user's answer was the one applied.
+- A rule whose stored executable path later became an alias (a legacy
+  `/bin/curl`, or a target a package turned into a symlink) could not be
+  disabled, renamed or re-imported, only deleted. A path sent back unchanged
+  is accepted; new and changed paths are still checked.
+- A new timed rule took its creation date from the client, so a date in the
+  future kept "allow for 90s" alive indefinitely. Dates are clamped to now.
+- Enabled legacy hostname rules refuse flows that are logged as the default
+  policy. The daemon now names each one in a warning at startup.
+- eBPF: exit events usually arrived before the parent reaped the process and
+  were dropped, so on kernels without `group_dead` an in-kernel deny outlived
+  its process until a rule change or restart, where a recycled pid could
+  inherit it. Candidates are now checked again until their group is gone.
+  Overlapping verdict resyncs could also leave the older rule set's answers
+  in the kernel, and a rule changed during the startup resync never reached
+  it.
+- A daemon started by hand under umask 000 created its socket directory
+  world-writable, so a local user could replace the socket.
 
 ## [0.7.0] - 2026-09-30
 
