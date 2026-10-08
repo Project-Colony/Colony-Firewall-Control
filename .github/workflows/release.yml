@@ -261,7 +261,9 @@ jobs:
   pkgbuild:
     if: github.ref_type == 'tag'
     # Package only after the main build succeeds. Publishing runs separately
-    # with write permission after both builds complete.
+    # with write permission after both builds complete. build has already
+    # refused a tag other than v<Cargo version> and run check-versions.sh,
+    # which holds pkgver to that version, so pkgver matches the tag here.
     needs: build
     runs-on: ubuntu-latest
     container: archlinux:base-devel
@@ -288,16 +290,6 @@ jobs:
         run: |
           useradd -m builder
           chown -R builder: .
-
-      - name: Verify pkgver matches the tag
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          PKGVER="$(sed -n 's/^pkgver=//p' pkg/PKGBUILD | head -n1)"
-          if [ "${REF_NAME}" != "v${PKGVER}" ]; then
-            echo "::error::pkg/PKGBUILD pkgver=${PKGVER} does not match tag ${REF_NAME}"
-            exit 1
-          fi
 
       - name: updpkgsums - replace the SKIP placeholder with real checksums
         working-directory: pkg
