@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
-Version:        0.7.0
+Version:        0.8.0
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -269,6 +269,14 @@ fi
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 
 %changelog
+* Thu Oct 08 2026 MotherSphere <mothersphere.colony@gmail.com> - 0.8.0-1
+- Accept rule changes only from root and the installed app and tray; polkit guards pause, resume, rule import and Allow rules naming no program
+- A program Deny or Reject now wins over every Allow rule that names no program
+- Prompt instead of silently refusing flows whose program or UDP owner is only partly known
+- Keep IPv6 neighbour discovery, MLD and IGMP working under the outbound policy
+- Settle loopback: judged by the daemon while it runs, allowed while it is down
+- Remove the disabled Fast Allow path from the daemon, CLI and protocol
+
 * Wed Sep 30 2026 MotherSphere <mothersphere.colony@gmail.com> - 0.7.0-1
 - Add opt-in headless application confinement with explicit numeric IP permissions
 - Disable Fast Allow and new hostname policies; require explicit canonical targets
