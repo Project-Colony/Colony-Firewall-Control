@@ -58,6 +58,11 @@ fn ip_prefixes(value: &Value) -> Result<BTreeSet<(IpAddr, u32)>> {
     Ok(result)
 }
 
+/// The unit's own pair must be attached directly and run. Extra effective
+/// programs come from ancestors, such as the daemon's DNS observer on the
+/// cgroup root. They are accepted because these attach points only take
+/// cgroup_skb programs, whose verdicts the kernel ANDs: another program can
+/// drop more traffic, never admit what the native pair refuses.
 fn program_set(direct: &[u32], effective: &[u32]) -> Result<()> {
     let expected: BTreeSet<_> = direct.iter().copied().collect();
     let actual: BTreeSet<_> = effective.iter().copied().collect();
@@ -66,7 +71,7 @@ fn program_set(direct: &[u32], effective: &[u32]) -> Result<()> {
         "missing or duplicate native cgroup filters"
     );
     ensure!(
-        effective.len() == 2 && actual == expected,
+        actual.len() == effective.len() && !actual.contains(&0) && actual.is_superset(&expected),
         "unexpected effective cgroup filters"
     );
     Ok(())
@@ -1132,12 +1137,16 @@ mod tests {
     }
 
     #[test]
-    fn effective_filters_must_exactly_match_direct_pair() {
+    fn effective_filters_must_run_the_direct_pair() {
         assert!(program_set(&[7, 9], &[9, 7]).is_ok());
+        // An ancestor's program, such as CFC's DNS observer on the root.
+        assert!(program_set(&[7, 9], &[7, 9, 10]).is_ok());
         for (direct, effective) in [
             (vec![], vec![]),
             (vec![7, 9], vec![7]),
-            (vec![7, 9], vec![7, 9, 10]),
+            (vec![7, 9], vec![7, 10]),
+            (vec![7, 9], vec![7, 9, 9]),
+            (vec![7, 9], vec![7, 9, 0]),
             (vec![7, 7], vec![7, 7]),
             (vec![0, 9], vec![0, 9]),
         ] {
