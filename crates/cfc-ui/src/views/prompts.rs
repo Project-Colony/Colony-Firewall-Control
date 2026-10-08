@@ -39,7 +39,7 @@ pub fn view<'a>(
             column![
                 text("No pending prompts").size(18),
                 text("Outbound flows without a matching rule will appear here for you to allow or block.").size(12),
-                text("Keyboard: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(11),
+                text("Keyboard, on the top prompt: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(11),
             ]
             .spacing(8),
         )
@@ -54,9 +54,12 @@ pub fn view<'a>(
         .unwrap_or(proto::Action::Unspecified as i32);
     let timeout_secs = status.map(|s| s.prompt_timeout_secs).unwrap_or(0);
 
+    // The first card is the one the A/D keys answer (see
+    // `App::answer_key_target`), so it is the one that carries the marker.
     let cards: Vec<Element<'a, Message>> = prompts
         .iter()
-        .map(|c| prompt_card(c, timeout_action, timeout_secs, now_ms))
+        .enumerate()
+        .map(|(i, c)| prompt_card(c, timeout_action, timeout_secs, now_ms, i == 0))
         .collect();
 
     container(scrollable(column(cards).spacing(12).padding(8)).height(Length::Fill))
@@ -359,11 +362,28 @@ fn prompt_card(
     timeout_action: i32,
     timeout_secs: u32,
     now_ms: i64,
+    key_target: bool,
 ) -> Element<'_, Message> {
     let ev = &card.event;
     let program = program_label(ev);
+    // Disabled for a moment after the card appears, so a click aimed at
+    // whatever was here before cannot land on a verdict.
+    let armed = card.armed(now_ms);
 
-    let header = text(heading(ev)).size(16);
+    let marker: Element<'_, Message> = if key_target {
+        text("A / D answer this prompt")
+            .size(10)
+            .color(crate::theme::PARCHMENT_MUTED)
+            .into()
+    } else {
+        Space::new().into()
+    };
+    let header = row![
+        text(heading(ev)).size(16),
+        Space::new().width(Length::Fill),
+        marker
+    ]
+    .align_y(iced::Alignment::Center);
     let countdown = countdown_row(card, timeout_action, timeout_secs, now_ms);
 
     let table = column(
@@ -385,28 +405,32 @@ fn prompt_card(
             ev,
             &program,
             iced::widget::button::success,
-            true
+            true,
+            armed
         ),
         action_row(
             PromptAction::BlockProgram,
             ev,
             &program,
             iced::widget::button::danger,
-            true
+            true,
+            armed
         ),
         action_row(
             PromptAction::BlockOnce,
             ev,
             &program,
             iced::widget::button::secondary,
-            true
+            true,
+            armed
         ),
         action_row(
             PromptAction::AllowOnce,
             ev,
             &program,
             crate::theme::action_secondary,
-            false
+            false,
+            armed
         ),
     ]
     .spacing(6);
@@ -470,20 +494,24 @@ fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
 
 /// A full-width choice: what it does on line one, what it persists on line
 /// two. `prominent` is the difference between one of the three decisions
-/// and the subordinate "Allow once" beneath them.
+/// and the subordinate "Allow once" beneath them. Rendered disabled until
+/// `armed`.
 fn action_row<'a>(
     choice: PromptAction,
     ev: &proto::PromptEvent,
     program: &str,
     style: ButtonStyle,
     prominent: bool,
+    armed: bool,
 ) -> Element<'a, Message> {
-    let press = verdict_for(choice, ev).map(|v| Message::SubmitVerdict {
-        prompt_id: ev.prompt_id.clone(),
-        action: v.action,
-        scope: v.scope,
-        duration: v.duration,
-    });
+    let press = verdict_for(choice, ev)
+        .filter(|_| armed)
+        .map(|v| Message::SubmitVerdict {
+            prompt_id: ev.prompt_id.clone(),
+            action: v.action,
+            scope: v.scope,
+            duration: v.duration,
+        });
 
     let (title_size, sub_size) = if prominent { (14, 11) } else { (12, 10) };
     let padding: iced::Padding = if prominent {

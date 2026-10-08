@@ -39,6 +39,13 @@ const DELETE_CONFIRM_MS: i64 = 3_000;
 /// a smooth bar, slow enough to stay off the CPU when nothing is pending.
 const DEADLINE_TICK_MS: u64 = 400;
 
+/// How long a prompt's verdict controls stay disabled after the card
+/// appears, and how long the keyboard target stays disarmed after it
+/// changes. A click or key press already on its way when the layout changed
+/// (the window was raised, a card arrived, the card above expired) must not
+/// land on a verdict the user never saw.
+const PROMPT_ARM_MS: i64 = 1_000;
+
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -61,6 +68,9 @@ pub struct App {
     pub rules: Vec<proto::RuleInfo>,
     pub live: VecDeque<LiveEntry>,
     pub prompts: Vec<PromptCard>,
+    /// The card the A/D keys answer and when they may: `(prompt_id,
+    /// armed_at_ms)`. See [`App::sync_key_target`].
+    pub key_target: Option<(String, i64)>,
     pub status: Option<proto::StatusResponse>,
     pub log: StatusLog,
     pub editor: Option<RuleEditor>,
@@ -333,24 +343,29 @@ pub struct PromptCard {
     /// Wall clock at which the daemon answers this prompt itself. 0 means
     /// the daemon attached no deadline.
     pub deadline_unix_ms: i64,
+    /// Wall clock before which the verdict buttons stay disabled.
+    pub armed_at_ms: i64,
 }
 
 impl PromptCard {
-    fn new(event: proto::PromptEvent) -> Self {
+    fn new(event: proto::PromptEvent, now_ms: i64) -> Self {
         Self {
             deadline_unix_ms: event.deadline_unix_ms,
             event,
+            armed_at_ms: now_ms.saturating_add(PROMPT_ARM_MS),
         }
+    }
+
+    pub fn armed(&self, now_ms: i64) -> bool {
+        now_ms >= self.armed_at_ms
     }
 }
 
 /// How loudly a newly arrived prompt announces itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attention {
-    /// Leave the window alone entirely.
+    /// Leave the window and the tab alone; the sidebar badge counts it.
     None,
-    /// Show the Prompts tab, but do not touch the window.
-    Tab,
     /// Show the Prompts tab and pull the window in front of whatever the
     /// user is looking at.
     TabAndRaise,
@@ -359,20 +374,22 @@ pub enum Attention {
 /// Decides what the arrival of a prompt does to the window.
 ///
 /// `pending_before` is the queue length *before* this prompt was pushed, so
-/// only the 0 -> 1 transition raises. A burst of ten prompts must not slam
-/// the window into the user's face ten times; a queue that drains and then
-/// refills is a genuinely new interruption and may raise again.
+/// only the 0 -> 1 transition switches the tab and raises. A burst of ten
+/// prompts must not slam the window into the user's face ten times, and a
+/// user who left the Prompts tab with prompts pending already knows about
+/// them: switching the tab under their cursor again would turn the click
+/// they were making on a rule row into a click on a verdict. A queue that
+/// drains and then refills is a genuinely new interruption and may raise
+/// again.
 ///
 /// An open rule editor suppresses all of it. Focus-stealing is disruptive
 /// at the best of times, and yanking the tab out from under someone
 /// half-way through a form loses what they had typed.
 pub fn prompt_attention(pending_before: usize, editor_open: bool) -> Attention {
-    if editor_open {
+    if editor_open || pending_before > 0 {
         Attention::None
-    } else if pending_before == 0 {
-        Attention::TabAndRaise
     } else {
-        Attention::Tab
+        Attention::TabAndRaise
     }
 }
 
@@ -519,6 +536,7 @@ impl App {
             rules: Vec::new(),
             live: VecDeque::with_capacity(LIVE_CAP),
             prompts: Vec::new(),
+            key_target: None,
             status: None,
             log: StatusLog::default(),
             editor: None,
@@ -624,6 +642,21 @@ impl App {
                 ),
                 now,
             );
+        }
+        self.sync_key_target();
+    }
+
+    /// Points the keyboard at the top card and disarms it for
+    /// [`PROMPT_ARM_MS`] whenever that card changes.
+    ///
+    /// The top card is the oldest one, first on screen and first to expire,
+    /// and a new arrival never displaces it. Re-arming on every change means
+    /// a key press already on its way when the card above expired or was
+    /// answered does not land on the card that just moved up.
+    fn sync_key_target(&mut self) {
+        let top = self.prompts.first().map(|card| &card.event.prompt_id);
+        if self.key_target.as_ref().map(|(id, _)| id) != top {
+            self.key_target = top.map(|id| (id.clone(), self.now_ms.saturating_add(PROMPT_ARM_MS)));
         }
     }
 
@@ -765,17 +798,17 @@ impl App {
                 // notifications now - two bubbles per prompt would train
                 // users to ignore them. The GUI shows its card either way.
                 self.stream_trouble = false;
+                // The arming deadline is measured from now, not from the
+                // last tick, which can be two seconds old.
+                self.now_ms = now_ms();
                 // A prompt is a held-open connection with a deadline on it;
                 // a card the user only sees if they happen to be looking at
                 // the right tab is not an ask, it is a countdown they lose.
                 let attention = prompt_attention(self.prompts.len(), self.editor.is_some());
-                self.prompts.push(PromptCard::new(ev));
+                self.prompts.push(PromptCard::new(ev, self.now_ms));
+                self.sync_key_target();
                 match attention {
                     Attention::None => Task::none(),
-                    Attention::Tab => {
-                        self.tab = Tab::Prompts;
-                        Task::none()
-                    }
                     Attention::TabAndRaise => {
                         self.tab = Tab::Prompts;
                         raise_window()
@@ -918,7 +951,10 @@ impl App {
                 self.log.clear();
                 Task::none()
             }
-            Message::Key(kp) => self.handle_key(kp),
+            Message::Key(kp) => {
+                self.now_ms = now_ms();
+                self.handle_key(kp)
+            }
             Message::TogglePaused => {
                 let current = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
                 let socket = self.socket_path.clone();
@@ -1077,14 +1113,23 @@ impl App {
                 Task::none()
             }
             keyboard::Key::Character(ref c) => {
+                // Only bare keys and Shift are ours. Ctrl+A is "select all"
+                // out of habit, and Alt and Super chords belong to the
+                // desktop; none of them may answer a prompt.
+                if kp.modifiers.control() || kp.modifiers.alt() || kp.modifiers.logo() {
+                    return Task::none();
+                }
                 let shift = kp.modifiers.shift();
+                let on_prompts = self.tab == Tab::Prompts;
                 match c.to_lowercase().as_str() {
-                    "a" => self.answer_newest(if shift {
+                    // The verdict keys only work where the card they answer
+                    // is on screen.
+                    "a" if on_prompts => self.answer_key_target(if shift {
                         PromptAction::AllowProgram
                     } else {
                         PromptAction::AllowOnce
                     }),
-                    "d" => self.answer_newest(if shift {
+                    "d" if on_prompts => self.answer_key_target(if shift {
                         PromptAction::BlockProgram
                     } else {
                         PromptAction::BlockOnce
@@ -1100,16 +1145,29 @@ impl App {
         }
     }
 
-    /// Answers the most recent prompt with the same verdict the matching
-    /// button would submit.
+    /// Answers the top card, the one marked as the keyboard target, with
+    /// the same verdict the matching button would submit. Does nothing while
+    /// the target is disarmed (see [`App::sync_key_target`]).
+    ///
+    /// It used to answer the newest prompt, which is the bottom card and
+    /// often below the fold: the user read the card at the top, pressed
+    /// Shift+A, and wrote an always-allow rule for a program they never saw.
     ///
     /// A program-scoped choice on a flow with no executable path has no
     /// honest verdict (see `verdict_for`), so it degrades to the one-off
     /// answer of the same action rather than doing nothing: the user
     /// pressed Shift+D to stop a connection, and stopping it is the part
     /// that matters.
-    fn answer_newest(&mut self, choice: PromptAction) -> Task<Message> {
-        let Some(card) = self.prompts.last() else {
+    fn answer_key_target(&mut self, choice: PromptAction) -> Task<Message> {
+        self.sync_key_target();
+        if !self
+            .key_target
+            .as_ref()
+            .is_some_and(|(_, armed_at)| self.now_ms >= *armed_at)
+        {
+            return Task::none();
+        }
+        let Some(card) = self.prompts.first() else {
             return Task::none();
         };
         let ev = &card.event;
@@ -1256,6 +1314,7 @@ impl App {
 
         let hints = column![
             text("1-4  switch tab").size(9),
+            text("Keys answer the top prompt:").size(9),
             text("A  allow once").size(9),
             text("D  block for now").size(9),
             text("Shift+A  always allow program").size(9),
@@ -1946,7 +2005,7 @@ mod tests {
     fn customization_waits_for_a_verdict_and_drops_stale_actions() {
         let (mut app, _) = App::new();
         let event = prompt_event();
-        app.prompts.push(PromptCard::new(event.clone()));
+        app.prompts.push(PromptCard::new(event.clone(), 0));
         let task = app.update(Message::CustomizePromptRule(event.prompt_id.clone()));
         assert_eq!(task.units(), 0, "opening the editor issues no verdict RPC");
         assert_eq!(app.prompts.len(), 1, "the prompt remains pending");
@@ -1969,7 +2028,7 @@ mod tests {
     fn an_expired_prompt_closes_its_customization() {
         let (mut app, _) = App::new();
         let event = prompt_event();
-        app.prompts.push(PromptCard::new(event.clone()));
+        app.prompts.push(PromptCard::new(event.clone(), 0));
         app.editor = Some(RuleEditor::from_prompt(&event));
         app.now_ms = event.deadline_unix_ms + 1;
         app.housekeeping();
@@ -2036,9 +2095,10 @@ mod tests {
     fn a_first_prompt_raises_the_window_and_a_burst_does_not() {
         // 0 -> 1 is the interruption worth stealing focus for.
         assert_eq!(prompt_attention(0, false), Attention::TabAndRaise);
-        // 1 -> 2, 2 -> 3: the user is already looking at the queue.
-        assert_eq!(prompt_attention(1, false), Attention::Tab);
-        assert_eq!(prompt_attention(9, false), Attention::Tab);
+        // 1 -> 2, 2 -> 3: the user already knows about the queue, and a tab
+        // switch under their cursor would turn a click into a verdict.
+        assert_eq!(prompt_attention(1, false), Attention::None);
+        assert_eq!(prompt_attention(9, false), Attention::None);
         // Drained and refilled: a genuinely new interruption.
         assert_eq!(prompt_attention(0, false), Attention::TabAndRaise);
     }
@@ -2050,6 +2110,74 @@ mod tests {
         assert_eq!(prompt_attention(3, true), Attention::None);
     }
 
+    fn key(c: &str, modifiers: keyboard::Modifiers) -> KeyPress {
+        KeyPress {
+            key: keyboard::Key::Character(c.into()),
+            modifiers,
+        }
+    }
+
+    fn prompt(id: &str, exe: &str) -> proto::PromptEvent {
+        let mut ev = prompt_event();
+        ev.prompt_id = id.into();
+        ev.process.as_mut().unwrap().exe = exe.into();
+        ev.deadline_unix_ms = 0;
+        ev
+    }
+
+    #[test]
+    fn verdict_keys_answer_the_armed_top_card_only() {
+        let (mut app, _) = App::new();
+        app.now_ms = 1_000_000;
+        app.prompts.push(PromptCard::new(
+            prompt("top", "/usr/lib/firefox/firefox"),
+            0,
+        ));
+        app.prompts.push(PromptCard::new(
+            prompt("below", "/home/u/.cache/x/updater"),
+            0,
+        ));
+        let shift = keyboard::Modifiers::SHIFT;
+
+        // The top card just became the target: a press already on its way
+        // answers nothing.
+        assert_eq!(app.handle_key(key("A", shift)).units(), 0);
+        assert_eq!(app.prompts.len(), 2);
+
+        app.now_ms += PROMPT_ARM_MS;
+        // Chords and other tabs never answer.
+        for m in [
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+            keyboard::Modifiers::CTRL | shift,
+        ] {
+            assert_eq!(app.handle_key(key("a", m)).units(), 0, "{m:?}");
+        }
+        app.tab = Tab::Rules;
+        assert_eq!(app.handle_key(key("a", shift)).units(), 0);
+        app.tab = Tab::Prompts;
+
+        assert_eq!(app.handle_key(key("A", shift)).units(), 1);
+        let ids: Vec<_> = app.prompts.iter().map(|c| &c.event.prompt_id).collect();
+        assert_eq!(ids, ["below"], "the top card is answered, not the newest");
+
+        // The card that moved up is disarmed again.
+        assert_eq!(
+            app.handle_key(key("a", keyboard::Modifiers::empty()))
+                .units(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_prompt_card_is_disarmed_right_after_it_appears() {
+        let card = PromptCard::new(prompt("p", "/usr/bin/curl"), 5_000);
+        assert!(!card.armed(5_000));
+        assert!(!card.armed(5_000 + PROMPT_ARM_MS - 1));
+        assert!(card.armed(5_000 + PROMPT_ARM_MS));
+    }
+
     #[test]
     fn prompt_card_captures_the_daemon_deadline() {
         let ev = proto::PromptEvent {
@@ -2057,6 +2185,6 @@ mod tests {
             deadline_unix_ms: 1_700_000_000_000,
             ..Default::default()
         };
-        assert_eq!(PromptCard::new(ev).deadline_unix_ms, 1_700_000_000_000);
+        assert_eq!(PromptCard::new(ev, 0).deadline_unix_ms, 1_700_000_000_000);
     }
 }
