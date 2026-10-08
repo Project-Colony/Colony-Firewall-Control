@@ -247,7 +247,9 @@ is a separate launch mode.
   that way too. Digests and the
   root-sealed test trust what the filesystem reports: on a FUSE filesystem
   the daemon can read (`user_allow_other` in `/etc/fuse.conf`), the user who
-  mounted it controls both.
+  mounted it controls both. An image the daemon cannot open at all, such as
+  an AppImage or anything on a FUSE mount without `allow_other`, has no
+  executable identity, so an Allow scoped to its path never applies to it.
 - **Raw and packet sockets**: applications with `CAP_NET_RAW` can use AF_PACKET
   outside the shipped `inet OUTPUT` hook. Raw IP packets can coincide with
   another socket's tuple even when TCP matching is strict. Tuple and inode
