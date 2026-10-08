@@ -1313,21 +1313,27 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
         "dest.host" | "dest.domain" => anyhow::bail!(
             "hostname policy is unsupported; use an explicit numeric dest.ip or dest.network"
         ),
+        // Parsed here, as the daemon will: one bad value must skip its own
+        // file with a reason, not fail the whole batch at the daemon.
         "dest.ip" => {
+            let ip = s.data.parse::<std::net::IpAddr>().map_err(|_| {
+                anyhow::anyhow!("operand `dest.ip`: `{}` is not an IP address", s.data)
+            })?;
             // single IP -> /32 or /128
-            let net = if s.data.contains(':') {
-                format!("{}/128", s.data)
-            } else {
-                format!("{}/32", s.data)
-            };
+            let net = ipnet::IpNet::from(ip).to_string();
             set_once("dest.ip", &mut scope.dst_net, net)?;
         }
-        "dest.network" => set_once("dest.network", &mut scope.dst_net, s.data.clone())?,
+        "dest.network" => {
+            let net = s.data.parse::<ipnet::IpNet>().map_err(|_| {
+                anyhow::anyhow!("operand `dest.network`: `{}` is not a CIDR network", s.data)
+            })?;
+            set_once("dest.network", &mut scope.dst_net, net.to_string())?;
+        }
         "dest.port" => {
             if scope.has_dst_port {
                 anyhow::bail!("operand `dest.port` appears more than once");
             }
-            scope.dst_port = s.data.parse::<u32>().map_err(|_| {
+            scope.dst_port = s.data.parse::<u16>().map(u32::from).map_err(|_| {
                 anyhow::anyhow!("operand `dest.port`: `{}` is not a port number", s.data)
             })?;
             scope.has_dst_port = true;
@@ -3228,6 +3234,26 @@ mod opensnitch_tests {
         )
         .unwrap();
         assert_eq!(r.scope.unwrap().dst_net, "2001:db8::1/128");
+    }
+
+    // These used to pass conversion and then fail the whole batch at the
+    // daemon, so one bad file stopped the import without being named.
+    #[test]
+    fn malformed_addresses_and_ports_fail_their_own_file() {
+        for (operand, data) in [
+            ("dest.ip", "10.0.0.0/8"),
+            ("dest.ip", "example.org"),
+            ("dest.network", "10.0.0.0/33"),
+            ("dest.network", "10.0.0.1"),
+            ("dest.port", "70000"),
+        ] {
+            let source = format!(
+                r#"{{"action":"deny","duration":"always","operator":{{"type":"simple","operand":"{operand}","data":"{data}"}}}}"#
+            );
+            assert!(parse(&source).is_err(), "{operand} {data}");
+        }
+        let r = parse(r#"{"action":"deny","operator":{"type":"simple","operand":"dest.network","data":"10.0.0.0/8"}}"#).unwrap();
+        assert_eq!(r.scope.unwrap().dst_net, "10.0.0.0/8");
     }
 
     #[test]
