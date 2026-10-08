@@ -112,6 +112,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under `ptrace` and patches it before it seals itself, which the default
   Yama `ptrace_scope = 1` allows; the daemon warns at startup until
   `kernel.yama.ptrace_scope` is 2.
+  The tray now takes a prompt notification's answer only from the
+  notification server's own bus connection: the button signal is one any
+  session-bus program can emit, and the tray, trusted by the daemon, used to
+  act on it, so a program could press "Always allow app" on its own prompt.
 - **Breaking: pause, resume and rule import from the app or tray ask for an
   administrator password** through polkit
   (`org.projectcolony.firewall.pause`, `org.projectcolony.firewall.import-rules`,

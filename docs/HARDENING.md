@@ -400,6 +400,11 @@ runs inside the installed app is the app:
   echo 'kernel.yama.ptrace_scope = 2' | sudo tee /etc/sysctl.d/60-ptrace-scope.conf
   sudo sysctl --system
   ```
+- the session's notification server, which the tray's prompt buttons go
+  through. The tray takes an answer only from the connection that owns
+  `org.freedesktop.Notifications` (a button signal any other program emits
+  is ignored), but a same-user program that stops the notification daemon
+  and takes that name answers for you, "Always allow app" included;
 - synthetic input into the GUI under X11 or XWayland can click its buttons;
 - a socket handed back into the app: a same-user program that started the
   app itself (connect first, then exec the installed binary, keeping a copy

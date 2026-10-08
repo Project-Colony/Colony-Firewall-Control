@@ -8,6 +8,7 @@
 //! same control socket as the GUI and CLI - quitting the tray never
 //! touches the daemon.
 
+mod answers;
 mod icon;
 mod model;
 mod theme;
@@ -572,54 +573,46 @@ impl PromptNotifier {
             .map(|p| p.exe.clone())
             .unwrap_or_default();
         let tx = self.tx.clone();
-        // One blocking task per shown notification: show() and
-        // wait_for_action() both block on D-Bus, and the wait lasts until
-        // the user acts or the bubble expires.
-        on_notification_thread(move || {
-            let mut notification = notify_rust::Notification::new();
-            brand(&mut notification)
-                .summary(&n.summary)
-                .body(&n.body)
-                .timeout(notify_rust::Timeout::Milliseconds(n.timeout_ms))
-                // Verdicts first and short: these are what the user came
-                // for, and long labels wrap the button row onto a second
-                // line. "Details" is the freedesktop `default` action, so
-                // clicking the bubble body opens the GUI too.
-                .action(model::KEY_ALLOW_ONCE, "Allow once");
-            if n.offer_block {
-                notification.action(model::KEY_ALLOW, "Always allow app");
-            }
-            notification.action(model::KEY_DENY, "Deny");
-            if n.offer_block {
-                notification.action(model::KEY_BLOCK, "Block app");
-            }
-            notification.action(model::KEY_DEFAULT, "Details");
-            let shown_id = prompt_id.clone();
-            let shown_tx = tx.clone();
-            let done = move |key: &str| {
-                // Failing only means the main loop is gone; the process
-                // is on its way out.
-                let _ = tx.send(Cmd::PromptResult {
-                    prompt_id,
-                    exe,
-                    key: key.to_string(),
-                });
-            };
-            match notification.show() {
-                Ok(handle) => {
-                    let _ = shown_tx.send(Cmd::PromptShown {
-                        prompt_id: shown_id,
-                        id: handle.id(),
-                    });
-                    handle.wait_for_action(done);
-                }
+        let mut notification = notify_rust::Notification::new();
+        brand(&mut notification)
+            .summary(&n.summary)
+            .body(&n.body)
+            .timeout(notify_rust::Timeout::Milliseconds(n.timeout_ms))
+            // Verdicts first and short: these are what the user came
+            // for, and long labels wrap the button row onto a second
+            // line. "Details" is the freedesktop `default` action, so
+            // clicking the bubble body opens the GUI too.
+            .action(model::KEY_ALLOW_ONCE, "Allow once");
+        if n.offer_block {
+            notification.action(model::KEY_ALLOW, "Always allow app");
+        }
+        notification.action(model::KEY_DENY, "Deny");
+        if n.offer_block {
+            notification.action(model::KEY_BLOCK, "Block app");
+        }
+        notification.action(model::KEY_DEFAULT, "Details");
+        // Waited for past the prompt's deadline: by then the slot is
+        // reclaimed and the bubble closed, so this only ends a wait whose
+        // server vanished without saying so.
+        let wait = Duration::from_millis(
+            u64::try_from(ev.deadline_unix_ms.saturating_sub(now_unix_ms())).unwrap_or(0),
+        ) + ANSWER_GRACE;
+        tokio::spawn(async move {
+            let key = match await_answer(notification, &prompt_id, &tx, wait).await {
+                Ok(key) => key,
                 Err(e) => {
-                    warn!("showing prompt notification: {e}");
-                    // Free the slot; the daemon's timeout_action covers
-                    // the prompt itself.
-                    done(model::KEY_CLOSED);
+                    // The daemon's timeout_action covers the prompt itself.
+                    warn!("prompt notification: {e}");
+                    model::KEY_CLOSED.to_string()
                 }
-            }
+            };
+            // Failing only means the main loop is gone; the process is on
+            // its way out.
+            let _ = tx.send(Cmd::PromptResult {
+                prompt_id,
+                exe,
+                key,
+            });
         });
     }
 
@@ -638,6 +631,8 @@ impl PromptNotifier {
                     match shown {
                         Ok(handle) => {
                             let _ = tx.send(Cmd::OverflowShown { id: handle.id() });
+                            // notify-rust takes this answer from any sender
+                            // (see `answers`); here that can only open the GUI.
                             handle.wait_for_action(|key: &str| {
                                 let _ = tx.send(Cmd::OverflowResult {
                                     key: key.to_string(),
@@ -702,6 +697,41 @@ impl PromptNotifier {
             None => close_notifications(vec![id]),
         }
     }
+}
+
+/// How long past a prompt's deadline its bubble's answer is waited for.
+const ANSWER_GRACE: Duration = Duration::from_secs(10);
+
+/// Shows `notification` and returns the key the user picked, as told by the
+/// notification server only (see [`answers`]); [`model::KEY_CLOSED`] when it
+/// closed or `wait` ran out.
+async fn await_answer(
+    notification: notify_rust::Notification,
+    prompt_id: &str,
+    tx: &mpsc::UnboundedSender<Cmd>,
+    wait: Duration,
+) -> anyhow::Result<String> {
+    let conn = zbus::Connection::session().await?;
+    let mut answers = answers::Answers::subscribe(&conn).await?;
+    // show() blocks on D-Bus through zbus's own runtime, which must not be
+    // entered from this one: a plain thread does it.
+    let (shown_tx, shown) = tokio::sync::oneshot::channel();
+    on_notification_thread(move || {
+        let _ = shown_tx.send(notification.show().map(|handle| handle.id()));
+    });
+    let id = shown
+        .await
+        .context("no thread to show the notification")?
+        .context("showing the notification")?;
+    let _ = tx.send(Cmd::PromptShown {
+        prompt_id: prompt_id.to_string(),
+        id,
+    });
+    Ok(tokio::time::timeout(wait, answers.next_for(id))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| model::KEY_CLOSED.to_string()))
 }
 
 /// Closes notification bubbles by server id, off the main loop.
