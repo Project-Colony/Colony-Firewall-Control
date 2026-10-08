@@ -1047,10 +1047,7 @@ impl Firewall for FirewallService {
                             connection: Some(convert::connection_to_pb(&obs.connection)),
                             process: Some(convert::process_to_pb(&obs.process)),
                             verdict: convert::verdict_to_pb_action(&obs.verdict) as i32,
-                            rule_id: match obs.verdict.source {
-                                cfc_core::VerdictSource::Rule(id) => id.to_string(),
-                                _ => String::new(),
-                            },
+                            rule_id: obs.rule_id().map(|id| id.to_string()).unwrap_or_default(),
                         };
                         if tx.send(Ok(ev)).await.is_err() {
                             break;
@@ -1450,11 +1447,7 @@ pub fn spawn_event_pipeline(
                     if obs.verdict.action != cfc_core::Action::Allow {
                         continue;
                     }
-                    feeder.push(convert::event_row_from_observed(
-                        &obs.connection,
-                        &obs.process,
-                        &obs.verdict,
-                    ));
+                    feeder.push(convert::event_row_from_observed(&obs));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     count_dropped(
@@ -2052,6 +2045,7 @@ mod tests {
                 443,
             ),
             process,
+            undecided: None,
         })
         .await
         .unwrap();
@@ -2435,6 +2429,7 @@ mod tests {
                 action,
                 source: cfc_core::VerdictSource::DefaultPolicy,
             },
+            undecided: None,
         }
     }
 
@@ -2448,11 +2443,7 @@ mod tests {
         // The worker queues a refusal itself and then publishes it; the
         // feeder must not record it a second time.
         let blocked = observed(80, cfc_core::Action::Deny);
-        sink.push(convert::event_row_from_observed(
-            &blocked.connection,
-            &blocked.process,
-            &blocked.verdict,
-        ));
+        sink.push(convert::event_row_from_observed(&blocked));
         tx.send(blocked).unwrap();
 
         // Well past the batch interval; paused time auto-advances.
@@ -2518,11 +2509,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(64);
         let sink = spawn_event_pipeline(store.clone(), &tx, 1000);
         let blocked = observed(80, cfc_core::Action::Deny);
-        let row = convert::event_row_from_observed(
-            &blocked.connection,
-            &blocked.process,
-            &blocked.verdict,
-        );
+        let row = convert::event_row_from_observed(&blocked);
         for _ in 0..3 {
             sink.push(row.clone());
         }

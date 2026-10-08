@@ -66,6 +66,11 @@ message PromptEvent {
   // hash-bound deny is one file swap away from not applying, while the
   // path-bound one covers whatever bytes sit there next.
   bool binds_to_hash = 5;
+  // Set when a rule may apply but the process identity (exe, uid or digest)
+  // is incomplete, so the rule could not be decided: the UI shows the
+  // identity as unknown and names this rule. The answer applies to this
+  // connection. Empty when no rule is about the flow.
+  string undecided_rule_id = 6;
 }
 
 message VerdictRequest {
@@ -99,6 +104,9 @@ message ConnectionEvent {
   ConnectionInfo connection = 1;
   ProcessInfo process = 2;
   Action verdict = 3;
+  // The rule that answered, or, when `verdict` did not come from a rule, the
+  // rule that could not be decided because the process identity was
+  // incomplete (see PromptEvent.undecided_rule_id). Empty otherwise.
   string rule_id = 4;
 }
 
@@ -300,6 +308,9 @@ message Event {
   Action action = 11;
   // Verdict provenance: "rule" | "user" | "default" | "timeout".
   string source = 12;
+  // The rule that answered when `source` is "rule". With any other source, a
+  // non-empty id names the rule that could not be decided because the
+  // process identity was incomplete.
   string rule_id = 13;
 }
 

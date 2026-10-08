@@ -948,6 +948,7 @@ mod tests {
             process: Some(process()),
             deadline_unix_ms: 1_700_000_030_000,
             binds_to_hash: false,
+            undecided_rule_id: String::new(),
         };
         let v = serde_json::to_value(to_json(&ev, None, None)).unwrap();
         assert_eq!(v["prompt_id"], "17");

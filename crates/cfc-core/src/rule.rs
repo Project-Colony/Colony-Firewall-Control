@@ -623,18 +623,29 @@ impl RuleSet {
     /// `now_unix_ms` is the current wall-clock time; rules whose
     /// `Duration::Seconds(..)` window has elapsed are skipped (see
     /// [`Rule::is_expired`]).
-    /// Missing identity cannot yield to a lower Allow. A definite refusal
-    /// may still answer after earlier possible refusals. See [`Match`].
+    ///
+    /// A rule this process cannot be checked against (see
+    /// [`RuleScope::undecidable_for`]) or a legacy hostname rule is walked
+    /// past and remembered. The definite winner then answers only if every
+    /// way those rules could resolve gives the same action; otherwise the
+    /// answer is [`Match::Undecidable`]. See [`Match`].
     pub fn lookup(
         &self,
         conn: &crate::Connection,
         proc: &crate::Process,
         now_unix_ms: i64,
     ) -> Match<'_> {
-        let mut undecidable = None;
+        // The rule reported when the outcome is open. A legacy hostname rule
+        // takes the slot from an identity one: the caller refuses it rather
+        // than prompting.
+        let mut undecided: Option<&Rule> = None;
+        // Whether an undecided Allow, or an undecided Deny/Reject, was passed.
+        let mut maybe_allow = false;
+        let mut maybe_closed = false;
         // The first definite Allow that names no program. Held, not returned:
         // a program Deny ranked below it may still override it.
         let mut generic_allow: Option<&Rule> = None;
+        let mut winner = None;
         for rule in self
             .rules
             .iter()
@@ -660,45 +671,41 @@ impl RuleSet {
             // application's intended hostname or enumerates every alias.
             // Keep a legacy name at its original priority as uncertainty.
             if missing_process || rule.scope.dst_host.is_some() {
-                if rule.action == Action::Allow {
-                    // Under a held generic Allow, a possible program Allow
-                    // cannot change the answer: if it matched, the generic
-                    // Allow would still win.
-                    if generic_allow.is_some() {
-                        continue;
-                    }
-                    // A possible Allow keeps its precedence.
-                    return Match::Undecidable(undecidable.unwrap_or(rule));
+                if undecided
+                    .is_none_or(|u| u.scope.dst_host.is_none() && rule.scope.dst_host.is_some())
+                {
+                    undecided = Some(rule);
                 }
-                // Only a sequence of possible closed actions may yield to a
-                // definite Deny.
-                undecidable.get_or_insert(rule);
+                if rule.action == Action::Allow {
+                    maybe_allow = true;
+                } else {
+                    maybe_closed = true;
+                }
                 continue;
             }
-            let winner = match generic_allow {
+            winner = Some(match generic_allow {
                 // A lower program Allow cannot turn the answer into a refusal.
                 Some(held) if rule.action == Action::Allow => held,
-                Some(_) => rule,
                 None if rule.action == Action::Allow && !rule.scope.names_program() => {
-                    if let Some(first) = undecidable {
-                        return Match::Undecidable(first);
-                    }
                     generic_allow = Some(rule);
                     continue;
                 }
-                None => rule,
-            };
-            if winner.action == Action::Allow {
-                if let Some(first) = undecidable {
-                    return Match::Undecidable(first);
-                }
-            }
-            return Match::Rule(winner);
+                _ => rule,
+            });
+            break;
         }
-        match (undecidable, generic_allow) {
-            (Some(first), _) => Match::Undecidable(first),
-            (None, Some(held)) => Match::Rule(held),
-            (None, None) => Match::None,
+        let Some(winner) = winner.or(generic_allow) else {
+            return undecided.map_or(Match::None, Match::Undecidable);
+        };
+        // Every resolution of the undecided rules gives the winner's action.
+        let settled = if winner.action == Action::Allow {
+            !maybe_closed
+        } else {
+            !maybe_allow
+        };
+        match undecided {
+            Some(first) if !settled => Match::Undecidable(first),
+            _ => Match::Rule(winner),
         }
     }
 }
@@ -706,8 +713,10 @@ impl RuleSet {
 /// What [`RuleSet::lookup`] found.
 ///
 /// Three outcomes, not two, and the third is the whole point. Precedence is
-/// ordered, so a rule that cannot be decided must not be walked past: the
-/// rules beneath it are the ones its author wrote it to override.
+/// ordered, so a rule that cannot be decided must not be ignored: the rules
+/// beneath it are the ones its author wrote it to override. When it and the
+/// rule that would otherwise answer agree on the action, that rule answers;
+/// when they disagree, nobody does.
 ///
 /// The case in the field is a `deny` scoped to `exe_sha256` over a binary the
 /// daemon cannot hash - over 64 MiB, unreadable, or a process whose image is
@@ -722,9 +731,11 @@ impl RuleSet {
 pub enum Match<'a> {
     /// This rule answered.
     Rule(&'a Rule),
-    /// This rule could apply, but its process identity or hostname cannot be decided.
-    /// The caller must refuse conservatively; a prompt or permissive fallback
-    /// cannot establish the missing identity.
+    /// This rule could apply, but the process identity (exe, uid or digest)
+    /// or a legacy hostname cannot be decided, and the rules that could apply
+    /// disagree. The caller asks the user, with the identity shown as unknown;
+    /// a legacy hostname rule (`dst_host`) is refused instead, since no answer
+    /// can establish the name.
     Undecidable(&'a Rule),
     /// No rule is about this flow.
     None,
@@ -759,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_hostname_policy_never_authorizes_or_yields_to_a_lower_allow() {
+    fn legacy_hostname_policy_never_yields_to_a_disagreeing_lower_allow() {
         for action in [Action::Allow, Action::Deny, Action::Reject] {
             let mut named = RuleScope::any();
             named.exe_path = Some("/usr/bin/curl".into());
@@ -789,10 +800,21 @@ mod tests {
                     let mut conn = mk_conn();
                     conn.dst_host = host.map(str::to_owned);
                     conn.dst_host_verified = verified;
-                    assert!(
-                        matches!(set.lookup(&conn, &proc, now()), Match::Undecidable(r) if r.name == "legacy-name"),
-                        "{action:?} {host:?} verified={verified}"
-                    );
+                    // A legacy Allow over a lower Allow: both resolutions
+                    // allow, so the lower rule answers. A legacy refusal over
+                    // it stays open, whatever the PTR says.
+                    let result = set.lookup(&conn, &proc, now());
+                    if action == Action::Allow {
+                        assert!(
+                            matches!(result, Match::Rule(r) if r.name == "lower-allow"),
+                            "{host:?} verified={verified}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(result, Match::Undecidable(r) if r.name == "legacy-name"),
+                            "{action:?} {host:?} verified={verified}"
+                        );
+                    }
                     assert!(!set.rules[0].scope.matches(&conn, &proc));
                 }
             }
@@ -1414,6 +1436,142 @@ mod tests {
             winner(&set, &mk_conn(), &mk_proc("/usr/bin/curl")),
             Some("allow-tcp-443")
         );
+    }
+
+    fn exe(path: &str) -> RuleScope {
+        RuleScope {
+            exe_path: Some(path.into()),
+            ..RuleScope::any()
+        }
+    }
+
+    #[test]
+    fn an_undecidable_allow_yields_to_a_definite_allow_below() {
+        // One "allow this program" rule used to make every unattributed flow
+        // undecidable, so ICMP that a generic rule allows was refused.
+        let set = sorted(vec![
+            scoped("allow-firefox", Action::Allow, exe("/usr/bin/firefox")),
+            scoped(
+                "allow-icmp",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Icmp),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        let ping = Connection {
+            protocol: Protocol::Icmp,
+            src_port: 0,
+            dst_port: 0,
+            ..mk_conn()
+        };
+        assert_eq!(
+            winner(&set, &ping, &Process::unknown(0)),
+            Some("allow-icmp")
+        );
+    }
+
+    #[test]
+    fn undecidable_allow_over_a_definite_deny_is_undecidable() {
+        let set = sorted(vec![
+            scoped(
+                "allow-firefox",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    ..exe("/usr/bin/firefox")
+                },
+            ),
+            scoped(
+                "deny-https",
+                Action::Deny,
+                RuleScope {
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert!(matches!(
+            set.lookup(&mk_conn(), &Process::unknown(0), now()),
+            Match::Undecidable(r) if r.name == "allow-firefox"
+        ));
+    }
+
+    #[test]
+    fn undecidable_deny_over_a_definite_allow_is_undecidable() {
+        let set = sorted(vec![
+            scoped("deny-x", Action::Deny, exe("/usr/bin/x")),
+            scoped(
+                "allow-https",
+                Action::Allow,
+                RuleScope {
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert!(matches!(
+            set.lookup(&mk_conn(), &Process::unknown(0), now()),
+            Match::Undecidable(r) if r.name == "deny-x"
+        ));
+        // With no rule that disagrees, the refusal is settled either way.
+        let deny_only = sorted(vec![
+            scoped("deny-x", Action::Deny, exe("/usr/bin/x")),
+            scoped(
+                "deny-https",
+                Action::Deny,
+                RuleScope {
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert_eq!(
+            winner(&deny_only, &mk_conn(), &Process::unknown(0)),
+            Some("deny-https")
+        );
+    }
+
+    #[test]
+    fn an_undecidable_program_allow_under_a_generic_allow_keeps_a_program_deny_open() {
+        // allow --sha256 H --dst-port 443 ranks above deny --exe /usr/bin/y.
+        // If the image hashes to H, that Allow ends the walk under the generic
+        // Allow and the answer is Allow; if not, the program Deny wins. With
+        // no digest, neither can be claimed.
+        let set = sorted(vec![
+            scoped(
+                "allow-net",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    dst_net: Some("1.2.3.0/24".parse().unwrap()),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "allow-h",
+                Action::Allow,
+                RuleScope {
+                    exe_sha256: Some("aa".repeat(32)),
+                    dst_port: Some(443),
+                    protocol: Some(Protocol::Tcp),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped("deny-y", Action::Deny, exe("/usr/bin/y")),
+        ]);
+        let unhashed = mk_proc("/usr/bin/y");
+        assert!(matches!(
+            set.lookup(&mk_conn(), &unhashed, now()),
+            Match::Undecidable(r) if r.name == "allow-h"
+        ));
+        let mut hashed = mk_proc("/usr/bin/y");
+        hashed.sha256 = Some("aa".repeat(32));
+        assert_eq!(winner(&set, &mk_conn(), &hashed), Some("allow-net"));
+        hashed.sha256 = Some("cc".repeat(32));
+        assert_eq!(winner(&set, &mk_conn(), &hashed), Some("deny-y"));
     }
 
     #[test]

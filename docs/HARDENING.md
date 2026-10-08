@@ -197,8 +197,10 @@ usually past it. For such a program:
 
 - `cfc rules add --pin-hash` refuses the file. A digest supplied another way
   (`--sha256`, an import) is stored but can never be compared, so a rule
-  carrying one, Allow or Deny, refuses the program's flows wherever its other
-  fields match, and no rule below it can allow them.
+  carrying one, Allow or Deny, cannot be decided for the program. Wherever
+  its other fields match and the rules below it would answer differently,
+  the program's flows are prompted, naming that rule, and take
+  `no_ui_action` when no UI is connected.
 - On a root-sealed path (root-owned, with root-owned ancestors, as a package
   installs it) nothing else changes: "Allow always" saves a path-only rule.
 - On any other path (under a home directory, a user-writable `/opt`
@@ -207,6 +209,18 @@ usually past it. For such a program:
   retransmit included, opens its own prompt. A hand-written path-only rule
   (`cfc rules add --exe <path>`) works, but whoever can write that file
   inherits it. Installing the program root-owned is the better fix.
+
+**Incomplete identity is asked, not refused.** A flow whose executable,
+uid or digest is unknown (unattributed UDP, an expired attribution budget,
+a process that exited first) cannot be checked against a program rule. When
+such a rule and the rest of the rule set disagree, the flow is prompted
+with the identity shown as unknown; with no UI connected it takes
+`no_ui_action`. That is Deny on every shipped profile. If you set
+`no_ui_action = "Allow"`, a `deny --exe` rule no longer holds on a machine
+nobody is watching: a program can make its own UDP attribution ambiguous
+(binding a port another of its user's sockets shares) or exit before
+`/proc` is read, and its flow then gets the permissive fallback. Keep
+`no_ui_action` at Deny where program denies matter.
 
 ## What this firewall does *not* protect against
 

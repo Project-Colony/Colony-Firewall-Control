@@ -187,6 +187,9 @@ pub struct PromptRequest {
     pub prompt_id: u64,
     pub connection: Connection,
     pub process: Process,
+    /// A rule that may apply but cannot be decided, because the process
+    /// identity is incomplete. See [`Decision::NeedsPrompt`].
+    pub undecided: Option<uuid::Uuid>,
 }
 
 /// A resolved prompt flowing back from the router to the worker.
@@ -202,6 +205,21 @@ pub struct ObservedConnection {
     pub connection: Connection,
     pub process: Process,
     pub verdict: Verdict,
+    /// The rule that could not be decided for this flow, when that is why it
+    /// was prompted. See [`Decision::NeedsPrompt`].
+    pub undecided: Option<uuid::Uuid>,
+}
+
+impl ObservedConnection {
+    /// The rule recorded with this flow: the one that answered, or else the
+    /// one that could not be decided. A rule id with a source other than
+    /// `rule` therefore means "this rule could not be decided".
+    pub fn rule_id(&self) -> Option<uuid::Uuid> {
+        match self.verdict.source {
+            cfc_core::VerdictSource::Rule(id) => Some(id),
+            _ => self.undecided,
+        }
+    }
 }
 
 /// Logs a refusal to the journal, then publishes to the bounded, lossy live
@@ -215,6 +233,7 @@ pub fn publish_observation(tx: &broadcast::Sender<ObservedConnection>, obs: Obse
             pid = obs.process.pid,
             uid = ?obs.process.uid,
             dst = %format_args!("{}:{}", obs.connection.dst_ip, obs.connection.dst_port),
+            undecided_rule = ?obs.undecided,
             "connection blocked"
         );
     }
@@ -734,6 +753,7 @@ impl<Q: PacketQueue> Worker<Q> {
             // Per packet, not per prompt: a Reject response is derived from
             // the individual segment (its sequence numbers, its source
             // port), and parallel connections share one prompt.
+            let mut undecided = None;
             let verdict = match self.engine.peek(&packet.connection, &packet.process) {
                 // A refusal decided since the prompt opened always wins.
                 Decision::Resolved(current) if current.action != Action::Allow => current,
@@ -750,6 +770,12 @@ impl<Q: PacketQueue> Worker<Q> {
                 {
                     current
                 }
+                // The user's answer applies to a flow whose identity is
+                // incomplete: no rule can decide it, that is why it was asked.
+                Decision::NeedsPrompt { undecided: u, .. } => {
+                    undecided = u;
+                    pv.verdict
+                }
                 _ => pv.verdict,
             };
             // Only a rule whose answer was applied gets the hit.
@@ -762,6 +788,7 @@ impl<Q: PacketQueue> Worker<Q> {
                     connection: packet.connection,
                     process: packet.process,
                     verdict,
+                    undecided,
                 },
             )?;
         }
@@ -795,13 +822,15 @@ impl<Q: PacketQueue> Worker<Q> {
                     connection,
                     process,
                     verdict,
+                    undecided: None,
                 },
             ),
             PacketOutcome::Prompt {
                 connection,
                 process,
                 fallback,
-            } => self.park_for_prompt(msg, connection, process, fallback),
+                undecided,
+            } => self.park_for_prompt(msg, connection, process, fallback, undecided),
         }
     }
 
@@ -815,6 +844,7 @@ impl<Q: PacketQueue> Worker<Q> {
         connection: Connection,
         process: Process,
         fallback: Verdict,
+        undecided: Option<uuid::Uuid>,
     ) -> anyhow::Result<()> {
         let flow = FlowKey::for_flow(&connection, &process);
         if let Some(&prompt_id) = self.pending_flows.get(&flow) {
@@ -834,7 +864,7 @@ impl<Q: PacketQueue> Worker<Q> {
                         parked = pending.packets.len(),
                         "prompt already holds its packet cap; applying the fallback"
                     );
-                    return self.deliver_fallback(msg, connection, process, fallback);
+                    return self.deliver_fallback(msg, connection, process, fallback, undecided);
                 }
                 trace!(
                     prompt_id,
@@ -876,7 +906,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 parked = self.waiters.len(),
                 "prompt backlog at its cap; applying the fallback rather than parking"
             );
-            return self.deliver_fallback(msg, connection, process, fallback);
+            return self.deliver_fallback(msg, connection, process, fallback, undecided);
         }
 
         let prompt_id = self.next_prompt_id;
@@ -888,6 +918,7 @@ impl<Q: PacketQueue> Worker<Q> {
             prompt_id,
             connection: connection.clone(),
             process: process.clone(),
+            undecided,
         };
         match self.prompt_tx.try_send(req) {
             Ok(()) => {
@@ -909,7 +940,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 // Router saturated or gone: apply the default policy now
                 // rather than stranding the packet.
                 trace!("prompt channel unavailable ({e}); applying fallback");
-                return self.deliver_fallback(msg, connection, process, fallback);
+                return self.deliver_fallback(msg, connection, process, fallback, undecided);
             }
         }
         Ok(())
@@ -929,6 +960,7 @@ impl<Q: PacketQueue> Worker<Q> {
         connection: Connection,
         process: Process,
         fallback: Verdict,
+        undecided: Option<uuid::Uuid>,
     ) -> anyhow::Result<()> {
         self.deliver(
             msg,
@@ -936,6 +968,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 connection,
                 process,
                 verdict: fallback,
+                undecided,
             },
         )
     }
@@ -953,11 +986,8 @@ impl<Q: PacketQueue> Worker<Q> {
         if obs.verdict.action == Action::Allow {
             self.dns.enqueue(obs.connection.dst_ip);
         } else {
-            self.events.push(crate::convert::event_row_from_observed(
-                &obs.connection,
-                &obs.process,
-                &obs.verdict,
-            ));
+            self.events
+                .push(crate::convert::event_row_from_observed(&obs));
         }
         record(&self.stats, obs.verdict.action);
         publish_observation(&self.observed_tx, obs);
@@ -1101,13 +1131,15 @@ enum PacketOutcome {
         process: Process,
         verdict: Verdict,
     },
-    /// No rule matched and prompting is enabled: ask the user, applying
+    /// No rule answered and prompting is enabled: ask the user, applying
     /// `fallback` if no prompt can be delivered. Stats are recorded when
-    /// the prompt resolves.
+    /// the prompt resolves. `undecided` names the rule that may apply but
+    /// could not be decided, if that is why.
     Prompt {
         connection: Connection,
         process: Process,
         fallback: Verdict,
+        undecided: Option<uuid::Uuid>,
     },
 }
 
@@ -1206,7 +1238,10 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
             process: proc,
             verdict,
         },
-        Decision::NeedsPrompt { fallback } => {
+        Decision::NeedsPrompt {
+            fallback,
+            undecided,
+        } => {
             // Inbound never asks.
             //
             // The decision the owner took, and it is not a shortcut: nothing
@@ -1234,15 +1269,16 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                 };
             }
             // Preserve desktop IPC for unmatched local flows after explicit
-            // policy and incomplete-identity refusals have had their say.
-            if meta.loopback {
+            // policy has had its say. Neither this nor pause lifts a flow a
+            // rule may be about: its identity is incomplete, so it is asked.
+            if meta.loopback && undecided.is_none() {
                 return PacketOutcome::Deliver {
                     connection: conn,
                     process: proc,
                     verdict: Verdict::default_allow(),
                 };
             }
-            if deps.stats.is_paused() {
+            if deps.stats.is_paused() && undecided.is_none() {
                 // Paused means "stop prompting", not "stop filtering":
                 // rules above still applied; only unmatched flows pass
                 // without a prompt.
@@ -1258,6 +1294,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                 connection: conn,
                 process: proc,
                 fallback,
+                undecided,
             }
         }
     }
@@ -1502,6 +1539,7 @@ mod tests {
                     conn_to(1024 + i as u16, 1111),
                     test_process(4242, "/usr/bin/curl"),
                     Verdict::default_deny(),
+                    None,
                 )
                 .unwrap();
             // Drain as we go: the harness channel holds 16, and a full channel
@@ -1520,6 +1558,7 @@ mod tests {
                 conn_to(9000, 1111),
                 test_process(4242, "/usr/bin/curl"),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
 
@@ -1572,6 +1611,7 @@ mod tests {
                     conn_to(443, 1111 + i as u16),
                     test_process(4242, "/usr/bin/curl"),
                     Verdict::default_deny(),
+                    None,
                 )
                 .unwrap();
         }
@@ -1587,6 +1627,7 @@ mod tests {
                 conn_to(443, 9999),
                 test_process(4242, "/usr/bin/curl"),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
 
@@ -1888,6 +1929,7 @@ mod tests {
                 connection,
                 process,
                 fallback,
+                ..
             } => {
                 assert_eq!(fallback.action, Action::Deny);
                 assert_eq!(connection.pid, Some(4242));
@@ -2186,6 +2228,7 @@ mod tests {
                 first,
                 process.clone(),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
         h.worker()
@@ -2194,6 +2237,7 @@ mod tests {
                 second,
                 process,
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
         let request = h.prompt_rx.try_recv().unwrap();
@@ -2212,16 +2256,79 @@ mod tests {
         );
     }
 
+    fn exe_rule(action: Action, exe: &str) -> Rule {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from(exe));
+        Rule::new(format!("{action:?} {exe}"), action, scope)
+    }
+
+    /// Minimal IPv4/UDP packet: 1.2.3.4:5555 -> 5.6.7.8:`dst_port`.
+    fn udp_packet(dst_port: u16) -> Vec<u8> {
+        let mut pkt = tcp_packet(dst_port);
+        pkt.truncate(28);
+        pkt[9] = 17;
+        pkt
+    }
+
+    /// The process could not be attributed: no socket owner was found, as for
+    /// ambiguous UDP or an expired attribution budget.
+    fn unattributed(env: &mut TestEnv) {
+        env.resolver.pid = None;
+    }
+
+    fn expect_undecided_prompt(outcome: PacketOutcome, rule: &Rule, fallback: Action) {
+        match outcome {
+            PacketOutcome::Prompt {
+                undecided,
+                fallback: f,
+                ..
+            } => {
+                assert_eq!(undecided, Some(rule.id));
+                assert_eq!(f.action, fallback);
+                assert_eq!(f.source, VerdictSource::DefaultPolicy);
+            }
+            other => panic!("expected an undecided prompt, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn missing_executable_cannot_lift_a_deny_when_paused() {
+    fn an_unattributed_flow_under_a_program_allow_is_prompted_not_dropped() {
+        let rule = exe_rule(Action::Allow, "/usr/bin/firefox");
+        for policy in [dp_allow(), dp_deny()] {
+            let no_ui_action = policy.no_ui_action;
+            let mut env = TestEnv::new(vec![rule.clone()], policy);
+            unattributed(&mut env);
+            expect_undecided_prompt(env.handle(&tcp_packet(443), &NO_META), &rule, no_ui_action);
+        }
+    }
+
+    #[test]
+    fn an_undecided_flow_is_prompted_while_paused() {
+        // Pause means "stop asking about flows no rule is about"; a program
+        // rule may be about this one.
         let mut rule = deny_port_rule(443);
         rule.scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
-        let mut env = TestEnv::new(vec![rule], dp_allow());
-        env.resolver.pid = None;
+        let mut env = TestEnv::new(vec![rule.clone()], dp_allow());
+        unattributed(&mut env);
         env.stats.set_paused(true);
-        match env.handle(&tcp_packet(443), &NO_META) {
-            PacketOutcome::Deliver { verdict, .. } => assert_eq!(verdict.action, Action::Deny),
-            other => panic!("expected closed policy, got {other:?}"),
+        expect_undecided_prompt(env.handle(&tcp_packet(443), &NO_META), &rule, Action::Allow);
+    }
+
+    #[test]
+    fn ambiguous_udp_under_a_program_deny_is_prompted() {
+        let rule = exe_rule(Action::Deny, "/usr/bin/x");
+        let mut env = TestEnv::new(vec![rule.clone()], dp_deny());
+        unattributed(&mut env);
+        expect_undecided_prompt(env.handle(&udp_packet(53), &NO_META), &rule, Action::Deny);
+    }
+
+    #[test]
+    fn ambiguous_udp_with_no_rules_is_prompted() {
+        let mut env = TestEnv::new(vec![], dp_deny());
+        unattributed(&mut env);
+        match env.handle(&udp_packet(53), &NO_META) {
+            PacketOutcome::Prompt { undecided, .. } => assert_eq!(undecided, None),
+            other => panic!("expected a prompt, got {other:?}"),
         }
     }
 
@@ -2745,24 +2852,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn loopback_missing_identity_cannot_override_an_application_refusal() {
-        let mut scope = RuleScope::any();
-        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
-        let rule = Rule::new("local application refusal", Action::Deny, scope);
-        let mut h = LoopHarness::new(vec![], vec![rule], dp_deny());
+    /// A [`LoopHarness`] whose resolver attributes nothing.
+    fn unattributed_harness(rules: Vec<Rule>, policy: DefaultPolicy) -> LoopHarness {
+        let mut h = LoopHarness::new(vec![], rules, policy);
         h.worker().resolver = Box::new(StubResolver {
             pid: None,
             process: Process::unknown(0),
             socket_lookups: std::sync::atomic::AtomicUsize::new(0),
         });
+        h
+    }
+
+    #[test]
+    fn an_undecided_loopback_flow_is_prompted() {
+        let rule = exe_rule(Action::Deny, "/usr/bin/curl");
+        let mut h = unattributed_harness(vec![rule.clone()], dp_deny());
         h.stats.set_paused(true);
         let mut msg = FakeMsg::new(1, tcp_packet(53));
         msg.outdev = 1;
         h.worker().handle_message(msg).unwrap();
-        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
-        assert_eq!(h.audited().len(), 1);
-        assert!(h.prompt_rx.try_recv().is_err());
+        assert!(h.verdicts().is_empty(), "the packet waits for the answer");
+        let req = h.prompt_rx.try_recv().expect("prompt dispatched");
+        assert_eq!(req.undecided, Some(rule.id));
+    }
+
+    #[test]
+    fn resolve_prompt_applies_the_users_allow_to_an_undecided_flow() {
+        // Before, the per-packet re-check turned an undecided flow into a
+        // Deny whatever the user answered.
+        let rule = exe_rule(Action::Deny, "/usr/bin/curl");
+        let mut h = unattributed_harness(vec![rule.clone()], dp_deny());
+        h.worker()
+            .handle_message(FakeMsg::new(1, tcp_packet(443)))
+            .unwrap();
+        let req = h.prompt_rx.try_recv().expect("prompt dispatched");
+        h.send_verdict(
+            req.prompt_id,
+            Verdict {
+                action: Action::Allow,
+                source: VerdictSource::UserPrompt,
+            },
+        );
+        h.worker().drain_verdicts().unwrap();
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+        let observed = h.observed_rx.try_recv().unwrap();
+        assert_eq!(observed.undecided, Some(rule.id));
+        assert_eq!(observed.rule_id(), Some(rule.id));
+    }
+
+    #[test]
+    fn an_undecided_prompt_past_the_cap_takes_no_ui_action() {
+        let rule = exe_rule(Action::Deny, "/usr/bin/curl");
+        let mut h = unattributed_harness(vec![rule.clone()], dp_deny());
+        // Unknown identities never share a prompt, so every packet parks its
+        // own until the backlog cap.
+        for i in 0..MAX_PARKED_PROMPTS {
+            h.worker()
+                .handle_message(FakeMsg::new(i as u32, tcp_packet(443)))
+                .unwrap();
+            while h.prompt_rx.try_recv().is_ok() {}
+        }
+        assert!(h.verdicts().is_empty());
+        let overflow = MAX_PARKED_PROMPTS as u32;
+        h.worker()
+            .handle_message(FakeMsg::new(overflow, tcp_packet(443)))
+            .unwrap();
+        assert_eq!(h.verdicts(), vec![(overflow, NfqVerdict::Drop)]);
+        let audited = h.audited();
+        assert_eq!(audited.len(), 1);
+        assert_eq!(audited[0].source, "default");
+        assert_eq!(audited[0].rule_id, Some(rule.id.to_string()));
     }
 
     #[test]
@@ -3040,6 +3199,7 @@ mod tests {
                 conn_to(443, 1111),
                 test_process(4242, "/usr/bin/curl"),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
         let req = h.prompt_rx.try_recv().expect("prompt dispatched");
@@ -3162,6 +3322,7 @@ mod tests {
                 conn,
                 proc,
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
 

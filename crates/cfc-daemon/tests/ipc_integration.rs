@@ -211,6 +211,7 @@ impl TestDaemon {
                 prompt_id,
                 connection: connection(443),
                 process,
+                undecided: None,
             })
             .await
             .expect("prompt channel closed");
@@ -416,6 +417,7 @@ fn observed(dst_port: u16, action: Action) -> ObservedConnection {
             action,
             source: VerdictSource::DefaultPolicy,
         },
+        undecided: None,
     }
 }
 
@@ -1286,11 +1288,7 @@ async fn observed_connections_reach_list_events_through_the_pipeline() {
         .expect("the pipeline is subscribed");
     let blocked = observed(25, Action::Deny);
     d.store
-        .insert_events(&[cfc_daemon::convert::event_row_from_observed(
-            &blocked.connection,
-            &blocked.process,
-            &blocked.verdict,
-        )])
+        .insert_events(&[cfc_daemon::convert::event_row_from_observed(&blocked)])
         .expect("committing refusal before publication");
     d.observed_tx
         .send(blocked)
@@ -1410,6 +1408,7 @@ async fn stream_connections_maps_the_live_feed() {
             connection: conn,
             process: process(),
             verdict: Verdict::deny_from_rule(rule_id),
+            undecided: None,
         })
         .expect("a subscriber exists");
 
@@ -1439,6 +1438,17 @@ async fn stream_connections_maps_the_live_feed() {
     let event = next_message(&mut stream).await;
     assert_eq!(event.verdict, pb::Action::Allow as i32);
     assert!(event.rule_id.is_empty());
+
+    // A prompted flow whose rule could not be decided names that rule.
+    let undecided = uuid::Uuid::new_v4();
+    d.observed_tx
+        .send(ObservedConnection {
+            undecided: Some(undecided),
+            ..observed(53, Action::Allow)
+        })
+        .expect("a subscriber exists");
+    let event = next_message(&mut stream).await;
+    assert_eq!(event.rule_id, undecided.to_string());
 }
 
 /// Copies /usr/bin/sleep into a tempdir and starts it: the ~/.local/bin shape

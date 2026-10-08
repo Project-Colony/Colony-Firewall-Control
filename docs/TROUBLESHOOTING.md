@@ -682,6 +682,30 @@ ranked either, so a rule that relied on `--dst-net 0.0.0.0/0` to outrank
 another may now lose the tie to a Deny. `cfc rules list` shows the rules
 involved; the hit counters show which one answers.
 
+## A prompt says the program could not be identified
+
+Since 0.8.0 a flow whose program is only partly known (no socket owner
+found, a binary too large to hash, a process that exited first) is asked
+about when a rule naming a program may apply to it, instead of being
+refused in silence. The prompt names that rule and says the program could
+not be fully identified; your answer applies to that connection only. With
+no app, tray or `sudo cfc prompts` connected the flow takes `no_ui_action`,
+and the event log shows it with that rule's id and source `default`.
+
+These prompts appear even while paused or for loopback flows, because a
+rule may be about them. If they are frequent, find out why attribution
+fails. Run the daemon with `--debug` (`systemctl edit colony-firewalld`,
+then repeat `ExecStart=` with `--debug` appended) and look for:
+
+```sh
+journalctl -u colony-firewalld -g 'udp attribution ambiguous|attribution budget expired|table unreadable|identity is incomplete'
+```
+
+"udp attribution ambiguous" means several sockets could own the datagram
+(typically `SO_REUSEPORT` or a wildcard-bound socket shared across
+programs); scope a rule on the port instead of the program for that
+traffic.
+
 ## Where things live
 
 | Thing                   | Path                                        |

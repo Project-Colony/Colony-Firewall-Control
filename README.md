@@ -308,7 +308,8 @@ by default, so a `--network=host` container has it; drop it with
 `--cap-drop NET_RAW` for workloads CFC should govern.
 
 Executables over 64 MiB (Chromium, Electron apps, VS Code) are never hashed.
-A hash-pinned rule naming one refuses its flows, and outside a root-owned
+A hash-pinned rule naming one cannot be decided, so its flows are prompted
+(or take `no_ui_action` with no UI connected), and outside a root-owned
 path an "Allow always" for one cannot be saved, so it prompts for every new
 flow. See [docs/HARDENING.md](docs/HARDENING.md#rule-design-principles).
 The complete list of non-goals is in

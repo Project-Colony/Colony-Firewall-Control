@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
                 prompt_id,
                 connection,
                 process,
+                undecided: None,
             })
             .await
             .is_err()

@@ -55,7 +55,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// Per-lookup budget for the /proc slow path.
 const RESOLVE_BUDGET: Duration = Duration::from_millis(50);
@@ -529,24 +529,33 @@ fn udp_inode_from_tables(
     uid: Option<u32>,
     deadline: Instant,
 ) -> Option<u64> {
+    // Each `None` below leaves the flow unattributed; it is then prompted
+    // with the identity shown as unknown. Named, so the journal says which.
+    let expired = || {
+        debug!("attribution budget expired");
+        None
+    };
     let mut entries = Vec::new();
     for table in tables {
         if Instant::now() > deadline {
-            return None;
+            return expired();
         }
         let contents = match fs::read_to_string(table) {
             Ok(contents) => contents,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
+            Err(e) => {
+                debug!(table, "table unreadable: {e}");
+                return None;
+            }
         };
         entries.extend(contents.lines().skip(1).filter_map(parse_table_line));
     }
     if Instant::now() > deadline {
-        return None;
+        return expired();
     }
     let inode = scan_table_entries(&entries, Protocol::Udp, local, remote, uid);
     if Instant::now() > deadline {
-        return None;
+        return expired();
     }
     inode
 }
@@ -606,6 +615,7 @@ fn scan_table_entries(
                 && (endpoint_eq(e.remote, remote) || endpoint_is_zero(e.remote))
             {
                 if inode.is_some_and(|inode| inode != e.inode) {
+                    debug!(local = ?local, remote = ?remote, "udp attribution ambiguous");
                     return None;
                 }
                 inode = Some(e.inode);

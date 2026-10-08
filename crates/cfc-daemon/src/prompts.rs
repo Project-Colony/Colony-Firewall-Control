@@ -256,6 +256,7 @@ impl PromptRouter {
             // Said before the user answers, because "your allow will follow
             // the hash, not the path" changes what clicking Allow means.
             binds_to_hash: binding.hash_expected,
+            undecided_rule_id: req.undecided.map(|id| id.to_string()).unwrap_or_default(),
         };
 
         self.inner.pending.lock().insert(prompt_id, binding);
@@ -451,6 +452,7 @@ mod tests {
                 443,
             ),
             process: Process::unknown(1),
+            undecided: None,
         }
     }
 
@@ -625,6 +627,41 @@ mod tests {
         assert_eq!(pv.verdict.action, Action::Deny);
         // Nothing is pending: a late submit is rejected.
         assert!(router.submit("7", user_allow()).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_undecided_prompt_carries_its_rule_id() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+        let mut ui = router.subscribe(1000, true);
+        let rule = uuid::Uuid::new_v4();
+        router.enqueue(
+            PromptRequest {
+                undecided: Some(rule),
+                ..req(3)
+            },
+            PromptBinding::default(),
+        );
+        router.enqueue(req(4), PromptBinding::default());
+        assert_eq!(ui.recv().await.unwrap().undecided_rule_id, rule.to_string());
+        assert_eq!(ui.recv().await.unwrap().undecided_rule_id, "");
+    }
+
+    #[tokio::test]
+    async fn with_no_answering_ui_an_undecided_prompt_gets_no_ui_action() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+        let _watcher = router.subscribe(1000, false);
+        router.enqueue(
+            PromptRequest {
+                undecided: Some(uuid::Uuid::new_v4()),
+                ..req(9)
+            },
+            PromptBinding::default(),
+        );
+        let pv = rx.try_recv().expect("no_ui_action applies immediately");
+        assert_eq!(pv.prompt_id, 9);
+        assert_eq!(pv.verdict.source, VerdictSource::DefaultPolicy);
     }
 
     #[tokio::test]

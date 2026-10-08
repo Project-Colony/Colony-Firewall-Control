@@ -139,8 +139,9 @@ disconnects entirely, every outstanding prompt gets its fallback applied so
 no packet is stranded.
 
 **Pause is not a kill switch.** Rules are still evaluated while paused;
-only the prompt is skipped, and only for flows that matched no rule. An
-explicit Deny or Reject rule keeps blocking. Pause has a deadline: the
+only the prompt is skipped, and only for flows that no rule is about. An
+explicit Deny or Reject rule keeps blocking, and a flow that a rule may be
+about but cannot be decided (see below) is still prompted. Pause has a deadline: the
 daemon clamps the requested duration (24h maximum), reports the real resume
 time, and auto-resumes.
 
@@ -162,8 +163,13 @@ hundred microseconds before the packet's latency becomes visible.
    misses. UDP always reads all relevant tables first and requires one unique
    compatible inode: exact or wildcard local address, with exact or zero
    remote address. An unreadable table, an exhausted lookup budget or
-   several compatible inodes leave attribution unknown; an absent table
-   (`udp6` under `ipv6.disable=1`) counts as empty. The packet's socket UID,
+   several compatible inodes leave attribution unknown (with `--debug` the
+   journal says which: "table unreadable", "attribution budget expired",
+   "udp attribution ambiguous"); an absent table (`udp6` under
+   `ipv6.disable=1`) counts as empty. An unknown owner is judged like any
+   other incomplete identity: rules that name no program still answer, and
+   where a program rule may apply the flow is prompted with the identity
+   shown as unknown. The packet's socket UID,
    when present, filters candidates. All comparisons run on canonical form,
    so `::ffff:a.b.c.d`
    rows in the v6 tables match plain IPv4 flows - which is what dual-stack
@@ -274,6 +280,23 @@ Allow 5 > generic Deny 4 > program Allow 3), so no sort key could express
 it. The in-kernel precompute (`Engine::process_wide_action` and
 `deny_still_possible_for`) walks the same way, so the connect hooks and the
 packet path agree.
+
+**Incomplete identity is asked, not refused.** When the process's
+executable, uid or digest is unknown (an unattributed socket, a binary over
+the hashing cap, a process gone before `/proc` was read), a rule that tests
+the missing field can be neither matched nor excluded. The scan walks past
+such a rule and remembers whether it was an Allow or a refusal. If the rule
+that then answers agrees with every rule passed that way (all allow, or all
+refuse), it answers. Otherwise the flow is prompted, the prompt names the
+first rule that could not be decided (`PromptEvent.undecided_rule_id`), and
+the UIs show the identity as unknown. The user's answer applies to that
+connection; an "always" answer for an unknown program is refused as before.
+With no answering UI connected the flow takes `no_ui_action`, and the prompt
+caps send overflow to the same fallback. Neither pause nor the loopback
+allowance lifts such a flow. The recorded event and the live feed carry the
+undecided rule's id in `rule_id` with a source other than `rule`. A legacy
+hostname rule (`dst_host`) that cannot be decided is still refused, since no
+answer can establish the name.
 
 Disabled and expired rules are filtered at lookup, so a `Seconds(n)` rule
 stops matching the instant it expires rather than when the reaper next runs.

@@ -50,8 +50,15 @@ struct EngineInner {
 pub enum Decision {
     /// A persistent rule matched. Return the verdict immediately.
     Resolved(Verdict),
-    /// No rule matched. Caller should prompt the user.
-    NeedsPrompt { fallback: Verdict },
+    /// No rule answered. Caller should prompt the user, and apply `fallback`
+    /// (no_ui_action) when nobody can be asked.
+    NeedsPrompt {
+        fallback: Verdict,
+        /// A rule that may apply but cannot be decided, because the process
+        /// identity (exe, uid or digest) is incomplete. `None` when no rule is
+        /// about this flow.
+        undecided: Option<uuid::Uuid>,
+    },
 }
 
 impl Engine {
@@ -159,30 +166,33 @@ impl Engine {
     /// must not credit the rule it did not follow.
     pub fn peek(&self, conn: &Connection, proc: &Process) -> Decision {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let rule_match = {
-            let rules = self.inner.rules.read();
-            match rules.lookup(conn, proc, now_unix_ms) {
-                cfc_core::rule::Match::Rule(r) => Some((r.id, r.action)),
-                // Missing identity cannot authorize traffic or be overridden
-                // by pause, a permissive fallback, or a prompt response.
-                cfc_core::rule::Match::Undecidable(r) => {
-                    tracing::debug!(
-                        rule = %r.name,
-                        exe = %proc.exe.display(),
-                        "policy identity is incomplete; refusing this flow"
-                    );
-                    return Decision::Resolved(Verdict::from_policy(cfc_core::Action::Deny));
-                }
-                cfc_core::rule::Match::None => None,
-            }
-        };
-        if let Some((rule_id, action)) = rule_match {
+        let rules = self.inner.rules.read();
+        let undecided = match rules.lookup(conn, proc, now_unix_ms) {
             // Verbatim: a Reject rule must reach the datapath as Reject so
             // the refusal is actually injected, not silently downgraded.
-            return Decision::Resolved(Verdict::from_rule(action, rule_id));
-        }
+            cfc_core::rule::Match::Rule(r) => {
+                return Decision::Resolved(Verdict::from_rule(r.action, r.id));
+            }
+            // No answer can establish a legacy hostname, so it stays refused.
+            cfc_core::rule::Match::Undecidable(r) if r.scope.dst_host.is_some() => {
+                tracing::debug!(rule = %r.name, "legacy hostname rule cannot be decided; refusing this flow");
+                return Decision::Resolved(Verdict::from_policy(cfc_core::Action::Deny));
+            }
+            // Incomplete identity is uncertainty, not a refusal: ask the user.
+            cfc_core::rule::Match::Undecidable(r) => {
+                tracing::debug!(
+                    rule = %r.name,
+                    exe = %proc.exe.display(),
+                    "process identity is incomplete; prompting for this flow"
+                );
+                Some(r.id)
+            }
+            cfc_core::rule::Match::None => None,
+        };
+        drop(rules);
         Decision::NeedsPrompt {
             fallback: self.fallback_verdict(),
+            undecided,
         }
     }
 
@@ -1150,10 +1160,52 @@ mod tests {
     fn no_rules_returns_needs_prompt() {
         let engine = Engine::new(RuleSet::default(), shared(dp_allow()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
-            Decision::NeedsPrompt { fallback } => {
+            Decision::NeedsPrompt { fallback, .. } => {
                 assert_eq!(fallback.action, Action::Allow);
             }
             _ => panic!("expected NeedsPrompt"),
+        }
+    }
+
+    #[test]
+    fn incomplete_identity_needs_a_prompt_naming_the_rule() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let rule = Rule::new("deny-curl", Action::Deny, scope);
+        let id = rule.id;
+        let engine = Engine::new(RuleSet { rules: vec![rule] }, shared(dp_allow()));
+        match engine.evaluate(&conn(443), &Process::unknown(0)) {
+            Decision::NeedsPrompt {
+                fallback,
+                undecided,
+            } => {
+                assert_eq!(undecided, Some(id));
+                assert_eq!(fallback, Verdict::from_policy(Action::Allow));
+            }
+            _ => panic!("expected NeedsPrompt"),
+        }
+        assert!(matches!(
+            engine.evaluate(&conn(443), &proc("/usr/bin/wget")),
+            Decision::NeedsPrompt {
+                undecided: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_hostname_policy_still_refuses() {
+        let mut scope = RuleScope::any();
+        scope.dst_host = Some("example.org".into());
+        let engine = Engine::new(
+            RuleSet {
+                rules: vec![Rule::new("legacy", Action::Deny, scope)],
+            },
+            shared(dp_allow()),
+        );
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::Resolved(v) => assert_eq!(v, Verdict::from_policy(Action::Deny)),
+            _ => panic!("expected Resolved"),
         }
     }
 
@@ -1186,7 +1238,7 @@ mod tests {
     fn fallback_respects_default_policy_deny() {
         let engine = Engine::new(RuleSet::default(), shared(dp_deny()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
-            Decision::NeedsPrompt { fallback } => {
+            Decision::NeedsPrompt { fallback, .. } => {
                 assert_eq!(fallback.action, Action::Deny);
             }
             _ => panic!("expected NeedsPrompt"),
@@ -1261,7 +1313,7 @@ mod tests {
         *policy.write().unwrap() = dp_deny();
         assert_eq!(engine.fallback_verdict().action, Action::Deny);
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
-            Decision::NeedsPrompt { fallback } => {
+            Decision::NeedsPrompt { fallback, .. } => {
                 assert_eq!(fallback.action, Action::Deny);
             }
             _ => panic!("expected NeedsPrompt"),

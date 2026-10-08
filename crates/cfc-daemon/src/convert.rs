@@ -404,10 +404,9 @@ pub fn verdict_to_pb_action(v: &Verdict) -> pb::Action {
 /// Flattens a decided flow into the row shape persisted by
 /// [`crate::storage::RuleStore::insert_events`].
 pub fn event_row_from_observed(
-    conn: &Connection,
-    proc: &Process,
-    verdict: &Verdict,
+    obs: &crate::nfqueue::ObservedConnection,
 ) -> crate::storage::EventRow {
+    let (conn, proc, verdict) = (&obs.connection, &obs.process, &obs.verdict);
     crate::storage::EventRow {
         id: 0,
         ts_unix_ms: conn.timestamp.timestamp_millis(),
@@ -422,10 +421,7 @@ pub fn event_row_from_observed(
         uid: proc.uid,
         action: action_db_str(verdict.action).to_string(),
         source: verdict_source_db_str(&verdict.source).to_string(),
-        rule_id: match verdict.source {
-            cfc_core::VerdictSource::Rule(id) => Some(id.to_string()),
-            _ => None,
-        },
+        rule_id: obs.rule_id().map(|id| id.to_string()),
     }
 }
 
@@ -921,7 +917,7 @@ mod tests {
         let rule_id = uuid::Uuid::new_v4();
         let verdict = cfc_core::Verdict::deny_from_rule(rule_id);
 
-        let row = event_row_from_observed(&conn, &proc, &verdict);
+        let row = event_row_from_observed(&observed(conn, proc, verdict, None));
         assert_eq!(row.action, "Deny");
         assert_eq!(row.source, "rule");
         assert_eq!(row.rule_id.as_deref(), Some(rule_id.to_string().as_str()));
@@ -948,11 +944,73 @@ mod tests {
             2,
         );
         let proc = cfc_core::Process::unknown(7);
-        let row = event_row_from_observed(&conn, &proc, &cfc_core::Verdict::default_allow());
+        let row = event_row_from_observed(&observed(
+            conn,
+            proc,
+            cfc_core::Verdict::default_allow(),
+            None,
+        ));
         assert_eq!(row.uid, None);
         assert_eq!(row.source, "default");
         assert_eq!(row.rule_id, None);
         assert_eq!(event_row_to_pb(&row).uid, None);
+    }
+
+    fn observed(
+        connection: cfc_core::Connection,
+        process: cfc_core::Process,
+        verdict: cfc_core::Verdict,
+        undecided: Option<uuid::Uuid>,
+    ) -> crate::nfqueue::ObservedConnection {
+        crate::nfqueue::ObservedConnection {
+            connection,
+            process,
+            verdict,
+            undecided,
+        }
+    }
+
+    #[test]
+    fn an_undecided_outcome_records_the_rule_id() {
+        let conn = cfc_core::Connection::new(
+            Protocol::Udp,
+            Direction::Outbound,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5353,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            53,
+        );
+        let undecided = uuid::Uuid::new_v4();
+        for verdict in [
+            cfc_core::Verdict::from_policy(Action::Deny),
+            cfc_core::Verdict::default_allow(),
+            cfc_core::Verdict {
+                action: Action::Deny,
+                source: cfc_core::VerdictSource::Timeout,
+            },
+            cfc_core::Verdict {
+                action: Action::Allow,
+                source: cfc_core::VerdictSource::UserPrompt,
+            },
+        ] {
+            let row = event_row_from_observed(&observed(
+                conn.clone(),
+                cfc_core::Process::unknown(0),
+                verdict,
+                Some(undecided),
+            ));
+            assert_ne!(row.source, "rule");
+            assert_eq!(row.rule_id.as_deref(), Some(undecided.to_string().as_str()));
+        }
+        // A rule that answered is recorded as itself, not as undecided.
+        let answered = uuid::Uuid::new_v4();
+        let row = event_row_from_observed(&observed(
+            conn,
+            cfc_core::Process::unknown(0),
+            cfc_core::Verdict::deny_from_rule(answered),
+            Some(undecided),
+        ));
+        assert_eq!(row.rule_id.as_deref(), Some(answered.to_string().as_str()));
     }
 
     #[test]

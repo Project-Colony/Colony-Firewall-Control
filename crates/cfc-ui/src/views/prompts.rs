@@ -636,6 +636,7 @@ mod tests {
             process: Some(process()),
             deadline_unix_ms: 1_700_000_015_000,
             binds_to_hash: false,
+            undecided_rule_id: String::new(),
         }
     }
 
