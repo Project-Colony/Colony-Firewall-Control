@@ -31,6 +31,7 @@ const PROGRAM_LABEL: &str = "Program";
 
 pub fn view<'a>(
     prompts: &'a [PromptCard],
+    rules: &'a [proto::RuleInfo],
     status: Option<&'a proto::StatusResponse>,
     now_ms: i64,
 ) -> Element<'a, Message> {
@@ -38,7 +39,7 @@ pub fn view<'a>(
         return container(
             column![
                 text("No pending prompts").size(18),
-                text("Outbound flows without a matching rule will appear here for you to allow or block.").size(12),
+                text("Outbound flows that no rule decides will appear here for you to allow or block.").size(12),
                 text("Keyboard, on the top prompt: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(11),
             ]
             .spacing(8),
@@ -60,7 +61,16 @@ pub fn view<'a>(
     let cards: Vec<Element<'a, Message>> = prompts
         .iter()
         .enumerate()
-        .map(|(i, c)| prompt_card(c, timeout_action, timeout_secs, now_ms, Some(i) == target))
+        .map(|(i, c)| {
+            prompt_card(
+                c,
+                rules,
+                timeout_action,
+                timeout_secs,
+                now_ms,
+                Some(i) == target,
+            )
+        })
         .collect();
 
     container(scrollable(column(cards).spacing(12).padding(8)).height(Length::Fill))
@@ -226,6 +236,24 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
     rows
 }
 
+/// Why this flow was asked about although a rule may cover it: the daemon
+/// could not fully identify the program, so it could not decide that rule.
+/// Names the rule from the loaded list, or by id when it is not there.
+pub fn undecided_warning(ev: &proto::PromptEvent, rules: &[proto::RuleInfo]) -> Option<String> {
+    if ev.undecided_rule_id.is_empty() {
+        return None;
+    }
+    let rule = rules
+        .iter()
+        .find(|r| r.id == ev.undecided_rule_id)
+        .map(|r| convert::display_safe(&r.name))
+        .unwrap_or_else(|| convert::display_safe(&ev.undecided_rule_id));
+    Some(format!(
+        "Rule \"{rule}\" may apply, but the program could not be fully identified; \
+         your answer applies to this connection."
+    ))
+}
+
 /// `"pid 4242 (parent pid 1310)"`.
 ///
 /// WFC names the parent program; the proto carries only `ppid`, so the
@@ -371,13 +399,14 @@ pub fn action_consequence(choice: PromptAction, program: &str) -> String {
 
 type ButtonStyle = fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style;
 
-fn prompt_card(
-    card: &PromptCard,
+fn prompt_card<'a>(
+    card: &'a PromptCard,
+    rules: &[proto::RuleInfo],
     timeout_action: i32,
     timeout_secs: u32,
     now_ms: i64,
     key_target: bool,
-) -> Element<'_, Message> {
+) -> Element<'a, Message> {
     let ev = &card.event;
     let program = program_label(ev);
     // Disabled for a moment after the card appears, so a click aimed at
@@ -385,7 +414,7 @@ fn prompt_card(
     // verdict is on the way.
     let armed = card.armed(now_ms);
 
-    let marker: Element<'_, Message> = if key_target {
+    let marker: Element<'a, Message> = if key_target {
         text("A / D answer this prompt")
             .size(10)
             .color(crate::theme::PARCHMENT_MUTED)
@@ -452,7 +481,7 @@ fn prompt_card(
 
     // Without an exe path the two program rows are dead: say why, once,
     // rather than leaving the user clicking a button that does nothing.
-    let unscopable: Element<'_, Message> = if verdict_for(PromptAction::AllowProgram, ev).is_some()
+    let unscopable: Element<'a, Message> = if verdict_for(PromptAction::AllowProgram, ev).is_some()
     {
         Space::new().into()
     } else {
@@ -465,10 +494,20 @@ fn prompt_card(
         .into()
     };
 
-    container(column![header, countdown, table, customize, actions, unscopable].spacing(9))
-        .padding(12)
-        .style(crate::theme::panel)
-        .into()
+    let undecided: Element<'a, Message> = match undecided_warning(ev, rules) {
+        Some(warning) => text(warning)
+            .size(11)
+            .color(crate::theme::BURGUNDY_DARK)
+            .into(),
+        None => Space::new().into(),
+    };
+
+    container(
+        column![header, countdown, undecided, table, customize, actions, unscopable].spacing(9),
+    )
+    .padding(12)
+    .style(crate::theme::panel)
+    .into()
 }
 
 fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
@@ -894,6 +933,26 @@ mod tests {
             heading(&proto::PromptEvent::default()),
             "Outgoing connection"
         );
+    }
+
+    #[test]
+    fn an_undecided_prompt_names_the_rule_it_could_not_decide() {
+        assert_eq!(undecided_warning(&event(), &[]), None);
+        let ev = proto::PromptEvent {
+            undecided_rule_id: "r1".into(),
+            ..event()
+        };
+        let rules = [proto::RuleInfo {
+            id: "r1".into(),
+            name: "block telemetry".into(),
+            ..Default::default()
+        }];
+        let line = undecided_warning(&ev, &rules).unwrap();
+        assert!(line.contains("\"block telemetry\""), "{line}");
+        assert!(line.contains("could not be fully identified"), "{line}");
+        assert!(line.contains("this connection"), "{line}");
+        // A rule not in the loaded list is still named, by its id.
+        assert!(undecided_warning(&ev, &[]).unwrap().contains("\"r1\""));
     }
 
     #[test]

@@ -19,6 +19,21 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   predicate when rules are ranked; it still limits a rule to one address
   family, and stored rules that carry only a `/0` keep loading. Some flows
   change verdict on upgrade: review `cfc rules list`.
+- **Breaking: a flow whose process identity is incomplete is prompted
+  instead of silently refused** when a program rule may apply to it: an
+  unattributed socket (ambiguous UDP, an expired attribution budget), a
+  binary too large to hash, a process that exited first. The prompt names
+  the rule that could not be decided (`PromptEvent.undecided_rule_id`) and
+  the app, tray and `cfc prompts` show the program as unknown. With no UI
+  connected the flow takes `no_ui_action` (Deny on every shipped profile),
+  and prompt caps send overflow there too; pause and the loopback allowance
+  no longer let such flows through without asking. One "allow this program"
+  rule no longer blocks every unattributed flow that a generic rule allows.
+  The event log and live feed record the undecided rule in `rule_id` with a
+  source other than `rule`. A legacy hostname rule that cannot be decided is
+  still refused. With `no_ui_action = "Allow"`, a program can reach that
+  fallback by making its own attribution fail, so keep it at Deny where
+  program denies matter.
 - New loopback flows now go through the queue instead of being accepted
   outright (`oifname "lo" accept` is gone from the outbound table). While the
   daemon runs, explicit rules apply to them, so a loopback Deny that 0.7.0

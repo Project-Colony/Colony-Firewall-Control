@@ -1365,7 +1365,12 @@ impl App {
         let sidebar = self.sidebar();
         let header = self.header_bar(paused);
         let body: Element<'_, Message> = match self.tab {
-            Tab::Prompts => views::prompts::view(&self.prompts, self.status.as_ref(), self.now_ms),
+            Tab::Prompts => views::prompts::view(
+                &self.prompts,
+                &self.rules,
+                self.status.as_ref(),
+                self.now_ms,
+            ),
             Tab::Rules => views::rules::view(views::rules::ListArgs {
                 rules: &self.rules,
                 filter: &self.rules_filter,

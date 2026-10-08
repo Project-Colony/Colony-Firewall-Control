@@ -314,6 +314,13 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
             },
         );
     }
+    // Why a flow a rule may cover is asked about at all.
+    if !ev.undecided_rule_id.is_empty() {
+        body.push_str(
+            "\nA rule may apply, but the program could not be fully identified; \
+             your answer applies to this connection.",
+        );
+    }
     let remaining = ev.deadline_unix_ms.saturating_sub(now_unix_ms);
     let timeout_ms = remaining.clamp(i64::from(MIN_PROMPT_TIMEOUT_MS), i64::from(u32::MAX)) as u32;
     PromptNotification {
@@ -846,6 +853,24 @@ mod tests {
         assert!(n.body.starts_with("93.184.216.34:443 (tcp)"), "{}", n.body);
         let n = prompt_notification(&prompt_event("/usr/bin/curl", "", "", 0), 0);
         assert!(n.body.starts_with("unknown:443 (tcp)"), "{}", n.body);
+    }
+
+    #[test]
+    fn an_undecided_prompt_says_the_program_was_not_identified() {
+        let plain = prompt_notification(&prompt_event("", "", "1.1.1.1", 0), 0);
+        assert!(!plain.body.contains("could not be fully identified"));
+        let ev = proto::PromptEvent {
+            undecided_rule_id: "r1".into(),
+            ..prompt_event("", "", "1.1.1.1", 0)
+        };
+        let n = prompt_notification(&ev, 0);
+        assert!(
+            n.body
+                .contains("A rule may apply, but the program could not be fully identified"),
+            "{}",
+            n.body
+        );
+        assert!(n.body.contains("this connection"));
     }
 
     #[test]
