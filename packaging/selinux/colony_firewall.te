@@ -51,10 +51,6 @@ files_type(colony_firewall_var_lib_t)
 type colony_firewall_runtime_t;
 files_pid_file(colony_firewall_runtime_t)
 
-# /var/log/colony-firewall
-type colony_firewall_log_t;
-logging_log_file(colony_firewall_log_t)
-
 type colony_firewall_unit_file_t;
 systemd_unit_file(colony_firewall_unit_file_t)
 
@@ -270,10 +266,6 @@ manage_files_pattern(colony_firewalld_t, colony_firewall_var_lib_t, colony_firew
 # and never surfaces as an error anywhere.
 allow colony_firewalld_t colony_firewall_var_lib_t:file map;
 files_var_lib_filetrans(colony_firewalld_t, colony_firewall_var_lib_t, { dir file })
-
-manage_dirs_pattern(colony_firewalld_t, colony_firewall_log_t, colony_firewall_log_t)
-manage_files_pattern(colony_firewalld_t, colony_firewall_log_t, colony_firewall_log_t)
-logging_log_filetrans(colony_firewalld_t, colony_firewall_log_t, { dir file })
 
 manage_dirs_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
 manage_files_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)

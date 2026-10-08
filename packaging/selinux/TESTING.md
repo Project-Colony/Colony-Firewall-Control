@@ -70,7 +70,7 @@ this directory):
 make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
 sudo semodule -i colony_firewall.pp
 sudo restorecon -RvF /usr/bin/colony-firewalld /etc/colony-firewall \
-    /var/lib/colony-firewall /var/log/colony-firewall /run/colony-firewall
+    /var/lib/colony-firewall /run/colony-firewall
 ```
 
 Verify the label took - this is the single most common way a policy "fails"

@@ -101,12 +101,13 @@ ProtectHome=true
 # process-lifetime links, and `kill -9` on this unit lifts every in-kernel deny
 # it holds - which is the one thing that layer exists to prevent. The daemon
 # only ever creates /sys/fs/bpf/colony-firewall/; it writes nothing else there.
-ReadWritePaths=/var/lib/colony-firewall /run/colony-firewall /var/log/colony-firewall /sys/fs/bpf
+# StateDirectory= and RuntimeDirectory= below are writable without a line here.
+# The daemon logs to the journal and owns no log directory.
+ReadWritePaths=/sys/fs/bpf
 RuntimeDirectory=colony-firewall
 RuntimeDirectoryMode=0755
 StateDirectory=colony-firewall
 StateDirectoryMode=0750
-LogsDirectory=colony-firewall
 
 # Sandboxing
 PrivateTmp=true

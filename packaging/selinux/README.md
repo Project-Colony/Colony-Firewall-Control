@@ -12,7 +12,7 @@ are built around. So: a real module.
 make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
 sudo semodule -i colony_firewall.pp
 sudo restorecon -RvF /usr/bin/colony-firewalld /etc/colony-firewall \
-    /var/lib/colony-firewall /var/log/colony-firewall /run/colony-firewall
+    /var/lib/colony-firewall /run/colony-firewall
 ```
 
 `selinux-policy-devel` provides that Makefile. The `.spec` in `packaging/rpm`

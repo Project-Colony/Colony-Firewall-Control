@@ -439,7 +439,7 @@ to shrink what a code-execution bug could reach:
 | `SystemCallFilter=bpf perf_event_open` | The two syscalls the eBPF layer needs, named individually |
 | `SystemCallArchitectures=native`   | Closes the 32-bit-syscall bypass of that filter |
 | `MemoryDenyWriteExecute`           | Nothing here JITs; no W+X memory |
-| `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths` | Read-only filesystem apart from the state, runtime and log directories |
+| `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths` | Read-only filesystem apart from the state and runtime directories and the bpffs pin directory |
 | `PrivateDevices`                   | Private `/dev` with only pseudo devices: uid 0 cannot open the block devices and write underneath `ProtectSystem` |
 | `RestrictAddressFamilies`          | AF_UNIX, AF_INET, AF_INET6, AF_NETLINK only; no packet sockets |
 | `RestrictNamespaces`, `LockPersonality`, `RestrictRealtime`, `RestrictSUIDSGID` | Namespace and personality lockdown |

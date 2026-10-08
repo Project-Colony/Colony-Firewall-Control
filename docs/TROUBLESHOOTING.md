@@ -210,7 +210,7 @@ journalctl -u colony-firewalld -b -g 'opening rule store|durable storage require
 
 - `durable storage requires WAL` or `synchronous=FULL`: the path is on a
   filesystem that cannot hold a WAL journal (a network share, for one), or
-  outside the unit's `ReadWritePaths`. Keep `[storage] path` on local disk
+  outside the directories the unit can write. Keep `[storage] path` on local disk
   under `/var/lib/colony-firewall`.
 - `newer than this daemon supports`: the package was downgraded. Reinstall
   the newer one, or restore a backup of `rules.db` that the older version
