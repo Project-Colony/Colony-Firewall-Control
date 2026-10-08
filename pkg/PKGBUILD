@@ -46,17 +46,23 @@ sha256sums=('SKIP')
 # GitHub release tarballs extract to <repo>-<version> (no leading 'v').
 _srcname=Colony-Firewall-Control-$pkgver
 
-prepare() {
+# Called from build() too: `makepkg --noprepare` skips prepare().
+_require_checksum() {
     if [[ "${sha256sums[0]}" == 'SKIP' ]]; then
         printf '%s\n' 'Release template has no source checksum. Run updpkgsums before building.' >&2
         return 1
     fi
+}
+
+prepare() {
+    _require_checksum
     cd "$srcdir/$_srcname"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
+    _require_checksum
     cd "$srcdir/$_srcname"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
