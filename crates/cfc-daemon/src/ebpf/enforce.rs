@@ -490,15 +490,7 @@ impl VerdictSink {
         // the time this runs, whatever the exec program wrote for a
         // mismatched spelling is overwritten or cleared. The residual window
         // is the exec-to-consumer latency, and the packet path covers it.
-        let resolved = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .map(|exe| {
-                let s = exe.to_string_lossy();
-                match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
-                    Some(stripped) => std::path::PathBuf::from(stripped),
-                    None => exe,
-                }
-            });
+        let resolved = proc_exe(pid);
         // The uid here stays the event's, not a fresh read: at the moment of an
         // execve that *is* the process's uid, and a drop of privileges between
         // the kernel's tracepoint and this consumer is both vanishingly narrow
@@ -656,16 +648,14 @@ impl VerdictSink {
     }
 }
 
-/// `/proc/<pid>/exe`, with the kernel's `" (deleted)"` suffix stripped.
+/// `/proc/<pid>/exe` as rules match it (`policy_exe_path`). `None` when the
+/// process is gone or its image cannot be read.
 fn proc_exe(pid: u32) -> Option<std::path::PathBuf> {
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    let s = exe.to_string_lossy();
-    Some(
-        match s.strip_suffix(crate::process_resolve::DELETED_SUFFIX) {
-            Some(stripped) => std::path::PathBuf::from(stripped),
-            None => exe,
-        },
-    )
+    use std::os::unix::fs::MetadataExt as _;
+    let link = format!("/proc/{pid}/exe");
+    let path = std::fs::read_link(&link).ok()?;
+    let unlinked = std::fs::metadata(&link).ok()?.nlink() == 0;
+    Some(crate::process_resolve::policy_exe_path(path, unlinked))
 }
 
 /// Everything a resync decision needs about one pid, read from /proc, plus the

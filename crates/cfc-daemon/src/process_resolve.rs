@@ -217,7 +217,7 @@ fn resolve_inner(
 
     let image = image.and_then(|image| image.finish(&proc_exe_path));
     let image = image.filter(|_| read_starttime(pid) == starttime);
-    let (exe, sha256) = match image {
+    let (exe, sha256, unlinked) = match image {
         Some(identity) => identity,
         None => {
             // The event filename is an exec argument, including aliases.
@@ -225,7 +225,7 @@ fn resolve_inner(
             // or changed during resolution. Kernel credentials remain useful.
             cmdline.clear();
             cwd = None;
-            (PathBuf::from(cfc_core::UNKNOWN_EXE), None)
+            (PathBuf::from(cfc_core::UNKNOWN_EXE), None, false)
         }
     };
 
@@ -251,14 +251,11 @@ fn resolve_inner(
     // digest below is of the *old* bytes, and comparing those against the new
     // file on disk would report `Modified` for every process running across an
     // upgrade - so it is passed the original.
-    let replaced_on_disk = exe.to_string_lossy().ends_with(DELETED_SUFFIX);
+    //
+    // Only an image with no link left is stripped (`policy_exe_path`): a file
+    // literally named "curl (deleted)" must not pass for "curl".
     let exe_for_provenance = exe.clone();
-    let exe = if replaced_on_disk {
-        let s = exe.to_string_lossy();
-        PathBuf::from(&s[..s.len() - DELETED_SUFFIX.len()])
-    } else {
-        exe
-    };
+    let exe = policy_exe_path(exe, unlinked);
 
     // Package provenance reuses the digest computed just above rather than
     // re-hashing. That digest comes from /proc/{pid}/exe -- the binary the
@@ -819,6 +816,23 @@ fn parse_starttime(stat: &str) -> Option<u64> {
 /// gone, provenance wants to know it was there.
 pub(crate) const DELETED_SUFFIX: &str = " (deleted)";
 
+/// The path rules match for an image `/proc/<pid>/exe` names `path`.
+///
+/// The kernel appends [`DELETED_SUFFIX`] once the image has no link left, as
+/// after a package upgrade under a running program; it is dropped so a rule
+/// for the path keeps matching. A file that is merely named "x (deleted)"
+/// still has a link and keeps its whole name, so it cannot pass for "x".
+pub(crate) fn policy_exe_path(path: PathBuf, unlinked: bool) -> PathBuf {
+    let stripped = unlinked
+        .then(|| {
+            path.to_str()?
+                .strip_suffix(DELETED_SUFFIX)
+                .map(PathBuf::from)
+        })
+        .flatten();
+    stripped.unwrap_or(path)
+}
+
 /// One opened mapped image. Its link and metadata must still describe this
 /// file after hashing; otherwise no executable identity is published.
 struct MappedImage {
@@ -842,7 +856,9 @@ impl MappedImage {
         Some(Self { file, path, key })
     }
 
-    fn finish(self, link: &Path) -> Option<(PathBuf, Option<String>)> {
+    /// The image's path as `/proc` renders it, its digest, and whether it has
+    /// no link left.
+    fn finish(self, link: &Path) -> Option<(PathBuf, Option<String>, bool)> {
         let meta = self.file.metadata().ok()?;
         if image_key(&meta) != self.key {
             return None;
@@ -860,7 +876,7 @@ impl MappedImage {
         {
             return None;
         }
-        Some((self.path, sha256))
+        Some((self.path, sha256, meta.nlink() == 0))
     }
 }
 
@@ -1078,15 +1094,22 @@ mod tests {
         // path string, so leaving it there means the rule the user wrote - or
         // the one a prompt created - matches nothing.
         let raw = PathBuf::from("/usr/lib/firefox/firefox (deleted)");
-        let s = raw.to_string_lossy();
-        assert!(s.ends_with(DELETED_SUFFIX));
-        let cleaned = PathBuf::from(&s[..s.len() - DELETED_SUFFIX.len()]);
-        assert_eq!(cleaned, PathBuf::from("/usr/lib/firefox/firefox"));
+        assert_eq!(
+            policy_exe_path(raw.clone(), true),
+            PathBuf::from("/usr/lib/firefox/firefox")
+        );
+
+        // A linked file literally named that keeps its name: it is not the
+        // firefox an upgrade replaced.
+        assert_eq!(
+            policy_exe_path(raw, false).to_str(),
+            Some("/usr/lib/firefox/firefox (deleted)")
+        );
 
         // And a path that merely *contains* the words is left alone: the
         // suffix is a suffix, not a substring.
         let odd = PathBuf::from("/opt/my (deleted) app/bin");
-        assert!(!odd.to_string_lossy().ends_with(DELETED_SUFFIX));
+        assert_eq!(policy_exe_path(odd.clone(), true), odd);
     }
 
     #[test]
@@ -1558,8 +1581,9 @@ mod tests {
         fs::write(&second, b"another image").unwrap();
         symlink(&first, &link).unwrap();
 
-        let (path, digest) = MappedImage::open(&link).unwrap().finish(&link).unwrap();
+        let (path, digest, unlinked) = MappedImage::open(&link).unwrap().finish(&link).unwrap();
         assert_eq!(path, first);
+        assert!(!unlinked);
         assert_eq!(
             digest.as_deref(),
             Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
