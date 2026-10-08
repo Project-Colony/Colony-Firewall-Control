@@ -8,7 +8,9 @@
 //! 1. its start time matches the one captured at accept (the "before" read);
 //! 2. it runs in the host mount and user namespaces, so no private mount or
 //!    user namespace can show it a different `/usr/bin`;
-//! 3. it is not traced and its effective uid is the connection's uid;
+//! 3. it is not traced, runs under no seccomp filter (a filter can make
+//!    the prologue's `close_range` report success without closing
+//!    anything) and its effective uid is the connection's uid;
 //! 4. it is non-dumpable, which is the mark `seal_official_process` leaves:
 //!    the kernel hands the files under `/proc/<pid>` to root exactly then;
 //! 5. its image is, by device and inode, one of the allowlisted binaries,
@@ -116,7 +118,14 @@ fn inspect(pid: u32, uid: u32, sock_ino: u64, allowlist: &[PathBuf]) -> Result<P
     Ok(matched)
 }
 
-/// `TracerPid` is 0 and the effective uid is `uid`.
+/// `TracerPid` is 0, no seccomp filter is installed and the effective uid
+/// is `uid`.
+///
+/// A filter survives `exec`, so a program can install one that answers
+/// `close_range` and `close` with success and then exec the official binary:
+/// its prologue "closes" an inherited connection that stays open. The app
+/// and tray never install one. A kernel built without seccomp has no
+/// `Seccomp:` line and cannot run a filter either.
 fn status_is_clean(status: &str, uid: u32) -> Result<(), String> {
     let field = |name: &str| {
         status
@@ -129,6 +138,14 @@ fn status_is_clean(status: &str, uid: u32) -> Result<(), String> {
         Some(0) => {}
         Some(_) => return Err("the caller is being traced".into()),
         None => return Err("the caller's status has no TracerPid".into()),
+    }
+    if field("Seccomp:")
+        .and_then(|mut v| v.next())
+        .is_some_and(|mode| mode != "0")
+    {
+        return Err(
+            "the caller runs under a seccomp filter, which the app and tray never install".into(),
+        );
     }
     let effective = field("Uid:").and_then(|mut v| v.nth(1)?.parse::<u32>().ok());
     if effective != Some(uid) {
@@ -381,6 +398,20 @@ mod tests {
             "the caller is being traced"
         );
         assert!(status_is_clean("Uid:\t1000\t1000\t1000\t1000\n", 1000).is_err());
+    }
+
+    #[test]
+    fn a_seccomp_filter_is_refused() {
+        let base = "TracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\n";
+        assert!(status_is_clean(&format!("{base}Seccomp:\t0\n"), 1000).is_ok());
+        assert!(
+            status_is_clean(base, 1000).is_ok(),
+            "no seccomp support at all"
+        );
+        for mode in ["1", "2"] {
+            let error = status_is_clean(&format!("{base}Seccomp:\t{mode}\n"), 1000).unwrap_err();
+            assert!(error.contains("seccomp"), "{error}");
+        }
     }
 
     #[test]

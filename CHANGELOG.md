@@ -98,8 +98,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its process runs the installed, root-sealed `/usr/bin/colony-firewall` or
   `/usr/bin/colony-firewall-tray` (by device and inode), sealed itself at
   startup (inherited descriptors closed, non-dumpable), holds the connection
-  itself, is not traced, runs in the host namespaces and mapped no executable
-  file from outside root-owned directories. Every other program of the
+  itself, is not traced, runs under no seccomp filter (one installed before
+  `exec` can fake the descriptor closing), runs in the host namespaces and
+  mapped no executable file from outside root-owned directories. Every other
+  program of the
   desktop user, a non-root `cfc` included, is read-only: its changes are
   refused with the reason (exit 1 in `cfc`), its prompt subscription does not
   count as a connected UI and it cannot answer prompts. A peer with the

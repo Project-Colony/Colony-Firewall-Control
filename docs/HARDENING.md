@@ -341,7 +341,10 @@ that wants to change something is checked against the calling process, all
 of it between two reads of that process's start time (so a reused pid fails):
 
 - it runs in the host's mount and user namespaces;
-- it is not traced, and its effective uid is the connection's;
+- it is not traced, runs under no seccomp filter (a filter installed before
+  `exec` survives it and can make the prologue's descriptor closing report
+  success without closing anything), and its effective uid is the
+  connection's;
 - it ran the app's sealing prologue at startup: every inherited descriptor
   closed and the process made non-dumpable, which the kernel shows by giving
   its `/proc` files to root;

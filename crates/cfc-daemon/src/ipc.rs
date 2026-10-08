@@ -24,8 +24,8 @@
 //!      start-time reads) whose process passes [`crate::official::check`]:
 //!      it runs one of the installed, root-sealed `[ipc] official_clients`
 //!      binaries, ran their sealing prologue, holds this very connection, is
-//!      not traced and mapped no executable file from outside sealed
-//!      directories. `require_group = false` waives the group proof for
+//!      not traced, runs under no seccomp filter and mapped no executable
+//!      file from outside sealed directories. `require_group = false` waives the group proof for
 //!      official clients only.
 //!
 //!    Pause, resume and `ApplyRules` change the whole firewall at once, so

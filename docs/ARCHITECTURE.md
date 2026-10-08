@@ -371,7 +371,8 @@ the entire attack surface. Two layers:
    `DeleteRule`, `ApplyRules`, `SetPaused`) are accepted from root (or the
    daemon's own uid) and from the installed app and tray only. From
    `SO_PEERCRED`'s pid, `official.rs` checks, between two start-time reads,
-   that the process runs in the host namespaces, is not traced, has sealed
+   that the process runs in the host namespaces, is not traced, runs under
+   no seccomp filter (one can fake the prologue's `close_range`), has sealed
    itself (`cfc_client::seal_official_process`: inherited descriptors closed,
    non-dumpable), runs one of the root-sealed `[ipc] official_clients`
    binaries by device and inode, holds this connection's client end itself
