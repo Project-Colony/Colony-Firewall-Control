@@ -67,7 +67,7 @@ pub struct App {
     pub tab: Tab,
     pub daemon: DaemonState,
     pub rules: Vec<proto::RuleInfo>,
-    pub live: VecDeque<LiveEntry>,
+    pub live: VecDeque<proto::ConnectionEvent>,
     pub prompts: Vec<PromptCard>,
     /// The card the A/D keys answer and when they may: `(prompt_id,
     /// armed_at_ms)`. See [`App::sync_key_target`].
@@ -83,7 +83,7 @@ pub struct App {
     pub live_verdict: VerdictFilter,
     /// Snapshot rendered while the feed is paused. The buffer behind it
     /// keeps filling, so nothing is lost.
-    pub live_frozen: Option<Vec<LiveEntry>>,
+    pub live_frozen: Option<Vec<proto::ConnectionEvent>>,
     pub live_new: usize,
     pub session: SessionStats,
     /// Consecutive `StatusLoaded(Err)` since the last success.
@@ -127,97 +127,63 @@ pub struct RuleEditor {
     pub created_at_unix_ms: i64,
     pub hit_count: u64,
     pub enabled: bool,
-    /// Scope predicates this editor has no widget for, carried through
-    /// untouched.
+    /// The edited rule's scope, so the predicates this editor has no widget
+    /// for are carried through untouched.
     ///
     /// `cfc rules add --uid`, an imported opensnitch ruleset, or a
     /// checksum-pinned rule can all set these. Rebuilding the scope from
     /// the visible fields alone would silently *widen* such a rule on
     /// save: a deny scoped to one uid would start matching every user,
-    /// and a sha256-pinned allow would lose its binary pin.
-    pub carried_scope: CarriedScope,
+    /// a sha256-pinned allow would lose its binary pin, and an inbound rule
+    /// (unset direction means outbound) would turn outbound with its source
+    /// scope gone. Its visible fields are stale once the form is edited, so
+    /// only [`hidden_scope_is_set`] and [`hidden_scope_summary`] read it, and
+    /// saving overwrites them from the form.
+    pub carried_scope: proto::RuleScope,
 }
 
-/// Scope predicates preserved verbatim across an edit (see
-/// [`RuleEditor::carried_scope`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CarriedScope {
-    pub exe_sha256: String,
-    pub parent_exe: String,
-    pub uid: u32,
-    pub has_uid: bool,
-    // The flow-side predicates the editor has no widgets for. Before they
-    // were carried, saving any edit rebuilt them as unset - and an unset
-    // direction means outbound, so renaming an inbound rule silently turned
-    // it into an outbound one with its source scope gone.
-    pub direction: i32,
-    pub has_direction: bool,
-    pub src_net: String,
-    pub src_port: u32,
-    pub has_src_port: bool,
+/// True when `scope` carries a constraint the editor cannot show, so the view
+/// can tell the user rather than let them assume the visible fields are the
+/// whole rule.
+pub fn hidden_scope_is_set(scope: &proto::RuleScope) -> bool {
+    scope.has_uid
+        || !scope.exe_sha256.is_empty()
+        || !scope.parent_exe.is_empty()
+        || scope.has_direction
+        || !scope.src_net.is_empty()
+        || scope.has_src_port
 }
 
-impl CarriedScope {
-    fn from_scope(scope: Option<&proto::RuleScope>) -> Self {
-        match scope {
-            Some(s) => Self {
-                exe_sha256: s.exe_sha256.clone(),
-                parent_exe: s.parent_exe.clone(),
-                uid: s.uid,
-                has_uid: s.has_uid,
-                direction: s.direction,
-                has_direction: s.has_direction,
-                src_net: s.src_net.clone(),
-                src_port: s.src_port,
-                has_src_port: s.has_src_port,
-            },
-            None => Self::default(),
-        }
+/// One-line human summary of the hidden predicates, for that notice.
+pub fn hidden_scope_summary(scope: &proto::RuleScope) -> String {
+    let mut parts = Vec::new();
+    if scope.has_direction {
+        parts.push(
+            match proto::Direction::try_from(scope.direction) {
+                Ok(proto::Direction::Inbound) => "inbound",
+                Ok(proto::Direction::Outbound) => "outbound",
+                _ => "direction ?",
+            }
+            .to_string(),
+        );
     }
-
-    /// True when the rule carries a constraint the editor cannot show, so
-    /// the view can tell the user rather than let them assume the visible
-    /// fields are the whole rule.
-    pub fn is_set(&self) -> bool {
-        self.has_uid
-            || !self.exe_sha256.is_empty()
-            || !self.parent_exe.is_empty()
-            || self.has_direction
-            || !self.src_net.is_empty()
-            || self.has_src_port
+    if !scope.src_net.is_empty() {
+        parts.push(format!("from {}", scope.src_net));
     }
-
-    /// One-line human summary of the hidden predicates, for that notice.
-    pub fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        if self.has_direction {
-            parts.push(
-                match proto::Direction::try_from(self.direction) {
-                    Ok(proto::Direction::Inbound) => "inbound",
-                    Ok(proto::Direction::Outbound) => "outbound",
-                    _ => "direction ?",
-                }
-                .to_string(),
-            );
-        }
-        if !self.src_net.is_empty() {
-            parts.push(format!("from {}", self.src_net));
-        }
-        if self.has_src_port {
-            parts.push(format!("src port {}", self.src_port));
-        }
-        if self.has_uid {
-            parts.push(format!("uid {}", self.uid));
-        }
-        if !self.parent_exe.is_empty() {
-            parts.push(format!("parent {}", self.parent_exe));
-        }
-        if !self.exe_sha256.is_empty() {
-            let short: String = self.exe_sha256.chars().take(12).collect();
-            parts.push(format!("sha256 {short}..."));
-        }
-        parts.join(", ")
+    if scope.has_src_port {
+        parts.push(format!("src port {}", scope.src_port));
     }
+    if scope.has_uid {
+        parts.push(format!("uid {}", scope.uid));
+    }
+    if !scope.parent_exe.is_empty() {
+        parts.push(format!("parent {}", scope.parent_exe));
+    }
+    if !scope.exe_sha256.is_empty() {
+        let short: String = scope.exe_sha256.chars().take(12).collect();
+        parts.push(format!("sha256 {short}..."));
+    }
+    parts.join(", ")
 }
 
 impl Default for RuleEditor {
@@ -239,7 +205,7 @@ impl Default for RuleEditor {
             created_at_unix_ms: 0,
             hit_count: 0,
             enabled: true,
-            carried_scope: CarriedScope::default(),
+            carried_scope: proto::RuleScope::default(),
         }
     }
 }
@@ -271,7 +237,7 @@ impl RuleEditor {
             created_at_unix_ms: rule.created_at_unix_ms,
             hit_count: rule.hit_count,
             enabled: rule.enabled,
-            carried_scope: CarriedScope::from_scope(scope),
+            carried_scope: scope.cloned().unwrap_or_default(),
         }
     }
 
@@ -351,10 +317,10 @@ impl RuleEditor {
                 dst_port.to_string()
             },
             protocol,
-            carried_scope: CarriedScope {
+            carried_scope: proto::RuleScope {
                 direction: if inbound { direction } else { 0 },
                 has_direction: inbound,
-                ..CarriedScope::default()
+                ..Default::default()
             },
             ..Self::default()
         }
@@ -362,16 +328,10 @@ impl RuleEditor {
 }
 
 #[derive(Debug, Clone)]
-pub struct LiveEntry {
-    pub event: proto::ConnectionEvent,
-}
-
-#[derive(Debug, Clone)]
 pub struct PromptCard {
+    /// `deadline_unix_ms` is the wall clock at which the daemon answers this
+    /// prompt itself; 0 means it attached no deadline.
     pub event: proto::PromptEvent,
-    /// Wall clock at which the daemon answers this prompt itself. 0 means
-    /// the daemon attached no deadline.
-    pub deadline_unix_ms: i64,
     /// Wall clock before which the verdict buttons stay disabled.
     pub armed_at_ms: i64,
     /// A verdict for it is on its way to the daemon. The card stays until
@@ -383,7 +343,6 @@ pub struct PromptCard {
 impl PromptCard {
     fn new(event: proto::PromptEvent, now_ms: i64) -> Self {
         Self {
-            deadline_unix_ms: event.deadline_unix_ms,
             event,
             armed_at_ms: now_ms.saturating_add(PROMPT_ARM_MS),
             submitting: false,
@@ -673,7 +632,7 @@ impl App {
         let now = self.now_ms;
         let mut expired: Vec<String> = Vec::new();
         self.prompts.retain(|p| {
-            if format::is_expired(p.deadline_unix_ms, now) {
+            if format::is_expired(p.event.deadline_unix_ms, now) {
                 expired.push(prompt_label(&p.event));
                 false
             } else {
@@ -871,7 +830,7 @@ impl App {
             Message::LiveEvent(ev) => {
                 self.stream_trouble = false;
                 self.session.record(&ev);
-                self.live.push_front(LiveEntry { event: ev });
+                self.live.push_front(ev);
                 while self.live.len() > LIVE_CAP {
                     self.live.pop_back();
                 }
@@ -1792,7 +1751,7 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         && dst_net.is_empty()
         && dst_port.is_none()
         && ed.protocol.is_none()
-        && !ed.carried_scope.is_set();
+        && !hidden_scope_is_set(&ed.carried_scope);
     if scope_empty {
         return Err(
             "rule must restrict at least one of: exe, dst-host, dst-net, dst-port, protocol".into(),
@@ -1813,30 +1772,18 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
             .into_owned()
     };
 
+    // Every field this form shows is rebuilt from it; everything else is
+    // carried, so a predicate the editor cannot show is never dropped and the
+    // rule never widens on save.
     let scope = proto::RuleScope {
         exe_path: exe,
-        // Not editable here, so preserved rather than dropped: rebuilding
-        // the scope from the visible fields alone would widen the rule.
-        exe_sha256: ed.carried_scope.exe_sha256.clone(),
-        parent_exe: ed.carried_scope.parent_exe.clone(),
-        uid: ed.carried_scope.uid,
-        has_uid: ed.carried_scope.has_uid,
         dst_host: ed.dst_host.trim().to_string(),
         dst_net: dst_net.to_string(),
         dst_port: dst_port.map(u32::from).unwrap_or(0),
         has_dst_port: dst_port.is_some(),
         protocol: ed.protocol.map(|p| p as i32).unwrap_or(0),
         has_protocol: ed.protocol.is_some(),
-        // Carried like exe_sha256 above, and for the same reason - these
-        // three used to be rebuilt as unset here, two lines under the comment
-        // explaining why that must not happen. Unset direction means
-        // outbound, so the visible casualty was every inbound rule touched by
-        // this editor.
-        direction: ed.carried_scope.direction,
-        has_direction: ed.carried_scope.has_direction,
-        src_net: ed.carried_scope.src_net.clone(),
-        src_port: ed.carried_scope.src_port,
-        has_src_port: ed.carried_scope.has_src_port,
+        ..ed.carried_scope.clone()
     };
 
     Ok(proto::RuleInfo {
@@ -2158,7 +2105,7 @@ mod tests {
             ..existing_rule()
         };
         let ed = RuleEditor::from_existing(&uid_only);
-        assert!(ed.carried_scope.is_set());
+        assert!(hidden_scope_is_set(&ed.carried_scope));
         assert!(build_rule_from_editor(&ed).is_ok());
 
         // A genuinely empty scope is still refused.
@@ -2172,11 +2119,11 @@ mod tests {
     #[test]
     fn hidden_scope_summary_names_each_predicate() {
         let ed = RuleEditor::from_existing(&rule_with_hidden_scope());
-        let summary = ed.carried_scope.summary();
+        let summary = hidden_scope_summary(&ed.carried_scope);
         assert!(summary.contains("uid 1000"), "{summary}");
         assert!(summary.contains("/usr/bin/bash"), "{summary}");
         assert!(summary.contains("sha256 abc123def456"), "{summary}");
-        assert!(!CarriedScope::default().is_set());
+        assert!(!hidden_scope_is_set(&proto::RuleScope::default()));
     }
 
     #[test]
@@ -2499,15 +2446,5 @@ mod tests {
         assert!(!card.armed(5_000));
         assert!(!card.armed(5_000 + PROMPT_ARM_MS - 1));
         assert!(card.armed(5_000 + PROMPT_ARM_MS));
-    }
-
-    #[test]
-    fn prompt_card_captures_the_daemon_deadline() {
-        let ev = proto::PromptEvent {
-            prompt_id: "7".into(),
-            deadline_unix_ms: 1_700_000_000_000,
-            ..Default::default()
-        };
-        assert_eq!(PromptCard::new(ev, 0).deadline_unix_ms, 1_700_000_000_000);
     }
 }

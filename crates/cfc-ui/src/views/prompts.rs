@@ -555,13 +555,13 @@ fn countdown_row<'a>(
     timeout_secs: u32,
     now_ms: i64,
 ) -> Element<'a, Message> {
-    let Some(left) = format::remaining_secs(card.deadline_unix_ms, now_ms) else {
+    let Some(left) = format::remaining_secs(card.event.deadline_unix_ms, now_ms) else {
         return text("no deadline - waiting for your answer")
             .size(10)
             .into();
     };
 
-    let fraction = format::countdown_fraction(card.deadline_unix_ms, now_ms, timeout_secs);
+    let fraction = format::countdown_fraction(card.event.deadline_unix_ms, now_ms, timeout_secs);
     let style = if left <= URGENT_SECS {
         crate::theme::countdown_bar_urgent
     } else {
