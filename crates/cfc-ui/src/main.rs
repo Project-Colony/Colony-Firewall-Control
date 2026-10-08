@@ -275,7 +275,8 @@ impl RuleEditor {
     /// creating it").
     ///
     /// The connection remains pending until Save submits an explicit verdict,
-    /// or the daemon applies its timeout policy.
+    /// or the daemon applies its timeout policy. In that second case the
+    /// editor stays open as a new rule (see `App::detach_orphaned_editor`).
     pub fn from_prompt(ev: &proto::PromptEvent) -> Self {
         let exe = ev
             .process
@@ -369,6 +370,10 @@ pub struct PromptCard {
     pub deadline_unix_ms: i64,
     /// Wall clock before which the verdict buttons stay disabled.
     pub armed_at_ms: i64,
+    /// A verdict for it is on its way to the daemon. The card stays until
+    /// the daemon confirms, so a verdict that never arrived can be given
+    /// again instead of leaving the flow to the timeout default.
+    pub submitting: bool,
 }
 
 impl PromptCard {
@@ -377,12 +382,24 @@ impl PromptCard {
             deadline_unix_ms: event.deadline_unix_ms,
             event,
             armed_at_ms: now_ms.saturating_add(PROMPT_ARM_MS),
+            submitting: false,
         }
     }
 
+    /// Whether its verdict controls accept input.
     pub fn armed(&self, now_ms: i64) -> bool {
-        now_ms >= self.armed_at_ms
+        !self.submitting && now_ms >= self.armed_at_ms
     }
+}
+
+/// A verdict that did not do what the user asked.
+#[derive(Debug, Clone)]
+pub struct VerdictFailure {
+    pub prompt_id: String,
+    /// The daemon applied the answer and only the lasting rule failed. The
+    /// prompt is gone then, so its card must not come back.
+    pub applied: bool,
+    pub message: String,
 }
 
 /// How loudly a newly arrived prompt announces itself.
@@ -477,7 +494,7 @@ pub enum Message {
         scope: Option<proto::RuleScope>,
         duration: proto::Duration,
     },
-    VerdictSubmitted(Result<(String, bool, Option<String>), String>),
+    VerdictSubmitted(Result<(String, bool, Option<String>), VerdictFailure>),
     OpenEditor,
     EditExistingRule(String),
     CloseEditor,
@@ -512,7 +529,7 @@ pub enum Message {
     EditorProtocol(Option<proto::Protocol>),
     SaveRule,
     RuleSaved(Result<String, String>),
-    PromptRuleSaved(Result<(String, bool, Option<String>), String>),
+    PromptRuleSaved(Result<(String, bool, Option<String>), VerdictFailure>),
 }
 
 /// Raw key press forwarded from the subscription. The decision of what a
@@ -650,14 +667,7 @@ impl App {
                 true
             }
         });
-        if self
-            .editor
-            .as_ref()
-            .and_then(|editor| editor.prompt_id.as_ref())
-            .is_some_and(|id| !self.prompts.iter().any(|card| &card.event.prompt_id == id))
-        {
-            self.editor = None;
-        }
+        self.detach_orphaned_editor();
         for label in expired {
             self.log.warn(
                 format!(
@@ -678,10 +688,55 @@ impl App {
     /// a key press already on its way when the card above expired or was
     /// answered does not land on the card that just moved up.
     fn sync_key_target(&mut self) {
-        let top = self.prompts.first().map(|card| &card.event.prompt_id);
+        let top = self.key_target_card().map(|card| &card.event.prompt_id);
         if self.key_target.as_ref().map(|(id, _)| id) != top {
             self.key_target = top.map(|id| (id.clone(), self.now_ms.saturating_add(PROMPT_ARM_MS)));
         }
+    }
+
+    /// The top card that is not already being answered.
+    fn key_target_card(&self) -> Option<&PromptCard> {
+        self.prompts.iter().find(|card| !card.submitting)
+    }
+
+    /// Keeps a customization whose prompt is gone (expired, answered
+    /// elsewhere, stream dropped) open as a plain new rule.
+    ///
+    /// It used to be closed, which threw away the rule the user was
+    /// building and any error banner explaining why a save failed. Save now
+    /// stores the rule with `UpsertRule`, since there is no prompt left to
+    /// answer.
+    fn detach_orphaned_editor(&mut self) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if editor
+            .prompt_id
+            .as_ref()
+            .is_some_and(|id| !self.prompts.iter().any(|card| &card.event.prompt_id == id))
+        {
+            editor.prompt_id = None;
+            self.log.warn(
+                "the prompt being customized is gone; Save now stores a new rule",
+                self.now_ms,
+            );
+        }
+    }
+
+    /// Settles the card a verdict was sent for: gone once the daemon has
+    /// applied an answer, answerable again when nothing was applied.
+    fn settle_card(&mut self, prompt_id: &str, applied: bool) {
+        if applied {
+            self.prompts
+                .retain(|card| card.event.prompt_id != prompt_id);
+        } else if let Some(card) = self
+            .prompts
+            .iter_mut()
+            .find(|card| card.event.prompt_id == prompt_id)
+        {
+            card.submitting = false;
+        }
+        self.sync_key_target();
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -842,13 +897,7 @@ impl App {
             Message::PromptStreamEnded(e) => {
                 self.stream_trouble = true;
                 self.prompts.clear();
-                if self
-                    .editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.prompt_id.is_some())
-                {
-                    self.editor = None;
-                }
+                self.detach_orphaned_editor();
                 info!("prompt stream interrupted: {e}");
                 Task::none()
             }
@@ -867,14 +916,25 @@ impl App {
                 scope,
                 duration,
             } => {
-                self.prompts.retain(|p| p.event.prompt_id != prompt_id);
+                // One verdict per card at a time. The card stays, disabled,
+                // until the daemon confirms (see `settle_card`).
+                let Some(card) = self
+                    .prompts
+                    .iter_mut()
+                    .find(|p| p.event.prompt_id == prompt_id && !p.submitting)
+                else {
+                    return Task::none();
+                };
+                card.submitting = true;
+                self.sync_key_target();
                 let socket = self.socket_path.clone();
                 Task::perform(
                     submit_verdict(socket, prompt_id, action, scope, duration, false),
                     Message::VerdictSubmitted,
                 )
             }
-            Message::VerdictSubmitted(Ok((_, true, note))) => {
+            Message::VerdictSubmitted(Ok((prompt_id, true, note))) => {
+                self.settle_card(&prompt_id, true);
                 // The daemon telling the user something true about the rule
                 // it stored - today, that a user-writable binary was
                 // hash-bound and a swapped file will prompt again. Shown in
@@ -888,7 +948,8 @@ impl App {
                 let socket = self.socket_path.clone();
                 Task::perform(fetch_rules(socket), Message::RulesLoaded)
             }
-            Message::VerdictSubmitted(Ok((_, false, _))) => {
+            Message::VerdictSubmitted(Ok((prompt_id, false, _))) => {
+                self.settle_card(&prompt_id, true);
                 // The daemon had already answered this prompt itself. The
                 // old code swallowed this, so the user believed they had
                 // allowed something the timeout had actually decided.
@@ -898,8 +959,17 @@ impl App {
                 );
                 Task::none()
             }
-            Message::VerdictSubmitted(Err(e)) => {
-                self.log.error(format!("verdict failed: {e}"), self.now_ms);
+            Message::VerdictSubmitted(Err(failure)) => {
+                self.settle_card(&failure.prompt_id, failure.applied);
+                let still = if failure.applied {
+                    ""
+                } else {
+                    " - the prompt is still waiting for an answer"
+                };
+                self.log.error(
+                    format!("verdict failed: {}{still}", failure.message),
+                    self.now_ms,
+                );
                 Task::none()
             }
             Message::OpenEditor => {
@@ -1058,6 +1128,8 @@ impl App {
                 Task::none()
             }
             Message::SaveRule => {
+                // The prompt may have expired since the last tick.
+                self.detach_orphaned_editor();
                 let Some(editor) = &mut self.editor else {
                     return Task::none();
                 };
@@ -1069,8 +1141,18 @@ impl App {
                             let action = editor.action;
                             let duration = editor.duration;
                             let scope = rule.scope;
-                            self.prompts
-                                .retain(|card| card.event.prompt_id != prompt_id);
+                            // Held, not dropped, until the daemon answers:
+                            // a dropped card closed this editor on the next
+                            // tick and took a failed save's banner with it.
+                            let Some(card) = self
+                                .prompts
+                                .iter_mut()
+                                .find(|c| c.event.prompt_id == prompt_id && !c.submitting)
+                            else {
+                                return Task::none();
+                            };
+                            card.submitting = true;
+                            self.sync_key_target();
                             Task::perform(
                                 submit_verdict(socket, prompt_id, action, scope, duration, true),
                                 Message::PromptRuleSaved,
@@ -1094,11 +1176,18 @@ impl App {
                 self.editor = None;
                 self.update(Message::VerdictSubmitted(Ok((id, true, note))))
             }
-            Message::PromptRuleSaved(Ok((_, false, _))) => {
+            Message::PromptRuleSaved(Ok((id, false, _))) => {
                 self.editor = None;
-                self.update(Message::VerdictSubmitted(Ok((String::new(), false, None))))
+                self.update(Message::VerdictSubmitted(Ok((id, false, None))))
             }
-            Message::PromptRuleSaved(Err(error)) => self.update(Message::RuleSaved(Err(error))),
+            Message::PromptRuleSaved(Err(failure)) => {
+                // The editor stays open with the error. If the answer was
+                // applied the card is gone, and the editor then turns into a
+                // plain new rule the user can save again.
+                self.settle_card(&failure.prompt_id, failure.applied);
+                self.detach_orphaned_editor();
+                self.update(Message::RuleSaved(Err(failure.message)))
+            }
             Message::RuleSaved(Ok(line)) => {
                 // Say what was stored: closing the editor in silence read
                 // as accepted whatever scope the rule ended up with.
@@ -1199,7 +1288,7 @@ impl App {
         {
             return Task::none();
         }
-        let Some(card) = self.prompts.first() else {
+        let Some(card) = self.key_target_card() else {
             return Task::none();
         };
         let ev = &card.event;
@@ -1769,23 +1858,33 @@ async fn submit_verdict(
     scope: Option<proto::RuleScope>,
     duration: proto::Duration,
     require_confirmed_rule: bool,
-) -> Result<(String, bool, Option<String>), String> {
+) -> Result<(String, bool, Option<String>), VerdictFailure> {
     let wanted_rule = scope.is_some();
-    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let fail = |applied: bool, message: String| VerdictFailure {
+        prompt_id: prompt_id.clone(),
+        applied,
+        message,
+    };
+    let mut client = Client::connect(&path)
+        .await
+        .map_err(|e| fail(false, e.to_string()))?;
     let outcome = client
         .submit_verdict(&prompt_id, action, duration, scope)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| fail(false, e.to_string()))?;
     // A verdict that applied but saved no rule is not a success to report
     // quietly: the user asked for a lasting answer, did not get one, and will
     // be prompted again by the next connection from the same program.
     if outcome.accepted && wanted_rule && outcome.rule_persisted == Some(false) {
-        return Err(outcome
-            .persist_error
-            .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()));
+        return Err(fail(
+            true,
+            outcome
+                .persist_error
+                .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()),
+        ));
     }
     if outcome.accepted && require_confirmed_rule && outcome.rule_persisted != Some(true) {
-        return Err("the verdict applied, but this daemon did not confirm a standing rule; restart the updated daemon".into());
+        return Err(fail(true, "the verdict applied, but this daemon did not confirm a standing rule; restart the updated daemon".into()));
     }
     Ok((prompt_id, outcome.accepted, outcome.persist_note))
 }
@@ -2167,25 +2266,63 @@ mod tests {
         );
         let _ = app.update(Message::PromptStreamEnded("disconnected".into()));
         assert!(app.prompts.is_empty());
-        assert!(app.editor.is_none());
+        assert!(
+            app.editor.as_ref().unwrap().prompt_id.is_none(),
+            "the edits stay, as a plain rule"
+        );
         assert_eq!(
             app.update(Message::CustomizePromptRule(event.prompt_id))
                 .units(),
             0
         );
-        assert!(app.editor.is_none());
+        assert!(app.editor.as_ref().unwrap().prompt_id.is_none());
     }
 
     #[test]
-    fn an_expired_prompt_closes_its_customization() {
+    fn an_expired_prompt_keeps_its_customization_as_a_new_rule() {
         let (mut app, _) = App::new();
         let event = prompt_event();
         app.prompts.push(PromptCard::new(event.clone(), 0));
-        app.editor = Some(RuleEditor::from_prompt(&event));
+        let mut editor = RuleEditor::from_prompt(&event);
+        editor.name = "careful".into();
+        app.editor = Some(editor);
         app.now_ms = event.deadline_unix_ms + 1;
         app.housekeeping();
         assert!(app.prompts.is_empty());
-        assert!(app.editor.is_none());
+        let editor = app.editor.as_ref().expect("the edits are kept");
+        assert!(editor.prompt_id.is_none());
+        assert_eq!(editor.name, "careful");
+        // Save now stores the rule instead of answering a dead prompt.
+        assert_eq!(app.update(Message::SaveRule).units(), 1);
+    }
+
+    #[test]
+    fn a_verdict_that_was_not_applied_leaves_the_prompt_answerable() {
+        let (mut app, _) = App::new();
+        let event = prompt_event();
+        app.prompts.push(PromptCard::new(event.clone(), 0));
+        let submit = || Message::SubmitVerdict {
+            prompt_id: event.prompt_id.clone(),
+            action: proto::Action::Deny,
+            scope: None,
+            duration: proto::Duration::Once,
+        };
+        assert_eq!(app.update(submit()).units(), 1);
+        assert!(app.prompts[0].submitting, "held until the daemon confirms");
+        assert_eq!(app.update(submit()).units(), 0, "one verdict at a time");
+
+        let failure = |applied| VerdictFailure {
+            prompt_id: event.prompt_id.clone(),
+            applied,
+            message: "connection refused".into(),
+        };
+        let _ = app.update(Message::VerdictSubmitted(Err(failure(false))));
+        assert_eq!(app.prompts.len(), 1);
+        assert!(!app.prompts[0].submitting, "it can be answered again");
+
+        let _ = app.update(submit());
+        let _ = app.update(Message::VerdictSubmitted(Err(failure(true))));
+        assert!(app.prompts.is_empty(), "an applied answer retires the card");
     }
 
     #[test]
@@ -2311,8 +2448,8 @@ mod tests {
         app.tab = Tab::Prompts;
 
         assert_eq!(app.handle_key(key("A", shift)).units(), 1);
-        let ids: Vec<_> = app.prompts.iter().map(|c| &c.event.prompt_id).collect();
-        assert_eq!(ids, ["below"], "the top card is answered, not the newest");
+        assert!(app.prompts[0].submitting, "the top card is answered");
+        assert!(!app.prompts[1].submitting, "not the newest");
 
         // The card that moved up is disarmed again.
         assert_eq!(

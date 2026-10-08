@@ -54,12 +54,13 @@ pub fn view<'a>(
         .unwrap_or(proto::Action::Unspecified as i32);
     let timeout_secs = status.map(|s| s.prompt_timeout_secs).unwrap_or(0);
 
-    // The first card is the one the A/D keys answer (see
-    // `App::answer_key_target`), so it is the one that carries the marker.
+    // The top card not already being answered is the one the A/D keys
+    // answer (see `App::answer_key_target`), so it carries the marker.
+    let target = prompts.iter().position(|c| !c.submitting);
     let cards: Vec<Element<'a, Message>> = prompts
         .iter()
         .enumerate()
-        .map(|(i, c)| prompt_card(c, timeout_action, timeout_secs, now_ms, i == 0))
+        .map(|(i, c)| prompt_card(c, timeout_action, timeout_secs, now_ms, Some(i) == target))
         .collect();
 
     container(scrollable(column(cards).spacing(12).padding(8)).height(Length::Fill))
@@ -367,7 +368,8 @@ fn prompt_card(
     let ev = &card.event;
     let program = program_label(ev);
     // Disabled for a moment after the card appears, so a click aimed at
-    // whatever was here before cannot land on a verdict.
+    // whatever was here before cannot land on a verdict, and while its
+    // verdict is on the way.
     let armed = card.armed(now_ms);
 
     let marker: Element<'_, Message> = if key_target {
