@@ -28,9 +28,43 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a rule the editor refuses is also reported in the footer.
 - GUI: a prompt arriving while others are pending no longer switches to the
   Prompts tab; only the first one does, and raises the window.
+- `cfc rules import-opensnitch` stops before changing anything when a source
+  rule cannot be converted (hostname and regexp rules among them), because
+  dropping a narrow deny next to a broad allow imported a wider policy than
+  the source with only a skip count to show for it. `--skip-unconvertible`
+  imports the rest, naming each skipped file. **Breaking** for scripts that
+  relied on the old additive behaviour.
+- Bundles name the binary that connects. The rules for Firefox on Arch, git,
+  cargo under rustup and apt pinned a launcher or front end that never shows
+  up as the connecting executable, so they never fired. `web` and `dev` drop
+  Epiphany, npm and pip, whose traffic comes from a shared WebKit helper or
+  an interpreter. Hosts that installed `web`, `dev` or `updates` before keep
+  the old rules: `cfc rules bundle remove NAME` then `bundle add NAME`
+  replaces them, and `bundle add` names each one that pins an old path.
+- Rule summaries in the GUI and `cfc rules list` show the protocol, a uid and
+  `[pinned]` for a hash-pinned rule, so a scoped rule no longer reads as
+  global.
+- `cfc rules export` writes `expires_at_unix_ms` for timed rules, and import
+  keeps that deadline instead of starting the full lifetime again. Older
+  versions refuse an export that contains the field.
+- Confinement: a refused launch exits 125 and its reason is in
+  `journalctl -u cfc-app-ID.service`; it used to be discarded and reported
+  as the application's status 1.
 
 ### Security
 
+- `cfc prompts`: keys typed while no prompt was shown, such as an answer
+  typed just as a prompt expired, answered the next prompt as soon as it was
+  printed, and an arrow key skipped one prompt and left `A` or `D` to answer
+  the next. On a terminal, pending input is now discarded before each prompt.
+- The CLI printed the daemon's reason for not saving a rule raw, and that
+  reason can quote an executable path a local user named, escape sequences
+  included. The client now escapes it for every front end, and escapes the
+  backslash in every escaped string so a literal `\n` cannot pass for an
+  escaped newline.
+- Confinement: on kernels 6.17 to 7.1 the root gate's `BPF_PROG_QUERY`
+  attribute was 32 bytes and the kernel wrote 8 bytes past it on the stack.
+  The attribute now has its full size.
 - GUI: `A`, `D`, `Shift+A` and `Shift+D` answered the newest prompt, the
   bottom card and often off-screen, from any tab and with Ctrl, Alt or Super
   held, so `Shift+A` on the card being read could write an always-allow rule
@@ -156,6 +190,25 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so later prompts only reached the overflow bubble, which cannot answer
   them. Slots are freed once their prompt's deadline has passed, and the
   stale bubbles are closed.
+- Confinement refused every launch while the daemon's DNS observer, on by
+  default, was attached at the cgroup root, because the gate required the
+  unit's effective filters to be exactly its own pair. Programs inherited
+  from ancestors are now accepted; the unit's own pair must still be exact.
+- Confinement: Ctrl-C while systemctl ran, a closed terminal or a dropped
+  SSH session killed the launcher and left the tree running with its
+  grants. SIGINT, SIGHUP, SIGQUIT and SIGTERM now stop the tree at any
+  point, and its identity is printed before it starts.
+- `cfc rules bootstrap-defaults` and `bundle add` failed on hosts seeded
+  before 0.7.0, calling the bundle's own rules outside it. An identical
+  same-named rule now counts as present; a different one still stops the
+  command.
+- `cfc rules bundle remove` deleted a bundle rule the user had edited into a
+  deny. It now keeps any of its rules that is no longer an allow.
+- OpenSnitch import passed `dest.ip` networks (`10.0.0.0/8/32`), bad CIDRs
+  and ports above 65535 to the daemon, which refused the whole import
+  without naming the file. They now fail their own file.
+- The GUI's prompt subscription stayed open after the GUI dropped it, so the
+  daemon held the next prompt for an absent listener until it timed out.
 
 ## [0.7.0] - 2026-09-30
 
