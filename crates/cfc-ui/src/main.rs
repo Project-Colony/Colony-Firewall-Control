@@ -137,8 +137,8 @@ pub struct RuleEditor {
     /// a sha256-pinned allow would lose its binary pin, and an inbound rule
     /// (unset direction means outbound) would turn outbound with its source
     /// scope gone. Its visible fields are stale once the form is edited, so
-    /// only [`hidden_scope_is_set`] and [`hidden_scope_summary`] read it, and
-    /// saving overwrites them from the form.
+    /// only [`hidden_scope_is_set`], [`hidden_scope_summary`] and the
+    /// unchanged-path check read it, and saving overwrites them from the form.
     pub carried_scope: proto::RuleScope,
 }
 
@@ -1658,14 +1658,12 @@ async fn fetch_rules(path: PathBuf) -> Result<Vec<proto::RuleInfo>, String> {
 }
 
 /// Saves `rule` and returns the log line describing what was stored.
+///
+/// No executable validation here: the editor validates a path the user typed
+/// or changed, and the enable toggle sends the stored path back unchanged,
+/// which the daemon accepts as is. Checking it again refused to toggle a rule
+/// whose target had since become an alias.
 async fn upsert_rule(path: PathBuf, rule: proto::RuleInfo) -> Result<String, String> {
-    if let Some(scope) = rule
-        .scope
-        .as_ref()
-        .filter(|scope| !scope.exe_path.is_empty())
-    {
-        cfc_core::exe_path::resolve_policy(std::path::Path::new(&scope.exe_path))?;
-    }
     let line = saved_rule_line(&rule);
     let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
     client.upsert_rule(rule).await.map_err(|e| e.to_string())?;
@@ -1762,9 +1760,14 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
     // and PrivateTmp hide exactly the paths a person commonly enters.
     // Not trimmed: a file name may end in a space, and saving a rule for
     // "/opt/app " must not quietly retarget it to "/opt/app".
+    // An edited rule's unchanged path is sent back as stored, as the daemon
+    // expects: it may have become an alias since, and refusing it here left
+    // such a rule impossible to rename or retarget anywhere but the CLI.
     let typed = ed.exe.as_str();
     let exe = if typed.trim().is_empty() {
         String::new()
+    } else if ed.editing_id.is_some() && typed == ed.carried_scope.exe_path {
+        typed.to_string()
     } else {
         cfc_core::exe_path::resolve_policy(std::path::Path::new(typed))?
             .into_path()
@@ -1924,6 +1927,22 @@ mod tests {
         let rule = build_rule_from_editor(&editor_with_scope()).unwrap();
         assert_eq!(rule.duration, proto::Duration::Always as i32);
         assert_eq!(rule.scope.unwrap().exe_path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn editor_sends_an_unchanged_alias_back_but_refuses_a_typed_one() {
+        // /proc/self/exe is a symlink on every Linux, so it stands in for a
+        // stored path that has since become an alias.
+        let mut rule = existing_rule();
+        rule.scope.as_mut().unwrap().exe_path = "/proc/self/exe".into();
+        let mut ed = RuleEditor::from_existing(&rule);
+        ed.name = "renamed".into();
+        let saved = build_rule_from_editor(&ed).expect("unchanged path is kept");
+        assert_eq!(saved.scope.unwrap().exe_path, "/proc/self/exe");
+
+        let mut fresh = editor_with_scope();
+        fresh.exe = "/proc/self/exe".into();
+        assert!(build_rule_from_editor(&fresh).is_err());
     }
 
     #[test]

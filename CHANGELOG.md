@@ -224,7 +224,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A rule whose stored executable path later became an alias (a legacy
   `/bin/curl`, or a target a package turned into a symlink) could not be
   disabled, renamed or re-imported, only deleted. A path sent back unchanged
-  is accepted; new and changed paths are still checked.
+  is accepted by the daemon, the GUI's toggle and editor, and
+  `cfc rules import`; new and changed paths are still checked.
 - A new timed rule took its creation date from the client, so a date in the
   future kept "allow for 90s" alive indefinitely. Dates are clamped to now.
 - Enabled legacy hostname rules refuse flows that are logged as the default

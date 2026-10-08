@@ -627,12 +627,17 @@ pub async fn import(
     let rules: Vec<ExportedRule> = serde_json::from_str(&json).context("parsing JSON")?;
 
     // Parse and validate the complete file before the atomic server-side batch.
+    let stored = client.list_rules().await?;
     let mut pending = Vec::with_capacity(rules.len());
     let mut problems = Vec::new();
     let mut seen_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for r in rules {
         match r.try_into_proto() {
             Ok(pb) => {
+                if let Err(e) = check_new_exe(&pb, &stored) {
+                    problems.push(e);
+                    continue;
+                }
                 // Two rules sharing an id are not two rules: the second upsert
                 // overwrites the first, so the file describes a state the
                 // import cannot produce and the count printed at the end is
@@ -709,6 +714,35 @@ pub async fn import(
         println!("imported {imported} rules");
     }
     Ok(())
+}
+
+/// Validates an imported rule's executable path in the caller's namespace,
+/// where `ProtectHome` and `PrivateTmp` hide nothing, before the daemon does
+/// in its own.
+///
+/// A rule that sends back the path already stored under its id is left alone,
+/// as the daemon leaves it: that path may have become an alias since it was
+/// written, and refusing it made a `--replace` restore of an export fail for
+/// as long as such a rule existed.
+fn check_new_exe(rule: &proto::RuleInfo, stored: &[proto::RuleInfo]) -> Result<(), String> {
+    let Some(exe) = rule
+        .scope
+        .as_ref()
+        .map(|scope| scope.exe_path.as_str())
+        .filter(|exe| !exe.is_empty())
+    else {
+        return Ok(());
+    };
+    let kept = !rule.id.is_empty()
+        && stored
+            .iter()
+            .any(|old| old.id == rule.id && old.scope.as_ref().is_some_and(|s| s.exe_path == exe));
+    if kept {
+        return Ok(());
+    }
+    cfc_core::exe_path::resolve_policy(std::path::Path::new(exe))
+        .map(drop)
+        .map_err(|error| format!("rule `{}`: {error}", rule.name))
 }
 
 // ---------------------------------------------------------------------------
@@ -933,8 +967,6 @@ impl ExportedRule {
                      match on absolute executable paths, so it could never fire"
                 ));
             }
-            cfc_core::exe_path::resolve_policy(std::path::Path::new(exe))
-                .map_err(|error| format!("rule `{name}`: {error}"))?;
         }
         let exe_sha256 = match self.scope.exe_sha256.as_deref() {
             Some(h) => Some(
@@ -2518,6 +2550,23 @@ mod json_tests {
         let mut rule = exported("allow");
         rule.scope.dst_host = Some(String::new());
         assert!(rule.try_into_proto().is_err());
+    }
+
+    // A legacy rule whose path became an alias blocked every restore.
+    #[test]
+    fn import_checks_only_a_new_or_changed_executable_path() {
+        // /proc/self/exe is a symlink on every Linux: an alias.
+        let mut rule = exported("allow");
+        rule.id = "1f0a5c7e-0000-4000-8000-000000000001".into();
+        rule.scope.exe_path = Some("/proc/self/exe".into());
+        let pb = rule
+            .try_into_proto()
+            .expect("the daemon decides on aliases");
+        assert!(check_new_exe(&pb, &[]).is_err());
+        assert!(check_new_exe(&pb, std::slice::from_ref(&pb)).is_ok());
+        let mut moved = pb.clone();
+        moved.scope.as_mut().unwrap().exe_path = "/proc/self/cwd".into();
+        assert!(check_new_exe(&moved, std::slice::from_ref(&pb)).is_err());
     }
 
     // A restored backup used to start a timed Allow's lifetime again.
