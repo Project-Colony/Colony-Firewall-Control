@@ -852,21 +852,28 @@ pub(super) fn load_and_attach(
     if report.exec_tracking && report.exit_tracking {
         let t = table.clone();
         let sink_exit = sink.clone();
+        let pending = PendingExits::default();
+        let queue = pending.clone();
         match spawn_ring(&mut bpf, MAP_EXIT, move |bytes| {
             if let Some(event) = decode::<ExitEvent>(bytes) {
-                if !process_group_is_gone(event.pid) {
-                    return;
-                }
-                t.observe_exit(event.pid);
-                // The verdict map is pinned, so an entry the daemon forgets
-                // outlives the daemon. Evicting here is what stops a recycled
-                // pid inheriting a dead process's answer.
-                if let Some(sink) = &sink_exit {
-                    sink.on_exit(event.pid);
+                // Dated before the check, so a later recheck can tell this
+                // process from the next owner of its pid.
+                let born = crate::process_resolve::read_starttime(event.pid);
+                if process_group_is_gone(event.pid) {
+                    evict_exited(&t, sink_exit.as_deref(), event.pid);
+                } else {
+                    let mut queue = queue.lock();
+                    if queue.len() >= MAX_PENDING_EXITS {
+                        queue.remove(0);
+                    }
+                    queue.push((event.pid, born));
                 }
             }
         }) {
-            Ok(task) => tasks.push(task),
+            Ok(task) => {
+                tasks.push(task);
+                tasks.push(spawn_exit_recheck(pending, table.clone(), sink.clone()));
+            }
             Err(e) => {
                 // Same reasoning as above: no eviction stream, no kernel
                 // identity.
@@ -1200,10 +1207,92 @@ fn exec_process(event: &ExecEvent) -> Process {
     }
 }
 
-/// A leader exit event is only a candidate on compatibility kernels. Any
-/// readable task directory or permission failure preserves identity and deny.
+/// Whether an exit candidate's whole thread group has finished.
+///
+/// `sched_process_exit` fires from `do_exit`, before the task is reaped, so the
+/// group is usually still in /proc when its event arrives. An absent
+/// `/proc/<pid>/task` means reaped; a zombie leader that lists only itself has
+/// no thread left either, only its parent's wait. A leader that exited before
+/// its workers lists them, and any other read failure preserves identity and
+/// deny.
 fn process_group_is_gone(pid: u32) -> bool {
-    matches!(std::fs::read_dir(format!("/proc/{pid}/task")), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let only_leader = tasks
+        .map(|task| task.map(|task| task.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .is_ok_and(|names| names.len() == 1 && names[0] == *pid.to_string());
+    only_leader
+        && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next());
+            matches!(state, Some("Z" | "X"))
+        })
+}
+
+/// Exit candidates waiting for their group to finish, at most. Each is a
+/// leader still running its exit or a leader whose workers outlive it, so the
+/// list is short; past the cap the oldest is dropped and its entries wait for
+/// the next resync or restart, as every candidate did before.
+const MAX_PENDING_EXITS: usize = 1024;
+
+/// Exit candidates still visible on arrival, oldest first, each with the
+/// start time read when its event came in.
+type PendingExits = std::sync::Arc<parking_lot::Mutex<Vec<(u32, Option<u64>)>>>;
+
+/// How often the pending exit candidates are looked at again.
+const EXIT_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Drops an exited process's identity and in-kernel verdict.
+///
+/// The verdict map is pinned, so an entry the daemon forgets outlives the
+/// daemon. Evicting is what stops a recycled pid inheriting a dead process's
+/// answer.
+fn evict_exited(table: &KernelProcTable, sink: Option<&enforce::VerdictSink>, pid: u32) {
+    table.observe_exit(pid);
+    if let Some(sink) = sink {
+        sink.on_exit(pid);
+    }
+}
+
+/// Re-examines exit candidates whose group was still visible on arrival.
+///
+/// A one-shot check dropped them, and the pinned deny and the identity then
+/// stayed until a rule change or a restart. A candidate is evicted once its
+/// group is gone, and forgotten without eviction once its pid belongs to
+/// another process: that owner's exec has replaced both entries, and clearing
+/// them could erase its fresh deny.
+fn spawn_exit_recheck(
+    pending: PendingExits,
+    table: KernelProcTable,
+    sink: Option<std::sync::Arc<enforce::VerdictSink>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(EXIT_RECHECK_INTERVAL);
+        loop {
+            tick.tick().await;
+            let candidates = std::mem::take(&mut *pending.lock());
+            let waiting: Vec<_> = candidates
+                .into_iter()
+                .filter(|&(pid, born)| {
+                    if process_group_is_gone(pid) {
+                        evict_exited(&table, sink.as_deref(), pid);
+                        return false;
+                    }
+                    // Unreadable for now: keep it, the next tick decides.
+                    crate::process_resolve::read_starttime(pid).is_none_or(|now| Some(now) == born)
+                })
+                .collect();
+            if !waiting.is_empty() {
+                let mut queue = pending.lock();
+                queue.splice(0..0, waiting);
+                queue.truncate(MAX_PENDING_EXITS);
+            }
+        }
+    })
 }
 
 /// Takes a ring-buffer map out of the object and starts a task that drains it.
@@ -1277,6 +1366,24 @@ mod tests {
     fn a_live_thread_group_is_not_evicted() {
         assert!(!process_group_is_gone(std::process::id()));
         assert!(process_group_is_gone(u32::MAX));
+    }
+
+    /// The exit event arrives before the parent reaps, and the zombie is still
+    /// listed in /proc. It has no thread left, so it is gone.
+    #[test]
+    fn an_unreaped_zombie_is_gone() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap()
+            .contains(") Z ")
+        {
+            assert!(Instant::now() < deadline, "child never became a zombie");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(process_group_is_gone(pid));
+        child.wait().unwrap();
     }
 
     use std::net::Ipv4Addr;

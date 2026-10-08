@@ -428,10 +428,14 @@ relied upon.
 
 **Compatibility exit handling.** When `sched_process_exit` exposes `group_dead`,
 the kernel evicts only on confirmed process death. Without that field, it
-preserves identity and deny entries on thread or leader exit. The daemon can
-remove a candidate only after `/proc/<pid>/task` is absent. A leader may exit
-before its workers, so this conservative fallback can leave stale denials until
-exec or reconciliation; it cannot guarantee immediate cleanup after group death.
+preserves identity and deny entries on thread or leader exit and reports the
+leader's exit as a candidate. The daemon evicts a candidate once
+`/proc/<pid>/task` is absent or lists only a zombie leader. The event usually
+arrives before that, while the leader is still exiting or its workers still
+run, so such a candidate is checked again every two seconds until its group is
+gone, or dropped once its pid belongs to another process. At most 1024
+candidates wait; past that the oldest leaves its entries to exec or the next
+reconciliation.
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately
