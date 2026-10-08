@@ -18,6 +18,7 @@ pub mod dns;
 pub mod ebpf;
 pub mod ipc;
 pub mod nfqueue;
+pub mod official;
 pub mod packet;
 pub mod process_resolve;
 pub mod prompts;

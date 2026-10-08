@@ -122,6 +122,7 @@ impl TestDaemonBuilder {
                     // authorization assertions deterministic.
                     group: format!("cfc-absent-{}", uuid::Uuid::new_v4()),
                     require_group: self.require_group,
+                    ..IpcConfig::default()
                 },
                 pause_default_secs: self.pause_default_secs,
                 dry_run: false,
@@ -820,43 +821,32 @@ async fn unattributed_prompt_is_delivered_to_any_session() {
 // Peer-credential authorization (wave 3)
 // ---------------------------------------------------------------------------
 
-/// The production shape: `require_group = true` with a socket the daemon
-/// could not gate (no such group / not root). Mutating RPCs must be refused
-/// for non-root peers; read-only RPCs must still work.
+/// A client with the daemon's own uid has full control, with
+/// `require_group = true` and a socket the daemon could not gate. In
+/// production the daemon is root, so this is root; here it is what lets every
+/// other round trip in this file run unprivileged. Who else may change what
+/// (the official app and tray, read-only peers, polkit) is pinned by the
+/// `authorization_table` unit test in `src/ipc.rs`, which can fake peers this
+/// single-uid process cannot be.
 #[tokio::test]
-async fn require_group_refuses_non_root_mutation() {
+async fn the_daemons_own_uid_has_full_control() {
     let d = TestDaemon::builder().require_group(true).build().await;
     let mut client = d.client().await;
 
-    // Read-only stays open: layer 1 (the socket mode) already decided who
-    // may connect at all.
     client.status().await.expect("status is read-only");
-    assert!(client
-        .list_rules()
-        .await
-        .expect("list_rules is read-only")
-        .is_empty());
-
-    let result = client
+    let id = client
         .upsert_rule(rule_pb("blocked", pb::Action::Deny, scope_port(25)))
-        .await;
-
-    if running_as_root() {
-        assert!(
-            result.is_ok(),
-            "root may always mutate, gated socket or not"
-        );
-    } else {
-        let status = status_of(result.expect_err("a non-root mutation must be refused"));
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
-        assert!(
-            status.message().contains("uid 0"),
-            "unexpected message: {}",
-            status.message()
-        );
-        // And nothing was written on the way to the refusal.
-        assert!(client.list_rules().await.expect("listing rules").is_empty());
-    }
+        .await
+        .expect("the daemon's own uid may change rules");
+    assert!(client.delete_rule(&id).await.expect("and delete them"));
+    assert!(client.set_paused(true, 60).await.expect("and pause").paused);
+    assert!(
+        !client
+            .set_paused(false, 0)
+            .await
+            .expect("and resume")
+            .paused
+    );
 }
 
 // ---------------------------------------------------------------------------

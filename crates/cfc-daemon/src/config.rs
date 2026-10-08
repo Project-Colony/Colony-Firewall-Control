@@ -272,12 +272,16 @@ pub struct IpcConfig {
     /// daemon chowns the socket to `root:<group>` and chmods it 0660, so
     /// group membership *is* the access check.
     pub group: String,
-    /// Require the socket to be group-gated before a non-root peer may
-    /// call a mutating RPC. When the group cannot be resolved the socket
-    /// stays root-only and non-root mutations are refused. Setting this to
-    /// false lets any peer that manages to connect mutate rules — only do
-    /// that if you gate the socket some other way (e.g. filesystem ACLs).
+    /// Require proved membership of `group` before an official client (the
+    /// installed app or tray) may change anything. Setting this to false
+    /// waives the group check for official clients only; every other
+    /// non-root peer stays read-only either way.
     pub require_group: bool,
+    /// The installed Colony Firewall app and tray: the only non-root
+    /// programs that may answer prompts, edit rules or ask to pause. Each
+    /// must be an absolute path to a root-owned file nobody else can write,
+    /// in root-owned directories nobody else can write. Bound at startup.
+    pub official_clients: Vec<std::path::PathBuf>,
 }
 
 impl Default for IpcConfig {
@@ -285,7 +289,36 @@ impl Default for IpcConfig {
         Self {
             group: "colony-firewall".to_string(),
             require_group: true,
+            official_clients: crate::official::DEFAULT_CLIENTS
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
         }
+    }
+}
+
+impl IpcConfig {
+    /// One line per `official_clients` entry that can never match, for the
+    /// startup log: the app or tray it names will be read-only.
+    pub fn official_client_warnings(&self) -> Vec<String> {
+        self.official_clients
+            .iter()
+            .filter_map(|path| {
+                let why = if !path.is_absolute() {
+                    "is not an absolute path"
+                } else if !path.exists() {
+                    "does not exist"
+                } else if crate::official::sealed_identity(path).is_none() {
+                    "is not a root-owned file in root-owned directories that only root can write"
+                } else {
+                    return None;
+                };
+                Some(format!(
+                    "[ipc] official_clients entry {} {why}; that program will be read-only",
+                    path.display()
+                ))
+            })
+            .collect()
     }
 }
 
@@ -836,6 +869,12 @@ enabled = " Auto ""#
         assert_eq!(cfg.ipc.group, "wheel");
         assert!(!cfg.ipc.require_group);
 
+        assert_eq!(
+            cfg.ipc.official_clients,
+            IpcConfig::default().official_clients,
+            "official_clients keeps its packaged default"
+        );
+
         // A partial [ipc] section keeps per-field defaults.
         let cfg = Config::from_toml_str("[ipc]\ngroup = \"wheel\"\n").unwrap();
         assert_eq!(cfg.ipc.group, "wheel");
@@ -846,6 +885,27 @@ enabled = " Auto ""#
         assert_eq!(cfg.nfqueue.queue_num, 7);
         assert_eq!(cfg.nfqueue.queue_max_len, 4096);
         assert!(!cfg.nfqueue.fail_open);
+    }
+
+    #[test]
+    fn official_clients_default_to_the_installed_app_and_tray() {
+        assert_eq!(
+            IpcConfig::default().official_clients,
+            [
+                std::path::PathBuf::from("/usr/bin/colony-firewall"),
+                std::path::PathBuf::from("/usr/bin/colony-firewall-tray")
+            ]
+        );
+        let cfg = Config::from_toml_str(
+            "[ipc]\nofficial_clients = [\"bin/gui\", \"/nonexistent/cfc-gui\", \"/tmp\"]\n",
+        )
+        .unwrap();
+        let warnings = cfg.ipc.official_client_warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("bin/gui is not an absolute path"));
+        assert!(warnings[1].contains("does not exist"));
+        assert!(warnings[2].contains("root-owned"));
+        assert!(warnings.iter().all(|w| w.ends_with("will be read-only")));
     }
 
     #[test]

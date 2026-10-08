@@ -72,12 +72,10 @@ async fn main() -> anyhow::Result<()> {
     let (_ipc, prompt_tx) = ipc::spawn(
         IpcOptions {
             socket_path: socket.clone(),
-            ipc: IpcConfig {
-                group: "colony-firewall".into(),
-                // Demo socket in the user's own temporary directory: let the
-                // invoking user talk to it.
-                require_group: false,
-            },
+            // The demo daemon runs as the invoking user, and a peer with the
+            // daemon's own uid has full control: the user's app, tray or CLI
+            // can drive it without any group or official-client setup.
+            ipc: IpcConfig::default(),
             pause_default_secs: 120,
             dry_run: true,
         },

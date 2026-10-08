@@ -377,8 +377,9 @@ impl Client {
 ///    daemon accepts a connection only when the official process itself holds
 ///    it, which closes the "connect, write a request, then exec the app"
 ///    route.
-/// 2. Marks the process non-dumpable. The kernel then gives `/proc/<pid>` to
-///    root, which is the marker the daemon checks, and same-user `ptrace`,
+/// 2. Marks the process non-dumpable. The kernel then gives the files under
+///    `/proc/<pid>` to root, which is the marker the daemon checks, and
+///    same-user `ptrace`,
 ///    `/proc/<pid>/mem` and `pidfd_getfd` are refused for the rest of the
 ///    process's life.
 ///

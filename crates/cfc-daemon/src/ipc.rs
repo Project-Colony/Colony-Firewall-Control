@@ -8,23 +8,36 @@
 //!
 //! 1. **The socket file.** After bind, the daemon chowns the socket to
 //!    `root:<[ipc] group>` and chmods it `0660`. The kernel therefore
-//!    refuses `connect(2)` to anyone outside that group. Membership *is*
-//!    the credential; there is no in-band authentication. If the group
+//!    refuses `connect(2)` to anyone outside that group. If the group
 //!    cannot be resolved (package installed without the sysusers fragment)
 //!    the daemon logs a prominent warning, leaves the socket `0600`
 //!    (root-only) and keeps running, so a root CLI still works.
 //!
-//! 2. **Per-RPC peer credentials.** Mutations require uid 0 or actual
-//!    membership of the configured group. The kernel peer gid proves primary
-//!    membership. Supplementary membership requires `/proc/<peer pid>/status`
-//!    with the same effective uid and process starttime captured at accept.
-//!    Missing evidence is refused. `require_group = false` explicitly opts
-//!    out for deployments authorizing their control socket another way.
+//! 2. **Per-RPC peer identity.** Reading (status, rules, the live feed,
+//!    the event log, receiving prompts) is open to every peer that could
+//!    connect. Changing the firewall (answering a prompt, writing or deleting
+//!    rules, pause and resume, importing rules) is open to:
+//!    - **root**, and the daemon's own uid (root in production; a process
+//!      with the daemon's uid could ptrace it anyway);
+//!    - **the official app and tray**: a proved member of the group (the
+//!      kernel peer gid, or `/proc/<pid>/status` read between two matching
+//!      start-time reads) whose process passes [`crate::official::check`]:
+//!      it runs one of the installed, root-sealed `[ipc] official_clients`
+//!      binaries, ran their sealing prologue, holds this very connection, is
+//!      not traced and mapped no executable file from outside sealed
+//!      directories. `require_group = false` waives the group proof for
+//!      official clients only.
 //!
-//! Consequence worth stating plainly: **every member of the configured
-//! group is fully trusted.** Group membership grants the ability to allow
-//! or deny any traffic on the host. It is not a multi-user privilege
-//! boundary; put only administrators of this machine in it.
+//!    Every other peer is read-only: its change RPCs get PERMISSION_DENIED
+//!    with the reason, its prompt subscription does not count as a UI (so
+//!    `no_ui_action` still applies), and it never enters a prompt's audience.
+//!
+//! Consequence worth stating plainly: group membership alone no longer
+//! changes anything. It lets the desktop session read the daemon's state and
+//! lets the installed app and tray connect; changes come from those two
+//! programs or from `sudo cfc`. Code running *inside* the official app (a
+//! preloaded payload that moved itself to anonymous memory, synthetic X11
+//! input) is still trusted; see docs/HARDENING.md.
 //!
 //! # Prompt ownership
 //!
@@ -37,8 +50,9 @@
 //!    everyone. So another user's UI never even learns the prompt id.
 //! 2. **Answers are checked against who was told.** A stream records
 //!    `prompt_id -> peer uid` as it hands an event to its client
-//!    ([`PromptAudience`]); `SubmitVerdict` requires the caller's uid to
-//!    appear in that prompt's audience. Root may always answer.
+//!    ([`PromptAudience`]) - only for a stream that may answer; `SubmitVerdict`
+//!    requires the caller's uid to appear in that prompt's audience. Root may
+//!    always answer.
 //!
 //! Step 2 alone was bookkeeping without teeth - every subscriber received
 //! every prompt, so every subscriber was in every audience. Step 1 is what
@@ -223,16 +237,46 @@ pub struct PeerId {
     pub gid: u32,
     pub pid: Option<i32>,
     pub starttime: Option<u64>,
+    /// Inode of the daemon's end of this connection, which names the
+    /// client's end through sock_diag. `None` means "never official".
+    pub sock_ino: Option<u64>,
 }
 
 /// Privilege an RPC requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Access {
-    /// Observing daemon state.
+    /// Observing daemon state: any peer that could connect.
     ReadOnly,
-    /// Changing the firewall's behaviour.
-    Mutate,
+    /// Changing the firewall's behaviour: root, or the official app or tray.
+    Control,
 }
+
+/// Where a peer stands for [`Access::Control`], before its image is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Root, or the daemon's own uid (root in production; a process of the
+    /// daemon's uid could ptrace it anyway).
+    Privileged,
+    /// A group member (or anyone, with `require_group = false`): allowed
+    /// only when it is the installed app or tray.
+    NeedOfficial,
+    /// Not a proved member of the configured group.
+    DenyGroup,
+}
+
+fn gate(peer_uid: u32, own_uid: u32, group_ok: bool) -> Gate {
+    if peer_uid == 0 || peer_uid == own_uid {
+        Gate::Privileged
+    } else if group_ok {
+        Gate::NeedOfficial
+    } else {
+        Gate::DenyGroup
+    }
+}
+
+/// The official-client check: `official::check` in production, a stub in
+/// unit tests. Not reachable from config or from any client.
+type OfficialCheck = fn(&PeerId, &[PathBuf]) -> Result<PathBuf, String>;
 
 /// Outcome of securing the socket file, and the policy knobs that decide
 /// what it implies for callers.
@@ -244,15 +288,6 @@ struct SocketAuth {
     /// the kernel is enforcing group membership on `connect(2)`.
     group_gated: bool,
     require_group: bool,
-}
-
-/// Pure policy over membership proved from the individual peer credentials.
-fn authorize_uid(uid: u32, level: Access, group_member: bool, require_group: bool) -> bool {
-    match level {
-        // Layer 1 (socket mode) already decided who may connect at all.
-        Access::ReadOnly => true,
-        Access::Mutate => uid == 0 || !require_group || group_member,
-    }
 }
 
 /// Extracts kernel-reported peer credentials from a request.
@@ -275,6 +310,7 @@ fn peer_of<T>(req: &Request<T>) -> Result<PeerId, Status> {
             .pid()
             .and_then(|pid| u32::try_from(pid).ok())
             .and_then(crate::process_resolve::read_starttime),
+        sock_ino: None,
     })
 }
 
@@ -291,16 +327,25 @@ impl PeerStream {
             .and_then(|pid| u32::try_from(pid).ok())
             .and_then(crate::process_resolve::read_starttime);
         Ok(Self {
-            stream,
             peer: PeerId {
                 uid: credentials.uid(),
                 gid: credentials.gid(),
                 pid,
                 starttime,
+                sock_ino: socket_inode(&stream),
             },
+            stream,
         })
     }
 }
+fn socket_inode(stream: &tokio::net::UnixStream) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: zeroed stat is valid out-param storage; the fd is open for
+    // the duration of the call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(stream.as_raw_fd(), &mut st) } == 0).then_some(st.st_ino)
+}
+
 impl Connected for PeerStream {
     type ConnectInfo = PeerId;
     fn connect_info(&self) -> PeerId {
@@ -441,6 +486,11 @@ struct FirewallService {
     /// Live default policy; SIGHUP swaps it, so status reflects reloads.
     policy: SharedPolicy,
     auth: SocketAuth,
+    /// The daemon's effective uid; see [`Gate::Privileged`].
+    own_uid: u32,
+    /// `[ipc] official_clients`, bound at startup.
+    official_clients: Arc<[PathBuf]>,
+    official: OfficialCheck,
     audience: Arc<PromptAudience>,
     /// Wall-clock deadline of the current pause, 0 when not paused. Held
     /// here rather than in `Stats` so the pause timer and `GetStatus` agree.
@@ -450,27 +500,69 @@ struct FirewallService {
 }
 
 impl FirewallService {
-    /// Resolves the caller and checks it may perform `level`.
-    fn authorize<T>(&self, req: &Request<T>, level: Access) -> Result<PeerId, Status> {
+    /// Resolves the caller of `rpc` and checks it may perform `level`.
+    async fn authorize<T>(
+        &self,
+        req: &Request<T>,
+        rpc: &'static str,
+        level: Access,
+    ) -> Result<PeerId, Status> {
         let peer = peer_of(req)?;
-        if authorize_uid(
-            peer.uid,
-            level,
-            peer_is_group_member(peer, self.auth.group_gid),
-            self.auth.require_group,
-        ) {
+        if level == Access::ReadOnly {
             return Ok(peer);
         }
-        warn!(
-            peer_uid = peer.uid,
-            peer_pid = ?peer.pid,
-            group = %self.auth.group,
-            "refusing mutating RPC: caller is not a member of the configured group"
-        );
-        Err(Status::permission_denied(format!(
-            "mutating RPCs require uid 0 or membership of group '{}'",
-            self.auth.group
-        )))
+        match self.standing(peer).await {
+            Ok(official) => {
+                info!(
+                    rpc,
+                    peer_uid = peer.uid,
+                    peer_pid = ?peer.pid,
+                    auth = if official.is_some() { "official" } else { "privileged" },
+                    official_exe = ?official,
+                    "authorized"
+                );
+                Ok(peer)
+            }
+            Err(status) => {
+                warn!(
+                    rpc,
+                    peer_uid = peer.uid,
+                    peer_pid = ?peer.pid,
+                    reason = status.message(),
+                    outcome = "permission_denied",
+                    "refusing a firewall change"
+                );
+                Err(status)
+            }
+        }
+    }
+
+    /// May `peer` change the firewall? `Ok(None)` for a privileged peer,
+    /// `Ok(Some(exe))` for the official app or tray, `Err` (with the reason
+    /// the client shows) for everyone else, who is read-only.
+    async fn standing(&self, peer: PeerId) -> Result<Option<PathBuf>, Status> {
+        let group_ok = !self.auth.require_group || peer_is_group_member(peer, self.auth.group_gid);
+        match gate(peer.uid, self.own_uid, group_ok) {
+            Gate::Privileged => Ok(None),
+            Gate::DenyGroup => Err(Status::permission_denied(format!(
+                "mutating RPCs require uid 0 or membership of group '{}'",
+                self.auth.group
+            ))),
+            Gate::NeedOfficial => {
+                let (check, list) = (self.official, self.official_clients.clone());
+                tokio::task::spawn_blocking(move || check(&peer, &list))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the identity check failed ({error})")))
+                    .map(Some)
+                    .map_err(|reason| {
+                        Status::permission_denied(format!(
+                            "read-only access: {reason}. Firewall changes are accepted only \
+                             from the installed Colony Firewall app and tray, or from root \
+                             (sudo cfc ...)."
+                        ))
+                    })
+            }
+        }
     }
 
     async fn upsert_rule_checked(
@@ -608,9 +700,25 @@ impl Firewall for FirewallService {
         &self,
         req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
-        let peer = self.authorize(&req, Access::ReadOnly)?;
+        let peer = self
+            .authorize(&req, "StreamPrompts", Access::ReadOnly)
+            .await?;
+        // Every peer is shown the prompts addressed to it; only one that may
+        // answer them is counted as a UI and enters their audience.
+        let answering = match self.standing(peer).await {
+            Ok(_) => true,
+            Err(status) => {
+                tracing::debug!(
+                    peer_uid = peer.uid,
+                    peer_pid = ?peer.pid,
+                    reason = status.message(),
+                    "read-only prompt subscriber"
+                );
+                false
+            }
+        };
         let (tx, rx) = mpsc::channel(64);
-        let mut sub = self.router.subscribe(peer.uid);
+        let mut sub = self.router.subscribe(peer.uid, answering);
         let audience = self.audience.clone();
         let uid = peer.uid;
         tokio::spawn(async move {
@@ -635,7 +743,9 @@ impl Firewall for FirewallService {
                         // subscriber is about to learn the prompt id, so it
                         // must be entitled to answer it by the time it can.
                         if let Ok(id) = event.prompt_id.parse::<u64>() {
-                            audience.record(id, uid);
+                            if answering {
+                                audience.record(id, uid);
+                            }
                         }
                         if tx.send(Ok(event)).await.is_err() {
                             break;
@@ -657,7 +767,9 @@ impl Firewall for FirewallService {
         &self,
         req: Request<VerdictRequest>,
     ) -> Result<Response<VerdictResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        let peer = self
+            .authorize(&req, "SubmitVerdict", Access::Control)
+            .await?;
         let req = req.into_inner();
 
         // Ownership: only a peer this prompt was actually delivered to may
@@ -826,7 +938,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "ListRules", Access::ReadOnly).await?;
         let snapshot = self.engine.snapshot();
         let rules = snapshot.rules.iter().map(convert::rule_to_pb).collect();
         Ok(Response::new(ListRulesResponse { rules }))
@@ -836,7 +948,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<UpsertRuleRequest>,
     ) -> Result<Response<UpsertRuleResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        let peer = self.authorize(&req, "UpsertRule", Access::Control).await?;
         self.upsert_rule_checked(peer, req.into_inner())
             .await
             .map(Response::new)
@@ -847,7 +959,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<ApplyRulesRequest>,
     ) -> Result<Response<ApplyRulesResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        let peer = self.authorize(&req, "ApplyRules", Access::Control).await?;
         self.apply_rules_checked(peer, req.into_inner())
             .await
             .map(Response::new)
@@ -858,7 +970,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<DeleteRuleRequest>,
     ) -> Result<Response<DeleteRuleResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        let peer = self.authorize(&req, "DeleteRule", Access::Control).await?;
         let id_str = req.into_inner().id;
         let id = uuid::Uuid::parse_str(&id_str)
             .map_err(|e| Status::invalid_argument(format!("bad uuid: {e}")))?;
@@ -888,7 +1000,8 @@ impl Firewall for FirewallService {
         &self,
         req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamConnectionsStream>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "StreamConnections", Access::ReadOnly)
+            .await?;
         let (tx, rx) = mpsc::channel(256);
         let mut sub = self.observed_tx.subscribe();
         tokio::spawn(async move {
@@ -924,7 +1037,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "GetStatus", Access::ReadOnly).await?;
         let rules_count = self.engine.rule_count() as u64;
         let policy = self.policy();
         let paused = self.stats.is_paused();
@@ -964,7 +1077,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<SetPausedRequest>,
     ) -> Result<Response<SetPausedResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        let peer = self.authorize(&req, "SetPaused", Access::Control).await?;
         let msg = req.into_inner();
 
         if !msg.paused {
@@ -1036,7 +1149,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<ListEventsRequest>,
     ) -> Result<Response<ListEventsResponse>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "ListEvents", Access::ReadOnly).await?;
         let (limit, offset, filter) =
             event_query_from_pb(&req.into_inner()).map_err(Status::invalid_argument)?;
         let rows = self
@@ -1428,6 +1541,9 @@ pub async fn spawn(
         .with_context(|| format!("binding {}", socket_path.display()))?;
     // Tighten ownership/mode before the first client can connect.
     let auth = secure_socket(&socket_path, &opts.ipc);
+    for warning in opts.ipc.official_client_warnings() {
+        warn!("{warning}");
+    }
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds)
         .map(|stream| stream.and_then(PeerStream::new));
 
@@ -1439,6 +1555,9 @@ pub async fn spawn(
         stats,
         policy,
         auth,
+        own_uid: nix::unistd::geteuid().as_raw(),
+        official_clients: opts.ipc.official_clients.clone().into(),
+        official: crate::official::check,
         audience: Arc::new(PromptAudience::default()),
         resume_at_ms: Arc::new(AtomicI64::new(0)),
         pause_default_secs: opts.pause_default_secs,
@@ -1506,30 +1625,284 @@ mod tests {
     // -- authorization ------------------------------------------------------
 
     #[test]
-    fn read_only_rpcs_are_open_to_any_connected_peer() {
-        for gated in [true, false] {
-            for require in [true, false] {
-                assert!(authorize_uid(1000, Access::ReadOnly, gated, require));
-                assert!(authorize_uid(0, Access::ReadOnly, gated, require));
+    fn gate_table() {
+        // (peer uid, daemon uid, group proved) -> standing
+        let cases = [
+            (0, 0, false, Gate::Privileged),
+            (0, 0, true, Gate::Privileged),
+            (1000, 1000, false, Gate::Privileged),
+            (0, 1000, false, Gate::Privileged),
+            (1000, 0, true, Gate::NeedOfficial),
+            (1000, 0, false, Gate::DenyGroup),
+        ];
+        for (peer, own, group_ok, want) in cases {
+            assert_eq!(gate(peer, own, group_ok), want, "{peer} {own} {group_ok}");
+        }
+    }
+
+    // -- the service's authorization table ---------------------------------
+
+    const OWN_UID: u32 = 999;
+    const GROUP_GID: u32 = 4242;
+    /// The pid the stub official check accepts.
+    const OFFICIAL_PID: i32 = 77;
+
+    fn stub_official(peer: &PeerId, _: &[PathBuf]) -> Result<PathBuf, String> {
+        if peer.pid == Some(OFFICIAL_PID) {
+            Ok(PathBuf::from("/usr/bin/colony-firewall"))
+        } else {
+            Err("not the installed app".into())
+        }
+    }
+
+    fn service(require_group: bool) -> FirewallService {
+        let store = RuleStore::open_in_memory().unwrap();
+        let policy: SharedPolicy = Arc::new(std::sync::RwLock::new(crate::config::DefaultPolicy {
+            no_ui_action: cfc_core::Action::Deny,
+            timeout_action: cfc_core::Action::Deny,
+            inbound_action: cfc_core::Action::Deny,
+            prompt_timeout_secs: 3600,
+        }));
+        let engine = Engine::new(store.snapshot().unwrap(), policy.clone());
+        let stats = Stats::new();
+        let (verdict_tx, verdicts) = std::sync::mpsc::channel();
+        // Verdicts are not asserted here; keep the receiver alive.
+        std::mem::forget(verdicts);
+        FirewallService {
+            router: PromptRouter::new(policy.clone(), stats.clone(), verdict_tx),
+            engine,
+            store,
+            observed_tx: broadcast::channel(16).0,
+            stats,
+            policy,
+            auth: SocketAuth {
+                group: "cfc-test".into(),
+                group_gid: Some(GROUP_GID),
+                group_gated: true,
+                require_group,
+            },
+            own_uid: OWN_UID,
+            official_clients: Arc::from(Vec::new()),
+            official: stub_official,
+            audience: Arc::new(PromptAudience::default()),
+            resume_at_ms: Arc::new(AtomicI64::new(0)),
+            pause_default_secs: 600,
+            dry_run: true,
+        }
+    }
+
+    fn peer(uid: u32, gid: u32, pid: i32) -> PeerId {
+        PeerId {
+            uid,
+            gid,
+            pid: Some(pid),
+            starttime: None,
+            sock_ino: None,
+        }
+    }
+
+    fn request<T>(message: T, peer: PeerId) -> Request<T> {
+        let mut req = Request::new(message);
+        req.extensions_mut().insert(peer);
+        req
+    }
+
+    fn rule_pb() -> RuleInfo {
+        let mut rule = cfc_core::Rule::new(
+            "smtp",
+            cfc_core::Action::Deny,
+            cfc_core::RuleScope {
+                dst_port: Some(25),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        rule.name = "smtp".into();
+        convert::rule_to_pb(&rule)
+    }
+
+    /// Which change RPCs `peer` got through, in the order UpsertRule,
+    /// DeleteRule, SetPaused, ApplyRules. A refusal must be
+    /// PERMISSION_DENIED; any other error fails the test.
+    async fn changes(svc: &FirewallService, peer: PeerId) -> [bool; 4] {
+        fn passed<T>(result: Result<T, Status>) -> bool {
+            match result {
+                Ok(_) => true,
+                Err(status) => {
+                    assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+                    false
+                }
             }
         }
+        let upsert = svc
+            .upsert_rule(request(
+                UpsertRuleRequest {
+                    rule: Some(rule_pb()),
+                },
+                peer,
+            ))
+            .await;
+        let delete = svc
+            .delete_rule(request(
+                DeleteRuleRequest {
+                    id: uuid::Uuid::new_v4().to_string(),
+                },
+                peer,
+            ))
+            .await;
+        let pause = svc
+            .set_paused(request(
+                SetPausedRequest {
+                    paused: false,
+                    duration_secs: 0,
+                },
+                peer,
+            ))
+            .await;
+        let apply = svc
+            .apply_rules(request(
+                ApplyRulesRequest {
+                    rules: vec![rule_pb()],
+                    replace: false,
+                },
+                peer,
+            ))
+            .await;
+        [passed(upsert), passed(delete), passed(pause), passed(apply)]
     }
 
-    #[test]
-    fn root_may_always_mutate() {
-        for gated in [true, false] {
-            assert!(authorize_uid(0, Access::Mutate, gated, true));
+    async fn reads(svc: &FirewallService, peer: PeerId) {
+        svc.list_rules(request(ListRulesRequest {}, peer))
+            .await
+            .unwrap();
+        svc.get_status(request(StatusRequest {}, peer))
+            .await
+            .unwrap();
+        svc.list_events(request(ListEventsRequest::default(), peer))
+            .await
+            .unwrap();
+        svc.stream_connections(request(SubscribeRequest::default(), peer))
+            .await
+            .unwrap();
+        svc.stream_prompts(request(SubscribeRequest::default(), peer))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorization_table() {
+        let root = peer(0, 0, 1);
+        let own = peer(OWN_UID, OWN_UID, 2);
+        let official_member = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let official_outsider = peer(1001, 1001, OFFICIAL_PID);
+        let read_only_member = peer(1000, GROUP_GID, 5);
+        let all = [true; 4];
+        let none = [false; 4];
+
+        let svc = service(true);
+        for (who, want) in [
+            (root, all),
+            (own, all),
+            (official_member, all),
+            (official_outsider, none),
+            (read_only_member, none),
+        ] {
+            reads(&svc, who).await;
+            assert_eq!(changes(&svc, who).await, want, "{who:?}");
         }
+
+        // require_group = false waives the group check, never the image check.
+        let svc = service(false);
+        assert_eq!(changes(&svc, official_outsider).await, all);
+        assert_eq!(changes(&svc, read_only_member).await, none);
+        assert_eq!(changes(&svc, peer(1002, 1002, 6)).await, none);
     }
 
-    #[test]
-    fn non_root_mutation_requires_proved_peer_group_membership() {
-        // Only proved peer membership authorizes a non-root mutation.
-        assert!(authorize_uid(1000, Access::Mutate, true, true));
-        // A socket mode is not membership evidence for an individual peer.
-        assert!(!authorize_uid(1000, Access::Mutate, false, true));
-        // Explicit opt-out: the admin gates the socket some other way.
-        assert!(authorize_uid(1000, Access::Mutate, false, false));
+    #[tokio::test]
+    async fn a_read_only_refusal_says_why_and_what_to_use_instead() {
+        let svc = service(true);
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest::default(),
+                peer(1000, GROUP_GID, 5),
+            ))
+            .await
+            .unwrap_err();
+        assert!(status
+            .message()
+            .starts_with("read-only access: not the installed app."));
+        assert!(
+            status.message().contains("sudo cfc"),
+            "{}",
+            status.message()
+        );
+        assert!(!svc.stats.is_paused());
+    }
+
+    /// A pending prompt about uid 1000's process, with an answering UI so it
+    /// waits, and uid 1000 in its audience.
+    async fn pending_prompt(svc: &FirewallService) -> crate::prompts::PromptSubscription {
+        use std::net::{IpAddr, Ipv4Addr};
+        let ui = svc.router.subscribe(1000, true);
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(crate::prompts::run_router_task(rx, svc.router.clone()));
+        let mut process = cfc_core::Process::unknown(4321);
+        process.uid = Some(1000);
+        tx.send(PromptRequest {
+            prompt_id: 5,
+            connection: cfc_core::Connection::new(
+                cfc_core::Protocol::Tcp,
+                cfc_core::Direction::Outbound,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                40000,
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                443,
+            ),
+            process,
+        })
+        .await
+        .unwrap();
+        while svc.stats.prompts_pending() == 0 {
+            tokio::task::yield_now().await;
+        }
+        svc.audience.record(5, 1000);
+        ui
+    }
+
+    fn answer(peer: PeerId) -> Request<VerdictRequest> {
+        request(
+            VerdictRequest {
+                prompt_id: "5".into(),
+                action: cfc_proto::v1::Action::Allow as i32,
+                duration: cfc_proto::v1::Duration::Once as i32,
+                persist_scope: None,
+            },
+            peer,
+        )
+    }
+
+    #[tokio::test]
+    async fn read_only_peer_cannot_answer_even_its_own_prompt() {
+        let svc = service(true);
+        let _ui = pending_prompt(&svc).await;
+        let status = svc
+            .submit_verdict(answer(peer(1000, GROUP_GID, 5)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(svc.stats.prompts_pending(), 1, "the prompt still waits");
+    }
+
+    #[tokio::test]
+    async fn official_peer_answers_without_password() {
+        let svc = service(true);
+        let _ui = pending_prompt(&svc).await;
+        let reply = svc
+            .submit_verdict(answer(peer(1000, GROUP_GID, OFFICIAL_PID)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.accepted);
+        assert_eq!(svc.stats.prompts_pending(), 0);
     }
 
     #[test]
