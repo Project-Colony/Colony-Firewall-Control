@@ -343,6 +343,17 @@ minutes). Root (`sudo cfc pause`) is never asked. What the refusals mean:
 - **"authorization timed out after 120 s"**: the dialog was left open; the
   daemon closed it.
 
+## The daemon warns about `kernel.yama.ptrace_scope`
+
+`kernel.yama.ptrace_scope is 1: a program of the desktop user can start the
+installed app or tray under ptrace ...` is logged once at startup. It is not
+an error: with that setting any program of yours can start the app under a
+debugger, change its code before it seals itself and make changes as it,
+and the daemon cannot tell afterwards. Setting
+`kernel.yama.ptrace_scope = 2` closes that route; the commands are in
+[HARDENING.md](HARDENING.md#the-control-socket-and-who-can-talk-to-it).
+Debugging your own programs then needs root.
+
 ## Loopback and the local resolver
 
 The snippet's `output` hook matches loopback traffic too. On systems using

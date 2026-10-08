@@ -1576,6 +1576,12 @@ pub async fn spawn(
     for warning in opts.ipc.official_client_warnings() {
         warn!("{warning}");
     }
+    if !opts.ipc.official_clients.is_empty() {
+        let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok();
+        if let Some(warning) = crate::official::ptrace_scope_warning(scope.as_deref()) {
+            warn!("{warning}");
+        }
+    }
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds)
         .map(|stream| stream.and_then(PeerStream::new));
 

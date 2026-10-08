@@ -38,8 +38,11 @@
 //!
 //! What it cannot see: code already running inside the official image that
 //! moved itself into anonymous memory (anonymous executable mappings are
-//! not judged, GPU drivers JIT into them), and synthetic input to the GUI
-//! under X11. See docs/HARDENING.md.
+//! not judged, GPU drivers JIT into them), code a tracer wrote into the
+//! image before the prologue ran and then detached (Yama's default
+//! `ptrace_scope = 1` lets a program trace its own child from `exec`; see
+//! [`ptrace_scope_warning`]), and synthetic input to the GUI. See
+//! docs/HARDENING.md.
 
 use crate::ipc::PeerId;
 use std::collections::HashMap;
@@ -49,6 +52,26 @@ use std::path::{Path, PathBuf};
 /// Packaged default for `[ipc] official_clients`: the installed GUI and tray.
 pub const DEFAULT_CLIENTS: [&str; 2] =
     ["/usr/bin/colony-firewall", "/usr/bin/colony-firewall-tray"];
+
+/// The startup warning for a Yama `ptrace_scope` (the contents of
+/// `/proc/sys/kernel/yama/ptrace_scope`, `None` without Yama) that lets a
+/// same-user program trace the app or tray from `exec`, patch it before it
+/// seals itself and detach. No later check can see a past trace; only
+/// scope 2 (tracing needs `CAP_SYS_PTRACE`, `PTRACE_TRACEME` included) or 3
+/// closes that route.
+pub fn ptrace_scope_warning(scope: Option<&str>) -> Option<String> {
+    let level = scope.and_then(|s| s.trim().parse::<u8>().ok());
+    if level.is_some_and(|level| level >= 2) {
+        return None;
+    }
+    let shown = level.map_or_else(|| "unavailable".to_string(), |level| level.to_string());
+    Some(format!(
+        "kernel.yama.ptrace_scope is {shown}: a program of the desktop user can start the \
+         installed app or tray under ptrace, change its code before it seals itself and \
+         make changes as it. Set kernel.yama.ptrace_scope = 2 to close that route (see \
+         docs/HARDENING.md)"
+    ))
+}
 
 /// Checks `peer` against `allowlist`. Blocking (reads `/proc` and asks
 /// sock_diag): call it from `spawn_blocking`. `Ok` carries the matched
@@ -398,6 +421,21 @@ mod tests {
             "the caller is being traced"
         );
         assert!(status_is_clean("Uid:\t1000\t1000\t1000\t1000\n", 1000).is_err());
+    }
+
+    #[test]
+    fn only_ptrace_scope_two_or_more_is_quiet() {
+        for quiet in ["2\n", "3\n"] {
+            assert_eq!(ptrace_scope_warning(Some(quiet)), None);
+        }
+        for loud in [Some("0\n"), Some("1\n"), Some("garbage"), None] {
+            let warning = ptrace_scope_warning(loud).unwrap();
+            assert!(warning.contains("ptrace_scope = 2"), "{warning}");
+        }
+        assert!(ptrace_scope_warning(Some("1\n"))
+            .unwrap()
+            .contains(" is 1:"));
+        assert!(ptrace_scope_warning(None).unwrap().contains("unavailable"));
     }
 
     #[test]

@@ -362,8 +362,9 @@ of it between two reads of that process's start time (so a reused pid fails):
 
 The prologue and the descriptor check are what stop the obvious trick:
 connect, write a whole request into the socket, then `exec` the installed app
-with the socket inherited. Non-dumpable also stops later same-user `ptrace`,
-`/proc/<pid>/mem` and `pidfd_getfd` on the app.
+with the socket inherited. Non-dumpable stops same-user `ptrace`,
+`/proc/<pid>/mem` and `pidfd_getfd` on the app from the moment the prologue
+runs. It does nothing about a tracer that was there before (see below).
 
 `require_group = true` (the default) also requires the app or tray to be run
 by a proved group member. `require_group = false` waives that for the app
@@ -385,6 +386,20 @@ runs inside the installed app is the app:
 - a preloaded payload that copies itself into anonymous executable memory and
   unmaps its file is not seen (anonymous executable mappings cannot be
   refused: GPU drivers JIT into them);
+- code written into the app before it sealed itself. Under Yama's
+  `kernel.yama.ptrace_scope = 1` (the default on most distributions) a
+  program may trace its own child, so it can start the installed app or tray
+  with `PTRACE_TRACEME` or under a debugger, patch its code at the `exec`
+  stop and detach. The patched process then runs the real prologue and every
+  check passes: nothing the daemon reads later shows a past trace. Setting
+  `kernel.yama.ptrace_scope = 2` (only root may trace, `PTRACE_TRACEME`
+  included) closes this, at the cost of debugging your own programs without
+  root; the daemon warns at startup while it is lower:
+
+  ```sh
+  echo 'kernel.yama.ptrace_scope = 2' | sudo tee /etc/sysctl.d/60-ptrace-scope.conf
+  sudo sysctl --system
+  ```
 - synthetic input into the GUI under X11 or XWayland can click its buttons;
 - a socket handed back into the app: a same-user program that started the
   app itself (connect first, then exec the installed binary, keeping a copy
@@ -400,8 +415,11 @@ The kernel-enforced next step would be making the two binaries setgid to a
 dedicated empty group and trusting the connect-time `SO_PEERCRED` gid: glibc
 then ignores `LD_PRELOAD`/`LD_AUDIT` (secure execution), the process is
 non-dumpable from `exec`, and a connection made before that `exec` carries
-the wrong gid, which also closes the handed-back socket above. That costs
-packaging work in every channel and is not done yet.
+the wrong gid, which also closes the handed-back socket above. An
+unprivileged tracer, or a seccomp filter (which needs `no_new_privs`), makes
+`exec` drop the setgid, so it would close the pre-seal tracing route too,
+whatever `ptrace_scope` says. That costs packaging work in every channel and
+is not done yet.
 
 Side effects of the sealing prologue: the app and tray write no core dumps,
 attaching a debugger to them needs root, and a developer build run from

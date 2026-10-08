@@ -108,7 +108,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   daemon's own uid keeps full control (root in production). New
   `[ipc] official_clients` key; `require_group` now waives the group check
   for the app and tray only. See docs/HARDENING.md for what this still
-  trusts.
+  trusts. One of those routes is a program that starts the app or tray
+  under `ptrace` and patches it before it seals itself, which the default
+  Yama `ptrace_scope = 1` allows; the daemon warns at startup until
+  `kernel.yama.ptrace_scope` is 2.
 - **Breaking: pause, resume and rule import from the app or tray ask for an
   administrator password** through polkit
   (`org.projectcolony.firewall.pause`, `org.projectcolony.firewall.import-rules`,
