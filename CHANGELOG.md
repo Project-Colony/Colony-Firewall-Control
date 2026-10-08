@@ -19,9 +19,32 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when every compatible socket agrees on its owner. The process and
   descriptor found must still hold the socket after the executable is read;
   otherwise the identity is unknown.
+- GUI: "make rule" on a Live row seeds the program, port and protocol, the
+  scope `cfc rules add --exe --dst-port --protocol` builds, instead of
+  pinning the one address seen, which left the app denied on its next
+  address (#46). A row without an identified program pins the address and
+  never seeds `<unknown>`; an inbound row keeps its direction. "Customize"
+  on a prompt seeds the same way. A saved rule logs the scope it stored, and
+  a rule the editor refuses is also reported in the footer.
+- GUI: a prompt arriving while others are pending no longer switches to the
+  Prompts tab; only the first one does, and raises the window.
 
 ### Security
 
+- GUI: `A`, `D`, `Shift+A` and `Shift+D` answered the newest prompt, the
+  bottom card and often off-screen, from any tab and with Ctrl, Alt or Super
+  held, so `Shift+A` on the card being read could write an always-allow rule
+  for another program. They now answer the marked top card, only on the
+  Prompts tab and without those modifiers. The keys are disarmed for one
+  second whenever their target changes, and a card's buttons for one second
+  after it appears, so input already on its way when the window was raised
+  or a card moved does not answer it.
+- GUI and tray: executable paths, command lines, working directories and DNS
+  names were shown raw, so bidi and control characters could reorder or add
+  lines to a prompt, and the tray's notification body was parsed as markup
+  by dunst and mako, so a path could hide part of itself. They are now
+  escaped as the CLI already did. The GUI's Remote row says whether the name
+  is verified.
 - While no daemon listens on the queue, new loopback flows are allowed
   (`oifname "lo" ct state new queue num 0 bypass`), so local services keep
   working when the daemon is down. Loopback Deny rules are not enforced then.
@@ -121,6 +144,18 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it.
 - A daemon started by hand under umask 000 created its socket directory
   world-writable, so a local user could replace the socket.
+- GUI: a prompt card was dropped before its verdict reached the daemon, so a
+  failed verdict left the flow to the timeout default with nothing to retry.
+  The card now stays until the daemon answers. A customization whose prompt
+  expired was closed with the user's edits; it now stays open as a new rule.
+  Footer errors are no longer pushed out by a burst of warnings.
+- GUI: Pause replaced Reconnect under the cursor as soon as the daemon came
+  back, so a double-click on Reconnect paused enforcement. Pause now stays
+  disabled for one second after connecting.
+- Tray: on GNOME, three expired prompt bubbles held every actionable slot,
+  so later prompts only reached the overflow bubble, which cannot answer
+  them. Slots are freed once their prompt's deadline has passed, and the
+  stale bubbles are closed.
 
 ## [0.7.0] - 2026-09-30
 
