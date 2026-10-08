@@ -20,6 +20,7 @@ pub mod ipc;
 pub mod nfqueue;
 pub mod official;
 pub mod packet;
+pub mod polkit;
 pub mod process_resolve;
 pub mod prompts;
 pub mod provenance;

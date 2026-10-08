@@ -103,6 +103,9 @@ pub struct App {
     /// Reconnect) or enforcement resuming (it replaces Resume). Pause stays
     /// disabled for [`PROMPT_ARM_MS`] after it (see [`App::pause_armed`]).
     pub pause_shown_at_ms: i64,
+    /// A pause or resume request is in flight, possibly waiting on the
+    /// administrator password dialog. Pause and Resume stay disabled.
+    pub pause_pending: bool,
     pub retry_at_ms: Option<i64>,
     /// Set when a gRPC stream drops; the badge shows "reconnecting" instead
     /// of the footer being rewritten every two seconds.
@@ -587,6 +590,7 @@ impl App {
             retry_attempts: 0,
             retry_at_ms: None,
             pause_shown_at_ms: 0,
+            pause_pending: false,
             stream_trouble: false,
             now_ms: now_ms(),
         };
@@ -1084,13 +1088,17 @@ impl App {
             }
             Message::TogglePaused => {
                 let current = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
-                if !current && !self.pause_armed() {
+                if self.pause_pending || (!current && !self.pause_armed()) {
                     return Task::none();
                 }
+                self.pause_pending = true;
+                self.log
+                    .info("Waiting for administrator authorization...", self.now_ms);
                 let socket = self.socket_path.clone();
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
             Message::PausedSet(Ok((paused, resume_at_unix_ms))) => {
+                self.pause_pending = false;
                 if !paused {
                     self.now_ms = now_ms();
                     self.pause_shown_at_ms = self.now_ms;
@@ -1113,6 +1121,7 @@ impl App {
                 Task::none()
             }
             Message::PausedSet(Err(e)) => {
+                self.pause_pending = false;
                 self.log.error(format!("pause failed: {e}"), self.now_ms);
                 Task::none()
             }
@@ -1537,13 +1546,16 @@ impl App {
             if paused {
                 button(text("Resume").size(12))
                     .padding([4, 14])
-                    .on_press(Message::TogglePaused)
+                    .on_press_maybe((!self.pause_pending).then_some(Message::TogglePaused))
                     .style(iced::widget::button::primary)
                     .into()
             } else {
                 button(text("Pause").size(12))
                     .padding([4, 14])
-                    .on_press_maybe(self.pause_armed().then_some(Message::TogglePaused))
+                    .on_press_maybe(
+                        (self.pause_armed() && !self.pause_pending)
+                            .then_some(Message::TogglePaused),
+                    )
                     .style(iced::widget::button::secondary)
                     .into()
             }
@@ -1705,9 +1717,12 @@ async fn delete_rule(path: PathBuf, id: String) -> Result<(String, bool), String
 }
 
 /// Returns `(paused, resume_at_unix_ms)`. `duration_secs = 0` lets the
-/// daemon apply its configured default and report the real deadline.
+/// daemon apply its configured default and report the real deadline. The
+/// daemon asks polkit first, so this may wait on a password dialog.
 async fn set_paused(path: PathBuf, paused: bool) -> Result<(bool, i64), String> {
-    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let mut client = Client::connect_interactive(&path)
+        .await
+        .map_err(|e| e.to_string())?;
     let resp = client
         .set_paused(paused, 0)
         .await
@@ -2561,6 +2576,22 @@ mod tests {
         let _ = app.update(Message::PausedSet(Ok((false, 0))));
         assert_eq!(app.update(Message::TogglePaused).units(), 0);
         app.now_ms += PROMPT_ARM_MS;
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
+    }
+
+    #[test]
+    fn pause_waits_for_authorization_and_ignores_clicks_meanwhile() {
+        let (mut app, _) = App::new();
+        app.status = Some(proto::StatusResponse::default());
+        app.now_ms += PROMPT_ARM_MS;
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
+        assert!(app.pause_pending);
+        assert_eq!(app.update(Message::TogglePaused).units(), 0, "in flight");
+        let _ = app.update(Message::PausedSet(Err(
+            "authorization dialog dismissed (polkit action org.projectcolony.firewall.pause)"
+                .into(),
+        )));
+        assert!(!app.pause_pending);
         assert_eq!(app.update(Message::TogglePaused).units(), 1);
     }
 

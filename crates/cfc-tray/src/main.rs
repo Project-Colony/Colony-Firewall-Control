@@ -121,6 +121,8 @@ enum Cmd {
     OverflowResult {
         key: String,
     },
+    /// A pause or resume request finished; `Err` is the reason to show.
+    PauseDone(Result<(), String>),
 }
 
 struct TrayApp {
@@ -357,31 +359,38 @@ async fn refresh(
 }
 
 /// Ask the daemon to pause (`duration_secs`, 0 = daemon default) or
-/// resume. Failures are logged, never fatal - the next poll will show the
-/// truth either way.
-async fn set_paused(client: &mut Option<Client>, socket: &Path, paused: bool, duration_secs: u32) {
-    let verb = if paused { "pause" } else { "resume" };
-    if client.is_none() {
-        match Client::connect(socket).await {
-            Ok(c) => *client = Some(c),
-            Err(e) => {
-                warn!("cannot {verb}: {e}");
-                return;
+/// resume, on a task of its own: the daemon asks polkit first, and the
+/// password dialog may stay open for up to two minutes, during which the
+/// main loop must keep showing prompts. The outcome comes back as
+/// [`Cmd::PauseDone`].
+fn spawn_set_paused(
+    tx: mpsc::UnboundedSender<Cmd>,
+    socket: PathBuf,
+    paused: bool,
+    duration_secs: u32,
+) {
+    tokio::spawn(async move {
+        let verb = if paused { "pause" } else { "resume" };
+        let result = async {
+            let mut client = Client::connect_interactive(&socket).await?;
+            client.set_paused(paused, duration_secs).await
+        }
+        .await;
+        let _ = tx.send(Cmd::PauseDone(match result {
+            Ok(resp) => {
+                debug!(
+                    paused = resp.paused,
+                    resume_at_unix_ms = resp.resume_at_unix_ms,
+                    "{verb} acknowledged"
+                );
+                Ok(())
             }
-        }
-    }
-    let c = client.as_mut().expect("connected above");
-    match c.set_paused(paused, duration_secs).await {
-        Ok(resp) => debug!(
-            paused = resp.paused,
-            resume_at_unix_ms = resp.resume_at_unix_ms,
-            "{verb} acknowledged"
-        ),
-        Err(e) => {
-            warn!("{verb} failed: {e}");
-            *client = None;
-        }
-    }
+            Err(e) => {
+                warn!("{verb} failed: {e}");
+                Err(model::pause_failed_body(verb, &e))
+            }
+        }));
+    });
 }
 
 /// Launches the GUI, detached: resolved via PATH, environment (including
@@ -967,6 +976,10 @@ async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
     // Notification wait tasks route their results over the same channel
     // as menu clicks; the main loop is the only place the client lives.
     let handle_tx = tx.clone();
+    let pause_tx = tx.clone();
+    // A pause or resume is waiting on the daemon (and maybe on a password
+    // dialog); further clicks are ignored until it answers.
+    let mut pause_in_flight = false;
     let tray = TrayApp {
         view: DaemonView::Connecting,
         tx,
@@ -1050,16 +1063,24 @@ async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
                     break;
                 }
                 Some(Cmd::OpenGui) => open_gui(),
+                Some(Cmd::Pause(_) | Cmd::Resume) if pause_in_flight => {
+                    debug!("pause or resume already waiting; click ignored");
+                }
                 Some(Cmd::Pause(secs)) => {
-                    set_paused(&mut client, &socket, true, secs).await;
-                    // Refresh immediately so the menu flips to "Resume
-                    // now" without waiting out the poll interval.
-                    if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
-                        break;
-                    }
+                    pause_in_flight = true;
+                    spawn_set_paused(pause_tx.clone(), socket.clone(), true, secs);
                 }
                 Some(Cmd::Resume) => {
-                    set_paused(&mut client, &socket, false, 0).await;
+                    pause_in_flight = true;
+                    spawn_set_paused(pause_tx.clone(), socket.clone(), false, 0);
+                }
+                Some(Cmd::PauseDone(result)) => {
+                    pause_in_flight = false;
+                    if let Err(body) = result {
+                        notify_brief(body);
+                    }
+                    // Refresh immediately so the menu flips to "Resume
+                    // now" without waiting out the poll interval.
                     if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
                         break;
                     }

@@ -29,7 +29,12 @@ Exit codes:
   4  daemon unreachable (not running, stale socket, or no socket permission)
 
 Anywhere a rule id is accepted you may also pass a unique id prefix or the
-rule's name.";
+rule's name.
+
+Changing the firewall (adding, editing, removing or importing rules, pause and
+resume, answering prompts) needs root: run cfc with sudo, or use the Colony
+Firewall app or tray. As a regular user cfc is read-only and the daemon
+answers a change with the reason it refused it (exit 1).";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -74,15 +79,17 @@ enum Command {
     },
     /// Show daemon status.
     Status,
-    /// Rules CRUD.
+    /// Rules CRUD (changes need sudo).
     Rules {
         #[command(subcommand)]
         cmd: RulesCmd,
     },
-    /// Answer connection prompts from this terminal.
+    /// Answer connection prompts from this terminal (needs sudo).
     ///
     /// Without a subscriber the daemon applies its no-UI action to every
-    /// prompt, so this is how a headless machine gets a say.
+    /// prompt, so this is how a headless machine gets a say: run it as
+    /// `sudo cfc prompts`. As a regular user it only watches; the daemon
+    /// neither counts it as a UI nor accepts its answers.
     ///
     /// Keys: a=allow, d=deny, r=reject, s=skip (let it time out), q=quit.
     /// Then a duration (1=once, 2=until restart, 3=always) and, for the
@@ -107,7 +114,8 @@ enum Command {
     },
     /// Query the persisted verdict log ("what did this app contact?").
     Log(events::LogArgs),
-    /// Temporarily allow all flows.
+    /// Temporarily allow all flows (needs sudo; the app and tray ask for an
+    /// administrator password instead).
     Pause {
         /// How long to stay paused, e.g. 30m, 2h. Omitted means the
         /// daemon's configured default; the daemon clamps the maximum.
@@ -115,7 +123,7 @@ enum Command {
               value_parser = humantime::parse_duration)]
         duration: Option<std::time::Duration>,
     },
-    /// Resume normal filtering immediately.
+    /// Resume normal filtering immediately (needs sudo).
     Resume,
     /// Print a shell completion script.
     #[command(hide = true)]
@@ -140,15 +148,15 @@ enum RulesCmd {
     List,
     /// Show every field of one rule.
     Show { id: String },
-    /// Delete a rule.
+    /// Delete a rule (needs sudo).
     Remove { id: String },
-    /// Flip a rule's enabled state.
+    /// Flip a rule's enabled state (needs sudo).
     Toggle { id: String },
-    /// Enable a rule (idempotent).
+    /// Enable a rule (idempotent; needs sudo).
     Enable { id: String },
-    /// Disable a rule (idempotent).
+    /// Disable a rule (idempotent; needs sudo).
     Disable { id: String },
-    /// Add a new rule.
+    /// Add a new rule (needs sudo).
     Add(rules::AddArgs),
     /// Export all rules as JSON to stdout.
     Export {
@@ -156,7 +164,7 @@ enum RulesCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Import rules from a JSON file (or stdin if omitted).
+    /// Import rules from a JSON file, or stdin if omitted (needs sudo).
     Import {
         /// File to read; reads stdin if omitted.
         file: Option<PathBuf>,
@@ -164,7 +172,7 @@ enum RulesCmd {
         #[arg(long)]
         replace: bool,
     },
-    /// Import rules from an opensnitch rules directory or single JSON file.
+    /// Import rules from an opensnitch rules directory or single JSON file (needs sudo).
     ///
     /// Rules with no faithful equivalent here (hostnames, regexps, unknown
     /// operands) cannot be converted. By default one of them stops the import
@@ -180,7 +188,7 @@ enum RulesCmd {
         #[arg(long, conflicts_with = "replace")]
         skip_unconvertible: bool,
     },
-    /// Install a small set of sensible starter rules: system DNS, NTP
+    /// Install a small set of sensible starter rules (needs sudo): system DNS, NTP
     /// (timesyncd/chrony), DHCP clients (dhcpcd/NetworkManager/networkd),
     /// pacman/paru HTTPS, and the SSH client.
     BootstrapDefaults {
@@ -188,7 +196,7 @@ enum RulesCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install or remove a named set of allow rules.
+    /// Install or remove a named set of allow rules (needs sudo).
     ///
     /// Every outbound rule in a bundle names an executable - there is no way
     /// to write "allow tcp/443" here, because a payload phoning home uses 443

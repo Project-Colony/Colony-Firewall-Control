@@ -102,6 +102,17 @@ pub fn unreachable_hint(err: &ClientError) -> String {
     }
 }
 
+/// Notification body for a pause or resume the daemon did not carry out.
+/// A denial is the daemon's own reason (a dismissed password dialog, no
+/// polkit agent, a tray that must be restarted), which already says what to
+/// do; anything else is a plain failure.
+pub fn pause_failed_body(verb: &str, err: &ClientError) -> String {
+    match err {
+        ClientError::Denied(reason) => format!("Could not {verb} the firewall: {reason}"),
+        other => format!("Could not {verb} the firewall ({other})"),
+    }
+}
+
 /// "2h 05m" / "5m 00s" / "42s". Negative input clamps to "0s".
 pub fn format_countdown(secs: i64) -> String {
     let s = secs.max(0);
@@ -668,6 +679,27 @@ mod tests {
             assert!(!hint.contains('\n'), "hint must be one line: {hint:?}");
             assert!(hint.len() < 80, "hint must stay short: {hint:?}");
         }
+    }
+
+    #[test]
+    fn a_denied_pause_says_why() {
+        let body = pause_failed_body(
+            "pause",
+            &ClientError::Denied(
+                "authorization dialog dismissed (polkit action org.projectcolony.firewall.pause)"
+                    .into(),
+            ),
+        );
+        assert_eq!(
+            body,
+            "Could not pause the firewall: authorization dialog dismissed \
+             (polkit action org.projectcolony.firewall.pause)"
+        );
+        let body = pause_failed_body("resume", &ClientError::StreamClosed);
+        assert!(
+            body.starts_with("Could not resume the firewall ("),
+            "{body}"
+        );
     }
 
     // --- menu model ---------------------------------------------------------

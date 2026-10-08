@@ -28,6 +28,11 @@
 //!      directories. `require_group = false` waives the group proof for
 //!      official clients only.
 //!
+//!    Pause, resume and `ApplyRules` change the whole firewall at once, so
+//!    an official client also needs a polkit authorization for them
+//!    ([`crate::polkit`]); root does not. Answering a prompt and editing one
+//!    rule never ask for a password.
+//!
 //!    Every other peer is read-only: its change RPCs get PERMISSION_DENIED
 //!    with the reason, its prompt subscription does not count as a UI (so
 //!    `no_ui_action` still applies), and it never enters a prompt's audience.
@@ -249,6 +254,9 @@ enum Access {
     ReadOnly,
     /// Changing the firewall's behaviour: root, or the official app or tray.
     Control,
+    /// A change to the whole firewall at once: as `Control`, and an official
+    /// client must also get this polkit action authorized (root need not).
+    Elevated(&'static str),
 }
 
 /// Where a peer stands for [`Access::Control`], before its image is checked.
@@ -277,6 +285,10 @@ fn gate(peer_uid: u32, own_uid: u32, group_ok: bool) -> Gate {
 /// The official-client check: `official::check` in production, a stub in
 /// unit tests. Not reachable from config or from any client.
 type OfficialCheck = fn(&PeerId, &[PathBuf]) -> Result<PathBuf, String>;
+
+/// The polkit check: `polkit::check` in production, a stub in unit tests.
+type PolkitCheck =
+    fn(PeerId, &'static str) -> futures::future::BoxFuture<'static, Result<(), String>>;
 
 /// Outcome of securing the socket file, and the policy knobs that decide
 /// what it implies for callers.
@@ -491,6 +503,7 @@ struct FirewallService {
     /// `[ipc] official_clients`, bound at startup.
     official_clients: Arc<[PathBuf]>,
     official: OfficialCheck,
+    polkit: PolkitCheck,
     audience: Arc<PromptAudience>,
     /// Wall-clock deadline of the current pause, 0 when not paused. Held
     /// here rather than in `Stats` so the pause timer and `GetStatus` agree.
@@ -511,14 +524,29 @@ impl FirewallService {
         if level == Access::ReadOnly {
             return Ok(peer);
         }
-        match self.standing(peer).await {
-            Ok(official) => {
+        let outcome = match self.standing(peer).await {
+            // Only an official client is asked; root never is.
+            Ok(Some(exe)) => match level {
+                Access::Elevated(action) => (self.polkit)(peer, action)
+                    .await
+                    .map(|()| (Some(exe), Some(action)))
+                    .map_err(|reason| {
+                        Status::permission_denied(format!("{reason} (polkit action {action})"))
+                    }),
+                _ => Ok((Some(exe), None)),
+            },
+            Ok(None) => Ok((None, None)),
+            Err(status) => Err(status),
+        };
+        match outcome {
+            Ok((official, polkit)) => {
                 info!(
                     rpc,
                     peer_uid = peer.uid,
                     peer_pid = ?peer.pid,
                     auth = if official.is_some() { "official" } else { "privileged" },
                     official_exe = ?official,
+                    polkit = ?polkit,
                     "authorized"
                 );
                 Ok(peer)
@@ -959,7 +987,13 @@ impl Firewall for FirewallService {
         &self,
         req: Request<ApplyRulesRequest>,
     ) -> Result<Response<ApplyRulesResponse>, Status> {
-        let peer = self.authorize(&req, "ApplyRules", Access::Control).await?;
+        let peer = self
+            .authorize(
+                &req,
+                "ApplyRules",
+                Access::Elevated(crate::polkit::IMPORT_RULES),
+            )
+            .await?;
         self.apply_rules_checked(peer, req.into_inner())
             .await
             .map(Response::new)
@@ -1077,7 +1111,11 @@ impl Firewall for FirewallService {
         &self,
         req: Request<SetPausedRequest>,
     ) -> Result<Response<SetPausedResponse>, Status> {
-        let peer = self.authorize(&req, "SetPaused", Access::Control).await?;
+        // Both directions: resuming is as much "the firewall now behaves
+        // differently" as pausing.
+        let peer = self
+            .authorize(&req, "SetPaused", Access::Elevated(crate::polkit::PAUSE))
+            .await?;
         let msg = req.into_inner();
 
         if !msg.paused {
@@ -1558,6 +1596,7 @@ pub async fn spawn(
         own_uid: nix::unistd::geteuid().as_raw(),
         official_clients: opts.ipc.official_clients.clone().into(),
         official: crate::official::check,
+        polkit: |peer, action| Box::pin(crate::polkit::check(peer, action)),
         audience: Arc::new(PromptAudience::default()),
         resume_at_ms: Arc::new(AtomicI64::new(0)),
         pause_default_secs: opts.pause_default_secs,
@@ -1655,7 +1694,32 @@ mod tests {
         }
     }
 
+    fn polkit_allows(
+        _: PeerId,
+        _: &'static str,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn polkit_denies(
+        _: PeerId,
+        _: &'static str,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Err("authorization dialog dismissed".to_string()) })
+    }
+
+    fn polkit_must_not_be_asked(
+        _: PeerId,
+        action: &'static str,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        panic!("polkit was asked for {action}")
+    }
+
     fn service(require_group: bool) -> FirewallService {
+        service_with(require_group, polkit_allows)
+    }
+
+    fn service_with(require_group: bool, polkit: PolkitCheck) -> FirewallService {
         let store = RuleStore::open_in_memory().unwrap();
         let policy: SharedPolicy = Arc::new(std::sync::RwLock::new(crate::config::DefaultPolicy {
             no_ui_action: cfc_core::Action::Deny,
@@ -1684,6 +1748,7 @@ mod tests {
             own_uid: OWN_UID,
             official_clients: Arc::from(Vec::new()),
             official: stub_official,
+            polkit,
             audience: Arc::new(PromptAudience::default()),
             resume_at_ms: Arc::new(AtomicI64::new(0)),
             pause_default_secs: 600,
@@ -1815,6 +1880,121 @@ mod tests {
         assert_eq!(changes(&svc, official_outsider).await, all);
         assert_eq!(changes(&svc, read_only_member).await, none);
         assert_eq!(changes(&svc, peer(1002, 1002, 6)).await, none);
+
+        // Pause and import need polkit from the official client, and only
+        // from it: a refusal there leaves the single-rule edits alone.
+        let svc = service_with(true, polkit_denies);
+        assert_eq!(
+            changes(&svc, official_member).await,
+            [true, true, false, false]
+        );
+        assert_eq!(changes(&svc, root).await, all);
+        assert_eq!(changes(&svc, own).await, all);
+    }
+
+    #[tokio::test]
+    async fn polkit_is_never_asked_for_root_or_for_prompt_answers() {
+        let svc = service_with(true, polkit_must_not_be_asked);
+        for who in [peer(0, 0, 1), peer(OWN_UID, OWN_UID, 2)] {
+            assert_eq!(changes(&svc, who).await, [true; 4]);
+        }
+        let official = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let [upsert, delete, ..] = changes_without_elevation(&svc, official).await;
+        assert!(upsert && delete);
+        let _ui = pending_prompt(&svc).await;
+        assert!(
+            svc.submit_verdict(answer(official))
+                .await
+                .unwrap()
+                .into_inner()
+                .accepted
+        );
+    }
+
+    /// UpsertRule and DeleteRule only.
+    async fn changes_without_elevation(svc: &FirewallService, peer: PeerId) -> [bool; 2] {
+        let upsert = svc
+            .upsert_rule(request(
+                UpsertRuleRequest {
+                    rule: Some(rule_pb()),
+                },
+                peer,
+            ))
+            .await
+            .is_ok();
+        let delete = svc
+            .delete_rule(request(
+                DeleteRuleRequest {
+                    id: uuid::Uuid::new_v4().to_string(),
+                },
+                peer,
+            ))
+            .await
+            .is_ok();
+        [upsert, delete]
+    }
+
+    #[tokio::test]
+    async fn a_denied_polkit_leaves_the_firewall_unpaused() {
+        let svc = service_with(true, polkit_denies);
+        let official = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest {
+                    paused: true,
+                    duration_secs: 60,
+                },
+                official,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            status.message().contains("dismissed"),
+            "{}",
+            status.message()
+        );
+        assert!(status.message().contains(crate::polkit::PAUSE));
+        assert!(!svc.stats.is_paused());
+
+        let status = svc
+            .apply_rules(request(
+                ApplyRulesRequest {
+                    rules: vec![rule_pb()],
+                    replace: true,
+                },
+                official,
+            ))
+            .await
+            .unwrap_err();
+        assert!(status.message().contains(crate::polkit::IMPORT_RULES));
+        assert_eq!(svc.engine.rule_count(), 0, "the store is unchanged");
+    }
+
+    #[tokio::test]
+    async fn resume_also_requires_polkit() {
+        let svc = service_with(true, polkit_denies);
+        svc.set_paused(request(
+            SetPausedRequest {
+                paused: true,
+                duration_secs: 60,
+            },
+            peer(0, 0, 1),
+        ))
+        .await
+        .unwrap();
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest {
+                    paused: false,
+                    duration_secs: 0,
+                },
+                peer(1000, GROUP_GID, OFFICIAL_PID),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(svc.stats.is_paused(), "still paused");
     }
 
     #[tokio::test]

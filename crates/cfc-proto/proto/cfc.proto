@@ -5,10 +5,19 @@ package cfc.v1;
 // Colony Firewall Control IPC schema.
 // Spoken between the root daemon (server) and UI/CLI clients over a Unix
 // domain socket.
+//
+// Authorization: reading (ListRules, GetStatus, ListEvents, the two streams)
+// is open to any peer that can connect. Changes (SubmitVerdict, UpsertRule,
+// DeleteRule, ApplyRules, SetPaused) are accepted from root and from the
+// installed Colony Firewall app and tray only; every other peer gets
+// PERMISSION_DENIED with the reason. ApplyRules and SetPaused from the app or
+// tray also need a polkit authorization, which may keep the call waiting on
+// a password dialog for up to 120 s.
 
 service Firewall {
   // The UI subscribes once and receives a streaming feed of new connections
-  // that need a verdict from the user.
+  // that need a verdict from the user. Any peer may subscribe; only one that
+  // may answer (root, the official app or tray) counts as a connected UI.
   rpc StreamPrompts(SubscribeRequest) returns (stream PromptEvent);
 
   // The UI returns a verdict for a specific prompt id.
@@ -18,7 +27,8 @@ service Firewall {
   rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
   rpc UpsertRule(UpsertRuleRequest) returns (UpsertRuleResponse);
   rpc DeleteRule(DeleteRuleRequest) returns (DeleteRuleResponse);
-  // Validate and apply a complete import atomically.
+  // Validate and apply a complete import atomically. From the app or tray
+  // it needs polkit action org.projectcolony.firewall.import-rules.
   rpc ApplyRules(ApplyRulesRequest) returns (ApplyRulesResponse);
 
   // Live observed connections (for the live view, no verdict requested).
@@ -32,7 +42,8 @@ service Firewall {
   // flow no rule matched is allowed straight through instead of raising a
   // prompt. A pause always ends by itself: duration_secs (or the daemon's
   // [pause] default_secs when 0) is clamped to at most 24h, and the
-  // response reports the resume deadline.
+  // response reports the resume deadline. Pausing and resuming from the app
+  // or tray need polkit action org.projectcolony.firewall.pause.
   rpc SetPaused(SetPausedRequest) returns (SetPausedResponse);
 
   // Persisted verdict/audit log, newest first. Read-only.
