@@ -247,7 +247,7 @@ struct Term {
     line_mode: bool,
     /// True when stdout is a terminal and an in-place countdown is useful.
     countdown: bool,
-    _raw: Option<RawMode>,
+    raw: Option<RawMode>,
 }
 
 enum Input {
@@ -291,8 +291,21 @@ impl Term {
             keys: tty::spawn_key_reader(),
             line_mode: raw.is_none(),
             countdown: tty::stdout_is_tty(),
-            _raw: raw,
+            raw,
         })
+    }
+
+    /// Drops keys typed while no prompt was on screen, and what is left of
+    /// an escape sequence, so they cannot answer a prompt nobody has read
+    /// yet. Line mode keeps them: piped input answers prompts in order.
+    fn discard_typeahead(&mut self) {
+        if self.line_mode {
+            return;
+        }
+        if let Some(raw) = &self.raw {
+            raw.discard_input();
+        }
+        while self.keys.try_recv().is_ok() {}
     }
 
     /// Waits for one of `valid` keys, redrawing a countdown until the
@@ -506,6 +519,7 @@ async fn handle_prompt(
         return Ok(false);
     };
 
+    term.discard_typeahead();
     print_prompt(ev);
 
     let label = "answer: [a]llow [d]eny [r]eject [s]kip [q]uit";
@@ -587,6 +601,11 @@ async fn handle_prompt(
                 Input::Key('1') => Scope::ExeAndPort,
                 Input::Key('2') => Scope::Exe,
                 Input::Key('3') => Scope::Destination,
+                // Escape, which an arrow key also starts.
+                Input::Key('s') => {
+                    println!("  skipped (the daemon will apply {timeout_action} at the deadline)");
+                    return Ok(false);
+                }
                 Input::Key(_) | Input::Interrupted | Input::Closed => return Ok(true),
                 Input::TimedOut => {
                     println!("  expired (daemon applied {timeout_action})");
@@ -710,6 +729,26 @@ fn print_prompt(ev: &proto::PromptEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keys typed while no prompt was shown, such as "a32" after one expired or
+    // the "[A" an Up arrow leaves, must not answer the next prompt.
+    #[test]
+    fn typeahead_is_dropped_before_a_new_prompt_in_raw_mode_only() {
+        for line_mode in [false, true] {
+            let (tx, keys) = tokio::sync::mpsc::unbounded_channel();
+            for byte in *b"a32[A" {
+                tx.send(byte).unwrap();
+            }
+            let mut term = Term {
+                keys,
+                line_mode,
+                countdown: false,
+                raw: None,
+            };
+            term.discard_typeahead();
+            assert_eq!(term.keys.try_recv().is_ok(), line_mode);
+        }
+    }
 
     fn process() -> proto::ProcessInfo {
         proto::ProcessInfo {

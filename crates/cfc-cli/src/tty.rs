@@ -59,6 +59,16 @@ impl RawMode {
     }
 }
 
+impl RawMode {
+    /// Discards bytes the terminal received that nobody has read yet.
+    pub fn discard_input(&self) {
+        // SAFETY: the fd is the live terminal captured in `enable`.
+        unsafe {
+            libc::tcflush(self.fd, libc::TCIFLUSH);
+        }
+    }
+}
+
 impl Drop for RawMode {
     fn drop(&mut self) {
         // SAFETY: restoring the exact termios captured in `enable`.
