@@ -149,6 +149,7 @@ pub struct VerdictOutcome {
     /// must complain only on `Some(false)`.
     pub rule_persisted: Option<bool>,
     /// Why the rule could not be stored, when one was asked for and failed.
+    /// Display-safe, like `persist_note`.
     pub persist_error: Option<String>,
     /// Something true about the rule that WAS stored, worth showing: today,
     /// that it was hash-bound (a replaced binary will prompt again), or that
@@ -291,8 +292,12 @@ impl Client {
                 (true, false) => None,
                 (true, true) => Some(!resp.persisted_rule_id.is_empty()),
             },
-            persist_error: (!resp.persist_error.is_empty()).then_some(resp.persist_error),
-            persist_note: (!resp.persist_note.is_empty()).then_some(resp.persist_note),
+            // Escaped once here for every front end: both can quote a path
+            // whose name a local user chose.
+            persist_error: (!resp.persist_error.is_empty())
+                .then(|| convert::display_safe(&resp.persist_error)),
+            persist_note: (!resp.persist_note.is_empty())
+                .then(|| convert::display_safe(&resp.persist_note)),
         })
     }
 
