@@ -90,6 +90,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by dunst and mako, so a path could hide part of itself. They are now
   escaped as the CLI already did. The GUI's Remote row says whether the name
   is verified.
+- An observed DNS answer could name an address with spaces and brackets,
+  such as `google.com (1.2.3.4; verified hostname)`, and every client printed
+  it before the real address and trust label. Observed names with anything
+  but letters, digits, `-`, `_` and `.` are now dropped.
 - While no daemon listens on the queue, new loopback flows are allowed
   (`oifname "lo" ct state new queue num 0 bypass`), so local services keep
   working when the daemon is down. Loopback Deny rules are not enforced then.

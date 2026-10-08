@@ -129,6 +129,9 @@ It does not validate a resolver transaction, sender or question. These records
 remain untrusted diagnostics in a separate cache. They cannot satisfy a
 policy rule. Observations and forward-confirmed PTR diagnostics use separate caches. Diagnostic entries
 retain the record TTL, clamped to 60s..1h; the policy cache remains separate.
+A name with anything but ASCII letters, digits, `-`, `_` and `.` is dropped,
+so a crafted answer cannot print text that looks like the address or trust
+label shown beside it.
 
 ## Deny or Reject?
 

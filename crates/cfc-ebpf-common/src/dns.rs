@@ -250,7 +250,10 @@ pub fn skip_questions(c: &DnsCursor<'_>, qdcount: u16) -> Option<usize> {
     Some(off)
 }
 
-/// Materialises the name at `start` into `out` as dot-separated ASCII.
+/// Materialises the name at `start` into `out` as dot-separated labels.
+///
+/// Label bytes are copied as received, unvalidated: the daemon keeps only
+/// host-name characters before showing a name anywhere.
 ///
 /// Returns `(bytes_written, offset_just_past_the_name_in_the_stream)`. A single
 /// NUL is written at `out[bytes_written]` (when it fits); bytes beyond that are
