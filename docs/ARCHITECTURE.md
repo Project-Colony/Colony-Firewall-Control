@@ -274,7 +274,9 @@ name a program keep their specificity order among themselves, so
 `allow --exe X --dst-port 443` still beats `deny --exe X`. Everything else
 keeps the order above. The scan holds the first matching generic Allow
 instead of returning it, and only a lower program rule can still change the
-answer: a program Deny or Reject replaces it, a program Allow leaves it. The
+answer: a program Deny or Reject replaces it, and a program Allow answers in
+its place with the same action (it is credited with the hit, since it is what
+keeps a lower program Deny from winning). The
 relation is not a total order (program Allow 3 > program Deny 2 > generic
 Allow 5 > generic Deny 4 > program Allow 3), so no sort key could express
 it. The in-kernel precompute (`Engine::process_wide_action` and

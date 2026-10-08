@@ -683,15 +683,17 @@ impl RuleSet {
                 }
                 continue;
             }
-            winner = Some(match generic_allow {
-                // A lower program Allow cannot turn the answer into a refusal.
-                Some(held) if rule.action == Action::Allow => held,
-                None if rule.action == Action::Allow && !rule.scope.names_program() => {
-                    generic_allow = Some(rule);
-                    continue;
-                }
-                _ => rule,
-            });
+            if generic_allow.is_none()
+                && rule.action == Action::Allow
+                && !rule.scope.names_program()
+            {
+                generic_allow = Some(rule);
+                continue;
+            }
+            // Under a held generic Allow this is a program rule. A program
+            // Deny overrides the Allow; a program Allow keeps the action but
+            // answers itself, since it is what stops a lower program Deny.
+            winner = Some(rule);
             break;
         }
         let Some(winner) = winner.or(generic_allow) else {
@@ -1383,7 +1385,9 @@ mod tests {
     }
 
     #[test]
-    fn a_program_allow_below_a_generic_allow_leaves_it_the_answer() {
+    fn a_program_allow_below_a_generic_allow_answers_with_the_same_action() {
+        // The program Allow is credited (hit counter, live view, log): it is
+        // the rule that keeps a lower program Deny from winning.
         let set = sorted(vec![
             scoped(
                 "allow-x",
@@ -1405,8 +1409,34 @@ mod tests {
         ]);
         assert_eq!(
             winner(&set, &mk_conn(), &mk_proc("/usr/bin/x")),
-            Some("allow-https")
+            Some("allow-x")
         );
+        // The documented carve-out (docs/TROUBLESHOOTING.md): the program
+        // Allow under the generic Allow is what keeps `deny --exe` from
+        // winning on 443, so it is the rule credited there.
+        let carve_out = sorted(vec![
+            set.rules
+                .iter()
+                .find(|r| r.name == "allow-https")
+                .unwrap()
+                .clone(),
+            scoped(
+                "allow-x-https",
+                Action::Allow,
+                RuleScope {
+                    dst_port: Some(443),
+                    ..exe("/usr/bin/x")
+                },
+            ),
+            scoped("deny-x", Action::Deny, exe("/usr/bin/x")),
+        ]);
+        let http = Connection {
+            dst_port: 80,
+            ..mk_conn()
+        };
+        let x = mk_proc("/usr/bin/x");
+        assert_eq!(winner(&carve_out, &mk_conn(), &x), Some("allow-x-https"));
+        assert_eq!(winner(&carve_out, &http, &x), Some("deny-x"));
     }
 
     #[test]
@@ -1569,7 +1599,7 @@ mod tests {
         ));
         let mut hashed = mk_proc("/usr/bin/y");
         hashed.sha256 = Some("aa".repeat(32));
-        assert_eq!(winner(&set, &mk_conn(), &hashed), Some("allow-net"));
+        assert_eq!(winner(&set, &mk_conn(), &hashed), Some("allow-h"));
         hashed.sha256 = Some("cc".repeat(32));
         assert_eq!(winner(&set, &mk_conn(), &hashed), Some("deny-y"));
     }
@@ -1604,6 +1634,51 @@ mod tests {
         // A known other program is decided: the Deny cannot be about it.
         assert_eq!(
             winner(&set, &mk_conn(), &mk_proc("/usr/bin/curl")),
+            Some("allow-https")
+        );
+    }
+
+    #[test]
+    fn a_digest_only_deny_leaves_every_unhashed_image_open_under_a_generic_allow() {
+        // Documented in docs/HARDENING.md: an image over the hashing cap
+        // (Chromium, Electron) could be the denied one, so a `--sha256`-only
+        // Deny keeps every such flow open under every generic Allow. Adding
+        // `--exe` settles every other program.
+        let https = RuleScope {
+            protocol: Some(Protocol::Tcp),
+            dst_port: Some(443),
+            ..RuleScope::any()
+        };
+        let digest = || Some("bb".repeat(32));
+        let chromium = mk_proc("/usr/lib/chromium/chromium");
+        let digest_only = sorted(vec![
+            scoped("allow-https", Action::Allow, https.clone()),
+            scoped(
+                "deny-tool",
+                Action::Deny,
+                RuleScope {
+                    exe_sha256: digest(),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert!(matches!(
+            digest_only.lookup(&mk_conn(), &chromium, now()),
+            Match::Undecidable(r) if r.name == "deny-tool"
+        ));
+        let with_exe = sorted(vec![
+            scoped("allow-https", Action::Allow, https),
+            scoped(
+                "deny-tool",
+                Action::Deny,
+                RuleScope {
+                    exe_sha256: digest(),
+                    ..exe("/usr/bin/tool")
+                },
+            ),
+        ]);
+        assert_eq!(
+            winner(&with_exe, &mk_conn(), &chromium),
             Some("allow-https")
         );
     }
@@ -1676,7 +1751,7 @@ mod tests {
         }
         assert_eq!(
             answers.into_iter().collect::<Vec<_>>(),
-            [Some("generic-allow".to_owned())]
+            [Some("program-allow".to_owned())]
         );
 
         // Without the program allow, the program deny overrides the generic

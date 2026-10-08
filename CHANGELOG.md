@@ -15,6 +15,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refuses the agent there too, and the in-kernel connect hooks refuse it
   outright. Rules that name a program keep their specificity order among
   themselves, so `allow --exe X --dst-port 443` still beats `deny --exe X`.
+  Under a generic Allow, a matching program Allow is the rule that answers
+  and is credited with the hit, so the carve-out keeps a hit count.
   A `/0` network (`--dst-net 0.0.0.0/0`, `::/0`) no longer counts as a
   predicate when rules are ranked; it still limits a rule to one address
   family, and stored rules that carry only a `/0` keep loading. Some flows
@@ -29,6 +31,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and prompt caps send overflow there too; pause and the loopback allowance
   no longer let such flows through without asking. One "allow this program"
   rule no longer blocks every unattributed flow that a generic rule allows.
+  The reverse holds: once any program Deny or Reject exists, a flow whose
+  program is unknown no longer passes a generic Allow it matches (that Deny
+  may be about it), and no Allow rule can settle it; scope the Deny to
+  destinations or make attribution succeed. A `--sha256` Deny without
+  `--exe` does this to every image over 64 MiB (Chromium, Electron, VS
+  Code); add `--exe` to it.
   The event log and live feed record the undecided rule in `rule_id` with a
   source other than `rule`. A legacy hostname rule that cannot be decided is
   still refused. With `no_ui_action = "Allow"`, a program can reach that

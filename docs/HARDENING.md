@@ -200,7 +200,10 @@ usually past it. For such a program:
   carrying one, Allow or Deny, cannot be decided for the program. Wherever
   its other fields match and the rules below it would answer differently,
   the program's flows are prompted, naming that rule, and take
-  `no_ui_action` when no UI is connected.
+  `no_ui_action` when no UI is connected. A `--sha256` Deny without
+  `--exe` therefore holds every such image open under every generic Allow
+  (any of them could be the denied one); give it `--exe` too, so other
+  programs are decided by path.
 - On a root-sealed path (root-owned, with root-owned ancestors, as a package
   installs it) nothing else changes: "Allow always" saves a path-only rule.
 - On any other path (under a home directory, a user-writable `/opt`

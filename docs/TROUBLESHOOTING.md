@@ -710,6 +710,17 @@ not be fully identified; your answer applies to that connection only. With
 no app, tray or `sudo cfc prompts` connected the flow takes `no_ui_action`,
 and the event log shows it with that rule's id and source `default`.
 
+The usual rule named is a program Deny or Reject (`deny --exe X`, often one
+an earlier "Deny always" answer created): since 0.8.0 it beats every
+generic Allow, so a flow from an unknown program no longer passes a generic
+Allow it matches while that Deny might be about it. Unattributed UDP under
+`allow --uid 1000 --protocol udp --dst-port 53` is the common case. No Allow
+rule can settle this. Either scope the named Deny to destinations
+(`--dst-port`, `--dst-net`) so it cannot apply to these flows, or make
+attribution succeed (below). A `--sha256` Deny without `--exe` does the same
+to every image over 64 MiB (Chromium, Electron, VS Code), since any of them
+could be the denied one: re-create it with `--exe` as well.
+
 These prompts appear even while paused or for loopback flows, because a
 rule may be about them. If they are frequent, find out why attribution
 fails. Run the daemon with `--debug` (`systemctl edit colony-firewalld`,
