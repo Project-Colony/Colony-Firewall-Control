@@ -223,7 +223,8 @@ enum BundleCmd {
     ///
     /// Matches the ids the bundle gave its rules, never a name or a prefix,
     /// so a rule you wrote yourself is never caught by it. Rules seeded
-    /// before 0.7.0 are removed only while identical to the bundle's entry.
+    /// before 0.7.0 are removed only while identical to what the entry
+    /// installs now or installed then.
     /// A bundle rule you edited into a deny or reject is kept.
     Remove {
         /// Bundle name (see `cfc rules bundle list`).

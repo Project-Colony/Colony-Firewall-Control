@@ -264,9 +264,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   grants. SIGINT, SIGHUP, SIGQUIT and SIGTERM now stop the tree at any
   point, and its identity is printed before it starts.
 - `cfc rules bootstrap-defaults` and `bundle add` failed on hosts seeded
-  before 0.7.0, calling the bundle's own rules outside it. An identical
-  same-named rule now counts as present, and `bundle remove` removes it; a
-  different one still stops the command.
+  before 0.7.0, calling the bundle's own rules outside it. A same-named rule
+  identical to what the entry installs here now, or to what 0.3.0 through
+  0.7.0 installed here (the old path, Epiphany, npm and pip included), counts
+  as present, and `bundle remove` removes it; a different one still stops
+  the command.
 - `cfc rules bundle remove` deleted a bundle rule the user had edited into a
   deny. It now keeps any of its rules that is no longer an allow.
 - OpenSnitch import passed `dest.ip` networks (`10.0.0.0/8/32`), bad CIDRs

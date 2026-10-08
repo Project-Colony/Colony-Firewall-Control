@@ -1456,6 +1456,7 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
 /// binaries come first, and launchers are skipped (see [`is_launcher`]).
 /// Tools where only an interpreter connects (npm, pip) are not bundled at all:
 /// allowing `/usr/bin/node` to reach 443 would allow every Node program.
+#[derive(Clone, Copy)]
 struct BundleRule {
     name: &'static str,
     /// Absolute paths to try, in order. First one that exists wins.
@@ -1492,6 +1493,19 @@ impl BundleRule {
             .filter(|p| std::path::Path::new(p).is_file())
             .map(|p| cfc_core::exe_path::resolve(std::path::Path::new(p)).into_path())
             .find(|p| !is_launcher(p))
+    }
+
+    /// The path 0.3.0 through 0.7.0 pinned: the first candidate that exists,
+    /// launcher or not.
+    fn resolve_pre_0_7(&self) -> Option<PathBuf> {
+        if self.exe_candidates.is_empty() {
+            return Some(PathBuf::new());
+        }
+        self.exe_candidates
+            .iter()
+            .map(std::path::Path::new)
+            .find(|p| p.is_file())
+            .map(|p| cfc_core::exe_path::resolve(p).into_path())
     }
 }
 
@@ -2055,29 +2069,134 @@ fn same_policy(rule: &proto::RuleInfo, wanted: &proto::RuleInfo) -> bool {
         && rule.scope == wanted.scope
 }
 
+/// Entries whose candidates changed after 0.7.0, or that were dropped, as
+/// 0.3.0 through 0.7.0 shipped them: `(bundle, entry, candidates, port)`, all
+/// TCP. Epiphany fetches through the WebKit network process every WebKitGTK
+/// app shares, and npm and pip connect as their interpreter, so those went.
+const PRE_0_7_CHANGED: &[(&str, &str, &[&str], u16)] = &[
+    (
+        "updates",
+        "updates-apt-https",
+        &["/usr/bin/apt-get", "/usr/lib/apt/methods/https"],
+        443,
+    ),
+    (
+        "updates",
+        "updates-apt-http",
+        &["/usr/bin/apt-get", "/usr/lib/apt/methods/http"],
+        80,
+    ),
+    ("dev", "dev-git-https", &["/usr/bin/git"], 443),
+    ("dev", "dev-git-ssh", &["/usr/bin/git"], 22),
+    (
+        "dev",
+        "dev-npm-https",
+        &["/usr/bin/npm", "/usr/bin/node"],
+        443,
+    ),
+    (
+        "dev",
+        "dev-pip-https",
+        &["/usr/bin/pip", "/usr/bin/pip3"],
+        443,
+    ),
+    (
+        "web",
+        "web-firefox-https",
+        &["/usr/bin/firefox", "/usr/lib/firefox/firefox"],
+        443,
+    ),
+    (
+        "web",
+        "web-firefox-http",
+        &["/usr/bin/firefox", "/usr/lib/firefox/firefox"],
+        80,
+    ),
+    ("web", "web-librewolf-https", &["/usr/bin/librewolf"], 443),
+    ("web", "web-librewolf-http", &["/usr/bin/librewolf"], 80),
+    (
+        "web",
+        "web-chromium-https",
+        &["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
+        443,
+    ),
+    (
+        "web",
+        "web-chromium-http",
+        &["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
+        80,
+    ),
+    (
+        "web",
+        "web-chrome-https",
+        &["/usr/bin/google-chrome-stable"],
+        443,
+    ),
+    (
+        "web",
+        "web-chrome-http",
+        &["/usr/bin/google-chrome-stable"],
+        80,
+    ),
+    ("web", "web-brave-https", &["/usr/bin/brave"], 443),
+    ("web", "web-brave-http", &["/usr/bin/brave"], 80),
+    (
+        "web",
+        "web-vivaldi-https",
+        &["/usr/bin/vivaldi-stable"],
+        443,
+    ),
+    ("web", "web-vivaldi-http", &["/usr/bin/vivaldi-stable"], 80),
+    ("web", "web-epiphany-https", &["/usr/bin/epiphany"], 443),
+    ("web", "web-epiphany-http", &["/usr/bin/epiphany"], 80),
+];
+
+/// Every entry of `bundle` as 0.3.0 through 0.7.0 shipped it, dropped ones
+/// included.
+fn pre_0_7_entries(bundle: &Bundle) -> Vec<BundleRule> {
+    let changed = PRE_0_7_CHANGED.iter().filter(|(b, ..)| *b == bundle.name);
+    bundle
+        .rules
+        .iter()
+        .filter(|r| !PRE_0_7_CHANGED.iter().any(|(_, name, ..)| *name == r.name))
+        .copied()
+        .chain(changed.map(|&(_, name, exe_candidates, port)| BundleRule {
+            name,
+            exe_candidates,
+            dst_port: Some(port),
+            protocol: Some(proto::Protocol::Tcp),
+            direction: None,
+            src_net: None,
+        }))
+        .collect()
+}
+
 /// Ids of the rules that are this bundle's own entries as seeded before 0.7.0
 /// gave bundle rules deterministic ids: same name, and granting exactly what
-/// the entry would install here. `bundle add` counts them as present and
+/// the entry would install here now, or what 0.3.0 through 0.7.0 installed
+/// here (see [`PRE_0_7_CHANGED`]). `bundle add` counts them as present and
 /// `bundle remove` removes them; an edited copy is neither.
 fn legacy_copies(
     bundle: &Bundle,
-    present: &[(&'static str, PathBuf)],
     existing: &[proto::RuleInfo],
 ) -> std::collections::HashSet<String> {
-    let mut ids = std::collections::HashSet::new();
-    for (rule_name, exe) in present {
-        let Some(spec) = bundle.rules.iter().find(|r| r.name == *rule_name) else {
-            continue;
-        };
-        let wanted = proto_for(spec, &exe.to_string_lossy());
-        ids.extend(
-            existing
+    let now = bundle.rules.iter().filter_map(|r| Some((*r, r.resolve()?)));
+    let then = pre_0_7_entries(bundle)
+        .into_iter()
+        .filter_map(|r| Some((r, r.resolve_pre_0_7()?)));
+    let wanted: Vec<proto::RuleInfo> = now
+        .chain(then)
+        .map(|(spec, exe)| proto_for(&spec, &exe.to_string_lossy()))
+        .collect();
+    existing
+        .iter()
+        .filter(|rule| {
+            wanted
                 .iter()
-                .filter(|rule| rule.name == *rule_name && same_policy(rule, &wanted))
-                .map(|rule| rule.id.clone()),
-        );
-    }
-    ids
+                .any(|w| w.name == rule.name && same_policy(rule, w))
+        })
+        .map(|rule| rule.id.clone())
+        .collect()
 }
 
 fn bundle_rule_id(bundle: &str, name: &str) -> String {
@@ -2220,7 +2339,7 @@ pub async fn bundle_add(
     // A rule with an entry's name but another id was not installed by this
     // bundle. A copy seeded before 0.7.0 counts as present; any other one
     // stops the command before it changes anything.
-    let legacy = legacy_copies(&bundle, &planned.present, &existing);
+    let legacy = legacy_copies(&bundle, &existing);
     for (rule_name, _) in &planned.present {
         let id = bundle_rule_id(bundle.name, rule_name);
         if let Some(rule) = existing
@@ -2238,7 +2357,10 @@ pub async fn bundle_add(
 
     for (rule_name, exe) in &planned.present {
         let id = bundle_rule_id(bundle.name, rule_name);
-        if let Some(rule) = existing.iter().find(|rule| rule.id == id) {
+        if let Some(rule) = existing
+            .iter()
+            .find(|rule| rule.id == id || (rule.name == *rule_name && legacy.contains(&rule.id)))
+        {
             let stored = rule.scope.as_ref().map_or("", |s| s.exe_path.as_str());
             if !format.is_json() && std::path::Path::new(stored) != exe.as_path() {
                 println!(
@@ -2248,13 +2370,6 @@ pub async fn bundle_add(
                     output::terminal_safe(&exe.to_string_lossy())
                 );
             }
-            skipped_present += 1;
-            continue;
-        }
-        if existing
-            .iter()
-            .any(|rule| rule.name == *rule_name && legacy.contains(&rule.id))
-        {
             skipped_present += 1;
             continue;
         }
@@ -2310,22 +2425,12 @@ pub async fn bundle_add(
     Ok(())
 }
 
-/// Entries a later version dropped because their rule could never fire:
-/// Epiphany fetches through the WebKit network process every WebKitGTK app
-/// shares, and npm and pip connect as their interpreter. `bundle remove`
-/// still removes what older versions installed under these names.
-const RETIRED_BUNDLE_RULES: &[(&str, &str)] = &[
-    ("web", "web-epiphany-https"),
-    ("web", "web-epiphany-http"),
-    ("dev", "dev-npm-https"),
-    ("dev", "dev-pip-https"),
-];
-
 /// `cfc rules bundle remove <name>`
 ///
 /// Removes the deterministic IDs this bundle gives its rules, and the copies
 /// of its entries seeded before 0.7.0 that still grant exactly what the entry
-/// would (see [`legacy_copies`]). Any other rule, same name or not, is kept.
+/// grants now or granted then (see [`legacy_copies`]), dropped entries
+/// included. Any other rule, same name or not, is kept.
 pub async fn bundle_remove(
     client: &mut Client,
     name: &str,
@@ -2333,20 +2438,16 @@ pub async fn bundle_remove(
     format: OutputFormat,
 ) -> CliResult {
     let bundle = find_bundle(name)?;
-    let retired = RETIRED_BUNDLE_RULES
-        .iter()
-        .filter(|(b, _)| *b == bundle.name)
-        .map(|(_, name)| *name);
+    // Dropped entries included: older versions installed them too.
     let owned: std::collections::HashSet<String> = bundle
         .rules
         .iter()
-        .map(|r| r.name)
-        .chain(retired)
-        .map(|name| bundle_rule_id(bundle.name, name))
+        .chain(&pre_0_7_entries(&bundle))
+        .map(|r| bundle_rule_id(bundle.name, r.name))
         .collect();
 
     let existing = client.list_rules().await?;
-    let legacy = legacy_copies(&bundle, &plan(&bundle).present, &existing);
+    let legacy = legacy_copies(&bundle, &existing);
     let mut removed = Vec::new();
     let mut kept = Vec::new();
     for r in existing
@@ -2825,8 +2926,7 @@ mod bundle_tests {
     fn a_pre_0_7_copy_of_a_bundle_rule_counts_only_while_unchanged() {
         let bundle = find_bundle("inbound").unwrap();
         let entry = &bundle.rules[0];
-        let present = [(entry.name, PathBuf::from("/usr/bin/sshd"))];
-        let wanted = proto_for(entry, "/usr/bin/sshd");
+        let wanted = proto_for(entry, "");
         let mut legacy = wanted.clone();
         legacy.id = "11111111-1111-4111-8111-111111111111".into();
         legacy.enabled = false;
@@ -2839,7 +2939,7 @@ mod bundle_tests {
         let mut elsewhere = legacy.clone();
         elsewhere.id = "44444444-4444-4444-8444-444444444444".into();
         elsewhere.scope.as_mut().unwrap().exe_path = "/usr/local/bin/sshd".into();
-        let found = legacy_copies(&bundle, &present, &[legacy, deny, wider, elsewhere]);
+        let found = legacy_copies(&bundle, &[legacy, deny, wider, elsewhere]);
         assert_eq!(
             found,
             std::collections::HashSet::from(["11111111-1111-4111-8111-111111111111".to_owned()])
@@ -2878,6 +2978,83 @@ mod bundle_tests {
         assert_eq!(entry(vec![leak(&script)]).resolve(), None);
         assert_eq!(entry(vec![leak(&proxy)]).resolve(), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // 0.6.0 pinned the first candidate that existed, a launcher included, and
+    // installed entries later versions re-pathed or dropped. Those copies are
+    // still the bundle's own.
+    #[test]
+    fn a_pre_0_7_copy_pinned_to_the_old_path_is_the_bundles_own() {
+        let dir = std::env::temp_dir().join(format!("cfc-bundle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("browser");
+        let real = dir.join("browser-bin");
+        std::fs::write(&script, "#!/bin/sh\nexec browser-bin \"$@\"\n").unwrap();
+        std::fs::write(&real, b"\x7fELF").unwrap();
+        let leak = |p: &std::path::Path| -> &'static str {
+            Box::leak(p.to_str().unwrap().to_owned().into_boxed_str())
+        };
+        let entry = BundleRule {
+            name: "test-https",
+            exe_candidates: Box::leak(vec![leak(&script), leak(&real)].into_boxed_slice()),
+            dst_port: Some(443),
+            protocol: Some(proto::Protocol::Tcp),
+            direction: None,
+            src_net: None,
+        };
+        let bundle = Bundle {
+            name: "test",
+            summary: "",
+            rules: vec![entry],
+        };
+        let seeded = |id: &str, exe: &std::path::Path| {
+            let mut rule = proto_for(
+                &entry,
+                &cfc_core::exe_path::resolve(exe)
+                    .into_path()
+                    .to_string_lossy(),
+            );
+            rule.id = id.into();
+            rule
+        };
+        let old = seeded("11111111-1111-4111-8111-111111111111", &script);
+        let new = seeded("22222222-2222-4222-8222-222222222222", &real);
+        let other = seeded("33333333-3333-4333-8333-333333333333", &dir);
+        assert_eq!(
+            legacy_copies(&bundle, &[old, new, other]),
+            std::collections::HashSet::from([
+                "11111111-1111-4111-8111-111111111111".to_owned(),
+                "22222222-2222-4222-8222-222222222222".to_owned(),
+            ])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // The shipped history: a re-pathed entry keeps its scope apart from
+        // the path, and the dropped ones are still known by name.
+        let mut dropped = Vec::new();
+        for bundle in bundles() {
+            for past in pre_0_7_entries(&bundle) {
+                match bundle.rules.iter().find(|r| r.name == past.name) {
+                    Some(now) => assert_eq!(
+                        (now.dst_port, now.protocol, now.direction, now.src_net),
+                        (past.dst_port, past.protocol, past.direction, past.src_net),
+                        "{}",
+                        past.name
+                    ),
+                    None => dropped.push(past.name),
+                }
+            }
+        }
+        dropped.sort_unstable();
+        assert_eq!(
+            dropped,
+            [
+                "dev-npm-https",
+                "dev-pip-https",
+                "web-epiphany-http",
+                "web-epiphany-https"
+            ]
+        );
     }
 
     /// The invariant the whole feature rests on.
