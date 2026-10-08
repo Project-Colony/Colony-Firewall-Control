@@ -8,6 +8,17 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: a Deny or Reject rule scoped to a program wins over every
+  Allow rule that names no program**, whatever their predicate counts.
+  `deny --exe /opt/agent` used to lose to `allow --protocol tcp
+  --dst-port 443` because the Allow carried more predicates; it now
+  refuses the agent there too, and the in-kernel connect hooks refuse it
+  outright. Rules that name a program keep their specificity order among
+  themselves, so `allow --exe X --dst-port 443` still beats `deny --exe X`.
+  A `/0` network (`--dst-net 0.0.0.0/0`, `::/0`) no longer counts as a
+  predicate when rules are ranked; it still limits a rule to one address
+  family, and stored rules that carry only a `/0` keep loading. Some flows
+  change verdict on upgrade: review `cfc rules list`.
 - New loopback flows now go through the queue instead of being accepted
   outright (`oifname "lo" accept` is gone from the outbound table). While the
   daemon runs, explicit rules apply to them, so a loopback Deny that 0.7.0

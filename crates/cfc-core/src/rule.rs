@@ -146,22 +146,37 @@ impl RuleScope {
     /// a scope constraining *only* the direction now counts as constraining
     /// nothing, and `reject_unscoped` refuses it - "allow every inbound flow
     /// from anyone" was never a rule this store should hold.
+    ///
+    /// A `/0` network is not counted either, for the same reason: it narrows
+    /// nothing within its address family, so `--dst-net 0.0.0.0/0` must not
+    /// lift a rule above a genuinely narrower one. Matching is unchanged
+    /// (an IPv4 `/0` still excludes IPv6 flows), only the ranking.
     pub fn specificity(&self) -> u8 {
+        let narrows = |net: &Option<IpNet>| net.is_some_and(|n| n.prefix_len() > 0);
         [
-            self.src_net.is_some(),
+            narrows(&self.src_net),
             self.src_port.is_some(),
             self.exe_path.is_some(),
             self.exe_sha256.is_some(),
             self.parent_exe.is_some(),
             self.uid.is_some(),
             self.dst_host.is_some(),
-            self.dst_net.is_some(),
+            narrows(&self.dst_net),
             self.dst_port.is_some(),
             self.protocol.is_some(),
         ]
         .into_iter()
         .filter(|set| *set)
         .count() as u8
+    }
+
+    /// True when this scope names a program: an `exe_path` or `exe_sha256`
+    /// predicate.
+    ///
+    /// The line [`RuleSet::lookup`] draws for precedence: a Deny or Reject
+    /// that names a program wins over every Allow that names none.
+    pub fn names_program(&self) -> bool {
+        self.exe_path.is_some() || self.exe_sha256.is_some()
     }
 
     /// True when this scope says anything at all about *where* a connection
@@ -562,14 +577,18 @@ fn action_rank(action: Action) -> u8 {
 impl RuleSet {
     /// Sort rules into deterministic precedence order:
     ///
-    /// 1. specificity DESC — more `Some(..)` scope predicates first;
-    /// 2. action severity — Deny, then Reject, before Allow on ties;
-    /// 3. `created_at` ASC — oldest rule first;
-    /// 4. `id` ASC — final total-order tiebreak.
+    /// 1. specificity DESC - more scope predicates first (see
+    ///    [`RuleScope::specificity`]);
+    /// 2. action severity - Deny, then Reject, before Allow on ties;
+    /// 3. `created_at` ASC - oldest rule first;
+    /// 4. `id` ASC - final total-order tiebreak.
+    ///
+    /// [`RuleSet::lookup`] applies one override on top of this order (a
+    /// program Deny beats a generic Allow); it cannot live in the sort key.
     ///
     /// Must be called whenever the set is (re)built or a rule is inserted,
-    /// replaced, or toggled, so `lookup`'s first-match walk is stable across
-    /// daemon restarts regardless of storage iteration order.
+    /// replaced, or toggled, so `lookup`'s walk is stable across daemon
+    /// restarts regardless of storage iteration order.
     pub fn sort_deterministic(&mut self) {
         self.rules.sort_by_key(|r| {
             (
@@ -583,10 +602,23 @@ impl RuleSet {
 
     /// Find the winning enabled, non-expired rule for `(conn, proc)`.
     ///
-    /// Precedence contract: most-specific scope wins; deny beats allow at
-    /// equal specificity; oldest rule first on remaining ties. This holds
-    /// because the set is kept in [`RuleSet::sort_deterministic`] order and
-    /// `lookup` returns the first match of that walk.
+    /// Precedence contract:
+    ///
+    /// 1. A Deny or Reject rule that names a program
+    ///    ([`RuleScope::names_program`]) wins over every Allow rule that names
+    ///    none, whatever their predicate counts. "Deny this program" means
+    ///    that program, even where a broader "allow HTTPS" ranks higher.
+    /// 2. Otherwise the most-specific scope wins; deny beats allow at equal
+    ///    specificity; oldest rule first on remaining ties. Rules that name a
+    ///    program keep this order among themselves, so `allow --exe X
+    ///    --dst-port 443` still beats `deny --exe X`.
+    ///
+    /// The set is kept in [`RuleSet::sort_deterministic`] order, which is the
+    /// second point alone. The first is applied here, during the walk, and not
+    /// in the sort key: the relation is not a total order (a program Allow of
+    /// specificity 3 beats a program Deny of 2, which beats a generic Allow of
+    /// 5, which beats a generic Deny of 4, which beats the program Allow), so
+    /// no comparator could express it.
     ///
     /// `now_unix_ms` is the current wall-clock time; rules whose
     /// `Duration::Seconds(..)` window has elapsed are skipped (see
@@ -600,11 +632,19 @@ impl RuleSet {
         now_unix_ms: i64,
     ) -> Match<'_> {
         let mut undecidable = None;
+        // The first definite Allow that names no program. Held, not returned:
+        // a program Deny ranked below it may still override it.
+        let mut generic_allow: Option<&Rule> = None;
         for rule in self
             .rules
             .iter()
             .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
         {
+            // Once a generic Allow is held, only a program rule can change
+            // the answer: anything else ranks below it and loses by order.
+            if generic_allow.is_some() && !rule.scope.names_program() {
+                continue;
+            }
             // The connection half first, so a rule's own destination
             // predicates can exclude it before its process half is ever
             // questioned. Without that order an undecidable rule would abstain
@@ -620,22 +660,46 @@ impl RuleSet {
             // application's intended hostname or enumerates every alias.
             // Keep a legacy name at its original priority as uncertainty.
             if missing_process || rule.scope.dst_host.is_some() {
-                let first = *undecidable.get_or_insert(rule);
-                // A possible Allow keeps its precedence. Only a sequence
-                // of possible closed actions may yield to a definite Deny.
                 if rule.action == Action::Allow {
-                    return Match::Undecidable(first);
+                    // Under a held generic Allow, a possible program Allow
+                    // cannot change the answer: if it matched, the generic
+                    // Allow would still win.
+                    if generic_allow.is_some() {
+                        continue;
+                    }
+                    // A possible Allow keeps its precedence.
+                    return Match::Undecidable(undecidable.unwrap_or(rule));
                 }
+                // Only a sequence of possible closed actions may yield to a
+                // definite Deny.
+                undecidable.get_or_insert(rule);
                 continue;
             }
-            if rule.action == Action::Allow {
+            let winner = match generic_allow {
+                // A lower program Allow cannot turn the answer into a refusal.
+                Some(held) if rule.action == Action::Allow => held,
+                Some(_) => rule,
+                None if rule.action == Action::Allow && !rule.scope.names_program() => {
+                    if let Some(first) = undecidable {
+                        return Match::Undecidable(first);
+                    }
+                    generic_allow = Some(rule);
+                    continue;
+                }
+                None => rule,
+            };
+            if winner.action == Action::Allow {
                 if let Some(first) = undecidable {
                     return Match::Undecidable(first);
                 }
             }
-            return Match::Rule(rule);
+            return Match::Rule(winner);
         }
-        undecidable.map_or(Match::None, Match::Undecidable)
+        match (undecidable, generic_allow) {
+            (Some(first), _) => Match::Undecidable(first),
+            (None, Some(held)) => Match::Rule(held),
+            (None, None) => Match::None,
+        }
     }
 }
 
@@ -1184,6 +1248,341 @@ mod tests {
             .expect("should match");
         assert_eq!(hit_fwd.id, hit_rev.id);
         assert_eq!(hit_fwd.name, "deny-curl");
+    }
+
+    fn scoped(name: &str, action: Action, scope: RuleScope) -> Rule {
+        Rule::new(name, action, scope)
+    }
+
+    fn sorted(rules: Vec<Rule>) -> RuleSet {
+        let mut set = RuleSet { rules };
+        set.sort_deterministic();
+        set
+    }
+
+    fn winner<'a>(set: &'a RuleSet, conn: &Connection, proc: &Process) -> Option<&'a str> {
+        set.lookup(conn, proc, now())
+            .rule()
+            .map(|r| r.name.as_str())
+    }
+
+    #[test]
+    fn a_program_deny_beats_a_more_specific_generic_allow() {
+        // The scenario that made the override necessary: "deny this agent"
+        // lost to "allow HTTPS" because the allow carried two predicates.
+        let set = sorted(vec![
+            scoped(
+                "deny-telemetry",
+                Action::Deny,
+                RuleScope {
+                    exe_path: Some("/opt/telemetry-agent".into()),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "allow-https",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert_eq!(set.rules[0].name, "allow-https", "the sort is unchanged");
+        let conn = mk_conn();
+        assert_eq!(
+            winner(&set, &conn, &mk_proc("/opt/telemetry-agent")),
+            Some("deny-telemetry")
+        );
+        assert_eq!(
+            winner(&set, &conn, &mk_proc("/usr/bin/curl")),
+            Some("allow-https")
+        );
+    }
+
+    #[test]
+    fn a_program_reject_beats_a_three_predicate_generic_allow() {
+        let set = sorted(vec![
+            scoped(
+                "reject-x",
+                Action::Reject,
+                RuleScope {
+                    exe_sha256: Some("aa".repeat(32)),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "allow-net",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    dst_net: Some("1.2.3.0/24".parse().unwrap()),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        let hashed = Process {
+            sha256: Some("aa".repeat(32)),
+            ..mk_proc("/usr/bin/x")
+        };
+        assert_eq!(winner(&set, &mk_conn(), &hashed), Some("reject-x"));
+    }
+
+    #[test]
+    fn a_more_specific_program_allow_still_beats_a_program_deny() {
+        let set = sorted(vec![
+            scoped(
+                "deny-x",
+                Action::Deny,
+                RuleScope {
+                    exe_path: Some("/usr/bin/x".into()),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "allow-x-443",
+                Action::Allow,
+                RuleScope {
+                    exe_path: Some("/usr/bin/x".into()),
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        let x = mk_proc("/usr/bin/x");
+        assert_eq!(winner(&set, &mk_conn(), &x), Some("allow-x-443"));
+        let http = Connection {
+            dst_port: 80,
+            ..mk_conn()
+        };
+        assert_eq!(winner(&set, &http, &x), Some("deny-x"));
+    }
+
+    #[test]
+    fn a_program_allow_below_a_generic_allow_leaves_it_the_answer() {
+        let set = sorted(vec![
+            scoped(
+                "allow-x",
+                Action::Allow,
+                RuleScope {
+                    exe_path: Some("/usr/bin/x".into()),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "allow-https",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert_eq!(
+            winner(&set, &mk_conn(), &mk_proc("/usr/bin/x")),
+            Some("allow-https")
+        );
+    }
+
+    #[test]
+    fn a_generic_deny_keeps_the_old_order_against_generic_allows() {
+        // The override is about rules that name a program. Between rules that
+        // name none, specificity still decides, whatever the action.
+        let set = sorted(vec![
+            scoped(
+                "deny-443",
+                Action::Deny,
+                RuleScope {
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "allow-tcp-443",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert_eq!(
+            winner(&set, &mk_conn(), &mk_proc("/usr/bin/curl")),
+            Some("allow-tcp-443")
+        );
+    }
+
+    #[test]
+    fn an_unknown_process_under_a_program_deny_and_a_generic_allow_is_undecidable() {
+        // The program Deny could be the one that overrides the Allow, and the
+        // process cannot be checked against it.
+        let set = sorted(vec![
+            scoped(
+                "deny-x",
+                Action::Deny,
+                RuleScope {
+                    exe_path: Some("/usr/bin/x".into()),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "allow-https",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert!(matches!(
+            set.lookup(&mk_conn(), &Process::unknown(0), now()),
+            Match::Undecidable(r) if r.name == "deny-x"
+        ));
+        // A known other program is decided: the Deny cannot be about it.
+        assert_eq!(
+            winner(&set, &mk_conn(), &mk_proc("/usr/bin/curl")),
+            Some("allow-https")
+        );
+    }
+
+    #[test]
+    fn lookup_is_independent_of_insertion_order_with_the_override() {
+        // Four rules whose pairwise precedence is a cycle: program allow (3)
+        // beats program deny (2) by specificity, which beats generic allow (5)
+        // by the override, which beats generic deny (4) by specificity, which
+        // beats the program allow (3) by specificity. The answer must still
+        // not depend on the order the rules arrived in.
+        let x = "/usr/bin/x";
+        let net = || Some("1.2.3.0/24".parse().unwrap());
+        let src = || Some("192.168.1.0/24".parse().unwrap());
+        let rules = [
+            scoped(
+                "program-allow",
+                Action::Allow,
+                RuleScope {
+                    exe_path: Some(x.into()),
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "program-deny",
+                Action::Deny,
+                RuleScope {
+                    exe_path: Some(x.into()),
+                    protocol: Some(Protocol::Tcp),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "generic-allow",
+                Action::Allow,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    dst_net: net(),
+                    src_net: src(),
+                    src_port: Some(54321),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "generic-deny",
+                Action::Deny,
+                RuleScope {
+                    protocol: Some(Protocol::Tcp),
+                    dst_port: Some(443),
+                    dst_net: net(),
+                    src_net: src(),
+                    ..RuleScope::any()
+                },
+            ),
+        ];
+        let proc = mk_proc(x);
+        let conn = mk_conn();
+        let mut answers = std::collections::BTreeSet::new();
+        for a in 0..4 {
+            for b in (0..4).filter(|b| *b != a) {
+                for c in (0..4).filter(|c| *c != a && *c != b) {
+                    let d = 6 - a - b - c;
+                    let set = sorted([a, b, c, d].map(|i| rules[i].clone()).to_vec());
+                    answers.insert(winner(&set, &conn, &proc).map(str::to_owned));
+                }
+            }
+        }
+        assert_eq!(
+            answers.into_iter().collect::<Vec<_>>(),
+            [Some("generic-allow".to_owned())]
+        );
+
+        // Without the program allow, the program deny overrides the generic
+        // allow above it.
+        let set = sorted(rules[1..].to_vec());
+        assert_eq!(winner(&set, &conn, &proc), Some("program-deny"));
+    }
+
+    #[test]
+    fn slash_zero_networks_add_no_specificity() {
+        let any_v4 = RuleScope {
+            dst_net: Some("0.0.0.0/0".parse().unwrap()),
+            dst_port: Some(443),
+            ..RuleScope::any()
+        };
+        assert_eq!(any_v4.specificity(), 1);
+        let any_v6_source = RuleScope {
+            src_net: Some("::/0".parse().unwrap()),
+            ..RuleScope::any()
+        };
+        assert_eq!(any_v6_source.specificity(), 0);
+        let half = RuleScope {
+            dst_net: Some("0.0.0.0/1".parse().unwrap()),
+            ..RuleScope::any()
+        };
+        assert_eq!(half.specificity(), 1);
+
+        // Only the ranking changed: an IPv4 `/0` still excludes IPv6 flows.
+        let v6 = Connection {
+            dst_ip: "2001:db8::1".parse().unwrap(),
+            src_ip: "2001:db8::2".parse().unwrap(),
+            ..mk_conn()
+        };
+        let proc = mk_proc("/usr/bin/curl");
+        assert!(any_v4.matches(&mk_conn(), &proc));
+        assert!(!any_v4.matches(&v6, &proc));
+    }
+
+    #[test]
+    fn a_slash_zero_rule_does_not_outrank_by_count() {
+        // Both now count one predicate, so the tie-break decides: closed wins.
+        let set = sorted(vec![
+            scoped(
+                "allow-all-v4-tcp",
+                Action::Allow,
+                RuleScope {
+                    dst_net: Some("0.0.0.0/0".parse().unwrap()),
+                    protocol: Some(Protocol::Tcp),
+                    ..RuleScope::any()
+                },
+            ),
+            scoped(
+                "deny-443",
+                Action::Deny,
+                RuleScope {
+                    dst_port: Some(443),
+                    ..RuleScope::any()
+                },
+            ),
+        ]);
+        assert_eq!(
+            winner(&set, &mk_conn(), &mk_proc("/usr/bin/curl")),
+            Some("deny-443")
+        );
     }
 
     #[test]

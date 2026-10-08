@@ -175,6 +175,15 @@ Two caveats, both real:
 protocol` is much safer than `exe` alone - if a process is later
 compromised, the attacker still can't pivot to arbitrary destinations.
 
+**A program Deny beats a generic Allow.** A Deny or Reject rule scoped to
+a program (`--exe` or `--sha256`) wins over every Allow rule that names no
+program, however many other predicates that Allow carries: `deny --exe
+/opt/agent` holds even next to `allow --protocol tcp --dst-port 443`. Among
+rules that name a program the more specific one still wins, so an
+`allow --exe X --dst-port 443` carves an exception out of `deny --exe X`.
+A `/0` network (`--dst-net 0.0.0.0/0`) does not count as a predicate when
+rules are ranked.
+
 **Watch the hit counter.** `cfc rules list` shows `hits` per rule. A rule
 with zero hits after weeks of use is probably obsolete or wrong.
 

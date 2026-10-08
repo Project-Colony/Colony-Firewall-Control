@@ -75,7 +75,9 @@ were wrong or missing once the happy path worked.
 ### Rule semantics
 
 - [x] Deterministic precedence (specificity, then Deny > Reject >
-      Allow, then created_at, then id)
+      Allow, then created_at, then id; a program-scoped Deny or Reject
+      beats any Allow that names no program, and `/0` adds no
+      specificity)
 - [x] `Duration` enforced at lookup; expired rules reaped periodically
 - [x] `Once` / `UntilRestart` purged at startup; persisting `Once` refused
 - [x] Forward-compatible rule serialization + frozen v0.1.0 fixtures

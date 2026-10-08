@@ -251,14 +251,29 @@ migration cannot recover that intent. This is a policy-entry contract; it
 does not pin an inode, follow aliases at exec time, or attest future pathname
 changes. Legacy alias intent loss is not repaired by this validation.
 
-`RuleSet` is kept sorted so that lookup is a linear scan that returns the
-first match, and the order does not depend on what SQLite happened to
-return:
+`RuleSet` is kept sorted so that lookup is a linear scan, and the order does
+not depend on what SQLite happened to return:
 
-1. specificity descending (how many scope predicates are set)
+1. specificity descending (how many scope predicates are set; a `/0`
+   network is not counted, since it narrows nothing within its address
+   family)
 2. Deny, then Reject, then Allow
 3. oldest `created_at` first
 4. `id`, as a total-order tiebreak
+
+One override is applied during the scan rather than in the sort: a Deny or
+Reject rule that names a program (`exe_path` or `exe_sha256`) wins over
+every Allow rule that names none, whatever their predicate counts. Rules that
+name a program keep their specificity order among themselves, so
+`allow --exe X --dst-port 443` still beats `deny --exe X`. Everything else
+keeps the order above. The scan holds the first matching generic Allow
+instead of returning it, and only a lower program rule can still change the
+answer: a program Deny or Reject replaces it, a program Allow leaves it. The
+relation is not a total order (program Allow 3 > program Deny 2 > generic
+Allow 5 > generic Deny 4 > program Allow 3), so no sort key could express
+it. The in-kernel precompute (`Engine::process_wide_action` and
+`deny_still_possible_for`) walks the same way, so the connect hooks and the
+packet path agree.
 
 Disabled and expired rules are filtered at lookup, so a `Seconds(n)` rule
 stops matching the instant it expires rather than when the reaper next runs.

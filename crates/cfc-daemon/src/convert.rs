@@ -336,8 +336,12 @@ pub fn rule_to_pb(r: &Rule) -> pb::RuleInfo {
 /// matches EVERYTHING"), which is the strongest argument for enforcing it here:
 /// three clients independently decided it was dangerous, and the one boundary
 /// they all pass through did not check.
+///
+/// A `/0` network adds no specificity but still counts as a scope here: it
+/// limits the rule to one address family, and refusing it would quarantine
+/// rules stored before `/0` stopped ranking (storage runs this at load).
 pub fn reject_unscoped(scope: &RuleScope) -> Result<(), String> {
-    if scope.specificity() == 0 {
+    if scope.specificity() == 0 && scope.src_net.is_none() && scope.dst_net.is_none() {
         return Err(
             "rule scope constrains nothing, so it would match every process and \
              every destination; scope it to at least one of exe_path, uid, \
@@ -580,6 +584,27 @@ mod tests {
             ..Default::default()
         });
         assert!(rule_from_pb(&pb).is_ok());
+    }
+
+    #[test]
+    fn a_slash_zero_only_scope_is_still_storable() {
+        // `/0` stopped adding specificity, but it still limits a rule to one
+        // address family, so the gate keeps accepting it: refusing it here
+        // would also quarantine such rules already on disk.
+        for net in ["0.0.0.0/0", "::/0"] {
+            let dst = RuleScope {
+                dst_net: Some(net.parse().unwrap()),
+                ..RuleScope::any()
+            };
+            assert_eq!(dst.specificity(), 0);
+            assert_eq!(reject_unscoped(&dst), Ok(()), "{net}");
+            let src = RuleScope {
+                src_net: Some(net.parse().unwrap()),
+                ..RuleScope::any()
+            };
+            assert_eq!(reject_unscoped(&src), Ok(()), "{net}");
+        }
+        assert!(reject_unscoped(&RuleScope::any()).is_err());
     }
 
     #[test]

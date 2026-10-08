@@ -828,6 +828,18 @@ mod tests {
             },
         );
         assert_eq!(super::quarantine_reason(&scoped), None);
+
+        // `/0` adds no specificity since 0.8.0 but is still a scope: a rule
+        // stored with only `--dst-net 0.0.0.0/0` keeps loading.
+        let slash_zero = Rule::new(
+            "every ipv4 destination",
+            cfc_core::Action::Deny,
+            cfc_core::RuleScope {
+                dst_net: Some("0.0.0.0/0".parse().unwrap()),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        assert_eq!(super::quarantine_reason(&slash_zero), None);
     }
 
     #[test]

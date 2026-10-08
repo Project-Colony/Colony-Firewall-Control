@@ -209,11 +209,18 @@ impl Engine {
     /// [`RuleScope::undecidable_for`] - also ends the walk with `None`, for
     /// the same reason: it might have been the one that mattered.
     ///
+    /// An Allow that names no program is walked past, because `lookup` lets a
+    /// program Deny or Reject below it win anyway. The first other rule that
+    /// applies then answers as above if it is such a refusal. If it is
+    /// anything else and a generic Allow was passed, the answer depends on
+    /// the destination (that Allow, or what lies below it), so `None`.
+    ///
     /// `None` means "ask the packet path", which is always a safe answer: it
     /// is what happened before this existed.
     pub fn process_wide_action(&self, proc: &Process) -> Option<cfc_core::Action> {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
+        let mut saw_generic_allow = false;
         for rule in rules
             .rules
             .iter()
@@ -240,6 +247,13 @@ impl Engine {
             }
             if !rule.scope.matches_process(proc) {
                 continue;
+            }
+            if is_generic_allow(rule) {
+                saw_generic_allow = true;
+                continue;
+            }
+            if saw_generic_allow && !is_program_refusal(rule) {
+                return None;
             }
             return (!rule.scope.constrains_destination()).then_some(rule.action);
         }
@@ -274,15 +288,22 @@ impl Engine {
     /// * a decidable match ends the walk exactly as `process_wide_action`
     ///   does: its action (or the packet path, for a destination-scoped
     ///   rule) is the whole answer, and nothing below it can matter.
+    /// * a decidable Allow that names no program does not end it: a program
+    ///   Deny below it still wins in `lookup`, so from there on only rules
+    ///   that name a program are looked at.
     pub fn deny_still_possible_for(&self, proc: &Process) -> bool {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
+        let mut saw_generic_allow = false;
         for rule in rules
             .rules
             .iter()
             .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
             .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
         {
+            if saw_generic_allow && !rule.scope.names_program() {
+                continue;
+            }
             if rule.scope.undecidable_for(proc) {
                 if matches!(
                     rule.action,
@@ -294,6 +315,10 @@ impl Engine {
                 continue;
             }
             if !rule.scope.matches_process(proc) {
+                continue;
+            }
+            if is_generic_allow(rule) {
+                saw_generic_allow = true;
                 continue;
             }
             return matches!(
@@ -498,6 +523,18 @@ impl Engine {
     }
 }
 
+/// An Allow that names no program: the rule `lookup` lets a program refusal
+/// override, whatever its rank.
+fn is_generic_allow(rule: &Rule) -> bool {
+    rule.action == cfc_core::Action::Allow && !rule.scope.names_program()
+}
+
+/// A Deny or Reject that names a program: the rule that overrides a generic
+/// Allow.
+fn is_program_refusal(rule: &Rule) -> bool {
+    rule.action != cfc_core::Action::Allow && rule.scope.names_program()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +592,13 @@ mod tests {
         let mut scope = RuleScope::any();
         scope.dst_port = Some(port);
         Rule::new(format!("allow-{port}"), Action::Allow, scope)
+    }
+
+    /// Two predicates, so it outranks a one-predicate rule of any action.
+    fn allow_tcp_port_rule(port: u16) -> Rule {
+        let mut rule = allow_port_rule(port);
+        rule.scope.protocol = Some(Protocol::Tcp);
+        rule
     }
 
     fn deny_port_rule(port: u16) -> Rule {
@@ -892,6 +936,75 @@ mod tests {
             Some(Action::Deny)
         );
         assert_eq!(engine.process_wide_action(&proc("/usr/bin/wget")), None);
+    }
+
+    #[test]
+    fn process_wide_action_applies_the_program_deny_over_a_generic_allow() {
+        // `lookup` lets the program Deny beat the higher-ranked generic Allow,
+        // so the connect hooks may refuse X outright: the packet path would
+        // refuse every flow of X too. Both must agree.
+        let engine = engine_with(vec![
+            exe_rule("deny-x", "/usr/bin/x", Action::Deny),
+            allow_tcp_port_rule(443),
+        ]);
+        let x = proc("/usr/bin/x");
+        assert_eq!(engine.process_wide_action(&x), Some(Action::Deny));
+        assert!(engine.deny_still_possible_for(&x));
+        assert!(matches!(
+            engine.peek(&conn(443), &x),
+            Decision::Resolved(v) if v.action == Action::Deny
+        ));
+
+        let y = proc("/usr/bin/y");
+        assert_eq!(engine.process_wide_action(&y), None);
+        assert!(!engine.deny_still_possible_for(&y));
+    }
+
+    #[test]
+    fn deny_still_possible_sees_a_program_deny_below_a_generic_allow() {
+        // The program Deny is pinned to a digest this process lacks: if it
+        // matches, it overrides the generic Allow ranked above it.
+        let mut hashed = RuleScope::any();
+        hashed.exe_path = Some(PathBuf::from("/usr/bin/x"));
+        hashed.exe_sha256 = Some("aa".repeat(32));
+        let mut generic = RuleScope::any();
+        generic.uid = Some(1000);
+        generic.protocol = Some(Protocol::Tcp);
+        generic.dst_port = Some(443);
+        let engine = engine_with(vec![
+            Rule::new("deny-x-pinned", Action::Deny, hashed),
+            Rule::new("allow-user-https", Action::Allow, generic),
+        ]);
+        let no_hash = proc("/usr/bin/x");
+        assert_eq!(engine.process_wide_action(&no_hash), None);
+        assert!(engine.deny_still_possible_for(&no_hash));
+    }
+
+    #[test]
+    fn a_generic_allow_above_a_generic_deny_keeps_process_wide_none() {
+        // No rule names a program, so the override does not apply and the
+        // old order stands: the generic Allow wins, and a lower destination-
+        // free generic Deny is never reachable.
+        let mut user = RuleScope::any();
+        user.uid = Some(1000);
+        let engine = engine_with(vec![
+            allow_tcp_port_rule(443),
+            Rule::new("deny-user", Action::Deny, user),
+        ]);
+        let p = proc("/usr/bin/curl");
+        assert_eq!(engine.process_wide_action(&p), None);
+        assert!(!engine.deny_still_possible_for(&p));
+    }
+
+    #[test]
+    fn a_program_allow_under_a_generic_allow_is_no_process_wide_answer() {
+        let engine = engine_with(vec![
+            exe_rule("allow-x", "/usr/bin/x", Action::Allow),
+            allow_tcp_port_rule(443),
+        ]);
+        let x = proc("/usr/bin/x");
+        assert_eq!(engine.process_wide_action(&x), None);
+        assert!(!engine.deny_still_possible_for(&x));
     }
 
     #[test]

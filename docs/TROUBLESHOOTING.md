@@ -668,6 +668,20 @@ journalctl -u colony-firewalld -g 'fails the API boundary'
 Remove it with `cfc rules remove <id>` (the full id) and re-create it in
 a form the daemon accepts. `cfc rules import --replace` also deletes such rows.
 
+## An Allow rule no longer lets a program through
+
+Since 0.8.0 a Deny or Reject rule scoped to a program (`--exe` or
+`--sha256`) wins over every Allow rule that names no program, however many
+predicates that Allow has. A broad `allow --protocol tcp --dst-port 443`
+therefore no longer admits a program that `deny --exe` refuses, and the
+connect hooks may refuse that program outright. To let it through on some
+destinations, add an Allow scoped to the same program and those
+destinations (`--exe X --dst-port 443`): among program rules the more
+specific one still wins. A `/0` network no longer counts when rules are
+ranked either, so a rule that relied on `--dst-net 0.0.0.0/0` to outrank
+another may now lose the tie to a Deny. `cfc rules list` shows the rules
+involved; the hit counters show which one answers.
+
 ## Where things live
 
 | Thing                   | Path                                        |
