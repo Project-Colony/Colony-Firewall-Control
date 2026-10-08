@@ -1,4 +1,4 @@
-policy_module(colony_firewall, 0.2.0)
+policy_module(colony_firewall, 0.3.0)
 
 ########################################
 #
@@ -23,7 +23,12 @@ policy_module(colony_firewall, 0.2.0)
 #   * runs rpm(8) once per package-database generation, for provenance;
 #   * runs nft(8) once at start, to flush a legacy Fast Allow set, and once a
 #     minute, to ask whether the filtering table is loaded;
-#   * serves a unix socket under /run/colony-firewall to the CLI, tray and GUI.
+#   * serves a unix socket under /run/colony-firewall to the CLI, tray and GUI,
+#     and checks that a non-root client is the installed app or tray: it stats
+#     the client's image and every executable file it mapped, and asks
+#     sock_diag (UNIX_DIAG) for the client end of the connection;
+#   * asks polkit over the system bus before the app or tray may pause,
+#     resume or import rules.
 #
 # Every one of those is a separate way to be denied, and the failure modes
 # differ: a denied bpf() degrades to sock_diag + /proc and the firewall keeps
@@ -246,6 +251,40 @@ optional_policy(`
 	can_exec(colony_firewalld_t, rpm_exec_t)
 	allow colony_firewalld_t rpm_var_lib_t:dir list_dir_perms;
 	allow colony_firewalld_t rpm_var_lib_t:file read_file_perms;
+')
+
+########################################
+#
+# Official clients and polkit
+#
+# Before a non-root client may change anything, the daemon checks it is the
+# installed app or tray: it stats that binary and every directory above it,
+# and every executable file the client mapped (binaries and libraries), to
+# prove each is root-owned and unwritable by anyone else. The /proc reads
+# (maps, fd, ns, status, and /proc/1/ns) are covered by the attribution
+# group above; the UNIX_DIAG query by the netlink_tcpdiag_socket rule (it is
+# the same NETLINK_SOCK_DIAG socket).
+#
+# A denial here makes the app and tray read-only, with the reason in their
+# error message; root (sudo cfc) keeps working.
+#
+########################################
+
+corecmd_getattr_all_executables(colony_firewalld_t)
+corecmd_search_bin(colony_firewalld_t)
+files_list_root(colony_firewalld_t)
+files_search_usr(colony_firewalld_t)
+libs_search_lib(colony_firewalld_t)
+
+# CheckAuthorization on org.freedesktop.PolicyKit1. Denied, pause, resume and
+# rule import from the app or tray fail with "system D-Bus is unreachable" or
+# "polkit check failed"; sudo cfc still works.
+optional_policy(`
+	dbus_system_bus_client(colony_firewalld_t)
+
+	optional_policy(`
+		policykit_dbus_chat(colony_firewalld_t)
+	')
 ')
 
 ########################################

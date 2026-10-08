@@ -44,6 +44,9 @@ Requires(postun): systemd
 Recommends:     libxkbcommon
 Recommends:     wayland
 Suggests:       libnotify
+# The app and tray ask for an administrator password through polkit before
+# they pause, resume or import rules; without it only sudo cfc can.
+Recommends:     polkit
 
 %description
 Colony Firewall Control asks before a program is allowed to reach the network,
@@ -135,6 +138,8 @@ install -Dpm 0644 pkg/colony-firewall-tray-autostart.desktop \
     %{buildroot}%{_sysconfdir}/xdg/autostart/colony-firewall-tray.desktop
 install -Dpm 0644 pkg/colony-firewall.svg \
     %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/colony-firewall.svg
+install -Dpm 0644 pkg/org.projectcolony.firewall.policy \
+    %{buildroot}%{_datadir}/polkit-1/actions/org.projectcolony.firewall.policy
 
 # Where the eBPF object goes if one is installed later. Shipping the directory
 # means the loader's ownership check (root-owned, unwritable by anyone else)
@@ -248,6 +253,9 @@ fi
 %{_sysconfdir}/xdg/autostart/colony-firewall.desktop
 %{_sysconfdir}/xdg/autostart/colony-firewall-tray.desktop
 %{_datadir}/icons/hicolor/scalable/apps/colony-firewall.svg
+%dir %{_datadir}/polkit-1
+%dir %{_datadir}/polkit-1/actions
+%{_datadir}/polkit-1/actions/org.projectcolony.firewall.policy
 %{_datadir}/bash-completion/completions/cfc
 %{_datadir}/zsh/site-functions/_cfc
 %{_datadir}/fish/vendor_completions.d/cfc.fish

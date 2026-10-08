@@ -192,6 +192,7 @@ jobs:
             pkg/colony-firewall-autostart.desktop \
             pkg/colony-firewall-tray-autostart.desktop \
             pkg/colony-firewall.svg \
+            pkg/org.projectcolony.firewall.policy \
             "${STAGE}/"
 
           # The kernel-side object. Fatal if absent: install.sh cannot express

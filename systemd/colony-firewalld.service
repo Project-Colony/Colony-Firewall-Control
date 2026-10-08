@@ -242,6 +242,13 @@ UMask=0077
 # AF_NETLINK carries NFQUEUE, sock_diag and nftables; AF_INET/AF_INET6 the
 # Reject raw sockets; AF_UNIX the control socket. Nothing opens a packet
 # socket, and AF_PACKET with CAP_NET_RAW would sniff or inject below netfilter.
+#
+# AF_UNIX also carries the polkit check (pause, resume and rule import from
+# the app or tray) to the system bus, and no other directive is needed for
+# it: connect(2) to /run/dbus/system_bus_socket is not blocked by
+# ProtectSystem=strict (a read-only mount does not stop connecting to a
+# socket inode), sendmsg/recvmsg are in @system-service, and the connection
+# is opened lazily on the first such request, so no After=dbus ordering.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]

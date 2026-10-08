@@ -35,6 +35,7 @@ optdepends=(
     'libbpf: mandatory interface filters for application confinement'
     'libnotify: desktop notifications on new prompts'
     'libx11: run the GUI in X11/XWayland sessions'
+    'polkit: administrator prompt when the app or tray pauses filtering or imports rules'
 )
 backup=('etc/colony-firewall/daemon.toml')
 install=colony-firewall-control.install
@@ -126,6 +127,11 @@ package() {
         "$pkgdir/etc/xdg/autostart/colony-firewall-tray.desktop"
     install -Dm644 pkg/colony-firewall.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/colony-firewall.svg"
+
+    # polkit actions the daemon asks about when the app or tray pauses,
+    # resumes or imports rules.
+    install -Dm644 pkg/org.projectcolony.firewall.policy \
+        "$pkgdir/usr/share/polkit-1/actions/org.projectcolony.firewall.policy"
 
     # Docs & license
     install -Dm644 README.md            "$pkgdir/usr/share/doc/$pkgname/README.md"

@@ -40,7 +40,13 @@ Key design points:
   managers and later external ruleset flushes.
 - **`colony-firewall.sysusers`** creates the `colony-firewall` group used
   to gate access to the daemon's gRPC UNIX socket. Users join with
-  `usermod -aG colony-firewall <user>`.
+  `usermod -aG colony-firewall <user>`. Membership gives read access and
+  lets the installed app and tray connect; changes come from those two
+  programs or from `sudo cfc`.
+- **`org.projectcolony.firewall.policy`** declares the polkit actions the
+  daemon asks about when the app or tray pauses, resumes or imports rules
+  (`auth_admin_keep`). Installed to `/usr/share/polkit-1/actions/`; polkit
+  is an optional dependency, and without it only `sudo cfc` can do those.
 - **XDG autostart** launches the GUI in every desktop session so prompts
   actually reach the user. Per-user opt-out: copy the file to
   `~/.config/autostart/` and set `Hidden=true`.
@@ -224,9 +230,9 @@ The version in the manifest's `asset` filename is checked by
 
 Follow the Manual section of the top-level `README.md`, then its First
 run section: enable enforcement, then seed the starter rules with
-`sudo cfc rules bootstrap-defaults` right away. `sudo` matters there, because
-group membership from `usermod -aG colony-firewall` only applies after a new
-login, and until the rules exist, unmatched DHCP, DNS and NTP flows are denied.
+`sudo cfc rules bootstrap-defaults` right away. `sudo` is required there: a
+non-root `cfc` is read-only, whatever its groups, and until the rules exist,
+unmatched DHCP, DNS and NTP flows are denied.
 
 ## Uninstall behavior (all channels)
 

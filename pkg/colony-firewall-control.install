@@ -16,11 +16,15 @@ post_install() {
        DHCP, DNS and NTP flows are denied):
            sudo cfc rules bootstrap-defaults
 
-    3. Let your desktop user talk to the daemon socket:
+    3. Let your desktop session read the daemon and the Colony Firewall
+       app and tray connect to it:
            usermod -aG colony-firewall <your-user>
        then log out/in. The 'colony-firewall' group is created by
        systemd-sysusers from /usr/lib/sysusers.d/colony-firewall.conf
-       (applied automatically by the pacman sysusers hook).
+       (applied automatically by the pacman sysusers hook). Changes come
+       from the app and tray (pause, resume and rule import ask for an
+       administrator password through polkit) or from sudo cfc; any other
+       program of yours, including cfc without sudo, is read-only.
 
 ==> The GUI autostarts for all desktop users via
     /etc/xdg/autostart/colony-firewall.desktop; per-user opt-out: copy it
@@ -45,6 +49,14 @@ post_upgrade() {
         echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
         return 1
     }
+    if [ "$(vercmp "$2" 0.8.0)" -lt 0 ]; then
+        cat <<'EOF'
+==> 0.8.0: restart Colony Firewall and its tray now; until then they are
+    read-only (the daemon trusts only the installed binaries). Pause/resume
+    and rule import ask for an administrator password through polkit.
+    cfc without sudo is read-only: use sudo cfc for changes.
+EOF
+    fi
     cat <<'EOF'
 ==> colony-firewall-control upgraded.
     Changes: /usr/share/doc/colony-firewall-control/README.md and
