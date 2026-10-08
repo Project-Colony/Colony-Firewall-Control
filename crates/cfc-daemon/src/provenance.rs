@@ -877,20 +877,18 @@ impl Rpm {
     /// One `rpm -qa` pass, streamed.
     ///
     /// A failure of any kind - rpm missing, the database locked, the query
-    /// timing out - yields an *empty* index rather than propagating. That is
-    /// the same answer this host gave before this backend existed
-    /// (`Unpackaged` everywhere), and it is the only answer that keeps a
-    /// package transaction from being able to stall the firewall.
+    /// timing out - yields an empty index rather than propagating, which keeps
+    /// a package transaction from being able to stall the firewall. That index
+    /// carries no stamp, so it is never current: the packet thread answers
+    /// `NotReady` (shown as unknown) and the next [`warm`] retries. Stamped,
+    /// it reported every binary as unpackaged until the next transaction.
     fn build_index(&self, stamp: Option<SystemTime>) -> Index {
         let mut idx = Index::empty(stamp);
         let out = match self.run_query() {
             Ok(out) => out,
             Err(e) => {
-                warn!(
-                    "rpm provenance query failed: {e}; \
-                     binaries on this host will report as unpackaged"
-                );
-                return idx;
+                warn!("rpm provenance query failed: {e}; retrying on the next index refresh");
+                return Index::empty(None);
             }
         };
         let mut current: Option<(String, u32)> = None;
@@ -1745,6 +1743,23 @@ mod tests {
         std::fs::create_dir_all(&db).unwrap();
         let rpm = Rpm::with_program(db, tmp.path().join("no-such-rpm"));
         assert!(rpm.lookup(Path::new("/usr/bin/curl")).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_rpm_query_is_not_kept_as_the_current_index() {
+        // A query that timed out at boot was stamped like a good one, so every
+        // binary read as unpackaged until the next package transaction.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("rpmdb");
+        std::fs::create_dir_all(&db).unwrap();
+        let rpm = Rpm::with_program(db, tmp.path().join("no-such-rpm"));
+        assert!(rpm.lookup(Path::new("/usr/bin/curl")).unwrap().is_none());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                mark_datapath_thread();
+                assert_eq!(rpm.lookup(Path::new("/usr/bin/curl")), Err(NotReady));
+            });
+        });
     }
 
     #[test]

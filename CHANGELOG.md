@@ -193,6 +193,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transaction. The packet thread now skips a busy or stale index, and that
   "not ready" answer is no longer cached for an hour as "not from a package";
   it shows as unknown until the index is ready.
+- A failed `rpm -qa` (a query timing out at boot, for instance) left an
+  empty package index that counted as current, so every binary showed as
+  "not from a package" until the next package transaction. The index from a
+  failed query is now retried at the next refresh, every two minutes, and
+  provenance shows as unknown meanwhile.
 - A refused `UpsertRule` or `ApplyRules` left nothing in the journal unless
   authorization refused it, so "never sent" and "sent and refused" looked the
   same (#46). Every refusal now logs the RPC, the caller's uid and pid, the
