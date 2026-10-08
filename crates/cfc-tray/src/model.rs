@@ -113,6 +113,27 @@ pub fn pause_failed_body(verb: &str, err: &ClientError) -> String {
     }
 }
 
+/// Notification body for a prompt answer the daemon refused, `None` when the
+/// failure was not a refusal (those are only logged). The daemon's reason
+/// already says what to do, e.g. restart the tray after an upgrade.
+pub fn verdict_refused_body(err: &ClientError) -> Option<String> {
+    match err {
+        ClientError::Denied(reason) => Some(format!("Your answer was not accepted: {reason}")),
+        _ => None,
+    }
+}
+
+/// Shown once when this tray's binary was replaced on disk while it ran.
+pub const REPLACED_BODY: &str = "Colony Firewall was updated. Quit the tray from its menu and \
+     start it again, and restart the app: until then the firewall refuses their answers and \
+     changes.";
+
+/// Whether `/proc/self/exe` (as read) names a file that was replaced or
+/// removed since this process started, which an upgrade does.
+pub fn replaced_on_disk(exe: &std::path::Path) -> bool {
+    exe.as_os_str().as_encoded_bytes().ends_with(b" (deleted)")
+}
+
 /// "2h 05m" / "5m 00s" / "42s". Negative input clamps to "0s".
 pub fn format_countdown(secs: i64) -> String {
     let s = secs.max(0);
@@ -707,6 +728,28 @@ mod tests {
             body.starts_with("Could not resume the firewall ("),
             "{body}"
         );
+    }
+
+    #[test]
+    fn a_refused_answer_says_why_and_other_failures_stay_quiet() {
+        let body = verdict_refused_body(&ClientError::Denied(
+            "read-only access: restart it after an upgrade".into(),
+        ))
+        .unwrap();
+        assert!(body.contains("not accepted"), "{body}");
+        assert!(body.contains("restart it after an upgrade"), "{body}");
+        assert_eq!(verdict_refused_body(&ClientError::StreamClosed), None);
+    }
+
+    #[test]
+    fn a_replaced_binary_is_noticed() {
+        use std::path::Path;
+        assert!(replaced_on_disk(Path::new(
+            "/usr/bin/colony-firewall-tray (deleted)"
+        )));
+        assert!(!replaced_on_disk(Path::new(
+            "/usr/bin/colony-firewall-tray"
+        )));
     }
 
     // --- menu model ---------------------------------------------------------

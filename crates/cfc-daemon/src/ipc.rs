@@ -497,6 +497,49 @@ impl PromptAudience {
 // Service
 // ---------------------------------------------------------------------------
 
+/// Who may change the firewall: what [`Control::standing`] needs, apart from
+/// the service so a prompt stream can ask again while it runs.
+#[derive(Clone)]
+struct Control {
+    auth: SocketAuth,
+    /// The daemon's effective uid; see [`Gate::Privileged`].
+    own_uid: u32,
+    /// `[ipc] official_clients`, bound at startup.
+    official_clients: Arc<[PathBuf]>,
+    official: OfficialCheck,
+}
+
+impl Control {
+    /// May `peer` change the firewall? `Ok(None)` for a privileged peer,
+    /// `Ok(Some(exe))` for the official app or tray, `Err` (with the reason
+    /// the client shows) for everyone else, who is read-only.
+    async fn standing(&self, peer: PeerId) -> Result<Option<PathBuf>, Status> {
+        let group_ok = !self.auth.require_group || peer_is_group_member(peer, self.auth.group_gid);
+        match gate(peer.uid, self.own_uid, group_ok) {
+            Gate::Privileged => Ok(None),
+            Gate::DenyGroup => Err(Status::permission_denied(format!(
+                "firewall changes require root, or the installed Colony Firewall app or \
+                 tray run by a member of group '{}'",
+                self.auth.group
+            ))),
+            Gate::NeedOfficial => {
+                let (check, list) = (self.official, self.official_clients.clone());
+                tokio::task::spawn_blocking(move || check(&peer, &list))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the identity check failed ({error})")))
+                    .map(Some)
+                    .map_err(|reason| {
+                        Status::permission_denied(format!(
+                            "read-only access: {reason}. Firewall changes are accepted only \
+                             from the installed Colony Firewall app and tray, or from root \
+                             (sudo cfc ...)."
+                        ))
+                    })
+            }
+        }
+    }
+}
+
 struct FirewallService {
     engine: Engine,
     store: RuleStore,
@@ -505,12 +548,7 @@ struct FirewallService {
     stats: Stats,
     /// Live default policy; SIGHUP swaps it, so status reflects reloads.
     policy: SharedPolicy,
-    auth: SocketAuth,
-    /// The daemon's effective uid; see [`Gate::Privileged`].
-    own_uid: u32,
-    /// `[ipc] official_clients`, bound at startup.
-    official_clients: Arc<[PathBuf]>,
-    official: OfficialCheck,
+    control: Control,
     polkit: PolkitCheck,
     audience: Arc<PromptAudience>,
     /// Wall-clock deadline of the current pause, 0 when not paused. Held
@@ -532,7 +570,7 @@ impl FirewallService {
         if level == Access::ReadOnly {
             return Ok(peer);
         }
-        let outcome = match self.standing(peer).await {
+        let outcome = match self.control.standing(peer).await {
             // Only an official client is asked; root never is.
             Ok(Some(exe)) => match level {
                 Access::Elevated(action) => (self.polkit)(peer, action)
@@ -569,35 +607,6 @@ impl FirewallService {
                     "refusing a firewall change"
                 );
                 Err(status)
-            }
-        }
-    }
-
-    /// May `peer` change the firewall? `Ok(None)` for a privileged peer,
-    /// `Ok(Some(exe))` for the official app or tray, `Err` (with the reason
-    /// the client shows) for everyone else, who is read-only.
-    async fn standing(&self, peer: PeerId) -> Result<Option<PathBuf>, Status> {
-        let group_ok = !self.auth.require_group || peer_is_group_member(peer, self.auth.group_gid);
-        match gate(peer.uid, self.own_uid, group_ok) {
-            Gate::Privileged => Ok(None),
-            Gate::DenyGroup => Err(Status::permission_denied(format!(
-                "firewall changes require root, or the installed Colony Firewall app or \
-                 tray run by a member of group '{}'",
-                self.auth.group
-            ))),
-            Gate::NeedOfficial => {
-                let (check, list) = (self.official, self.official_clients.clone());
-                tokio::task::spawn_blocking(move || check(&peer, &list))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("the identity check failed ({error})")))
-                    .map(Some)
-                    .map_err(|reason| {
-                        Status::permission_denied(format!(
-                            "read-only access: {reason}. Firewall changes are accepted only \
-                             from the installed Colony Firewall app and tray, or from root \
-                             (sudo cfc ...)."
-                        ))
-                    })
             }
         }
     }
@@ -732,7 +741,8 @@ impl FirewallService {
         peer: PeerId,
         rule: &cfc_core::Rule,
     ) -> Result<(), String> {
-        if !opens_for_every_program(rule) || gate(peer.uid, self.own_uid, true) == Gate::Privileged
+        if !opens_for_every_program(rule)
+            || gate(peer.uid, self.control.own_uid, true) == Gate::Privileged
         {
             return Ok(());
         }
@@ -763,7 +773,7 @@ impl Firewall for FirewallService {
             .await?;
         // Every peer is shown the prompts addressed to it; only one that may
         // answer them is counted as a UI and enters their audience.
-        let answering = match self.standing(peer).await {
+        let answering = match self.control.standing(peer).await {
             Ok(_) => true,
             Err(status) => {
                 tracing::debug!(
@@ -779,6 +789,10 @@ impl Firewall for FirewallService {
         let mut sub = self.router.subscribe(peer.uid, answering);
         let audience = self.audience.clone();
         let uid = peer.uid;
+        // Asked again before each prompt: an upgrade replaces the binary
+        // under a running app or tray, whose answers are then refused. Left
+        // counted as a UI, it would hold every prompt for the full timeout.
+        let recheck = answering.then(|| self.control.clone());
         tokio::spawn(async move {
             loop {
                 match sub.recv().await {
@@ -796,6 +810,15 @@ impl Firewall for FirewallService {
                                 break;
                             }
                             continue;
+                        }
+                        if let Some(control) = &recheck {
+                            if let Err(status) = control.standing(peer).await {
+                                // Ending the stream drops this census entry;
+                                // the client resubscribes read-only and is
+                                // told why.
+                                let _ = tx.send(Err(status)).await;
+                                break;
+                            }
                         }
                         // Record before handing the event over: this
                         // subscriber is about to learn the prompt id, so it
@@ -1633,10 +1656,12 @@ pub async fn spawn(
         router,
         stats,
         policy,
-        auth,
-        own_uid: nix::unistd::geteuid().as_raw(),
-        official_clients: opts.ipc.official_clients.clone().into(),
-        official: crate::official::check,
+        control: Control {
+            auth,
+            own_uid: nix::unistd::geteuid().as_raw(),
+            official_clients: opts.ipc.official_clients.clone().into(),
+            official: crate::official::check,
+        },
         polkit: |peer, action| Box::pin(crate::polkit::check(peer, action)),
         audience: Arc::new(PromptAudience::default()),
         resume_at_ms: Arc::new(AtomicI64::new(0)),
@@ -1727,7 +1752,19 @@ mod tests {
     /// The pid the stub official check accepts.
     const OFFICIAL_PID: i32 = 77;
 
+    /// An official client whose binary is replaced after its first check.
+    const UPGRADED_PID: i32 = 4243;
+
     fn stub_official(peer: &PeerId, _: &[PathBuf]) -> Result<PathBuf, String> {
+        static UPGRADED_CHECKS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        if peer.pid == Some(UPGRADED_PID) {
+            return if UPGRADED_CHECKS.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(PathBuf::from("/usr/bin/colony-firewall-tray"))
+            } else {
+                Err("this colony-firewall-tray is not the installed one (restart it after an upgrade)".into())
+            };
+        }
         if peer.pid == Some(OFFICIAL_PID) {
             Ok(PathBuf::from("/usr/bin/colony-firewall"))
         } else {
@@ -1780,15 +1817,17 @@ mod tests {
             observed_tx: broadcast::channel(16).0,
             stats,
             policy,
-            auth: SocketAuth {
-                group: "cfc-test".into(),
-                group_gid: Some(GROUP_GID),
-                group_gated: true,
-                require_group,
+            control: Control {
+                auth: SocketAuth {
+                    group: "cfc-test".into(),
+                    group_gid: Some(GROUP_GID),
+                    group_gated: true,
+                    require_group,
+                },
+                own_uid: OWN_UID,
+                official_clients: Arc::from(Vec::new()),
+                official: stub_official,
             },
-            own_uid: OWN_UID,
-            official_clients: Arc::from(Vec::new()),
-            official: stub_official,
             polkit,
             audience: Arc::new(PromptAudience::default()),
             resume_at_ms: Arc::new(AtomicI64::new(0)),
@@ -2194,6 +2233,54 @@ mod tests {
             reply.persist_error
         );
         assert_eq!(svc.engine.rule_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_client_stops_counting_as_a_ui_at_its_next_prompt() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let svc = service(true);
+        let mut stream = svc
+            .stream_prompts(request(
+                SubscribeRequest::default(),
+                peer(1000, GROUP_GID, UPGRADED_PID),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(svc.router.has_answering_ui(1000), "official at subscribe");
+
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(crate::prompts::run_router_task(rx, svc.router.clone()));
+        let mut process = cfc_core::Process::unknown(4321);
+        process.uid = Some(1000);
+        tx.send(PromptRequest {
+            prompt_id: 9,
+            connection: cfc_core::Connection::new(
+                cfc_core::Protocol::Tcp,
+                cfc_core::Direction::Outbound,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                40000,
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                443,
+            ),
+            process,
+            undecided: None,
+        })
+        .await
+        .unwrap();
+
+        let status = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("restart"), "{}", status.message());
+        assert!(stream.next().await.is_none(), "the stream ended");
+        for _ in 0..1000 {
+            if !svc.router.has_answering_ui(1000) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!svc.router.has_answering_ui(1000), "no longer a UI");
+        assert!(!svc.audience.allows(9, 1000), "and never told the id");
     }
 
     #[tokio::test]

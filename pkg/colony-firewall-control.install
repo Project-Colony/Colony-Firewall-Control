@@ -51,13 +51,15 @@ post_upgrade() {
     }
     if [ "$(vercmp "$2" 0.8.0)" -lt 0 ]; then
         cat <<'EOF'
-==> 0.8.0: restart Colony Firewall and its tray now; until then they are
-    read-only (the daemon trusts only the installed binaries). Pause/resume
-    and rule import ask for an administrator password through polkit.
-    cfc without sudo is read-only: use sudo cfc for changes.
+==> 0.8.0: pause/resume, rule import and Allow rules that name no program
+    ask for an administrator password through polkit. cfc without sudo is
+    read-only: use sudo cfc for changes.
 EOF
     fi
     cat <<'EOF'
+==> Restart Colony Firewall and its tray now (quit the tray from its menu,
+    then start both again). The daemon trusts only the binaries now
+    installed, so until then it refuses their answers and changes.
 ==> colony-firewall-control upgraded.
     Changes: /usr/share/doc/colony-firewall-control/README.md and
     https://github.com/Project-Colony/Colony-Firewall-Control/blob/main/CHANGELOG.md

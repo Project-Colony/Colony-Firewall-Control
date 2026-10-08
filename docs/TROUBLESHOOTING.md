@@ -300,7 +300,11 @@ installed Colony Firewall app and tray, or from root (sudo cfc ...).
   (restart it after an upgrade)"** or **"the caller did not seal itself at
   startup"**: the app or tray was upgraded under you, or is a 0.7 build.
   Quit and start it again (the tray from your session's autostart or by
-  hand, `colony-firewall-tray &`).
+  hand, `colony-firewall-tray &`). The tray tells you once in a
+  notification when its binary was replaced, and shows the reason when an
+  answer is refused. Until it restarts, the first prompt after the upgrade
+  waits out `prompt_timeout_secs` and later ones take `no_ui_action`, unless
+  the app is open and current.
 - **"the caller loaded /home/…/something.so"**: a library from outside the
   root-owned system directories is mapped into the app, usually a global
   `LD_PRELOAD` (MangoHud, gamemode) or a user-installed Vulkan layer or

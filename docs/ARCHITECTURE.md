@@ -389,7 +389,10 @@ the entire attack surface. Two layers:
 
 Every other peer is read-only. Its prompt subscription is not counted in the
 router's census, so `no_ui_action` still applies when only such peers
-listen, and it never enters a prompt's audience. Prompt ownership comes on
+listen, and it never enters a prompt's audience. An answering subscription
+is checked again before each prompt it is handed; one that fails (an app or
+tray whose binary an upgrade replaced) ends with the reason, which drops it
+from the census. Prompt ownership comes on
 top: the daemon records which answering subscriber uids actually received
 each prompt and refuses a verdict from anyone else, so one desktop session
 cannot answer another's. Root is exempt.

@@ -63,6 +63,6 @@
   "optionalDepends": {
     "libnotify": "desktop notifications",
     "libx11": "run the GUI in X11/XWayland sessions",
-    "polkit": "administrator prompt when the app or tray pauses filtering or imports rules"
+    "polkit": "administrator prompt when the app or tray pauses filtering, imports rules or allows every program"
   }
 }

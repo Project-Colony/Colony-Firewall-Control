@@ -884,6 +884,9 @@ async fn submit_prompt_verdict(
         }
         Err(e) => {
             warn!("submitting verdict: {e}");
+            if let Some(body) = model::verdict_refused_body(&e) {
+                notify_brief(body);
+            }
             *client = None;
         }
     }
@@ -1059,6 +1062,8 @@ async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
     let mut notifier = PromptNotifier::new(handle_tx);
     let mut was_reachable: Option<bool> = None;
     let generic = !actions_supported;
+    // Set once the tray has said its binary was replaced under it.
+    let mut told_replaced = false;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1066,6 +1071,14 @@ async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
         tokio::select! {
             _ = ticker.tick() => {
                 notifier.reclaim_expired();
+                // After an upgrade the daemon refuses this process: say so
+                // instead of failing every answer and pause quietly.
+                if !told_replaced
+                    && std::fs::read_link("/proc/self/exe").is_ok_and(|exe| model::replaced_on_disk(&exe))
+                {
+                    told_replaced = true;
+                    notify_brief(model::REPLACED_BODY.into());
+                }
                 if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
                     break;
                 }

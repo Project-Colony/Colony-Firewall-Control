@@ -353,7 +353,10 @@ of it between two reads of that process's start time (so a reused pid fails):
   and that file is root-owned, unwritable by group and other, in root-owned
   directories nobody else can write. Re-checked every time, so after an
   upgrade a process still running the replaced binary is read-only until it
-  is restarted;
+  is restarted. Its prompt subscription is checked again before each prompt
+  and ends at the first one after the upgrade (which still waits out the
+  timeout), so it stops counting as a UI and later prompts take
+  `no_ui_action`; the tray says it must be restarted;
 - it holds the client end of this very connection itself, on a descriptor
   above stderr (found through sock_diag's `UNIX_DIAG`);
 - every executable file it mapped comes from such sealed directories, so an

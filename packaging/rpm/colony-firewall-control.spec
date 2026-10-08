@@ -189,6 +189,8 @@ if [ $1 -gt 1 ]; then
         echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
         exit 1
     }
+    # The daemon trusts only the binaries now installed.
+    echo "Restart Colony Firewall and its tray now: until then the daemon refuses their answers and changes."
 fi
 
 %preun

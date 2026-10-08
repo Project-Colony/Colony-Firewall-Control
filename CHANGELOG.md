@@ -135,9 +135,13 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1. Scripts that ran `cfc` as a regular user to change rules, pause or
      answer prompts must use `sudo cfc`. Reading (`status`, `rules list`,
      `log`, `live`) is unchanged.
-  2. Restart Colony Firewall and its tray after the upgrade. The 0.7
-     processes, and any process still running a replaced binary, are
-     read-only until relaunched.
+  2. Restart Colony Firewall and its tray after the upgrade, and after every
+     later one. The 0.7 processes, and any process still running a replaced
+     binary, are read-only until relaunched: the tray says so in a
+     notification, a refused prompt answer shows the daemon's reason, and
+     such a process stops counting as a UI at the next prompt, so later
+     prompts are not held for the full timeout. The pacman and RPM scriptlets print
+     this on every upgrade.
   3. Pausing from the app or tray needs a polkit agent in the session
      (most desktops run one; on Hyprland, `hyprpolkitagent`). Without one
      the request is refused with that reason and `sudo cfc pause` works.

@@ -200,6 +200,13 @@ impl PromptRouter {
         }
     }
 
+    /// Whether an answering subscriber may see a prompt about `uid`'s
+    /// process.
+    #[cfg(test)]
+    pub(crate) fn has_answering_ui(&self, uid: u32) -> bool {
+        self.inner.has_audience(Some(uid))
+    }
+
     /// Resolves a pending prompt with the user's verdict. Returns what the
     /// prompt remembered about its process, or `None` if the id is unknown or
     /// the prompt already resolved another way (e.g. it timed out first), in
