@@ -83,8 +83,8 @@ Per release, by hand:
 cd pkg && updpkgsums PKGBUILD          # from pacman-contrib
 grep '^sha256sums=' PKGBUILD           # must no longer say SKIP
 # 4. Test build (needs colony-firewall-control.install next to PKGBUILD):
-mkdir /tmp/cfc-build && cp PKGBUILD colony-firewall-control.install /tmp/cfc-build/
-cd /tmp/cfc-build && makepkg -si
+build=$(mktemp -d) && cp PKGBUILD colony-firewall-control.install "$build"/
+cd "$build" && makepkg -si
 namcap PKGBUILD ./*.pkg.tar.zst        # no E: lines
 # 5. Regenerate .SRCINFO and push to the AUR:
 makepkg --printsrcinfo > .SRCINFO

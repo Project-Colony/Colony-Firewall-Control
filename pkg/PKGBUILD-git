@@ -3,9 +3,9 @@
 # Development / VCS variant of colony-firewall-control.
 #
 # Usage (from anywhere):
-#     mkdir /tmp/cfc-git && cp pkg/PKGBUILD-git /tmp/cfc-git/PKGBUILD
-#     cp pkg/colony-firewall-control.install /tmp/cfc-git/
-#     cd /tmp/cfc-git && makepkg -si
+#     build=$(mktemp -d) && cp pkg/PKGBUILD-git "$build"/PKGBUILD
+#     cp pkg/colony-firewall-control.install "$build"/
+#     cd "$build" && makepkg -si
 #
 # To build from your local checkout instead of GitHub (fast iteration,
 # uses your working tree's HEAD), point _giturl at the repo root, e.g.:

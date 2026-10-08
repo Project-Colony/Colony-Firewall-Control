@@ -103,10 +103,10 @@ Not on the AUR yet. Two recipes ship in `pkg/`; the `-git` one works
 today, without a published release:
 
 ```sh
-mkdir -p /tmp/cfc-build
-cp pkg/PKGBUILD-git /tmp/cfc-build/PKGBUILD
-cp pkg/colony-firewall-control.install /tmp/cfc-build/
-cd /tmp/cfc-build && makepkg -si
+build=$(mktemp -d)
+cp pkg/PKGBUILD-git "$build"/PKGBUILD
+cp pkg/colony-firewall-control.install "$build"/
+cd "$build" && makepkg -si
 ```
 
 `pkg/PKGBUILD` is the AUR release recipe instead: it builds from the
