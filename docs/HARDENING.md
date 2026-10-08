@@ -202,6 +202,10 @@ is a separate launch mode.
   remote flows delegated through AF_UNIX or D-Bus brokers. Existing local
   connections retain their authorization. Hostname rules and observed answers
   do not isolate DNS queries.
+- **Inbound-initiated connections**: with inbound filtering off (the
+  default) a connection a remote peer opens is never queued: its replies are
+  established traffic. A program that outbound rules deny still answers on
+  any port it listens on. Enable inbound filtering to decide those flows.
 - **Inherited or passed sockets**: established/related traffic keeps its
   connection-wide authorization. An inherited or passed descriptor is not
   reauthorized for each sending executable. Current descriptor ownership
@@ -217,6 +221,12 @@ is a separate launch mode.
   matched from a mount namespace, so pin its hash. Code already running as a
   user can also borrow an allowed program's identity by running it with
   chosen arguments or with `LD_PRELOAD`, which a hash pin does not prevent.
+  An image deleted while it runs is matched by the path it had (an upgraded
+  program keeps its rules), which the daemon cannot check against anything,
+  so a mount namespace can present a path that way too. Digests and the
+  root-sealed test trust what the filesystem reports: on a FUSE filesystem
+  the daemon can read (`user_allow_other` in `/etc/fuse.conf`), the user who
+  mounted it controls both.
 - **Raw and packet sockets**: applications with `CAP_NET_RAW` can use AF_PACKET
   outside the shipped `inet OUTPUT` hook. Raw IP packets can coincide with
   another socket's tuple even when TCP matching is strict. Tuple and inode

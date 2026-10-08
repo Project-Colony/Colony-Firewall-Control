@@ -280,6 +280,9 @@ managers, or a later external ruleset flush. Early unmatched flows use
 
 **Scope.** Normal mode decides new tracked IP flows from socket attribution;
 established and related traffic retains its connection-wide authorization.
+With inbound filtering off (the default) a connection a remote peer opens is
+never judged at all, so a program that outbound rules deny still answers on
+any port it listens on.
 Passed or inherited sockets are not reauthorized for each sending executable.
 A current descriptor holder does not prove which process sent a packet.
 While the daemon runs, new direct loopback flows follow explicit rules;
