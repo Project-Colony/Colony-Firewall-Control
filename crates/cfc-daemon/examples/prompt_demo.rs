@@ -7,8 +7,11 @@
 //!
 //! ```sh
 //! cargo run -p cfc-daemon --example prompt_demo
-//! CFC_SOCKET=/tmp/cfc-demo/cfc.sock colony-firewall-tray   # or the GUI/cfc
+//! CFC_SOCKET=<printed socket> colony-firewall-tray   # or the GUI/cfc
 //! ```
+//!
+//! The store and socket live in a fresh private temporary directory; the
+//! socket path is logged at startup.
 //!
 //! Verdicts coming back over the worker channel are printed, so you can see
 //! a notification button click arrive where the NFQUEUE worker would
@@ -28,8 +31,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-const SOCKET: &str = "/tmp/cfc-demo/cfc.sock";
-
 /// A rotating cast of pretend applications, so successive prompts look
 /// different in the notification.
 const CAST: &[(&str, &str, u16)] = &[
@@ -46,10 +47,12 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let dir = PathBuf::from("/tmp/cfc-demo");
-    std::fs::create_dir_all(&dir)?;
+    // mkdtemp, not a fixed /tmp name another user could create first or
+    // point somewhere else with a symlink.
+    let dir = tempfile::Builder::new().prefix("cfc-demo-").tempdir()?;
+    let socket = dir.path().join("cfc.sock");
 
-    let store = RuleStore::open(&dir.join("rules.db"))?;
+    let store = RuleStore::open(&dir.path().join("rules.db"))?;
     // 45s per prompt: enough time to read a notification and pick a
     // button. Timeout denies, like every shipped profile — an unanswered
     // question is not consent.
@@ -68,12 +71,11 @@ async fn main() -> anyhow::Result<()> {
 
     let (_ipc, prompt_tx) = ipc::spawn(
         IpcOptions {
-            socket_path: PathBuf::from(SOCKET),
-            ipc: IpcConfig {
-                group: "colony-firewall".into(),
-                // Demo socket in /tmp: let the invoking user talk to it.
-                require_group: false,
-            },
+            socket_path: socket.clone(),
+            // The demo daemon runs as the invoking user, and a peer with the
+            // daemon's own uid has full control: the user's app, tray or CLI
+            // can drive it without any group or official-client setup.
+            ipc: IpcConfig::default(),
             pause_default_secs: 120,
             dry_run: true,
         },
@@ -101,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
 
     let uid = nix::unistd::Uid::current().as_raw();
     tracing::info!(
-        socket = SOCKET,
+        socket = %socket.display(),
         uid,
         "demo daemon up - a prompt fires every 25s"
     );
@@ -130,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
                 prompt_id,
                 connection,
                 process,
+                undecided: None,
             })
             .await
             .is_err()

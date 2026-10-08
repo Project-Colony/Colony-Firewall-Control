@@ -20,15 +20,17 @@ longer lifts anything; `nft delete table` no longer lifts the denies it holds.
 Two pieces of it are deliberately not done, and both are real work rather than
 oversights:
 
-**1a. Fast Allow is disabled.** Socket marks do not attest the current sender,
-and grants can outlive their intended executable or rule. Every configuration,
-including `fast_allow = true`, uses NFQUEUE for allowed flows. The nft snippet
-no longer accepts the legacy set, startup clears old state, and upgrades reload
-active nft units atomically. Reintroducing an in-kernel Allow requires a design
-that verifies current socket ownership and revocation; the old mark protocol is
-not a supported security boundary.
+**1a. Fast Allow was removed.** It let a process a lasting Allow covered skip
+NFQUEUE by marking its sockets. A socket mark does not attest the current
+sender, and grants could outlive their intended executable or rule, so it
+opened bypasses. It was disabled in 0.7.0 and its userspace side has since been
+removed; allowed flows use NFQUEUE. The nft snippet no longer accepts the
+legacy set, startup flushes it and disarms the legacy pinned maps the kernel
+object still carries until an ABI bump, and upgrades reload active nft units
+atomically. Reintroducing an in-kernel Allow needs sender attestation: a design
+that verifies current socket ownership and revocation.
 
-The previous latency measurements describe the disabled implementation. The
+The previous latency measurements describe the removed implementation. The
 remaining NFQUEUE cost still warrants measurement and optimization, with the
 same application-policy semantics.
 
@@ -45,14 +47,12 @@ be resolved to addresses in advance.
 
 Mostly done in `8db949b` and `b05eefc`: the SELinux module, the RPM provenance
 backend, the `.spec`, and a 5.10 entry in the kernel matrix that sits *below*
-RHEL 9's backported 5.14. The fast-allow branch adds 5.15 above it, so the pair
+RHEL 9's backported 5.14. The matrix also carries 5.15 above it, so the pair
 brackets the RHEL kernel: what both allow, 5.14 allows unless Red Hat took it
 out; what only 5.15 allows, 5.14 has only if they backported it; what both
 refuse, 5.14 may still have through a backport. Where the two disagree is the
-list of things to check on a Rocky host rather than assume. The first 5.15 run
-named one such thing: 5.15 already accepts `bpf_getsockopt` on the sendmsg hooks
-that 5.10 refuses, so whether RHEL 9's 5.14 does is exactly what a Rocky host
-has to answer; neither kernel has `group_dead`.
+list of things to check on a Rocky host rather than assume. Neither kernel has
+`group_dead`.
 
 What remains needs a real enforcing machine - except 2b, which turned out to
 be doable from CI after all:
@@ -98,27 +98,33 @@ index - but "should be fine" is not "was observed".
 
 ## 3. Executable paths: what resolution does and does not fix
 
-Rules now resolve their `exe_path` to the form `/proc/<pid>/exe` reports, at
-every place a path is entered (`cfc_core::exe_path`). Three properties of that
-are worth stating rather than discovering:
+Rules must name the form `/proc/<pid>/exe` reports (`cfc_core::exe_path`):
+every place a new or changed path is entered refuses an alias and asks for
+the canonical target. Three properties of that are worth stating rather than
+discovering:
 
-- **Forward-only.** Rules already on disk are never re-resolved. An install
-  that wrote `/bin/curl` before this existed keeps an inert rule after
-  upgrading. The repair is one round trip - `cfc rules export > r.json &&
-  cfc rules import --replace r.json` - because upsert resolves.
-- **A versioned symlink resolves to a version.** `/usr/bin/python ->
-  python3.13` stores `python3.13` and stops applying when the symlink moves.
-  Not a regression (the unresolved rule never matched either), but a new
-  *time-dependent* failure, and worse for a Deny than an Allow.
-- **It follows symlinks the path's owner controls.** A rule for
-  `/home/bob/tool` pointing at `/usr/bin/curl` becomes a rule about curl. The
-  CLI prints what it stored and the daemon warns; nothing pins the inode.
+- **Stored rules keep their target.** Nothing re-resolves a rule on disk. An
+  install that wrote `/bin/curl` before validation existed keeps an inert
+  rule after upgrading, and so does a rule whose target a package update later
+  turned into a symlink. Sending the stored path back unchanged (enable,
+  disable, rename, `cfc rules export` then `import --replace`) is accepted;
+  the repair is to edit the rule to name `/usr/bin/curl`.
+- **A versioned target is a version.** `/usr/bin/python -> python3.13` has to
+  be written as `python3.13`, and stops applying when the symlink moves. Not a
+  regression (the alias never matched either), but a *time-dependent* failure,
+  and worse for a Deny than an Allow.
+- **The daemon cannot see every alias.** It runs with `ProtectHome=true` and
+  `PrivateTmp=true`, so `/home/bob/tool -> /usr/bin/curl` looks like a target
+  that is not installed yet and is accepted. The CLI and GUI check in the
+  caller's own namespace first; a raw gRPC client is not stopped. Such a rule
+  names a path the user controls and matches only that path, never curl.
 
 Process resolution now rereads policy identity for every packet lookup; pid
 and start time do not identify an executable across exec. Its path and digest
 come from one opened mapped image, with metadata and link consistency checks.
-Mutable images bypass the digest cache. A raw exec-event filename is retained
-for diagnostics only; once `/proc` is gone, the policy executable is unknown.
+Digests are cached by full image key, ctime included, once ctime has settled.
+A raw exec-event filename is retained for diagnostics only; once `/proc` is
+gone, the policy executable is unknown.
 Shared or passed socket descriptors remain outside sender attribution, and
 the mapped image is still a read-time snapshot rather than packet-time proof.
 
@@ -215,7 +221,7 @@ stable. An AUR install therefore gets `Degrade::ObjectMissing` and runs on
 
 Three ways out, none free:
 
-1. leave it (what happens today - the Colony tarball has the object, AUR does not);
+1. leave it (what happens today - the release tarball has the object, AUR does not);
 2. ship the object as a second `source=()` from the release assets - but that
    deadlocks against draft releases, and it would be the one shipped component
    no AUR user builds from source, which for kernel code deserves a hard think;
@@ -243,15 +249,17 @@ What defeats it completely:
 |---|---|
 | **Root** | narrower than it was, and still open. `nft delete table` no longer lifts the denials held in the kernel - those need `rm -rf /sys/fs/bpf/colony-firewall` as well, and anything not yet decided still falls through to a ruleset root can flush. CFC *is* root; it cannot confine root. |
 | **Code inside an allowed process** | a browser extension, a script under an allowed interpreter, `ptrace`/`LD_PRELOAD` injection. Structural to every application firewall. Making Allow persistent (`72964b5`) improved usability and widened this. |
-| **Loopback** | `oifname "lo" accept`, deliberately - filtering it stalls the systemd-resolved stub. Anything that can reach a local service which egresses is attributed to that service. |
+| **Loopback** | `oifname "lo" ct state new queue num 0 bypass`: the daemon judges new loopback flows while it runs (unmatched local IPC is allowed without prompting), and they are allowed unfiltered while no daemon listens, so local IPC survives a dead daemon (the systemd-resolved stub answers from its cache; its upstream queries are not loopback). In that window explicit loopback Deny rules are not enforced and nothing is logged. Anything that can reach a local service which egresses is attributed to that service. |
 | **DNS tunnelling** | the resolver must be allowed for anything to work. CFC *observes* answers; it does not inspect or block queries. |
 | **Inherited or passed socket descriptors** | Existing connection authorization is not rechecked for each sending executable; socket attribution is ambiguous when ownership is shared. |
 | **CAP_NET_RAW packet sockets** | Packet-layer egress can bypass the IP OUTPUT hook. Layer-2 confinement is outside the shipped rules. |
+| **Code inside the official app or tray** | the daemon accepts changes only from root and the installed, sealed app and tray, checking the running process (image, prologue, connection, tracer, file-backed executable mappings). Code already running inside them is not seen: a self-unmapping `LD_PRELOAD` payload living in anonymous memory, or synthetic X11/XWayland input clicking the GUI. Also a connection opened before exec'ing the app and handed back into it over D-Bus while a kept copy writes the request (a race, repeatable), and code patched into the app by a parent tracing it from exec before it seals itself (deterministic under the default Yama `ptrace_scope = 1`; scope 2 closes it, the daemon warns at startup). Setgid binaries trusted by connect-time gid would close the first and the last two; not done. |
 | **Prompt fatigue** | demonstrated on this machine: ten Firefox prompts in a row, all denied, browser lost. A malicious installer generating thirty prompts trains the user to click Allow. |
 
-And one tradeoff worth stating plainly: the ruleset is **fail-closed** (`ct
-state new queue num 0`, no `bypass`). Killing the daemon drops all new outbound
-traffic. That is the right choice for confidentiality and the wrong one for
+And one tradeoff worth stating plainly: the ruleset is **fail-closed for
+everything except new loopback flows, which are allowed while no daemon
+listens** (the final `ct state new queue num 0` has no `bypass`). Killing the
+daemon drops all new non-loopback outbound traffic. That is the right choice for confidentiality and the wrong one for
 availability - anything that can crash the daemon takes the machine's network
 with it.
 

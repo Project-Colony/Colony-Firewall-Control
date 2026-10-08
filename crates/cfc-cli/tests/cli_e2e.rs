@@ -36,6 +36,8 @@ struct FakeDaemon {
     /// tested. Without this the fake daemon has no failure mode at all and the
     /// central atomicity claim goes unexercised.
     upsert_fails_for: Arc<Mutex<Vec<String>>>,
+    /// Set when a prompt subscriber goes away.
+    unsubscribed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One mutation seen by the fake daemon.
@@ -55,6 +57,7 @@ impl Firewall for FakeDaemon {
         _req: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let unsubscribed = self.unsubscribed.clone();
         tokio::spawn(async move {
             let ev = pb::PromptEvent {
                 prompt_id: "42".into(),
@@ -85,11 +88,15 @@ impl Firewall for FakeDaemon {
                 // Far enough out that a slow CI box cannot expire it.
                 deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 60_000,
                 binds_to_hash: false,
+                undecided_rule_id: String::new(),
             };
             let _ = tx.send(Ok(ev)).await;
             // Hold the stream open; the CLI is expected to leave on its own
             // once --count is satisfied.
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::select! {
+                _ = tx.closed() => unsubscribed.store(true, std::sync::atomic::Ordering::SeqCst),
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -146,7 +153,6 @@ impl Firewall for FakeDaemon {
             skipped_rules: 2,
             enforcing: false,
             enforcement: "pinned".to_string(),
-            fast_allow: "off: [ebpf] fast_allow is not set".to_string(),
         }))
     }
 
@@ -570,9 +576,8 @@ async fn status_json_round_trips_over_a_real_socket() {
     assert_eq!(v["enforcing"], false);
     assert_eq!(v["skipped_rules"], 2);
     assert_eq!(v["timeout_action"], "deny");
-    // The daemon's own sentence, verbatim: a script must be able to read
-    // the reason, not only that there is one.
-    assert_eq!(v["fast_allow"], "off: [ebpf] fast_allow is not set");
+    // The removed Fast Allow field must not come back under its old name.
+    assert!(v.get("fast_allow").is_none(), "{v}");
     // Both warnings must be machine-readable too, not just printed.
     let warnings = v["warnings"].as_array().expect("warnings array");
     assert_eq!(warnings.len(), 2, "{warnings:?}");
@@ -1077,6 +1082,76 @@ async fn removing_a_bundle_preserves_a_manual_rule_with_the_same_name() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+// The GUI editor keeps a rule's id, so a bundle rule turned into a Deny still
+// carries the bundle's id. Removing the bundle must not delete that Deny.
+#[tokio::test]
+async fn removing_a_bundle_keeps_its_rule_edited_into_a_deny() {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest("colony-firewall-bundle\0inbound\0inbound-ssh-lan");
+    let id = uuid::Uuid::from_bytes(digest[..16].try_into().unwrap()).to_string();
+    let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let socket = dir.join("cli.sock");
+    let mut edited = stub_rule(&id, "inbound-ssh-lan");
+    edited.action = pb::Action::Deny as i32;
+    let fake = FakeDaemon::default();
+    fake.existing.lock().unwrap().push(edited);
+    let calls = fake.calls.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &[
+                "--socket",
+                &socket_arg,
+                "rules",
+                "bundle",
+                "remove",
+                "inbound",
+            ],
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("kept"));
+    assert!(calls.lock().unwrap().is_empty());
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_by_full_id_reaches_a_rule_the_daemon_does_not_list() {
+    // A quarantined row is not in ListRules; the journal names its id.
+    let socket = socket_path("remove-unlisted");
+    let fake = FakeDaemon::default();
+    let calls = fake.calls.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let id = "33333333-3333-4333-8333-333333333333";
+    let out = tokio::task::spawn_blocking(move || {
+        run_cli(
+            &["--socket", &socket_arg, "rules", "remove", id],
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(*calls.lock().unwrap(), vec![Call::Delete(id.into())]);
+    server.abort();
+    let _ = std::fs::remove_file(socket);
+}
+
 #[tokio::test]
 async fn a_partial_opensnitch_replace_changes_nothing() {
     let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));
@@ -1115,4 +1190,81 @@ async fn a_partial_opensnitch_replace_changes_nothing() {
     assert!(calls.lock().unwrap().is_empty());
     server.abort();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// An additive import used to drop the unconvertible deny, apply the allow and
+// exit 0, so the imported policy was wider than the source.
+#[tokio::test]
+async fn an_opensnitch_import_with_unconvertible_rules_needs_consent() {
+    let dir = std::env::temp_dir().join(format!("cfc-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let source = dir.join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("allow.json"), r#"{"name":"scoped","action":"allow","duration":"always","operator":{"type":"simple","operand":"dest.port","data":"443"}}"#).unwrap();
+    std::fs::write(source.join("deny.json"), r#"{"name":"tracker","action":"deny","duration":"always","operator":{"type":"simple","operand":"dest.host","data":"tracker.example"}}"#).unwrap();
+    let socket = dir.join("cli.sock");
+    let fake = FakeDaemon::default();
+    let calls = fake.calls.clone();
+    let server = serve(socket.clone(), fake).await;
+    let socket_arg = socket.to_string_lossy().into_owned();
+    let source_arg = source.to_string_lossy().into_owned();
+    let run = |extra: &'static [&'static str]| {
+        let socket_arg = socket_arg.clone();
+        let source_arg = source_arg.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut args = vec![
+                "--socket",
+                &socket_arg,
+                "rules",
+                "import-opensnitch",
+                &source_arg,
+            ];
+            args.extend_from_slice(extra);
+            run_cli(&args, Duration::from_secs(5))
+        })
+    };
+    let out = run(&[]).await.unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was changed"));
+    assert!(calls.lock().unwrap().is_empty());
+    let out = run(&["--skip-unconvertible"]).await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// A front end that drops its subscription (the GUI does on every disconnect)
+// must unsubscribe at once. The pump used to notice only when the next event
+// failed to send, so the daemon held that prompt for an absent listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_prompt_stream_unsubscribes_at_once() {
+    use futures::StreamExt as _;
+    let socket = socket_path("unsubscribe");
+    let fake = FakeDaemon::default();
+    let unsubscribed = fake.unsubscribed.clone();
+    let server = serve(socket.clone(), fake).await;
+    let mut stream = Box::pin(cfc_client::stream_prompts_resilient(&socket, "test".into()));
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+            Ok(Some(cfc_client::StreamItem::Event(_))) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("no prompt arrived: {other:?}"),
+        }
+    }
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !unsubscribed.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the subscription outlived its consumer"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    server.abort();
+    let _ = std::fs::remove_file(socket);
 }

@@ -3,6 +3,7 @@
 //! tested without a daemon, a D-Bus session, or a clock.
 
 use cfc_client::{proto, ClientError};
+use std::collections::HashMap;
 
 /// At most one desktop notification per this many milliseconds, however
 /// fast prompts arrive. Only used by the generic (non-actionable)
@@ -12,6 +13,10 @@ pub const NOTIFY_MIN_INTERVAL_MS: i64 = 30_000;
 /// At most this many actionable prompt notifications on screen at once;
 /// prompts beyond the cap fold into one collapsed overflow notification.
 pub const MAX_ACTIONABLE_NOTIFICATIONS: usize = 3;
+
+/// How long after a prompt's deadline its bubble keeps its actionable slot,
+/// so a click made just before the deadline still reaches the daemon.
+pub const SLOT_GRACE_MS: i64 = 2_000;
 
 /// Floor for a prompt notification's expire timeout. A deadline that is
 /// already past still gets a brief, visible bubble rather than a 0ms
@@ -92,8 +97,41 @@ pub fn unreachable_hint(err: &ClientError) -> String {
         ClientError::Connect { .. } | ClientError::Transport(_) => {
             "connection failed — is colony-firewalld healthy?".into()
         }
+        ClientError::Denied(_) => "read-only - restart the tray, or use sudo cfc".into(),
         ClientError::Rpc(_) | ClientError::StreamClosed => "daemon answered with an error".into(),
     }
+}
+
+/// Notification body for a pause or resume the daemon did not carry out.
+/// A denial is the daemon's own reason (a dismissed password dialog, no
+/// polkit agent, a tray that must be restarted), which already says what to
+/// do; anything else is a plain failure.
+pub fn pause_failed_body(verb: &str, err: &ClientError) -> String {
+    match err {
+        ClientError::Denied(reason) => format!("Could not {verb} the firewall: {reason}"),
+        other => format!("Could not {verb} the firewall ({other})"),
+    }
+}
+
+/// Notification body for a prompt answer the daemon refused, `None` when the
+/// failure was not a refusal (those are only logged). The daemon's reason
+/// already says what to do, e.g. restart the tray after an upgrade.
+pub fn verdict_refused_body(err: &ClientError) -> Option<String> {
+    match err {
+        ClientError::Denied(reason) => Some(format!("Your answer was not accepted: {reason}")),
+        _ => None,
+    }
+}
+
+/// Shown once when this tray's binary was replaced on disk while it ran.
+pub const REPLACED_BODY: &str = "Colony Firewall was updated. Quit the tray from its menu and \
+     start it again, and restart the app: until then the firewall refuses their answers and \
+     changes.";
+
+/// Whether `/proc/self/exe` (as read) names a file that was replaced or
+/// removed since this process started, which an upgrade does.
+pub fn replaced_on_disk(exe: &std::path::Path) -> bool {
+    exe.as_os_str().as_encoded_bytes().ends_with(b" (deleted)")
 }
 
 /// "2h 05m" / "5m 00s" / "42s". Negative input clamps to "0s".
@@ -223,7 +261,8 @@ pub struct PromptNotification {
     /// first line of the bubble reads as a sentence on its own.
     pub summary: String,
     /// The destination on the first line and the full exe path on the
-    /// second, so the path never runs into the prose.
+    /// second, so the path never runs into the prose. Already escaped with
+    /// [`body_markup`].
     pub body: String,
     /// Remaining time until the prompt's deadline, clamped to at least
     /// [`MIN_PROMPT_TIMEOUT_MS`]. When it expires unanswered the daemon
@@ -258,7 +297,7 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
             } else {
                 format!(
                     "{} ({ip}; {} hostname)",
-                    c.dst_host,
+                    cfc_client::convert::display_safe(&c.dst_host),
                     if c.dst_host_verified {
                         "verified"
                     } else {
@@ -277,7 +316,7 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
     let mut body = target;
     if !exe.is_empty() {
         body.push('\n');
-        body.push_str(exe);
+        body.push_str(&cfc_client::convert::display_safe(exe));
     }
     if cfc_client::convert::exe_is_rule_scopable(exe) {
         body.push_str("\nAlways allow app covers all destinations until the rule is removed.");
@@ -296,11 +335,18 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
             },
         );
     }
+    // Why a flow a rule may cover is asked about at all.
+    if !ev.undecided_rule_id.is_empty() {
+        body.push_str(
+            "\nA rule may apply, but the program could not be fully identified; \
+             your answer applies to this connection.",
+        );
+    }
     let remaining = ev.deadline_unix_ms.saturating_sub(now_unix_ms);
     let timeout_ms = remaining.clamp(i64::from(MIN_PROMPT_TIMEOUT_MS), i64::from(u32::MAX)) as u32;
     PromptNotification {
         summary,
-        body,
+        body: body_markup(&body),
         timeout_ms,
         offer_block: cfc_client::convert::exe_is_rule_scopable(exe),
     }
@@ -421,9 +467,59 @@ pub fn one_shot_fallback(choice: PromptChoice, exe: &str) -> String {
 
 /// The basename, for a message meant to be read at a glance.
 fn exe_display_name(exe: &str) -> String {
-    std::path::Path::new(exe)
-        .file_name()
-        .map_or_else(|| exe.to_string(), |n| n.to_string_lossy().into_owned())
+    cfc_client::convert::display_safe(
+        &std::path::Path::new(exe)
+            .file_name()
+            .map_or_else(|| exe.to_string(), |n| n.to_string_lossy().into_owned()),
+    )
+}
+
+/// Escapes a notification body for servers that parse it as markup.
+///
+/// The freedesktop spec lets a server that advertises `body-markup` read
+/// the body as a subset of HTML, and dunst and mako parse full Pango markup:
+/// a path segment like `<span alpha='1'>` hid the rest of the path right
+/// above "Always allow app". The summary is plain text by the spec and is
+/// left alone.
+///
+/// ponytail: escaped whether or not the server advertises `body-markup`, so
+/// a server without it shows `&amp;` for a literal `&`. Only names that
+/// carry `&`, `<` or `>` pay that; probe the capability if it ever matters.
+pub fn body_markup(body: &str) -> String {
+    body.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// One actionable prompt bubble the tray counts against
+/// [`MAX_ACTIONABLE_NOTIFICATIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    /// The prompt's deadline; 0 when the daemon attached none.
+    pub deadline_unix_ms: i64,
+    /// The notification server's id for the bubble, once it is shown.
+    pub server_id: Option<u32>,
+}
+
+/// Frees the slots of prompts the daemon has already decided, and returns
+/// the bubbles to close.
+///
+/// A slot used to be freed only by the bubble's own `ActionInvoked` or
+/// `NotificationClosed`. Servers that keep expired bubbles in a message
+/// list (GNOME Shell) send neither, so three expired prompts held every slot
+/// and every later prompt fell into the overflow bubble, which cannot answer
+/// it. Closing the bubble also ends the thread waiting on it.
+pub fn reclaim_expired(active: &mut HashMap<String, Slot>, now_unix_ms: i64) -> Vec<u32> {
+    let mut close = Vec::new();
+    active.retain(|_, slot| {
+        let expired = slot.deadline_unix_ms > 0
+            && now_unix_ms > slot.deadline_unix_ms.saturating_add(SLOT_GRACE_MS);
+        if expired {
+            close.extend(slot.server_id);
+        }
+        !expired
+    });
+    close
 }
 
 /// How a newly arrived prompt is surfaced.
@@ -456,7 +552,10 @@ pub fn overflow_body(count: u64) -> String {
     } else {
         "connections"
     };
-    format!("{count} more {noun} waiting — open Colony Firewall")
+    // Not "open Colony Firewall to answer": a window opened now does not
+    // receive prompts that are already pending, only one already running
+    // has them.
+    format!("{count} more {noun} waiting. An open Colony Firewall window can answer them; otherwise the default applies when they time out.")
 }
 
 #[cfg(test)]
@@ -577,7 +676,11 @@ mod tests {
     #[test]
     fn hints_are_short_and_actionable() {
         let p = PathBuf::from("/run/colony-firewall/cfc.sock");
-        let cases: [(ClientError, &str); 4] = [
+        let cases: [(ClientError, &str); 5] = [
+            (
+                ClientError::Denied("read-only access: ...".into()),
+                "sudo cfc",
+            ),
             (
                 ClientError::SocketMissing { path: p.clone() },
                 "systemctl status colony-firewalld",
@@ -604,6 +707,49 @@ mod tests {
             assert!(!hint.contains('\n'), "hint must be one line: {hint:?}");
             assert!(hint.len() < 80, "hint must stay short: {hint:?}");
         }
+    }
+
+    #[test]
+    fn a_denied_pause_says_why() {
+        let body = pause_failed_body(
+            "pause",
+            &ClientError::Denied(
+                "authorization dialog dismissed (polkit action org.projectcolony.firewall.pause)"
+                    .into(),
+            ),
+        );
+        assert_eq!(
+            body,
+            "Could not pause the firewall: authorization dialog dismissed \
+             (polkit action org.projectcolony.firewall.pause)"
+        );
+        let body = pause_failed_body("resume", &ClientError::StreamClosed);
+        assert!(
+            body.starts_with("Could not resume the firewall ("),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_refused_answer_says_why_and_other_failures_stay_quiet() {
+        let body = verdict_refused_body(&ClientError::Denied(
+            "read-only access: restart it after an upgrade".into(),
+        ))
+        .unwrap();
+        assert!(body.contains("not accepted"), "{body}");
+        assert!(body.contains("restart it after an upgrade"), "{body}");
+        assert_eq!(verdict_refused_body(&ClientError::StreamClosed), None);
+    }
+
+    #[test]
+    fn a_replaced_binary_is_noticed() {
+        use std::path::Path;
+        assert!(replaced_on_disk(Path::new(
+            "/usr/bin/colony-firewall-tray (deleted)"
+        )));
+        assert!(!replaced_on_disk(Path::new(
+            "/usr/bin/colony-firewall-tray"
+        )));
     }
 
     // --- menu model ---------------------------------------------------------
@@ -753,6 +899,24 @@ mod tests {
     }
 
     #[test]
+    fn an_undecided_prompt_says_the_program_was_not_identified() {
+        let plain = prompt_notification(&prompt_event("", "", "1.1.1.1", 0), 0);
+        assert!(!plain.body.contains("could not be fully identified"));
+        let ev = proto::PromptEvent {
+            undecided_rule_id: "r1".into(),
+            ..prompt_event("", "", "1.1.1.1", 0)
+        };
+        let n = prompt_notification(&ev, 0);
+        assert!(
+            n.body
+                .contains("A rule may apply, but the program could not be fully identified"),
+            "{}",
+            n.body
+        );
+        assert!(n.body.contains("this connection"));
+    }
+
+    #[test]
     fn prompt_notification_summary_is_the_exe_basename() {
         let n = prompt_notification(&prompt_event("/usr/bin/curl", "example.com", "", 0), 0);
         assert_eq!(n.summary, "curl wants to connect");
@@ -762,6 +926,55 @@ mod tests {
     fn prompt_notification_body_carries_the_full_exe_on_a_second_line() {
         let n = prompt_notification(&prompt_event("/usr/bin/curl", "example.com", "", 0), 0);
         assert_eq!(n.body, "example.com (unknown; unverified hostname):443 (tcp)\n/usr/bin/curl\nAlways allow app covers all destinations until the rule is removed.");
+    }
+
+    #[test]
+    fn expired_slots_are_freed_and_their_bubbles_closed() {
+        let slot = |deadline_unix_ms, server_id| Slot {
+            deadline_unix_ms,
+            server_id,
+        };
+        let mut active = HashMap::from([
+            ("expired".to_string(), slot(1_000, Some(7))),
+            ("expired-unshown".to_string(), slot(1_000, None)),
+            ("in-grace".to_string(), slot(5_000, Some(8))),
+            ("no-deadline".to_string(), slot(0, Some(9))),
+        ]);
+        let close = reclaim_expired(&mut active, 5_000 + SLOT_GRACE_MS);
+        assert_eq!(close, vec![7]);
+        let mut left: Vec<_> = active.keys().map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["in-grace", "no-deadline"]);
+        assert_eq!(
+            present_prompt(active.len(), 0),
+            PromptPresentation::Actionable,
+            "a freed slot takes the next prompt"
+        );
+    }
+
+    #[test]
+    fn prompt_notification_cannot_be_restyled_or_reflowed_by_its_strings() {
+        // A valid path whose segments are Pango markup, and a DNS name that
+        // forges a second, "verified" destination line.
+        let n = prompt_notification(
+            &prompt_event(
+                "/home/u/<span alpha='1'>.cache/evil</span>/firefox",
+                "google.com (1.2.3.4; verified hostname):443 (tcp)\n/usr/lib/firefox/firefox\n\n.x",
+                "6.6.6.6",
+                0,
+            ),
+            0,
+        );
+        assert!(!n.body.contains('<') && !n.body.contains('>'), "{}", n.body);
+        assert!(n.body.contains("&lt;span alpha='1'&gt;"), "{}", n.body);
+        assert_eq!(
+            n.body.lines().count(),
+            3,
+            "only the tray's own line breaks: {}",
+            n.body
+        );
+        let n = prompt_notification(&prompt_event("/tmp/\u{202e}fdp.sh", "", "1.2.3.4", 0), 0);
+        assert!(n.summary.is_ascii() && n.body.is_ascii(), "{}", n.body);
     }
 
     #[test]
@@ -919,14 +1132,8 @@ mod tests {
 
     #[test]
     fn overflow_body_counts_and_pluralizes() {
-        assert_eq!(
-            overflow_body(1),
-            "1 more connection waiting — open Colony Firewall"
-        );
-        assert_eq!(
-            overflow_body(4),
-            "4 more connections waiting — open Colony Firewall"
-        );
+        assert!(overflow_body(1).starts_with("1 more connection waiting."));
+        assert!(overflow_body(4).starts_with("4 more connections waiting."));
     }
 
     // --- capability fallback -------------------------------------------------

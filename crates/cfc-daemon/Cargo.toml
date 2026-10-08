@@ -59,7 +59,6 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }
-prost = { workspace = true }
 
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -81,7 +80,10 @@ dns-lookup = { workspace = true }
 # workspace-style) on purpose -- only the daemon reads a package database.
 flate2 = "1.1"
 
-once_cell = { workspace = true }
+# polkit CheckAuthorization on the system bus (pause, resume, rule import).
+# Already in Cargo.lock through cfc-tray, with the same features.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
 parking_lot = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

@@ -148,9 +148,11 @@ impl DnsCache {
     /// Records an `A`/`AAAA` record lifted out of a DNS response this host
     /// received, with `ttl` in seconds as the record carried it.
     ///
-    /// This is first-hand evidence (see the module docs) and outranks any PTR
-    /// result for the same address, present or future. Called from the
-    /// `DNS_PACKETS` ring-buffer consumer, never from the packet path.
+    /// Display only, never policy identity: the record is not tied to a
+    /// resolver transaction (see the module docs). It fills the diagnostic
+    /// cache alone; the policy cache keeps only forward-confirmed PTR names.
+    /// Called from the `DNS_PACKETS` ring-buffer consumer, never from the
+    /// packet path.
     pub fn observe_answer(&self, ip: IpAddr, name: &str, ttl: u32) {
         self.observe_answer_at(ip, name, ttl, Instant::now());
     }
@@ -160,7 +162,15 @@ impl DnsCache {
         // Trailing dots and case are presentation details of the wire format;
         // rules and the UI compare bare lowercase names.
         let name = name.trim_end_matches('.').to_ascii_lowercase();
-        if name.is_empty() {
+        // The record is copied byte for byte from an unauthenticated packet,
+        // and the tray, GUI and CLI show it next to the real address. Keep
+        // only host-name characters, so a name such as
+        // "google.com (1.2.3.4; verified hostname)" cannot pose as that label.
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
             return;
         }
         let ttl =
@@ -520,6 +530,23 @@ mod tests {
         // An empty name is not a name.
         cache.observe_answer_at(ip("5.6.7.8"), ".", 300, now);
         assert!(cache.lookup_at(ip("5.6.7.8"), now).is_none());
+    }
+
+    #[test]
+    fn observed_names_outside_host_name_characters_are_dropped() {
+        let cache = DnsCache::new();
+        let now = Instant::now();
+        for (addr, name) in [
+            ("5.6.7.8", "google.com (1.2.3.4; verified hostname)"),
+            ("5.6.7.9", "a\nb.example"),
+            ("5.6.7.10", "<b>x</b>.example"),
+            ("5.6.7.11", "caf\u{e9}.example"),
+        ] {
+            cache.observe_answer_at(ip(addr), name, 300, now);
+            assert!(cache.lookup_at(ip(addr), now).is_none(), "{name}");
+        }
+        cache.observe_answer_at(ip("5.6.7.12"), "_dmarc.x-1.example", 300, now);
+        assert!(cache.lookup_at(ip("5.6.7.12"), now).is_some());
     }
 
     #[test]

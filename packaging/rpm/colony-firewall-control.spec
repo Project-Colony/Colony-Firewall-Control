@@ -44,6 +44,9 @@ Requires(postun): systemd
 Recommends:     libxkbcommon
 Recommends:     wayland
 Suggests:       libnotify
+# The app and tray ask for an administrator password through polkit before
+# they pause, resume or import rules; without it only sudo cfc can.
+Recommends:     polkit
 
 %description
 Colony Firewall Control asks before a program is allowed to reach the network,
@@ -59,10 +62,11 @@ Install one - `cargo xtask build-ebpf`, dropped at
 /usr/lib/colony-firewall/cfc-ebpf.o, in the directory this package creates for
 it - and the daemon adds process attribution, DNS display enrichment, and
 in-kernel connect(2) denial. Pinned denials survive a daemon crash. Fast Allow
-is disabled; allowed connections continue through NFQUEUE.
+was removed; allowed connections go through NFQUEUE.
 
-The ruleset is fail-closed. If the daemon is not running, new outbound
-connections are dropped rather than allowed.
+The ruleset is fail-closed for everything except new loopback flows. If the
+daemon is not running, new non-loopback outbound connections are dropped
+rather than allowed; new loopback flows are allowed so local IPC keeps working.
 
 %package selinux
 Summary:        SELinux policy module for %{name}
@@ -79,7 +83,7 @@ SELinux policy module for Colony Firewall Control.
 Confines the daemon to what it actually needs: netlink_netfilter and raw
 sockets, bpf() and perf_event_open(), the bpffs pin directory, other domains'
 /proc entries for attribution, a read-only rpm query for package provenance,
-and running nft(8) to clear Fast Allow state left by older installations. CAP_SYS_ADMIN is deliberately not granted; that it is
+and running nft(8) to probe the table and flush the legacy Fast Allow set. CAP_SYS_ADMIN is deliberately not granted; that it is
 unnecessary is covered by a test rather than assumed.
 
 %prep
@@ -134,6 +138,8 @@ install -Dpm 0644 pkg/colony-firewall-tray-autostart.desktop \
     %{buildroot}%{_sysconfdir}/xdg/autostart/colony-firewall-tray.desktop
 install -Dpm 0644 pkg/colony-firewall.svg \
     %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/colony-firewall.svg
+install -Dpm 0644 pkg/org.projectcolony.firewall.policy \
+    %{buildroot}%{_datadir}/polkit-1/actions/org.projectcolony.firewall.policy
 
 # Where the eBPF object goes if one is installed later. Shipping the directory
 # means the loader's ownership check (root-owned, unwritable by anyone else)
@@ -171,8 +177,10 @@ cargo test --workspace --locked --no-fail-fast
 %sysusers_create_compat %{_sysusersdir}/colony-firewall.conf
 if [ $1 -gt 1 ]; then
     # Reload active nft units atomically before the daemon restart in postun.
+    # Reenable only enabled nft units: the daemon's Also= would enable an nft
+    # unit the admin disabled.
     systemctl daemon-reload
-    for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do
+    for unit in colony-firewall-nft.service colony-firewall-nft-inbound.service; do
         if systemctl is-enabled --quiet "$unit"; then
             systemctl reenable "$unit" || exit 1
         fi
@@ -181,9 +189,18 @@ if [ $1 -gt 1 ]; then
         echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
         exit 1
     }
+    # The daemon trusts only the binaries now installed.
+    echo "Restart Colony Firewall and its tray now: until then the daemon refuses their answers and changes."
 fi
 
 %preun
+if [ $1 -eq 0 ]; then
+    # Disable with a daemon reload before the stop. %systemd_preun stops with
+    # --no-reload, so the network managers' Requires= on the nft units is
+    # still loaded and the stop would take NetworkManager or systemd-networkd
+    # down with them, with nothing to start them again.
+    systemctl disable --now colony-firewall-nft-inbound.service colony-firewall-nft.service colony-firewalld.service >/dev/null 2>&1 || :
+fi
 %systemd_preun colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service
 
 %postun
@@ -238,6 +255,9 @@ fi
 %{_sysconfdir}/xdg/autostart/colony-firewall.desktop
 %{_sysconfdir}/xdg/autostart/colony-firewall-tray.desktop
 %{_datadir}/icons/hicolor/scalable/apps/colony-firewall.svg
+%dir %{_datadir}/polkit-1
+%dir %{_datadir}/polkit-1/actions
+%{_datadir}/polkit-1/actions/org.projectcolony.firewall.policy
 %{_datadir}/bash-completion/completions/cfc
 %{_datadir}/zsh/site-functions/_cfc
 %{_datadir}/fish/vendor_completions.d/cfc.fish

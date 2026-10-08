@@ -139,7 +139,8 @@ pub async fn list(client: &mut Client, format: OutputFormat) -> CliResult {
             convert::rule_duration_label(r),
             r.hit_count,
             output::truncate(&r.name, name_w),
-            output::terminal_safe(&convert::rule_summary(r))
+            // Already display-safe.
+            convert::rule_summary(r)
         );
     }
     Ok(())
@@ -172,10 +173,7 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
         }
     );
     println!("hits         {}", rule.hit_count);
-    println!(
-        "summary      {}",
-        output::terminal_safe(&convert::rule_summary(&rule))
-    );
+    println!("summary      {}", convert::rule_summary(&rule));
     println!("scope:");
     // Not dashed when unset: an absent direction is not "unconstrained", it
     // means outbound (the matcher's contract - unset kept the meaning every
@@ -232,26 +230,28 @@ pub async fn show(client: &mut Client, needle: &str, format: OutputFormat) -> Cl
 }
 
 pub async fn remove(client: &mut Client, needle: &str, format: OutputFormat) -> CliResult {
-    let rule = resolve_via_daemon(client, needle).await?;
-    let deleted = client.delete_rule(&rule.id).await?;
+    let (id, name) = match resolve_via_daemon(client, needle).await {
+        Ok(rule) => (rule.id, rule.name),
+        // A quarantined or unreadable row is never listed, so nothing
+        // resolves to it, but the daemon deletes it by the full id the
+        // journal names.
+        Err(CliError::NotFound(_)) if uuid::Uuid::parse_str(needle).is_ok() => {
+            (needle.to_string(), String::new())
+        }
+        Err(e) => return Err(e),
+    };
+    let deleted = client.delete_rule(&id).await?;
     if !deleted {
-        // The rule was listed a moment ago, so this is a race with another
-        // client rather than a typo - still "not found" for the caller.
-        return Err(CliError::not_found(format!(
-            "rule {} disappeared before it could be deleted",
-            rule.id
-        )));
+        // Either a race with another client or an id that was never there:
+        // "not found" for the caller either way.
+        return Err(CliError::not_found(format!("no rule with id {id}")));
     }
     if format.is_json() {
         return output::print_json(&serde_json::json!({
-            "deleted": true, "id": rule.id, "name": rule.name,
+            "deleted": true, "id": id, "name": name,
         }));
     }
-    println!(
-        "deleted {} ({})",
-        rule.id,
-        output::terminal_safe(&rule.name)
-    );
+    println!("deleted {} ({})", id, output::terminal_safe(&name));
     Ok(())
 }
 
@@ -267,15 +267,10 @@ pub async fn set_enabled(
     let was = rule.enabled;
     let want = target.unwrap_or(!was);
 
+    // No executable validation here: the path is the stored one, sent back
+    // unchanged, and the daemon validates only new or changed paths. Checking
+    // it again refused to disable a rule whose target became an alias.
     if want != was {
-        if let Some(scope) = rule
-            .scope
-            .as_ref()
-            .filter(|scope| !scope.exe_path.is_empty())
-        {
-            cfc_core::exe_path::resolve_policy(std::path::Path::new(&scope.exe_path))
-                .map_err(CliError::runtime)?;
-        }
         rule.enabled = want;
         client.upsert_rule(rule.clone()).await?;
     }
@@ -632,12 +627,17 @@ pub async fn import(
     let rules: Vec<ExportedRule> = serde_json::from_str(&json).context("parsing JSON")?;
 
     // Parse and validate the complete file before the atomic server-side batch.
+    let stored = client.list_rules().await?;
     let mut pending = Vec::with_capacity(rules.len());
     let mut problems = Vec::new();
     let mut seen_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for r in rules {
         match r.try_into_proto() {
             Ok(pb) => {
+                if let Err(e) = check_new_exe(&pb, &stored) {
+                    problems.push(e);
+                    continue;
+                }
                 // Two rules sharing an id are not two rules: the second upsert
                 // overwrites the first, so the file describes a state the
                 // import cannot produce and the count printed at the end is
@@ -716,6 +716,35 @@ pub async fn import(
     Ok(())
 }
 
+/// Validates an imported rule's executable path in the caller's namespace,
+/// where `ProtectHome` and `PrivateTmp` hide nothing, before the daemon does
+/// in its own.
+///
+/// A rule that sends back the path already stored under its id is left alone,
+/// as the daemon leaves it: that path may have become an alias since it was
+/// written, and refusing it made a `--replace` restore of an export fail for
+/// as long as such a rule existed.
+fn check_new_exe(rule: &proto::RuleInfo, stored: &[proto::RuleInfo]) -> Result<(), String> {
+    let Some(exe) = rule
+        .scope
+        .as_ref()
+        .map(|scope| scope.exe_path.as_str())
+        .filter(|exe| !exe.is_empty())
+    else {
+        return Ok(());
+    };
+    let kept = !rule.id.is_empty()
+        && stored
+            .iter()
+            .any(|old| old.id == rule.id && old.scope.as_ref().is_some_and(|s| s.exe_path == exe));
+    if kept {
+        return Ok(());
+    }
+    cfc_core::exe_path::resolve_policy(std::path::Path::new(exe))
+        .map(drop)
+        .map_err(|error| format!("rule `{}`: {error}", rule.name))
+}
+
 // ---------------------------------------------------------------------------
 // Export / import format
 // ---------------------------------------------------------------------------
@@ -736,6 +765,10 @@ pub struct ExportedRule {
     pub duration: String,
     #[serde(default)]
     pub duration_seconds: u32,
+    /// When a `seconds` rule runs out. Without it a restored backup started
+    /// the full lifetime again, so an expired temporary Allow came back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
     #[serde(default)]
     pub scope: ExportedScope,
 }
@@ -856,6 +889,19 @@ impl ExportedRule {
                 "rule `{name}`: duration_seconds requires duration `seconds`"
             ));
         }
+        // The daemon keeps a past creation time, so the rule ends when the
+        // exported one did; one already past is stored expired.
+        let created_at_unix_ms = match self.expires_at_unix_ms {
+            None => 0,
+            Some(_) if duration != proto::Duration::Seconds => {
+                return Err(format!(
+                    "rule `{name}`: expires_at_unix_ms requires duration `seconds`"
+                ))
+            }
+            Some(at) => at
+                .saturating_sub(i64::from(self.duration_seconds) * 1000)
+                .max(1),
+        };
         let direction_idx = match self.scope.direction.as_deref() {
             None => None,
             Some(d) => Some(match d.to_ascii_lowercase().as_str() {
@@ -921,8 +967,6 @@ impl ExportedRule {
                      match on absolute executable paths, so it could never fire"
                 ));
             }
-            cfc_core::exe_path::resolve_policy(std::path::Path::new(exe))
-                .map_err(|error| format!("rule `{name}`: {error}"))?;
         }
         let exe_sha256 = match self.scope.exe_sha256.as_deref() {
             Some(h) => Some(
@@ -1009,7 +1053,7 @@ impl ExportedRule {
             duration: duration as i32,
             duration_seconds: self.duration_seconds,
             scope: Some(scope),
-            created_at_unix_ms: 0,
+            created_at_unix_ms,
             hit_count: 0,
         })
     }
@@ -1031,6 +1075,9 @@ pub fn exported_rule(r: &proto::RuleInfo) -> ExportedRule {
         action: convert::action_label(r.action).to_string(),
         duration: convert::duration_label(r.duration).to_string(),
         duration_seconds: r.duration_seconds,
+        expires_at_unix_ms: (r.duration == proto::Duration::Seconds as i32
+            && r.created_at_unix_ms > 0)
+            .then(|| r.created_at_unix_ms + i64::from(r.duration_seconds) * 1000),
         scope: ExportedScope {
             exe_path: scope.and_then(|s| opt_string(&s.exe_path)),
             exe_sha256: scope.and_then(|s| opt_string(&s.exe_sha256)),
@@ -1104,6 +1151,7 @@ pub async fn import_opensnitch(
     client: &mut Client,
     path: PathBuf,
     replace: bool,
+    skip_unconvertible: bool,
     format: OutputFormat,
 ) -> CliResult {
     let mut files: Vec<PathBuf> = if path.is_dir() {
@@ -1127,7 +1175,9 @@ pub async fn import_opensnitch(
         )));
     }
 
-    // Unsupported rules may be skipped only for additive imports.
+    // Unsupported rules may be skipped only when asked, and never in replace
+    // mode: a skipped deny next to an imported allow is a wider policy than
+    // the source, and the skip count alone did not say so.
     let mut pending = Vec::new();
     let mut skipped = 0u32;
     for file in &files {
@@ -1157,6 +1207,14 @@ pub async fn import_opensnitch(
     }
     if replace && skipped > 0 {
         return Err(anyhow::anyhow!("refusing --replace: {skipped} source rules could not be converted; nothing was changed").into());
+    }
+    if skipped > 0 && !skip_unconvertible {
+        return Err(anyhow::anyhow!(
+            "refusing to import: {skipped} source rules could not be converted, and \
+             importing the rest would drop their restrictions; nothing was changed. \
+             Rewrite them, or pass --skip-unconvertible to import the rest anyway"
+        )
+        .into());
     }
     if replace && pending.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1188,8 +1246,9 @@ fn convert_opensnitch(file: &std::path::Path, osn: OsnRule) -> anyhow::Result<pr
     // unrecognised or missing action must never become an Allow. This one is
     // reachable from the migration path the README advertises, so a foreign
     // file's vocabulary decides what gets allowed - the worst possible input to
-    // trust. A rule that cannot be converted is skipped and counted, which is
-    // already how this command handles anything it does not understand.
+    // trust. A rule that cannot be converted stops the import, or is skipped
+    // and named under --skip-unconvertible, like anything else it does not
+    // understand.
     let action = match osn.action.to_ascii_lowercase().as_str() {
         "allow" | "accept" => proto::Action::Allow,
         "deny" | "drop" => proto::Action::Deny,
@@ -1316,21 +1375,27 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
         "dest.host" | "dest.domain" => anyhow::bail!(
             "hostname policy is unsupported; use an explicit numeric dest.ip or dest.network"
         ),
+        // Parsed here, as the daemon will: one bad value must skip its own
+        // file with a reason, not fail the whole batch at the daemon.
         "dest.ip" => {
+            let ip = s.data.parse::<std::net::IpAddr>().map_err(|_| {
+                anyhow::anyhow!("operand `dest.ip`: `{}` is not an IP address", s.data)
+            })?;
             // single IP -> /32 or /128
-            let net = if s.data.contains(':') {
-                format!("{}/128", s.data)
-            } else {
-                format!("{}/32", s.data)
-            };
+            let net = ipnet::IpNet::from(ip).to_string();
             set_once("dest.ip", &mut scope.dst_net, net)?;
         }
-        "dest.network" => set_once("dest.network", &mut scope.dst_net, s.data.clone())?,
+        "dest.network" => {
+            let net = s.data.parse::<ipnet::IpNet>().map_err(|_| {
+                anyhow::anyhow!("operand `dest.network`: `{}` is not a CIDR network", s.data)
+            })?;
+            set_once("dest.network", &mut scope.dst_net, net.to_string())?;
+        }
         "dest.port" => {
             if scope.has_dst_port {
                 anyhow::bail!("operand `dest.port` appears more than once");
             }
-            scope.dst_port = s.data.parse::<u32>().map_err(|_| {
+            scope.dst_port = s.data.parse::<u16>().map(u32::from).map_err(|_| {
                 anyhow::anyhow!("operand `dest.port`: `{}` is not a port number", s.data)
             })?;
             scope.has_dst_port = true;
@@ -1381,6 +1446,17 @@ fn apply_simple(s: &OsnSimple, scope: &mut proto::RuleScope) -> anyhow::Result<(
 /// The first candidate that **exists on this machine** is used; if none does,
 /// the entry is skipped and said out loud, so "installed 4 of 7, skipped 3 not
 /// present" is a normal, legible outcome rather than a silent partial success.
+///
+/// # Candidates name the program that connects
+///
+/// The daemon matches `/proc/<pid>/exe`, the image that was mapped. A launcher
+/// script (`/usr/bin/firefox` on Arch), a proxy that execs another binary
+/// (rustup's `cargo`) or a front end whose helper does the fetching (`git`,
+/// `apt-get`) never appears there, so a rule pinned to it never fires. Real
+/// binaries come first, and launchers are skipped (see [`is_launcher`]).
+/// Tools where only an interpreter connects (npm, pip) are not bundled at all:
+/// allowing `/usr/bin/node` to reach 443 would allow every Node program.
+#[derive(Clone, Copy)]
 struct BundleRule {
     name: &'static str,
     /// Absolute paths to try, in order. First one that exists wins.
@@ -1414,9 +1490,37 @@ impl BundleRule {
         self.exe_candidates
             .iter()
             .copied()
-            .find(|p| std::path::Path::new(p).is_file())
+            .filter(|p| std::path::Path::new(p).is_file())
             .map(|p| cfc_core::exe_path::resolve(std::path::Path::new(p)).into_path())
+            .find(|p| !is_launcher(p))
     }
+
+    /// The path 0.3.0 through 0.7.0 pinned: the first candidate that exists,
+    /// launcher or not.
+    fn resolve_pre_0_7(&self) -> Option<PathBuf> {
+        if self.exe_candidates.is_empty() {
+            return Some(PathBuf::new());
+        }
+        self.exe_candidates
+            .iter()
+            .map(std::path::Path::new)
+            .find(|p| p.is_file())
+            .map(|p| cfc_core::exe_path::resolve(p).into_path())
+    }
+}
+
+/// True for a file that execs another image instead of connecting itself: a
+/// `#!` script, or the rustup proxy every toolchain binary links to.
+fn is_launcher(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    if path.file_name() == Some(std::ffi::OsStr::new("rustup")) {
+        return true;
+    }
+    let mut head = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok()
+        && head == *b"#!"
 }
 
 /// A named, selectable set of rules.
@@ -1564,9 +1668,10 @@ fn bundles() -> Vec<Bundle> {
             name: "updates",
             summary: "package managers beyond pacman/paru, which are in `system`",
             rules: vec![
+                // apt-get hands the fetch to its method helpers.
                 BundleRule {
                     name: "updates-apt-https",
-                    exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/https"],
+                    exe_candidates: &["/usr/lib/apt/methods/https"],
                     dst_port: Some(443),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1576,7 +1681,7 @@ fn bundles() -> Vec<Bundle> {
                 // are signed, so the transport is not what protects them.
                 BundleRule {
                     name: "updates-apt-http",
-                    exe_candidates: &["/usr/bin/apt-get", "/usr/lib/apt/methods/http"],
+                    exe_candidates: &["/usr/lib/apt/methods/http"],
                     dst_port: Some(80),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1617,10 +1722,14 @@ fn bundles() -> Vec<Bundle> {
             name: "dev",
             summary: "the tools that fetch code and dependencies",
             rules: vec![
-                // git speaks both: HTTPS remotes and ssh:// remotes.
+                // git speaks both, but through helpers: git-remote-https for
+                // HTTPS remotes and ssh for ssh:// remotes.
                 BundleRule {
                     name: "dev-git-https",
-                    exe_candidates: &["/usr/bin/git"],
+                    exe_candidates: &[
+                        "/usr/lib/git-core/git-remote-https",
+                        "/usr/libexec/git-core/git-remote-https",
+                    ],
                     dst_port: Some(443),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1628,7 +1737,7 @@ fn bundles() -> Vec<Bundle> {
                 },
                 BundleRule {
                     name: "dev-git-ssh",
-                    exe_candidates: &["/usr/bin/git"],
+                    exe_candidates: &["/usr/bin/ssh"],
                     dst_port: Some(22),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1637,22 +1746,6 @@ fn bundles() -> Vec<Bundle> {
                 BundleRule {
                     name: "dev-cargo-https",
                     exe_candidates: &["/usr/bin/cargo"],
-                    dst_port: Some(443),
-                    protocol: Some(Tcp),
-                    direction: None,
-                    src_net: None,
-                },
-                BundleRule {
-                    name: "dev-npm-https",
-                    exe_candidates: &["/usr/bin/npm", "/usr/bin/node"],
-                    dst_port: Some(443),
-                    protocol: Some(Tcp),
-                    direction: None,
-                    src_net: None,
-                },
-                BundleRule {
-                    name: "dev-pip-https",
-                    exe_candidates: &["/usr/bin/pip", "/usr/bin/pip3"],
                     dst_port: Some(443),
                     protocol: Some(Tcp),
                     direction: None,
@@ -1846,16 +1939,28 @@ fn bundles() -> Vec<Bundle> {
 fn browser_rules() -> Vec<BundleRule> {
     /// `(rule stem, candidate paths)`.
     const BROWSERS: &[(&str, &[&str])] = &[
-        ("firefox", &["/usr/bin/firefox", "/usr/lib/firefox/firefox"]),
-        ("librewolf", &["/usr/bin/librewolf"]),
+        (
+            "firefox",
+            &[
+                "/usr/lib/firefox/firefox",
+                "/usr/lib64/firefox/firefox",
+                "/usr/bin/firefox",
+            ],
+        ),
+        (
+            "librewolf",
+            &["/usr/lib/librewolf/librewolf", "/usr/bin/librewolf"],
+        ),
         (
             "chromium",
-            &["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
+            &["/usr/lib/chromium/chromium", "/usr/bin/chromium"],
         ),
-        ("chrome", &["/usr/bin/google-chrome-stable"]),
-        ("brave", &["/usr/bin/brave"]),
-        ("vivaldi", &["/usr/bin/vivaldi-stable"]),
-        ("epiphany", &["/usr/bin/epiphany"]),
+        ("chrome", &["/opt/google/chrome/chrome"]),
+        (
+            "brave",
+            &["/opt/brave.com/brave/brave", "/opt/brave-bin/brave"],
+        ),
+        ("vivaldi", &["/opt/vivaldi/vivaldi-bin"]),
     ];
 
     // `&'static str` names are needed by `BundleRule`, and these are built at
@@ -1901,7 +2006,7 @@ struct Planned {
     /// Entries whose program is installed here, with the path as /proc will
     /// report it - not necessarily the candidate that matched.
     present: Vec<(&'static str, PathBuf)>,
-    /// Entries skipped because no candidate path exists.
+    /// Entries skipped because no candidate exists, or only a launcher does.
     absent: Vec<&'static str>,
 }
 
@@ -1923,38 +2028,12 @@ fn plan(bundle: &Bundle) -> Planned {
 /// install path uses. When this was inlined, the call site passed `None` for
 /// two of the fields and nothing noticed until a rule was read back off disk.
 fn proto_for(spec: &BundleRule, exe: &str) -> proto::RuleInfo {
-    allow_rule(
-        spec.name,
-        exe,
-        spec.dst_port,
-        spec.protocol,
-        spec.direction,
-        spec.src_net,
-    )
-}
-
-fn bundle_rule_id(bundle: &str, name: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("colony-firewall-bundle\0{bundle}\0{name}"));
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    uuid::Uuid::from_bytes(bytes).to_string()
-}
-
-/// `direction`/`src_net` are what an inbound bundle entry needs; every
-/// outbound one leaves them unset.
-fn allow_rule(
-    name: &str,
-    exe: &str,
-    port: Option<u16>,
-    proto_: Option<proto::Protocol>,
-    direction: Option<proto::Direction>,
-    src_net: Option<&str>,
-) -> proto::RuleInfo {
+    // `direction`/`src_net` are what an inbound bundle entry needs; every
+    // outbound one leaves them unset.
     proto::RuleInfo {
         duration_seconds: 0,
         id: String::new(),
-        name: name.to_string(),
+        name: spec.name.to_string(),
         enabled: true,
         action: proto::Action::Allow as i32,
         duration: proto::Duration::Always as i32,
@@ -1966,19 +2045,166 @@ fn allow_rule(
             has_uid: false,
             dst_host: String::new(),
             dst_net: String::new(),
-            dst_port: port.map(u32::from).unwrap_or(0),
-            has_dst_port: port.is_some(),
-            protocol: proto_.map(|p| p as i32).unwrap_or(0),
-            has_protocol: proto_.is_some(),
-            direction: direction.map(|d| d as i32).unwrap_or(0),
-            has_direction: direction.is_some(),
-            src_net: src_net.unwrap_or_default().to_string(),
+            dst_port: spec.dst_port.map(u32::from).unwrap_or(0),
+            has_dst_port: spec.dst_port.is_some(),
+            protocol: spec.protocol.map(|p| p as i32).unwrap_or(0),
+            has_protocol: spec.protocol.is_some(),
+            direction: spec.direction.map(|d| d as i32).unwrap_or(0),
+            has_direction: spec.direction.is_some(),
+            src_net: spec.src_net.unwrap_or_default().to_string(),
             src_port: 0,
             has_src_port: false,
         }),
         created_at_unix_ms: 0,
         hit_count: 0,
     }
+}
+
+/// Whether `rule` grants exactly what `wanted` would: same action, duration and
+/// scope. Name, id and enabled state are not policy.
+fn same_policy(rule: &proto::RuleInfo, wanted: &proto::RuleInfo) -> bool {
+    rule.action == wanted.action
+        && rule.duration == wanted.duration
+        && rule.duration_seconds == wanted.duration_seconds
+        && rule.scope == wanted.scope
+}
+
+/// Entries whose candidates changed after 0.7.0, or that were dropped, as
+/// 0.3.0 through 0.7.0 shipped them: `(bundle, entry, candidates, port)`, all
+/// TCP. Epiphany fetches through the WebKit network process every WebKitGTK
+/// app shares, and npm and pip connect as their interpreter, so those went.
+const PRE_0_7_CHANGED: &[(&str, &str, &[&str], u16)] = &[
+    (
+        "updates",
+        "updates-apt-https",
+        &["/usr/bin/apt-get", "/usr/lib/apt/methods/https"],
+        443,
+    ),
+    (
+        "updates",
+        "updates-apt-http",
+        &["/usr/bin/apt-get", "/usr/lib/apt/methods/http"],
+        80,
+    ),
+    ("dev", "dev-git-https", &["/usr/bin/git"], 443),
+    ("dev", "dev-git-ssh", &["/usr/bin/git"], 22),
+    (
+        "dev",
+        "dev-npm-https",
+        &["/usr/bin/npm", "/usr/bin/node"],
+        443,
+    ),
+    (
+        "dev",
+        "dev-pip-https",
+        &["/usr/bin/pip", "/usr/bin/pip3"],
+        443,
+    ),
+    (
+        "web",
+        "web-firefox-https",
+        &["/usr/bin/firefox", "/usr/lib/firefox/firefox"],
+        443,
+    ),
+    (
+        "web",
+        "web-firefox-http",
+        &["/usr/bin/firefox", "/usr/lib/firefox/firefox"],
+        80,
+    ),
+    ("web", "web-librewolf-https", &["/usr/bin/librewolf"], 443),
+    ("web", "web-librewolf-http", &["/usr/bin/librewolf"], 80),
+    (
+        "web",
+        "web-chromium-https",
+        &["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
+        443,
+    ),
+    (
+        "web",
+        "web-chromium-http",
+        &["/usr/bin/chromium", "/usr/lib/chromium/chromium"],
+        80,
+    ),
+    (
+        "web",
+        "web-chrome-https",
+        &["/usr/bin/google-chrome-stable"],
+        443,
+    ),
+    (
+        "web",
+        "web-chrome-http",
+        &["/usr/bin/google-chrome-stable"],
+        80,
+    ),
+    ("web", "web-brave-https", &["/usr/bin/brave"], 443),
+    ("web", "web-brave-http", &["/usr/bin/brave"], 80),
+    (
+        "web",
+        "web-vivaldi-https",
+        &["/usr/bin/vivaldi-stable"],
+        443,
+    ),
+    ("web", "web-vivaldi-http", &["/usr/bin/vivaldi-stable"], 80),
+    ("web", "web-epiphany-https", &["/usr/bin/epiphany"], 443),
+    ("web", "web-epiphany-http", &["/usr/bin/epiphany"], 80),
+];
+
+/// Every entry of `bundle` as 0.3.0 through 0.7.0 shipped it, dropped ones
+/// included.
+fn pre_0_7_entries(bundle: &Bundle) -> Vec<BundleRule> {
+    let changed = PRE_0_7_CHANGED.iter().filter(|(b, ..)| *b == bundle.name);
+    bundle
+        .rules
+        .iter()
+        .filter(|r| !PRE_0_7_CHANGED.iter().any(|(_, name, ..)| *name == r.name))
+        .copied()
+        .chain(changed.map(|&(_, name, exe_candidates, port)| BundleRule {
+            name,
+            exe_candidates,
+            dst_port: Some(port),
+            protocol: Some(proto::Protocol::Tcp),
+            direction: None,
+            src_net: None,
+        }))
+        .collect()
+}
+
+/// Ids of the rules that are this bundle's own entries as seeded before 0.7.0
+/// gave bundle rules deterministic ids: same name, and granting exactly what
+/// the entry would install here now, or what 0.3.0 through 0.7.0 installed
+/// here (see [`PRE_0_7_CHANGED`]). `bundle add` counts them as present and
+/// `bundle remove` removes them; an edited copy is neither.
+fn legacy_copies(
+    bundle: &Bundle,
+    existing: &[proto::RuleInfo],
+) -> std::collections::HashSet<String> {
+    let now = bundle.rules.iter().filter_map(|r| Some((*r, r.resolve()?)));
+    let then = pre_0_7_entries(bundle)
+        .into_iter()
+        .filter_map(|r| Some((r, r.resolve_pre_0_7()?)));
+    let wanted: Vec<proto::RuleInfo> = now
+        .chain(then)
+        .map(|(spec, exe)| proto_for(&spec, &exe.to_string_lossy()))
+        .collect();
+    existing
+        .iter()
+        .filter(|rule| {
+            wanted
+                .iter()
+                .any(|w| w.name == rule.name && same_policy(rule, w))
+        })
+        .map(|rule| rule.id.clone())
+        .collect()
+}
+
+fn bundle_rule_id(bundle: &str, name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("colony-firewall-bundle\0{bundle}\0{name}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(bytes).to_string()
 }
 
 /// `cfc rules bundle list`
@@ -2110,19 +2336,40 @@ pub async fn bundle_add(
     let planned = plan(&bundle);
     let mut added = Vec::new();
     let mut skipped_present = 0u32;
+    // A rule with an entry's name but another id was not installed by this
+    // bundle. A copy seeded before 0.7.0 counts as present; any other one
+    // stops the command before it changes anything.
+    let legacy = legacy_copies(&bundle, &existing);
     for (rule_name, _) in &planned.present {
         let id = bundle_rule_id(bundle.name, rule_name);
-        if existing
+        if let Some(rule) = existing
             .iter()
-            .any(|rule| rule.name == *rule_name && rule.id != id)
+            .find(|rule| rule.name == *rule_name && rule.id != id && !legacy.contains(&rule.id))
         {
-            return Err(CliError::runtime(format!("bundle rule `{rule_name}` collides with a rule outside this bundle; nothing was changed")));
+            return Err(CliError::runtime(format!(
+                "bundle rule `{rule_name}` collides with rule {} of the same name, which this \
+                 bundle did not install and which differs from it; rename or remove that rule \
+                 and retry. Nothing was changed",
+                short_id(&rule.id)
+            )));
         }
     }
 
     for (rule_name, exe) in &planned.present {
         let id = bundle_rule_id(bundle.name, rule_name);
-        if existing.iter().any(|rule| rule.id == id) {
+        if let Some(rule) = existing
+            .iter()
+            .find(|rule| rule.id == id || (rule.name == *rule_name && legacy.contains(&rule.id)))
+        {
+            let stored = rule.scope.as_ref().map_or("", |s| s.exe_path.as_str());
+            if !format.is_json() && std::path::Path::new(stored) != exe.as_path() {
+                println!(
+                    "kept: {rule_name} pins {}, but this bundle now names {}; \
+                     `bundle remove` and `bundle add` replace it",
+                    output::terminal_safe(stored),
+                    output::terminal_safe(&exe.to_string_lossy())
+                );
+            }
             skipped_present += 1;
             continue;
         }
@@ -2162,7 +2409,7 @@ pub async fn bundle_add(
     // network.
     if !planned.absent.is_empty() {
         println!(
-            "\nnot installed on this machine, so skipped ({}):",
+            "\nno program here that a rule can match (not installed, or only a launcher), so skipped ({}):",
             planned.absent.len()
         );
         for n in &planned.absent {
@@ -2180,8 +2427,10 @@ pub async fn bundle_add(
 
 /// `cfc rules bundle remove <name>`
 ///
-/// Removes only deterministic IDs created by this bundle. Existing rules
-/// imported by older versions lack this ownership evidence and are preserved.
+/// Removes the deterministic IDs this bundle gives its rules, and the copies
+/// of its entries seeded before 0.7.0 that still grant exactly what the entry
+/// grants now or granted then (see [`legacy_copies`]), dropped entries
+/// included. Any other rule, same name or not, is kept.
 pub async fn bundle_remove(
     client: &mut Client,
     name: &str,
@@ -2189,15 +2438,36 @@ pub async fn bundle_remove(
     format: OutputFormat,
 ) -> CliResult {
     let bundle = find_bundle(name)?;
+    // Dropped entries included: older versions installed them too.
     let owned: std::collections::HashSet<String> = bundle
         .rules
         .iter()
+        .chain(&pre_0_7_entries(&bundle))
         .map(|r| bundle_rule_id(bundle.name, r.name))
         .collect();
 
     let existing = client.list_rules().await?;
+    let legacy = legacy_copies(&bundle, &existing);
     let mut removed = Vec::new();
-    for r in existing.iter().filter(|r| owned.contains(&r.id)) {
+    let mut kept = Vec::new();
+    for r in existing
+        .iter()
+        .filter(|r| owned.contains(&r.id) || legacy.contains(&r.id))
+    {
+        // Bundles install only Allows. An editor keeps the id, so one that is
+        // now a Deny or Reject is the user's decision, and deleting it would
+        // let the traffic it stops through to the prompt or the default.
+        if r.action != proto::Action::Allow as i32 {
+            if !format.is_json() {
+                println!(
+                    "kept: {} ({}) was changed from allow; remove it by id if it should go",
+                    short_id(&r.id),
+                    output::terminal_safe(&r.name)
+                );
+            }
+            kept.push(r.name.clone());
+            continue;
+        }
         if !dry_run {
             client.delete_rule(&r.id).await?;
         }
@@ -2218,6 +2488,7 @@ pub async fn bundle_remove(
             "dry_run": dry_run,
             "removed": removed.len(),
             "rules": removed,
+            "kept": kept,
         }));
     }
     println!(
@@ -2382,6 +2653,42 @@ mod json_tests {
         assert!(rule.try_into_proto().is_err());
     }
 
+    // A legacy rule whose path became an alias blocked every restore.
+    #[test]
+    fn import_checks_only_a_new_or_changed_executable_path() {
+        // /proc/self/exe is a symlink on every Linux: an alias.
+        let mut rule = exported("allow");
+        rule.id = "1f0a5c7e-0000-4000-8000-000000000001".into();
+        rule.scope.exe_path = Some("/proc/self/exe".into());
+        let pb = rule
+            .try_into_proto()
+            .expect("the daemon decides on aliases");
+        assert!(check_new_exe(&pb, &[]).is_err());
+        assert!(check_new_exe(&pb, std::slice::from_ref(&pb)).is_ok());
+        let mut moved = pb.clone();
+        moved.scope.as_mut().unwrap().exe_path = "/proc/self/cwd".into();
+        assert!(check_new_exe(&moved, std::slice::from_ref(&pb)).is_err());
+    }
+
+    // A restored backup used to start a timed Allow's lifetime again.
+    #[test]
+    fn a_timed_rule_keeps_its_deadline_through_export_and_import() {
+        let mut rule = exported("allow").try_into_proto().unwrap();
+        rule.duration = proto::Duration::Seconds as i32;
+        rule.duration_seconds = 3600;
+        rule.created_at_unix_ms = 1_000_000;
+        let back = exported_rule(&rule);
+        assert_eq!(back.expires_at_unix_ms, Some(4_600_000));
+        assert_eq!(back.try_into_proto().unwrap().created_at_unix_ms, 1_000_000);
+        let mut always = exported("allow");
+        always.expires_at_unix_ms = Some(4_600_000);
+        assert!(always.try_into_proto().is_err());
+        assert_eq!(
+            exported_rule(&exported("allow").try_into_proto().unwrap()).expires_at_unix_ms,
+            None
+        );
+    }
+
     fn exported(action: &str) -> ExportedRule {
         ExportedRule {
             id: String::new(),
@@ -2390,6 +2697,7 @@ mod json_tests {
             action: action.into(),
             duration: "always".into(),
             duration_seconds: 0,
+            expires_at_unix_ms: None,
             scope: ExportedScope {
                 exe_path: Some("/usr/bin/curl".into()),
                 exe_sha256: None,
@@ -2610,6 +2918,144 @@ mod json_tests {
 #[cfg(test)]
 mod bundle_tests {
     use super::*;
+
+    // Hosts seeded before 0.7.0 hold the bundle's rules under random ids.
+    // An identical copy is the bundle's own, for add and for remove; an
+    // edited one is not.
+    #[test]
+    fn a_pre_0_7_copy_of_a_bundle_rule_counts_only_while_unchanged() {
+        let bundle = find_bundle("inbound").unwrap();
+        let entry = &bundle.rules[0];
+        let wanted = proto_for(entry, "");
+        let mut legacy = wanted.clone();
+        legacy.id = "11111111-1111-4111-8111-111111111111".into();
+        legacy.enabled = false;
+        let mut deny = legacy.clone();
+        deny.id = "22222222-2222-4222-8222-222222222222".into();
+        deny.action = proto::Action::Deny as i32;
+        let mut wider = legacy.clone();
+        wider.id = "33333333-3333-4333-8333-333333333333".into();
+        wider.scope.as_mut().unwrap().src_net.clear();
+        let mut elsewhere = legacy.clone();
+        elsewhere.id = "44444444-4444-4444-8444-444444444444".into();
+        elsewhere.scope.as_mut().unwrap().exe_path = "/usr/local/bin/sshd".into();
+        let found = legacy_copies(&bundle, &[legacy, deny, wider, elsewhere]);
+        assert_eq!(
+            found,
+            std::collections::HashSet::from(["11111111-1111-4111-8111-111111111111".to_owned()])
+        );
+    }
+
+    // `/usr/bin/firefox` on Arch is `exec /usr/lib/firefox/firefox`, and
+    // `/usr/bin/cargo` under rustup is the rustup proxy. Neither is ever
+    // /proc/<pid>/exe, so a rule pinned to one never fires.
+    #[test]
+    fn launchers_are_skipped_for_the_binary_that_connects() {
+        let dir = std::env::temp_dir().join(format!("cfc-bundle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("firefox");
+        let real = dir.join("firefox-bin");
+        let proxy = dir.join("rustup");
+        std::fs::write(&script, "#!/bin/sh\nexec firefox-bin \"$@\"\n").unwrap();
+        std::fs::write(&real, b"\x7fELF").unwrap();
+        std::fs::write(&proxy, b"\x7fELF").unwrap();
+        let leak = |p: &std::path::Path| -> &'static str {
+            Box::leak(p.to_str().unwrap().to_owned().into_boxed_str())
+        };
+        let entry = |candidates: Vec<&'static str>| BundleRule {
+            name: "test",
+            exe_candidates: Box::leak(candidates.into_boxed_slice()),
+            dst_port: Some(443),
+            protocol: None,
+            direction: None,
+            src_net: None,
+        };
+        let resolved = entry(vec![leak(&script), leak(&real)]).resolve();
+        assert_eq!(
+            resolved,
+            Some(cfc_core::exe_path::resolve(&real).into_path())
+        );
+        assert_eq!(entry(vec![leak(&script)]).resolve(), None);
+        assert_eq!(entry(vec![leak(&proxy)]).resolve(), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // 0.6.0 pinned the first candidate that existed, a launcher included, and
+    // installed entries later versions re-pathed or dropped. Those copies are
+    // still the bundle's own.
+    #[test]
+    fn a_pre_0_7_copy_pinned_to_the_old_path_is_the_bundles_own() {
+        let dir = std::env::temp_dir().join(format!("cfc-bundle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("browser");
+        let real = dir.join("browser-bin");
+        std::fs::write(&script, "#!/bin/sh\nexec browser-bin \"$@\"\n").unwrap();
+        std::fs::write(&real, b"\x7fELF").unwrap();
+        let leak = |p: &std::path::Path| -> &'static str {
+            Box::leak(p.to_str().unwrap().to_owned().into_boxed_str())
+        };
+        let entry = BundleRule {
+            name: "test-https",
+            exe_candidates: Box::leak(vec![leak(&script), leak(&real)].into_boxed_slice()),
+            dst_port: Some(443),
+            protocol: Some(proto::Protocol::Tcp),
+            direction: None,
+            src_net: None,
+        };
+        let bundle = Bundle {
+            name: "test",
+            summary: "",
+            rules: vec![entry],
+        };
+        let seeded = |id: &str, exe: &std::path::Path| {
+            let mut rule = proto_for(
+                &entry,
+                &cfc_core::exe_path::resolve(exe)
+                    .into_path()
+                    .to_string_lossy(),
+            );
+            rule.id = id.into();
+            rule
+        };
+        let old = seeded("11111111-1111-4111-8111-111111111111", &script);
+        let new = seeded("22222222-2222-4222-8222-222222222222", &real);
+        let other = seeded("33333333-3333-4333-8333-333333333333", &dir);
+        assert_eq!(
+            legacy_copies(&bundle, &[old, new, other]),
+            std::collections::HashSet::from([
+                "11111111-1111-4111-8111-111111111111".to_owned(),
+                "22222222-2222-4222-8222-222222222222".to_owned(),
+            ])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // The shipped history: a re-pathed entry keeps its scope apart from
+        // the path, and the dropped ones are still known by name.
+        let mut dropped = Vec::new();
+        for bundle in bundles() {
+            for past in pre_0_7_entries(&bundle) {
+                match bundle.rules.iter().find(|r| r.name == past.name) {
+                    Some(now) => assert_eq!(
+                        (now.dst_port, now.protocol, now.direction, now.src_net),
+                        (past.dst_port, past.protocol, past.direction, past.src_net),
+                        "{}",
+                        past.name
+                    ),
+                    None => dropped.push(past.name),
+                }
+            }
+        }
+        dropped.sort_unstable();
+        assert_eq!(
+            dropped,
+            [
+                "dev-npm-https",
+                "dev-pip-https",
+                "web-epiphany-http",
+                "web-epiphany-https"
+            ]
+        );
+    }
 
     /// The invariant the whole feature rests on.
     ///
@@ -3083,6 +3529,26 @@ mod opensnitch_tests {
         )
         .unwrap();
         assert_eq!(r.scope.unwrap().dst_net, "2001:db8::1/128");
+    }
+
+    // These used to pass conversion and then fail the whole batch at the
+    // daemon, so one bad file stopped the import without being named.
+    #[test]
+    fn malformed_addresses_and_ports_fail_their_own_file() {
+        for (operand, data) in [
+            ("dest.ip", "10.0.0.0/8"),
+            ("dest.ip", "example.org"),
+            ("dest.network", "10.0.0.0/33"),
+            ("dest.network", "10.0.0.1"),
+            ("dest.port", "70000"),
+        ] {
+            let source = format!(
+                r#"{{"action":"deny","duration":"always","operator":{{"type":"simple","operand":"{operand}","data":"{data}"}}}}"#
+            );
+            assert!(parse(&source).is_err(), "{operand} {data}");
+        }
+        let r = parse(r#"{"action":"deny","operator":{"type":"simple","operand":"dest.network","data":"10.0.0.0/8"}}"#).unwrap();
+        assert_eq!(r.scope.unwrap().dst_net, "10.0.0.0/8");
     }
 
     #[test]

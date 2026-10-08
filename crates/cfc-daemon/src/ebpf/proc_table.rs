@@ -69,7 +69,8 @@ use std::time::{Duration, Instant};
 const ENTRY_TTL: Duration = Duration::from_secs(3600);
 
 /// Hard cap on live entries, matching the kernel map's `max_entries`. When
-/// full, expired entries are pruned first and then the oldest is evicted.
+/// full, expired entries are pruned first and then the oldest eighth is
+/// evicted.
 const MAX_ENTRIES: usize = 10_240;
 
 /// One process as the kernel described it at `execve()` time.
@@ -200,9 +201,14 @@ impl KernelProcTable {
         if map.len() >= MAX_ENTRIES && !map.contains_key(&proc.pid) {
             map.retain(|_, e| now.saturating_duration_since(e.seen_at) <= ENTRY_TTL);
             if map.len() >= MAX_ENTRIES {
-                if let Some(oldest) = map.iter().min_by_key(|(_, e)| e.seen_at).map(|(k, _)| *k) {
-                    map.remove(&oldest);
-                }
+                // The oldest eighth in one pass, not the single oldest: that
+                // made every exec at the cap scan the whole table twice under
+                // the write lock packet-path lookups wait on. Now the next
+                // MAX_ENTRIES / 8 execs insert without scanning.
+                let mut ages: Vec<Instant> = map.values().map(|e| e.seen_at).collect();
+                let (_, cutoff, _) = ages.select_nth_unstable(MAX_ENTRIES / 8);
+                let cutoff = *cutoff;
+                map.retain(|_, e| e.seen_at > cutoff);
             }
         }
         map.insert(
@@ -498,6 +504,11 @@ mod tests {
             );
         }
         assert!(t.len() <= MAX_ENTRIES, "len {} > cap", t.len());
+        assert!(
+            t.len() <= MAX_ENTRIES - MAX_ENTRIES / 8 + 16,
+            "one full scan makes room for many execs, len {}",
+            t.len()
+        );
         let last = MAX_ENTRIES as u32 + 15;
         assert!(
             t.get(last, Some(u64::from(last)), now).is_some(),

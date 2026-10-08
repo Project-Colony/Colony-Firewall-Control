@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 
-/// Entries kept at once. Older ones fall off the back.
+/// Entries kept at once. The oldest non-sticky entry is dropped first.
 pub const CAP: usize = 5;
 
 /// How long a non-sticky entry stays visible.
@@ -80,8 +80,16 @@ impl StatusLog {
             count: 1,
             sticky,
         });
+        // Evict the oldest entry that is not sticky: a burst of routine
+        // lines (prompt expiries) must not push out the failure the user
+        // has to act on.
         while self.entries.len() > CAP {
-            self.entries.pop_back();
+            let victim = self
+                .entries
+                .iter()
+                .rposition(|e| !e.sticky)
+                .unwrap_or(self.entries.len() - 1);
+            let _ = self.entries.remove(victim);
         }
     }
 
@@ -161,6 +169,17 @@ mod tests {
         assert_eq!(log.iter().next().unwrap().text, format!("line {}", CAP + 2));
         // The oldest lines were evicted.
         assert!(!log.iter().any(|e| e.text == "line 0"));
+    }
+
+    #[test]
+    fn a_burst_of_warnings_does_not_evict_an_error() {
+        let mut log = StatusLog::default();
+        log.error("verdict failed", 0);
+        for i in 0..(CAP + 3) {
+            log.warn(format!("prompt {i} expired"), 1 + i as i64);
+        }
+        assert_eq!(log.len(), CAP);
+        assert!(log.iter().any(|e| e.text == "verdict failed"));
     }
 
     #[test]

@@ -39,13 +39,29 @@ const DELETE_CONFIRM_MS: i64 = 3_000;
 /// a smooth bar, slow enough to stay off the CPU when nothing is pending.
 const DEADLINE_TICK_MS: u64 = 400;
 
+/// How long a prompt's verdict controls stay disabled after the card
+/// appears, how long the keyboard target stays disarmed after it changes,
+/// and how long Pause stays disabled after a reconnect. A click or key press
+/// already on its way when the layout changed (the window was raised, a card
+/// arrived, the card above expired, Pause replaced Reconnect) must not land
+/// on a control the user never saw.
+const PROMPT_ARM_MS: i64 = 1_000;
+
 fn main() -> iced::Result {
+    // First, before any thread, display or daemon connection exists: the
+    // daemon accepts changes only from a sealed, installed copy of this app.
+    let sealed = cfc_client::seal_official_process();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,cfc_ui=info")),
         )
         .init();
+    if let Err(error) = sealed {
+        tracing::warn!(
+            "could not seal the process ({error}); the daemon will treat this app as read-only"
+        );
+    }
 
     iced::application(App::new, App::update, App::view)
         .title(App::title)
@@ -59,8 +75,11 @@ pub struct App {
     pub tab: Tab,
     pub daemon: DaemonState,
     pub rules: Vec<proto::RuleInfo>,
-    pub live: VecDeque<LiveEntry>,
+    pub live: VecDeque<proto::ConnectionEvent>,
     pub prompts: Vec<PromptCard>,
+    /// The card the A/D keys answer and when they may: `(prompt_id,
+    /// armed_at_ms)`. See [`App::sync_key_target`].
+    pub key_target: Option<(String, i64)>,
     pub status: Option<proto::StatusResponse>,
     pub log: StatusLog,
     pub editor: Option<RuleEditor>,
@@ -72,7 +91,7 @@ pub struct App {
     pub live_verdict: VerdictFilter,
     /// Snapshot rendered while the feed is paused. The buffer behind it
     /// keeps filling, so nothing is lost.
-    pub live_frozen: Option<Vec<LiveEntry>>,
+    pub live_frozen: Option<Vec<proto::ConnectionEvent>>,
     pub live_new: usize,
     pub session: SessionStats,
     /// Consecutive `StatusLoaded(Err)` since the last success.
@@ -80,6 +99,13 @@ pub struct App {
     pub status_ticks: u32,
     /// Failed reconnect attempts, feeding the backoff.
     pub retry_attempts: u32,
+    /// When Pause last took its header slot: a handshake (it replaces
+    /// Reconnect) or enforcement resuming (it replaces Resume). Pause stays
+    /// disabled for [`PROMPT_ARM_MS`] after it (see [`App::pause_armed`]).
+    pub pause_shown_at_ms: i64,
+    /// A pause or resume request is in flight, possibly waiting on the
+    /// administrator password dialog. Pause and Resume stay disabled.
+    pub pause_pending: bool,
     pub retry_at_ms: Option<i64>,
     /// Set when a gRPC stream drops; the badge shows "reconnecting" instead
     /// of the footer being rewritten every two seconds.
@@ -113,97 +139,63 @@ pub struct RuleEditor {
     pub created_at_unix_ms: i64,
     pub hit_count: u64,
     pub enabled: bool,
-    /// Scope predicates this editor has no widget for, carried through
-    /// untouched.
+    /// The edited rule's scope, so the predicates this editor has no widget
+    /// for are carried through untouched.
     ///
     /// `cfc rules add --uid`, an imported opensnitch ruleset, or a
     /// checksum-pinned rule can all set these. Rebuilding the scope from
     /// the visible fields alone would silently *widen* such a rule on
     /// save: a deny scoped to one uid would start matching every user,
-    /// and a sha256-pinned allow would lose its binary pin.
-    pub carried_scope: CarriedScope,
+    /// a sha256-pinned allow would lose its binary pin, and an inbound rule
+    /// (unset direction means outbound) would turn outbound with its source
+    /// scope gone. Its visible fields are stale once the form is edited, so
+    /// only [`hidden_scope_is_set`], [`hidden_scope_summary`] and the
+    /// unchanged-path check read it, and saving overwrites them from the form.
+    pub carried_scope: proto::RuleScope,
 }
 
-/// Scope predicates preserved verbatim across an edit (see
-/// [`RuleEditor::carried_scope`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CarriedScope {
-    pub exe_sha256: String,
-    pub parent_exe: String,
-    pub uid: u32,
-    pub has_uid: bool,
-    // The flow-side predicates the editor has no widgets for. Before they
-    // were carried, saving any edit rebuilt them as unset - and an unset
-    // direction means outbound, so renaming an inbound rule silently turned
-    // it into an outbound one with its source scope gone.
-    pub direction: i32,
-    pub has_direction: bool,
-    pub src_net: String,
-    pub src_port: u32,
-    pub has_src_port: bool,
+/// True when `scope` carries a constraint the editor cannot show, so the view
+/// can tell the user rather than let them assume the visible fields are the
+/// whole rule.
+pub fn hidden_scope_is_set(scope: &proto::RuleScope) -> bool {
+    scope.has_uid
+        || !scope.exe_sha256.is_empty()
+        || !scope.parent_exe.is_empty()
+        || scope.has_direction
+        || !scope.src_net.is_empty()
+        || scope.has_src_port
 }
 
-impl CarriedScope {
-    fn from_scope(scope: Option<&proto::RuleScope>) -> Self {
-        match scope {
-            Some(s) => Self {
-                exe_sha256: s.exe_sha256.clone(),
-                parent_exe: s.parent_exe.clone(),
-                uid: s.uid,
-                has_uid: s.has_uid,
-                direction: s.direction,
-                has_direction: s.has_direction,
-                src_net: s.src_net.clone(),
-                src_port: s.src_port,
-                has_src_port: s.has_src_port,
-            },
-            None => Self::default(),
-        }
+/// One-line human summary of the hidden predicates, for that notice.
+pub fn hidden_scope_summary(scope: &proto::RuleScope) -> String {
+    let mut parts = Vec::new();
+    if scope.has_direction {
+        parts.push(
+            match proto::Direction::try_from(scope.direction) {
+                Ok(proto::Direction::Inbound) => "inbound",
+                Ok(proto::Direction::Outbound) => "outbound",
+                _ => "direction ?",
+            }
+            .to_string(),
+        );
     }
-
-    /// True when the rule carries a constraint the editor cannot show, so
-    /// the view can tell the user rather than let them assume the visible
-    /// fields are the whole rule.
-    pub fn is_set(&self) -> bool {
-        self.has_uid
-            || !self.exe_sha256.is_empty()
-            || !self.parent_exe.is_empty()
-            || self.has_direction
-            || !self.src_net.is_empty()
-            || self.has_src_port
+    if !scope.src_net.is_empty() {
+        parts.push(format!("from {}", scope.src_net));
     }
-
-    /// One-line human summary of the hidden predicates, for that notice.
-    pub fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        if self.has_direction {
-            parts.push(
-                match proto::Direction::try_from(self.direction) {
-                    Ok(proto::Direction::Inbound) => "inbound",
-                    Ok(proto::Direction::Outbound) => "outbound",
-                    _ => "direction ?",
-                }
-                .to_string(),
-            );
-        }
-        if !self.src_net.is_empty() {
-            parts.push(format!("from {}", self.src_net));
-        }
-        if self.has_src_port {
-            parts.push(format!("src port {}", self.src_port));
-        }
-        if self.has_uid {
-            parts.push(format!("uid {}", self.uid));
-        }
-        if !self.parent_exe.is_empty() {
-            parts.push(format!("parent {}", self.parent_exe));
-        }
-        if !self.exe_sha256.is_empty() {
-            let short: String = self.exe_sha256.chars().take(12).collect();
-            parts.push(format!("sha256 {short}..."));
-        }
-        parts.join(", ")
+    if scope.has_src_port {
+        parts.push(format!("src port {}", scope.src_port));
     }
+    if scope.has_uid {
+        parts.push(format!("uid {}", scope.uid));
+    }
+    if !scope.parent_exe.is_empty() {
+        parts.push(format!("parent {}", scope.parent_exe));
+    }
+    if !scope.exe_sha256.is_empty() {
+        let short: String = scope.exe_sha256.chars().take(12).collect();
+        parts.push(format!("sha256 {short}..."));
+    }
+    parts.join(", ")
 }
 
 impl Default for RuleEditor {
@@ -225,7 +217,7 @@ impl Default for RuleEditor {
             created_at_unix_ms: 0,
             hit_count: 0,
             enabled: true,
-            carried_scope: CarriedScope::default(),
+            carried_scope: proto::RuleScope::default(),
         }
     }
 }
@@ -257,7 +249,7 @@ impl RuleEditor {
             created_at_unix_ms: rule.created_at_unix_ms,
             hit_count: rule.hit_count,
             enabled: rule.enabled,
-            carried_scope: CarriedScope::from_scope(scope),
+            carried_scope: scope.cloned().unwrap_or_default(),
         }
     }
 
@@ -265,23 +257,25 @@ impl RuleEditor {
     /// creating it").
     ///
     /// The connection remains pending until Save submits an explicit verdict,
-    /// or the daemon applies its timeout policy.
+    /// or the daemon applies its timeout policy. In that second case the
+    /// editor stays open as a new rule (see `App::detach_orphaned_editor`).
     pub fn from_prompt(ev: &proto::PromptEvent) -> Self {
         let exe = ev
             .process
             .as_ref()
             .map(|p| p.exe.as_str())
             .unwrap_or_default();
-        let (dst_host, dst_ip, dst_port, protocol) = match ev.connection.as_ref() {
+        let (src_ip, dst_ip, dst_port, protocol, direction) = match ev.connection.as_ref() {
             Some(c) => (
-                c.dst_host.as_str(),
+                c.src_ip.as_str(),
                 c.dst_ip.as_str(),
                 c.dst_port,
                 c.protocol,
+                c.direction,
             ),
-            None => ("", "", 0, 0),
+            None => ("", "", 0, 0, 0),
         };
-        let mut editor = Self::from_observed(exe, dst_host, dst_ip, dst_port, protocol);
+        let mut editor = Self::from_observed(exe, src_ip, dst_ip, dst_port, protocol, direction);
         editor.prompt_id = Some(ev.prompt_id.clone());
         editor.prompt_hash_required = ev.binds_to_hash;
         if ev.binds_to_hash {
@@ -294,63 +288,120 @@ impl RuleEditor {
         editor
     }
 
-    /// Seeds the editor from an observed flow (live feed "make rule").
-    /// Pins the numeric endpoint IP; DNS names remain diagnostic.
+    /// Seeds the editor from an observed flow (live feed "make rule", and
+    /// a prompt's "Customize").
+    ///
+    /// When the executable can scope a rule, the seed is that program on
+    /// that port and protocol, the same scope `cfc rules add --exe
+    /// --dst-port --protocol` builds. Pinning the one address seen made a
+    /// rule the next connection of the same service, to another CDN address
+    /// or over IPv6, did not match, so the app stayed denied after "make
+    /// rule" while the CLI rule worked (#46). The user can still type an
+    /// address into the destination field.
+    ///
+    /// Otherwise the placeholder for an unidentified process is never
+    /// seeded, since a rule on it is refused, and the numeric endpoint is
+    /// pinned instead so the rule does not cover the whole port. DNS names
+    /// stay diagnostic.
+    ///
+    /// An inbound flow keeps its direction (without it the rule would be an
+    /// outbound one to our own address) and pins the one peer seen as its
+    /// source. Inbound, the destination is this machine, which the daemon
+    /// refuses as a scope, and the editor has no source field: a seed on our
+    /// own address could not be saved, and clearing it opened the port to
+    /// every peer.
     pub fn from_observed(
         exe: &str,
-        _dst_host: &str,
+        src_ip: &str,
         dst_ip: &str,
         dst_port: u32,
         protocol: i32,
+        direction: i32,
     ) -> Self {
         let protocol = proto::Protocol::try_from(protocol)
             .ok()
             .filter(|p| !matches!(p, proto::Protocol::Unspecified));
+        let inbound = direction == proto::Direction::Inbound as i32;
+        // Inbound flows are never attributed to a program.
+        let scopable = !inbound && cfc_client::convert::exe_is_rule_scopable(exe);
         Self {
             name: String::new(),
-            exe: exe.to_string(),
+            exe: if scopable {
+                exe.to_string()
+            } else {
+                String::new()
+            },
             dst_host: String::new(),
-            dst_net: format::host_cidr(dst_ip),
+            dst_net: if scopable || inbound {
+                String::new()
+            } else {
+                format::host_cidr(dst_ip)
+            },
             dst_port: if dst_port == 0 {
                 String::new()
             } else {
                 dst_port.to_string()
             },
             protocol,
+            carried_scope: proto::RuleScope {
+                direction: if inbound { direction } else { 0 },
+                has_direction: inbound,
+                src_net: if inbound {
+                    format::host_cidr(src_ip)
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            },
             ..Self::default()
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct LiveEntry {
-    pub event: proto::ConnectionEvent,
-}
-
-#[derive(Debug, Clone)]
 pub struct PromptCard {
+    /// `deadline_unix_ms` is the wall clock at which the daemon answers this
+    /// prompt itself; 0 means it attached no deadline.
     pub event: proto::PromptEvent,
-    /// Wall clock at which the daemon answers this prompt itself. 0 means
-    /// the daemon attached no deadline.
-    pub deadline_unix_ms: i64,
+    /// Wall clock before which the verdict buttons stay disabled: a second
+    /// after the card arrives, and again after it moves up.
+    pub armed_at_ms: i64,
+    /// A verdict for it is on its way to the daemon. The card stays until
+    /// the daemon confirms, so a verdict that never arrived can be given
+    /// again instead of leaving the flow to the timeout default.
+    pub submitting: bool,
 }
 
 impl PromptCard {
-    fn new(event: proto::PromptEvent) -> Self {
+    fn new(event: proto::PromptEvent, now_ms: i64) -> Self {
         Self {
-            deadline_unix_ms: event.deadline_unix_ms,
             event,
+            armed_at_ms: now_ms.saturating_add(PROMPT_ARM_MS),
+            submitting: false,
         }
     }
+
+    /// Whether its verdict controls accept input.
+    pub fn armed(&self, now_ms: i64) -> bool {
+        !self.submitting && now_ms >= self.armed_at_ms
+    }
+}
+
+/// A verdict that did not do what the user asked.
+#[derive(Debug, Clone)]
+pub struct VerdictFailure {
+    pub prompt_id: String,
+    /// The daemon applied the answer and only the lasting rule failed. The
+    /// prompt is gone then, so its card must not come back.
+    pub applied: bool,
+    pub message: String,
 }
 
 /// How loudly a newly arrived prompt announces itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attention {
-    /// Leave the window alone entirely.
+    /// Leave the window and the tab alone; the sidebar badge counts it.
     None,
-    /// Show the Prompts tab, but do not touch the window.
-    Tab,
     /// Show the Prompts tab and pull the window in front of whatever the
     /// user is looking at.
     TabAndRaise,
@@ -359,20 +410,22 @@ pub enum Attention {
 /// Decides what the arrival of a prompt does to the window.
 ///
 /// `pending_before` is the queue length *before* this prompt was pushed, so
-/// only the 0 -> 1 transition raises. A burst of ten prompts must not slam
-/// the window into the user's face ten times; a queue that drains and then
-/// refills is a genuinely new interruption and may raise again.
+/// only the 0 -> 1 transition switches the tab and raises. A burst of ten
+/// prompts must not slam the window into the user's face ten times, and a
+/// user who left the Prompts tab with prompts pending already knows about
+/// them: switching the tab under their cursor again would turn the click
+/// they were making on a rule row into a click on a verdict. A queue that
+/// drains and then refills is a genuinely new interruption and may raise
+/// again.
 ///
 /// An open rule editor suppresses all of it. Focus-stealing is disruptive
 /// at the best of times, and yanking the tab out from under someone
 /// half-way through a form loses what they had typed.
 pub fn prompt_attention(pending_before: usize, editor_open: bool) -> Attention {
-    if editor_open {
+    if editor_open || pending_before > 0 {
         Attention::None
-    } else if pending_before == 0 {
-        Attention::TabAndRaise
     } else {
-        Attention::Tab
+        Attention::TabAndRaise
     }
 }
 
@@ -436,7 +489,7 @@ pub enum Message {
         scope: Option<proto::RuleScope>,
         duration: proto::Duration,
     },
-    VerdictSubmitted(Result<(String, bool, Option<String>), String>),
+    VerdictSubmitted(Result<(String, bool, Option<String>), VerdictFailure>),
     OpenEditor,
     EditExistingRule(String),
     CloseEditor,
@@ -449,10 +502,11 @@ pub enum Message {
     /// Opens the rule editor pre-filled from an observed connection.
     MakeRuleFromEvent {
         exe: String,
-        dst_host: String,
+        src_ip: String,
         dst_ip: String,
         dst_port: u32,
         protocol: i32,
+        direction: i32,
     },
     CopyText(String),
     DismissLogEntry(usize),
@@ -471,7 +525,7 @@ pub enum Message {
     EditorProtocol(Option<proto::Protocol>),
     SaveRule,
     RuleSaved(Result<String, String>),
-    PromptRuleSaved(Result<(String, bool, Option<String>), String>),
+    PromptRuleSaved(Result<(String, bool, Option<String>), VerdictFailure>),
 }
 
 /// Raw key press forwarded from the subscription. The decision of what a
@@ -519,6 +573,7 @@ impl App {
             rules: Vec::new(),
             live: VecDeque::with_capacity(LIVE_CAP),
             prompts: Vec::new(),
+            key_target: None,
             status: None,
             log: StatusLog::default(),
             editor: None,
@@ -534,6 +589,8 @@ impl App {
             status_ticks: 0,
             retry_attempts: 0,
             retry_at_ms: None,
+            pause_shown_at_ms: 0,
+            pause_pending: false,
             stream_trouble: false,
             now_ms: now_ms(),
         };
@@ -550,6 +607,15 @@ impl App {
 
     fn connected(&self) -> bool {
         matches!(self.daemon, DaemonState::Connected)
+    }
+
+    /// Pause takes the place of Reconnect, at the right end of the header,
+    /// as soon as a handshake lands, and the place of Resume as soon as
+    /// enforcement resumes. The second click of a double-click on Reconnect
+    /// or Resume would otherwise switch enforcement off with no
+    /// confirmation.
+    fn pause_armed(&self) -> bool {
+        self.now_ms >= self.pause_shown_at_ms.saturating_add(PROMPT_ARM_MS)
     }
 
     fn connect_task(&mut self) -> Task<Message> {
@@ -600,22 +666,15 @@ impl App {
 
         let now = self.now_ms;
         let mut expired: Vec<String> = Vec::new();
-        self.prompts.retain(|p| {
-            if format::is_expired(p.deadline_unix_ms, now) {
+        self.retire_cards(|p| {
+            if format::is_expired(p.event.deadline_unix_ms, now) {
                 expired.push(prompt_label(&p.event));
                 false
             } else {
                 true
             }
         });
-        if self
-            .editor
-            .as_ref()
-            .and_then(|editor| editor.prompt_id.as_ref())
-            .is_some_and(|id| !self.prompts.iter().any(|card| &card.event.prompt_id == id))
-        {
-            self.editor = None;
-        }
+        self.detach_orphaned_editor();
         for label in expired {
             self.log.warn(
                 format!(
@@ -625,6 +684,89 @@ impl App {
                 now,
             );
         }
+        self.sync_key_target();
+    }
+
+    /// Points the keyboard at the top card and disarms it for
+    /// [`PROMPT_ARM_MS`] whenever that card changes.
+    ///
+    /// The top card is the oldest one, first on screen and first to expire,
+    /// and a new arrival never displaces it. Re-arming on every change means
+    /// a key press already on its way when the card above expired or was
+    /// answered does not land on the card that just moved up.
+    fn sync_key_target(&mut self) {
+        let top = self.key_target_card().map(|card| &card.event.prompt_id);
+        if self.key_target.as_ref().map(|(id, _)| id) != top {
+            self.key_target = top.map(|id| (id.clone(), self.now_ms.saturating_add(PROMPT_ARM_MS)));
+        }
+    }
+
+    /// The top card that is not already being answered.
+    fn key_target_card(&self) -> Option<&PromptCard> {
+        self.prompts.iter().find(|card| !card.submitting)
+    }
+
+    /// Keeps a customization whose prompt is gone (expired, answered
+    /// elsewhere, stream dropped) open as a plain new rule.
+    ///
+    /// It used to be closed, which threw away the rule the user was
+    /// building and any error banner explaining why a save failed. Save now
+    /// stores the rule with `UpsertRule`, since there is no prompt left to
+    /// answer.
+    fn detach_orphaned_editor(&mut self) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if editor
+            .prompt_id
+            .as_ref()
+            .is_some_and(|id| !self.prompts.iter().any(|card| &card.event.prompt_id == id))
+        {
+            editor.prompt_id = None;
+            self.log.warn(
+                "the prompt being customized is gone; Save now stores a new rule",
+                self.now_ms,
+            );
+        }
+    }
+
+    /// Drops the cards `keep` rejects and disarms, for [`PROMPT_ARM_MS`],
+    /// every card that moved up to take a dropped card's place.
+    ///
+    /// A card's buttons are otherwise armed from its arrival, so the second
+    /// click of a double-click on one card, or a click on a card that
+    /// expired under the cursor, landed on the button of the program below
+    /// that just moved into the same spot.
+    fn retire_cards(&mut self, mut keep: impl FnMut(&PromptCard) -> bool) {
+        let rearm_at = self.now_ms.saturating_add(PROMPT_ARM_MS);
+        let mut moved = false;
+        self.prompts.retain_mut(|card| {
+            if !keep(card) {
+                moved = true;
+                return false;
+            }
+            if moved {
+                card.armed_at_ms = card.armed_at_ms.max(rearm_at);
+            }
+            true
+        });
+    }
+
+    /// Settles the card a verdict was sent for: gone once the daemon has
+    /// applied an answer, answerable again when nothing was applied.
+    fn settle_card(&mut self, prompt_id: &str, applied: bool) {
+        // The arming window below counts from now, not from the last tick.
+        self.now_ms = now_ms();
+        if applied {
+            self.retire_cards(|card| card.event.prompt_id != prompt_id);
+        } else if let Some(card) = self
+            .prompts
+            .iter_mut()
+            .find(|card| card.event.prompt_id == prompt_id)
+        {
+            card.submitting = false;
+        }
+        self.sync_key_target();
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -638,6 +780,8 @@ impl App {
                 self.connect_task()
             }
             Message::HandshakeDone(Ok(data)) => {
+                self.now_ms = now_ms();
+                self.pause_shown_at_ms = self.now_ms;
                 self.daemon = DaemonState::Connected;
                 self.status = Some(data.status);
                 self.rules = data.rules;
@@ -691,6 +835,10 @@ impl App {
                 Task::none()
             }
             Message::StatusLoaded(Ok(s)) => {
+                // A timed pause ran out, or another client resumed.
+                if self.status.as_ref().is_some_and(|old| old.paused) && !s.paused {
+                    self.pause_shown_at_ms = self.now_ms;
+                }
                 self.status = Some(s);
                 self.status_failures = 0;
                 self.stream_trouble = false;
@@ -744,7 +892,7 @@ impl App {
             Message::LiveEvent(ev) => {
                 self.stream_trouble = false;
                 self.session.record(&ev);
-                self.live.push_front(LiveEntry { event: ev });
+                self.live.push_front(ev);
                 while self.live.len() > LIVE_CAP {
                     self.live.pop_back();
                 }
@@ -765,17 +913,17 @@ impl App {
                 // notifications now - two bubbles per prompt would train
                 // users to ignore them. The GUI shows its card either way.
                 self.stream_trouble = false;
+                // The arming deadline is measured from now, not from the
+                // last tick, which can be two seconds old.
+                self.now_ms = now_ms();
                 // A prompt is a held-open connection with a deadline on it;
                 // a card the user only sees if they happen to be looking at
                 // the right tab is not an ask, it is a countdown they lose.
                 let attention = prompt_attention(self.prompts.len(), self.editor.is_some());
-                self.prompts.push(PromptCard::new(ev));
+                self.prompts.push(PromptCard::new(ev, self.now_ms));
+                self.sync_key_target();
                 match attention {
                     Attention::None => Task::none(),
-                    Attention::Tab => {
-                        self.tab = Tab::Prompts;
-                        Task::none()
-                    }
                     Attention::TabAndRaise => {
                         self.tab = Tab::Prompts;
                         raise_window()
@@ -785,13 +933,7 @@ impl App {
             Message::PromptStreamEnded(e) => {
                 self.stream_trouble = true;
                 self.prompts.clear();
-                if self
-                    .editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.prompt_id.is_some())
-                {
-                    self.editor = None;
-                }
+                self.detach_orphaned_editor();
                 info!("prompt stream interrupted: {e}");
                 Task::none()
             }
@@ -810,14 +952,25 @@ impl App {
                 scope,
                 duration,
             } => {
-                self.prompts.retain(|p| p.event.prompt_id != prompt_id);
+                // One verdict per card at a time. The card stays, disabled,
+                // until the daemon confirms (see `settle_card`).
+                let Some(card) = self
+                    .prompts
+                    .iter_mut()
+                    .find(|p| p.event.prompt_id == prompt_id && !p.submitting)
+                else {
+                    return Task::none();
+                };
+                card.submitting = true;
+                self.sync_key_target();
                 let socket = self.socket_path.clone();
                 Task::perform(
                     submit_verdict(socket, prompt_id, action, scope, duration, false),
                     Message::VerdictSubmitted,
                 )
             }
-            Message::VerdictSubmitted(Ok((_, true, note))) => {
+            Message::VerdictSubmitted(Ok((prompt_id, true, note))) => {
+                self.settle_card(&prompt_id, true);
                 // The daemon telling the user something true about the rule
                 // it stored - today, that a user-writable binary was
                 // hash-bound and a swapped file will prompt again. Shown in
@@ -831,7 +984,8 @@ impl App {
                 let socket = self.socket_path.clone();
                 Task::perform(fetch_rules(socket), Message::RulesLoaded)
             }
-            Message::VerdictSubmitted(Ok((_, false, _))) => {
+            Message::VerdictSubmitted(Ok((prompt_id, false, _))) => {
+                self.settle_card(&prompt_id, true);
                 // The daemon had already answered this prompt itself. The
                 // old code swallowed this, so the user believed they had
                 // allowed something the timeout had actually decided.
@@ -841,8 +995,17 @@ impl App {
                 );
                 Task::none()
             }
-            Message::VerdictSubmitted(Err(e)) => {
-                self.log.error(format!("verdict failed: {e}"), self.now_ms);
+            Message::VerdictSubmitted(Err(failure)) => {
+                self.settle_card(&failure.prompt_id, failure.applied);
+                let still = if failure.applied {
+                    ""
+                } else {
+                    " - the prompt is still waiting for an answer"
+                };
+                self.log.error(
+                    format!("verdict failed: {}{still}", failure.message),
+                    self.now_ms,
+                );
                 Task::none()
             }
             Message::OpenEditor => {
@@ -898,13 +1061,14 @@ impl App {
             }
             Message::MakeRuleFromEvent {
                 exe,
-                dst_host,
+                src_ip,
                 dst_ip,
                 dst_port,
                 protocol,
+                direction,
             } => {
                 self.editor = Some(RuleEditor::from_observed(
-                    &exe, &dst_host, &dst_ip, dst_port, protocol,
+                    &exe, &src_ip, &dst_ip, dst_port, protocol, direction,
                 ));
                 self.tab = Tab::Rules;
                 Task::none()
@@ -918,13 +1082,27 @@ impl App {
                 self.log.clear();
                 Task::none()
             }
-            Message::Key(kp) => self.handle_key(kp),
+            Message::Key(kp) => {
+                self.now_ms = now_ms();
+                self.handle_key(kp)
+            }
             Message::TogglePaused => {
                 let current = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
+                if self.pause_pending || (!current && !self.pause_armed()) {
+                    return Task::none();
+                }
+                self.pause_pending = true;
+                self.log
+                    .info("Waiting for administrator authorization...", self.now_ms);
                 let socket = self.socket_path.clone();
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
             Message::PausedSet(Ok((paused, resume_at_unix_ms))) => {
+                self.pause_pending = false;
+                if !paused {
+                    self.now_ms = now_ms();
+                    self.pause_shown_at_ms = self.now_ms;
+                }
                 if let Some(s) = &mut self.status {
                     s.paused = paused;
                     s.resume_at_unix_ms = resume_at_unix_ms;
@@ -943,6 +1121,7 @@ impl App {
                 Task::none()
             }
             Message::PausedSet(Err(e)) => {
+                self.pause_pending = false;
                 self.log.error(format!("pause failed: {e}"), self.now_ms);
                 Task::none()
             }
@@ -998,6 +1177,8 @@ impl App {
                 Task::none()
             }
             Message::SaveRule => {
+                // The prompt may have expired since the last tick.
+                self.detach_orphaned_editor();
                 let Some(editor) = &mut self.editor else {
                     return Task::none();
                 };
@@ -1009,8 +1190,18 @@ impl App {
                             let action = editor.action;
                             let duration = editor.duration;
                             let scope = rule.scope;
-                            self.prompts
-                                .retain(|card| card.event.prompt_id != prompt_id);
+                            // Held, not dropped, until the daemon answers:
+                            // a dropped card closed this editor on the next
+                            // tick and took a failed save's banner with it.
+                            let Some(card) = self
+                                .prompts
+                                .iter_mut()
+                                .find(|c| c.event.prompt_id == prompt_id && !c.submitting)
+                            else {
+                                return Task::none();
+                            };
+                            card.submitting = true;
+                            self.sync_key_target();
                             Task::perform(
                                 submit_verdict(socket, prompt_id, action, scope, duration, true),
                                 Message::PromptRuleSaved,
@@ -1020,6 +1211,11 @@ impl App {
                         }
                     }
                     Err(e) => {
+                        // Also in the footer: the banner sits at the bottom
+                        // of the form and can be below the fold, which made
+                        // Save look like it did nothing.
+                        self.log
+                            .error(format!("saving rule failed: {e}"), self.now_ms);
                         editor.validation = Some(e);
                         Task::none()
                     }
@@ -1029,12 +1225,22 @@ impl App {
                 self.editor = None;
                 self.update(Message::VerdictSubmitted(Ok((id, true, note))))
             }
-            Message::PromptRuleSaved(Ok((_, false, _))) => {
+            Message::PromptRuleSaved(Ok((id, false, _))) => {
                 self.editor = None;
-                self.update(Message::VerdictSubmitted(Ok((String::new(), false, None))))
+                self.update(Message::VerdictSubmitted(Ok((id, false, None))))
             }
-            Message::PromptRuleSaved(Err(error)) => self.update(Message::RuleSaved(Err(error))),
-            Message::RuleSaved(Ok(_)) => {
+            Message::PromptRuleSaved(Err(failure)) => {
+                // The editor stays open with the error. If the answer was
+                // applied the card is gone, and the editor then turns into a
+                // plain new rule the user can save again.
+                self.settle_card(&failure.prompt_id, failure.applied);
+                self.detach_orphaned_editor();
+                self.update(Message::RuleSaved(Err(failure.message)))
+            }
+            Message::RuleSaved(Ok(line)) => {
+                // Say what was stored: closing the editor in silence read
+                // as accepted whatever scope the rule ended up with.
+                self.log.info(line, self.now_ms);
                 self.editor = None;
                 let socket = self.socket_path.clone();
                 Task::perform(fetch_rules(socket), Message::RulesLoaded)
@@ -1077,14 +1283,23 @@ impl App {
                 Task::none()
             }
             keyboard::Key::Character(ref c) => {
+                // Only bare keys and Shift are ours. Ctrl+A is "select all"
+                // out of habit, and Alt and Super chords belong to the
+                // desktop; none of them may answer a prompt.
+                if kp.modifiers.control() || kp.modifiers.alt() || kp.modifiers.logo() {
+                    return Task::none();
+                }
                 let shift = kp.modifiers.shift();
+                let on_prompts = self.tab == Tab::Prompts;
                 match c.to_lowercase().as_str() {
-                    "a" => self.answer_newest(if shift {
+                    // The verdict keys only work where the card they answer
+                    // is on screen.
+                    "a" if on_prompts => self.answer_key_target(if shift {
                         PromptAction::AllowProgram
                     } else {
                         PromptAction::AllowOnce
                     }),
-                    "d" => self.answer_newest(if shift {
+                    "d" if on_prompts => self.answer_key_target(if shift {
                         PromptAction::BlockProgram
                     } else {
                         PromptAction::BlockOnce
@@ -1100,16 +1315,29 @@ impl App {
         }
     }
 
-    /// Answers the most recent prompt with the same verdict the matching
-    /// button would submit.
+    /// Answers the top card, the one marked as the keyboard target, with
+    /// the same verdict the matching button would submit. Does nothing while
+    /// the target is disarmed (see [`App::sync_key_target`]).
+    ///
+    /// It used to answer the newest prompt, which is the bottom card and
+    /// often below the fold: the user read the card at the top, pressed
+    /// Shift+A, and wrote an always-allow rule for a program they never saw.
     ///
     /// A program-scoped choice on a flow with no executable path has no
     /// honest verdict (see `verdict_for`), so it degrades to the one-off
     /// answer of the same action rather than doing nothing: the user
     /// pressed Shift+D to stop a connection, and stopping it is the part
     /// that matters.
-    fn answer_newest(&mut self, choice: PromptAction) -> Task<Message> {
-        let Some(card) = self.prompts.last() else {
+    fn answer_key_target(&mut self, choice: PromptAction) -> Task<Message> {
+        self.sync_key_target();
+        if !self
+            .key_target
+            .as_ref()
+            .is_some_and(|(_, armed_at)| self.now_ms >= *armed_at)
+        {
+            return Task::none();
+        }
+        let Some(card) = self.key_target_card() else {
             return Task::none();
         };
         let ev = &card.event;
@@ -1137,7 +1365,12 @@ impl App {
         let sidebar = self.sidebar();
         let header = self.header_bar(paused);
         let body: Element<'_, Message> = match self.tab {
-            Tab::Prompts => views::prompts::view(&self.prompts, self.status.as_ref(), self.now_ms),
+            Tab::Prompts => views::prompts::view(
+                &self.prompts,
+                &self.rules,
+                self.status.as_ref(),
+                self.now_ms,
+            ),
             Tab::Rules => views::rules::view(views::rules::ListArgs {
                 rules: &self.rules,
                 filter: &self.rules_filter,
@@ -1256,6 +1489,7 @@ impl App {
 
         let hints = column![
             text("1-4  switch tab").size(9),
+            text("Keys answer the top prompt:").size(9),
             text("A  allow once").size(9),
             text("D  block for now").size(9),
             text("Shift+A  always allow program").size(9),
@@ -1317,13 +1551,16 @@ impl App {
             if paused {
                 button(text("Resume").size(12))
                     .padding([4, 14])
-                    .on_press(Message::TogglePaused)
+                    .on_press_maybe((!self.pause_pending).then_some(Message::TogglePaused))
                     .style(iced::widget::button::primary)
                     .into()
             } else {
                 button(text("Pause").size(12))
                     .padding([4, 14])
-                    .on_press(Message::TogglePaused)
+                    .on_press_maybe(
+                        (self.pause_armed() && !self.pause_pending)
+                            .then_some(Message::TogglePaused),
+                    )
                     .style(iced::widget::button::secondary)
                     .into()
             }
@@ -1485,9 +1722,12 @@ async fn delete_rule(path: PathBuf, id: String) -> Result<(String, bool), String
 }
 
 /// Returns `(paused, resume_at_unix_ms)`. `duration_secs = 0` lets the
-/// daemon apply its configured default and report the real deadline.
+/// daemon apply its configured default and report the real deadline. The
+/// daemon asks polkit first, so this may wait on a password dialog.
 async fn set_paused(path: PathBuf, paused: bool) -> Result<(bool, i64), String> {
-    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let mut client = Client::connect_interactive(&path)
+        .await
+        .map_err(|e| e.to_string())?;
     let resp = client
         .set_paused(paused, 0)
         .await
@@ -1500,16 +1740,36 @@ async fn fetch_rules(path: PathBuf) -> Result<Vec<proto::RuleInfo>, String> {
     client.list_rules().await.map_err(|e| e.to_string())
 }
 
+/// Saves `rule` and returns the log line describing what was stored.
+///
+/// No executable validation here: the editor validates a path the user typed
+/// or changed, and the enable toggle sends the stored path back unchanged,
+/// which the daemon accepts as is. Checking it again refused to toggle a rule
+/// whose target had since become an alias.
+///
+/// An Allow that names no program waits on an administrator password: the
+/// daemon asks polkit first.
 async fn upsert_rule(path: PathBuf, rule: proto::RuleInfo) -> Result<String, String> {
-    if let Some(scope) = rule
-        .scope
-        .as_ref()
-        .filter(|scope| !scope.exe_path.is_empty())
-    {
-        cfc_core::exe_path::resolve_policy(std::path::Path::new(&scope.exe_path))?;
-    }
-    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
-    client.upsert_rule(rule).await.map_err(|e| e.to_string())
+    let line = saved_rule_line(&rule);
+    let mut client = Client::connect_interactive(&path)
+        .await
+        .map_err(|e| e.to_string())?;
+    client.upsert_rule(rule).await.map_err(|e| e.to_string())?;
+    Ok(line)
+}
+
+/// `"rule saved: allow /usr/bin/curl -> *:443 tcp, always"`.
+fn saved_rule_line(rule: &proto::RuleInfo) -> String {
+    use cfc_client::convert;
+    let summary = convert::rule_summary(rule)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let disabled = if rule.enabled { "" } else { ", disabled" };
+    format!(
+        "rule saved: {summary}, {}{disabled}",
+        convert::rule_duration_label(rule)
+    )
 }
 
 fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
@@ -1577,7 +1837,7 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
         && dst_net.is_empty()
         && dst_port.is_none()
         && ed.protocol.is_none()
-        && !ed.carried_scope.is_set();
+        && !hidden_scope_is_set(&ed.carried_scope);
     if scope_empty {
         return Err(
             "rule must restrict at least one of: exe, dst-host, dst-net, dst-port, protocol".into(),
@@ -1586,9 +1846,16 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
 
     // Validate in the user's namespace as well as the daemon's: ProtectHome
     // and PrivateTmp hide exactly the paths a person commonly enters.
-    let typed = ed.exe.trim();
-    let exe = if typed.is_empty() {
+    // Not trimmed: a file name may end in a space, and saving a rule for
+    // "/opt/app " must not quietly retarget it to "/opt/app".
+    // An edited rule's unchanged path is sent back as stored, as the daemon
+    // expects: it may have become an alias since, and refusing it here left
+    // such a rule impossible to rename or retarget anywhere but the CLI.
+    let typed = ed.exe.as_str();
+    let exe = if typed.trim().is_empty() {
         String::new()
+    } else if ed.editing_id.is_some() && typed == ed.carried_scope.exe_path {
+        typed.to_string()
     } else {
         cfc_core::exe_path::resolve_policy(std::path::Path::new(typed))?
             .into_path()
@@ -1596,30 +1863,18 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
             .into_owned()
     };
 
+    // Every field this form shows is rebuilt from it; everything else is
+    // carried, so a predicate the editor cannot show is never dropped and the
+    // rule never widens on save.
     let scope = proto::RuleScope {
         exe_path: exe,
-        // Not editable here, so preserved rather than dropped: rebuilding
-        // the scope from the visible fields alone would widen the rule.
-        exe_sha256: ed.carried_scope.exe_sha256.clone(),
-        parent_exe: ed.carried_scope.parent_exe.clone(),
-        uid: ed.carried_scope.uid,
-        has_uid: ed.carried_scope.has_uid,
         dst_host: ed.dst_host.trim().to_string(),
         dst_net: dst_net.to_string(),
         dst_port: dst_port.map(u32::from).unwrap_or(0),
         has_dst_port: dst_port.is_some(),
         protocol: ed.protocol.map(|p| p as i32).unwrap_or(0),
         has_protocol: ed.protocol.is_some(),
-        // Carried like exe_sha256 above, and for the same reason - these
-        // three used to be rebuilt as unset here, two lines under the comment
-        // explaining why that must not happen. Unset direction means
-        // outbound, so the visible casualty was every inbound rule touched by
-        // this editor.
-        direction: ed.carried_scope.direction,
-        has_direction: ed.carried_scope.has_direction,
-        src_net: ed.carried_scope.src_net.clone(),
-        src_port: ed.carried_scope.src_port,
-        has_src_port: ed.carried_scope.has_src_port,
+        ..ed.carried_scope.clone()
     };
 
     Ok(proto::RuleInfo {
@@ -1655,23 +1910,38 @@ async fn submit_verdict(
     scope: Option<proto::RuleScope>,
     duration: proto::Duration,
     require_confirmed_rule: bool,
-) -> Result<(String, bool, Option<String>), String> {
+) -> Result<(String, bool, Option<String>), VerdictFailure> {
     let wanted_rule = scope.is_some();
-    let mut client = Client::connect(&path).await.map_err(|e| e.to_string())?;
+    let fail = |applied: bool, message: String| VerdictFailure {
+        prompt_id: prompt_id.clone(),
+        applied,
+        message,
+    };
+    // A customized rule may be an Allow for every program, which waits on an
+    // administrator password before it is stored.
+    let connected = if require_confirmed_rule {
+        Client::connect_interactive(&path).await
+    } else {
+        Client::connect(&path).await
+    };
+    let mut client = connected.map_err(|e| fail(false, e.to_string()))?;
     let outcome = client
         .submit_verdict(&prompt_id, action, duration, scope)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| fail(false, e.to_string()))?;
     // A verdict that applied but saved no rule is not a success to report
     // quietly: the user asked for a lasting answer, did not get one, and will
     // be prompted again by the next connection from the same program.
     if outcome.accepted && wanted_rule && outcome.rule_persisted == Some(false) {
-        return Err(outcome
-            .persist_error
-            .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()));
+        return Err(fail(
+            true,
+            outcome
+                .persist_error
+                .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()),
+        ));
     }
     if outcome.accepted && require_confirmed_rule && outcome.rule_persisted != Some(true) {
-        return Err("the verdict applied, but this daemon did not confirm a standing rule; restart the updated daemon".into());
+        return Err(fail(true, "the verdict applied, but this daemon did not confirm a standing rule; restart the updated daemon".into()));
     }
     Ok((prompt_id, outcome.accepted, outcome.persist_note))
 }
@@ -1738,6 +2008,14 @@ mod tests {
     }
 
     #[test]
+    fn editor_keeps_an_executable_path_verbatim() {
+        let mut ed = editor_with_scope();
+        ed.exe = "/usr/bin/cfc-test-app ".into();
+        let rule = build_rule_from_editor(&ed).unwrap();
+        assert_eq!(rule.scope.unwrap().exe_path, "/usr/bin/cfc-test-app ");
+    }
+
+    #[test]
     fn editor_builds_a_persistable_rule() {
         let rule = build_rule_from_editor(&editor_with_scope()).unwrap();
         assert_eq!(rule.duration, proto::Duration::Always as i32);
@@ -1745,16 +2023,143 @@ mod tests {
     }
 
     #[test]
-    fn observed_seed_pins_the_numeric_endpoint_even_with_a_hostname() {
-        let ed = RuleEditor::from_observed("/bin/x", "example.com", "1.2.3.4", 443, 1);
+    fn editor_sends_an_unchanged_alias_back_but_refuses_a_typed_one() {
+        // /proc/self/exe is a symlink on every Linux, so it stands in for a
+        // stored path that has since become an alias.
+        let mut rule = existing_rule();
+        rule.scope.as_mut().unwrap().exe_path = "/proc/self/exe".into();
+        let mut ed = RuleEditor::from_existing(&rule);
+        ed.name = "renamed".into();
+        let saved = build_rule_from_editor(&ed).expect("unchanged path is kept");
+        assert_eq!(saved.scope.unwrap().exe_path, "/proc/self/exe");
+
+        let mut fresh = editor_with_scope();
+        fresh.exe = "/proc/self/exe".into();
+        assert!(build_rule_from_editor(&fresh).is_err());
+    }
+
+    #[test]
+    fn observed_seed_scopes_by_program_or_pins_the_endpoint_without_one() {
+        let ed = RuleEditor::from_observed("/bin/x", "", "1.2.3.4", 443, 1, 0);
+        assert_eq!(ed.exe, "/bin/x");
         assert!(ed.dst_host.is_empty());
-        assert_eq!(ed.dst_net, "1.2.3.4/32");
+        assert!(
+            ed.dst_net.is_empty(),
+            "a program rule is not pinned to one address"
+        );
         assert_eq!(ed.dst_port, "443");
 
-        let ed = RuleEditor::from_observed("/bin/x", "", "2001:db8::1", 0, 0);
-        assert_eq!(ed.dst_net, "2001:db8::1/128");
-        assert!(ed.dst_port.is_empty());
-        assert!(ed.protocol.is_none());
+        for exe in [cfc_client::convert::UNKNOWN_EXE, ""] {
+            let ed = RuleEditor::from_observed(exe, "", "2001:db8::1", 0, 0, 0);
+            assert!(ed.exe.is_empty(), "{exe:?} is never seeded");
+            assert_eq!(ed.dst_net, "2001:db8::1/128");
+            assert!(ed.dst_port.is_empty());
+            assert!(ed.protocol.is_none());
+        }
+
+        // Inbound: the peer seen, never our own address, which the daemon
+        // refuses as an inbound scope.
+        let inbound = proto::Direction::Inbound as i32;
+        let ed = RuleEditor::from_observed(
+            cfc_client::convert::UNKNOWN_EXE,
+            "192.168.1.20",
+            "10.0.0.2",
+            8384,
+            1,
+            inbound,
+        );
+        let scope = build_rule_from_editor(&ed).unwrap().scope.unwrap();
+        assert!(scope.has_direction);
+        assert_eq!(scope.direction, inbound);
+        assert_eq!(scope.src_net, "192.168.1.20/32");
+        assert!(scope.dst_net.is_empty());
+        assert!(scope.exe_path.is_empty());
+        assert_eq!(scope.dst_port, 8384);
+    }
+
+    /// Issue #46: "make rule" on a LIVE row must either send the rule or say
+    /// why not, and the rule it sends for an identified program must have
+    /// the CLI's scope (program, port, protocol), not a hostname or one IP.
+    #[test]
+    fn live_seeded_rule_is_sent_or_reported() {
+        use proto::Protocol::{Icmp, Tcp, Udp};
+        let rows: [(&str, &str, u32, proto::Protocol); 8] = [
+            ("/usr/bin/curl", "93.184.216.34", 443, Tcp),
+            ("/usr/bin/curl", "2001:db8::1", 443, Tcp),
+            ("/usr/bin/curl", "9.9.9.9", 53, Udp),
+            ("/usr/bin/curl", "93.184.216.34", 0, Icmp),
+            (cfc_client::convert::UNKNOWN_EXE, "93.184.216.34", 443, Tcp),
+            ("", "93.184.216.34", 443, Tcp),
+            ("relative/path", "93.184.216.34", 443, Tcp),
+            (
+                cfc_client::convert::UNKNOWN_EXE,
+                "",
+                0,
+                proto::Protocol::Unspecified,
+            ),
+        ];
+        for (exe, dst_ip, dst_port, protocol) in rows {
+            let (mut app, _) = App::new();
+            let _ = app.update(Message::MakeRuleFromEvent {
+                exe: exe.into(),
+                src_ip: "10.0.0.2".into(),
+                dst_ip: dst_ip.into(),
+                dst_port,
+                protocol: protocol as i32,
+                direction: 0,
+            });
+            let ed = app.editor.as_ref().expect("editor opened");
+            if let Ok(rule) = build_rule_from_editor(ed) {
+                let scope = rule.scope.unwrap();
+                assert!(scope.dst_host.is_empty(), "{exe} {dst_ip}");
+                if cfc_client::convert::exe_is_rule_scopable(exe) {
+                    assert_eq!(scope.exe_path, exe);
+                    assert!(scope.dst_net.is_empty(), "{exe} {dst_ip}");
+                    assert_eq!(scope.has_dst_port, dst_port != 0);
+                    assert!(scope.has_protocol);
+                } else {
+                    assert!(scope.exe_path.is_empty(), "{exe:?} never reaches a rule");
+                }
+            }
+            let errors_before = app
+                .log
+                .iter()
+                .filter(|e| e.severity == status_log::Severity::Error)
+                .count();
+            let sent = app.update(Message::SaveRule).units();
+            let errors = app
+                .log
+                .iter()
+                .filter(|e| e.severity == status_log::Severity::Error)
+                .count();
+            assert!(
+                sent == 1 || errors > errors_before,
+                "{exe:?} {dst_ip}: Save neither sent the rule nor said why"
+            );
+        }
+    }
+
+    #[test]
+    fn a_saved_rule_is_described_by_its_stored_scope() {
+        let rule = proto::RuleInfo {
+            action: proto::Action::Allow as i32,
+            duration: proto::Duration::Always as i32,
+            enabled: true,
+            scope: Some(proto::RuleScope {
+                exe_path: "/usr/bin/curl".into(),
+                dst_port: 443,
+                has_dst_port: true,
+                protocol: proto::Protocol::Tcp as i32,
+                has_protocol: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let line = saved_rule_line(&rule);
+        assert!(
+            line.starts_with("rule saved: allow /usr/bin/curl -> *:443 tcp"),
+            "{line}"
+        );
     }
 
     /// A rule as the daemon reports it: created a while ago, already hit,
@@ -1826,7 +2231,7 @@ mod tests {
             ..existing_rule()
         };
         let ed = RuleEditor::from_existing(&uid_only);
-        assert!(ed.carried_scope.is_set());
+        assert!(hidden_scope_is_set(&ed.carried_scope));
         assert!(build_rule_from_editor(&ed).is_ok());
 
         // A genuinely empty scope is still refused.
@@ -1840,11 +2245,11 @@ mod tests {
     #[test]
     fn hidden_scope_summary_names_each_predicate() {
         let ed = RuleEditor::from_existing(&rule_with_hidden_scope());
-        let summary = ed.carried_scope.summary();
+        let summary = hidden_scope_summary(&ed.carried_scope);
         assert!(summary.contains("uid 1000"), "{summary}");
         assert!(summary.contains("/usr/bin/bash"), "{summary}");
         assert!(summary.contains("sha256 abc123def456"), "{summary}");
-        assert!(!CarriedScope::default().is_set());
+        assert!(!hidden_scope_is_set(&proto::RuleScope::default()));
     }
 
     #[test]
@@ -1882,7 +2287,7 @@ mod tests {
 
     #[test]
     fn a_rule_seeded_from_an_observed_flow_is_new() {
-        let ed = RuleEditor::from_observed("/bin/x", "example.com", "1.2.3.4", 443, 1);
+        let ed = RuleEditor::from_observed("/bin/x", "", "1.2.3.4", 443, 1, 0);
         assert_eq!(ed.created_at_unix_ms, 0);
         assert_eq!(ed.hit_count, 0);
         assert!(ed.enabled);
@@ -1939,6 +2344,7 @@ mod tests {
             }),
             deadline_unix_ms: 1_700_000_015_000,
             binds_to_hash: false,
+            undecided_rule_id: String::new(),
         }
     }
 
@@ -1946,7 +2352,7 @@ mod tests {
     fn customization_waits_for_a_verdict_and_drops_stale_actions() {
         let (mut app, _) = App::new();
         let event = prompt_event();
-        app.prompts.push(PromptCard::new(event.clone()));
+        app.prompts.push(PromptCard::new(event.clone(), 0));
         let task = app.update(Message::CustomizePromptRule(event.prompt_id.clone()));
         assert_eq!(task.units(), 0, "opening the editor issues no verdict RPC");
         assert_eq!(app.prompts.len(), 1, "the prompt remains pending");
@@ -1956,25 +2362,63 @@ mod tests {
         );
         let _ = app.update(Message::PromptStreamEnded("disconnected".into()));
         assert!(app.prompts.is_empty());
-        assert!(app.editor.is_none());
+        assert!(
+            app.editor.as_ref().unwrap().prompt_id.is_none(),
+            "the edits stay, as a plain rule"
+        );
         assert_eq!(
             app.update(Message::CustomizePromptRule(event.prompt_id))
                 .units(),
             0
         );
-        assert!(app.editor.is_none());
+        assert!(app.editor.as_ref().unwrap().prompt_id.is_none());
     }
 
     #[test]
-    fn an_expired_prompt_closes_its_customization() {
+    fn an_expired_prompt_keeps_its_customization_as_a_new_rule() {
         let (mut app, _) = App::new();
         let event = prompt_event();
-        app.prompts.push(PromptCard::new(event.clone()));
-        app.editor = Some(RuleEditor::from_prompt(&event));
+        app.prompts.push(PromptCard::new(event.clone(), 0));
+        let mut editor = RuleEditor::from_prompt(&event);
+        editor.name = "careful".into();
+        app.editor = Some(editor);
         app.now_ms = event.deadline_unix_ms + 1;
         app.housekeeping();
         assert!(app.prompts.is_empty());
-        assert!(app.editor.is_none());
+        let editor = app.editor.as_ref().expect("the edits are kept");
+        assert!(editor.prompt_id.is_none());
+        assert_eq!(editor.name, "careful");
+        // Save now stores the rule instead of answering a dead prompt.
+        assert_eq!(app.update(Message::SaveRule).units(), 1);
+    }
+
+    #[test]
+    fn a_verdict_that_was_not_applied_leaves_the_prompt_answerable() {
+        let (mut app, _) = App::new();
+        let event = prompt_event();
+        app.prompts.push(PromptCard::new(event.clone(), 0));
+        let submit = || Message::SubmitVerdict {
+            prompt_id: event.prompt_id.clone(),
+            action: proto::Action::Deny,
+            scope: None,
+            duration: proto::Duration::Once,
+        };
+        assert_eq!(app.update(submit()).units(), 1);
+        assert!(app.prompts[0].submitting, "held until the daemon confirms");
+        assert_eq!(app.update(submit()).units(), 0, "one verdict at a time");
+
+        let failure = |applied| VerdictFailure {
+            prompt_id: event.prompt_id.clone(),
+            applied,
+            message: "connection refused".into(),
+        };
+        let _ = app.update(Message::VerdictSubmitted(Err(failure(false))));
+        assert_eq!(app.prompts.len(), 1);
+        assert!(!app.prompts[0].submitting, "it can be answered again");
+
+        let _ = app.update(submit());
+        let _ = app.update(Message::VerdictSubmitted(Err(failure(true))));
+        assert!(app.prompts.is_empty(), "an applied answer retires the card");
     }
 
     #[test]
@@ -2008,7 +2452,7 @@ mod tests {
         let ed = RuleEditor::from_prompt(&prompt_event());
         assert_eq!(ed.exe, "/usr/bin/curl");
         assert!(ed.dst_host.is_empty());
-        assert_eq!(ed.dst_net, "93.184.216.34/32");
+        assert!(ed.dst_net.is_empty());
         assert_eq!(ed.dst_port, "443");
         assert_eq!(ed.protocol, Some(proto::Protocol::Tcp));
         // It is a new rule, not an edit of an existing one.
@@ -2036,9 +2480,10 @@ mod tests {
     fn a_first_prompt_raises_the_window_and_a_burst_does_not() {
         // 0 -> 1 is the interruption worth stealing focus for.
         assert_eq!(prompt_attention(0, false), Attention::TabAndRaise);
-        // 1 -> 2, 2 -> 3: the user is already looking at the queue.
-        assert_eq!(prompt_attention(1, false), Attention::Tab);
-        assert_eq!(prompt_attention(9, false), Attention::Tab);
+        // 1 -> 2, 2 -> 3: the user already knows about the queue, and a tab
+        // switch under their cursor would turn a click into a verdict.
+        assert_eq!(prompt_attention(1, false), Attention::None);
+        assert_eq!(prompt_attention(9, false), Attention::None);
         // Drained and refilled: a genuinely new interruption.
         assert_eq!(prompt_attention(0, false), Attention::TabAndRaise);
     }
@@ -2050,13 +2495,139 @@ mod tests {
         assert_eq!(prompt_attention(3, true), Attention::None);
     }
 
+    fn key(c: &str, modifiers: keyboard::Modifiers) -> KeyPress {
+        KeyPress {
+            key: keyboard::Key::Character(c.into()),
+            modifiers,
+        }
+    }
+
+    fn prompt(id: &str, exe: &str) -> proto::PromptEvent {
+        let mut ev = prompt_event();
+        ev.prompt_id = id.into();
+        ev.process.as_mut().unwrap().exe = exe.into();
+        ev.deadline_unix_ms = 0;
+        ev
+    }
+
     #[test]
-    fn prompt_card_captures_the_daemon_deadline() {
-        let ev = proto::PromptEvent {
-            prompt_id: "7".into(),
-            deadline_unix_ms: 1_700_000_000_000,
+    fn verdict_keys_answer_the_armed_top_card_only() {
+        let (mut app, _) = App::new();
+        app.now_ms = 1_000_000;
+        app.prompts.push(PromptCard::new(
+            prompt("top", "/usr/lib/firefox/firefox"),
+            0,
+        ));
+        app.prompts.push(PromptCard::new(
+            prompt("below", "/home/u/.cache/x/updater"),
+            0,
+        ));
+        let shift = keyboard::Modifiers::SHIFT;
+
+        // The top card just became the target: a press already on its way
+        // answers nothing.
+        assert_eq!(app.handle_key(key("A", shift)).units(), 0);
+        assert_eq!(app.prompts.len(), 2);
+
+        app.now_ms += PROMPT_ARM_MS;
+        // Chords and other tabs never answer.
+        for m in [
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::LOGO,
+            keyboard::Modifiers::CTRL | shift,
+        ] {
+            assert_eq!(app.handle_key(key("a", m)).units(), 0, "{m:?}");
+        }
+        app.tab = Tab::Rules;
+        assert_eq!(app.handle_key(key("a", shift)).units(), 0);
+        app.tab = Tab::Prompts;
+
+        assert_eq!(app.handle_key(key("A", shift)).units(), 1);
+        assert!(app.prompts[0].submitting, "the top card is answered");
+        assert!(!app.prompts[1].submitting, "not the newest");
+
+        // The card that moved up is disarmed again.
+        assert_eq!(
+            app.handle_key(key("a", keyboard::Modifiers::empty()))
+                .units(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_card_that_moves_up_is_disarmed_again() {
+        let (mut app, _) = App::new();
+        app.prompts.push(PromptCard::new(
+            prompt("top", "/usr/lib/firefox/firefox"),
+            0,
+        ));
+        app.prompts.push(PromptCard::new(
+            prompt("below", "/home/u/.cache/x/updater"),
+            0,
+        ));
+        assert!(app.prompts[1].armed(app.now_ms));
+        let _ = app.update(Message::SubmitVerdict {
+            prompt_id: "top".into(),
+            action: proto::Action::Allow,
+            scope: None,
+            duration: proto::Duration::Always,
+        });
+        let _ = app.update(Message::VerdictSubmitted(Ok(("top".into(), true, None))));
+        // The second click of a double-click lands on the card that took
+        // the answered one's place.
+        assert_eq!(app.prompts[0].event.prompt_id, "below");
+        assert!(!app.prompts[0].armed(app.now_ms));
+        assert!(app.prompts[0].armed(app.now_ms + PROMPT_ARM_MS));
+    }
+
+    #[test]
+    fn pause_ignores_a_click_right_after_resuming() {
+        let (mut app, _) = App::new();
+        app.status = Some(proto::StatusResponse {
+            paused: true,
             ..Default::default()
-        };
-        assert_eq!(PromptCard::new(ev).deadline_unix_ms, 1_700_000_000_000);
+        });
+        assert_eq!(app.update(Message::TogglePaused).units(), 1, "Resume");
+        let _ = app.update(Message::PausedSet(Ok((false, 0))));
+        assert_eq!(app.update(Message::TogglePaused).units(), 0);
+        app.now_ms += PROMPT_ARM_MS;
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
+    }
+
+    #[test]
+    fn pause_waits_for_authorization_and_ignores_clicks_meanwhile() {
+        let (mut app, _) = App::new();
+        app.status = Some(proto::StatusResponse::default());
+        app.now_ms += PROMPT_ARM_MS;
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
+        assert!(app.pause_pending);
+        assert_eq!(app.update(Message::TogglePaused).units(), 0, "in flight");
+        let _ = app.update(Message::PausedSet(Err(
+            "authorization dialog dismissed (polkit action org.projectcolony.firewall.pause)"
+                .into(),
+        )));
+        assert!(!app.pause_pending);
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
+    }
+
+    #[test]
+    fn pause_ignores_a_click_right_after_reconnecting() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::HandshakeDone(Ok(HandshakeData {
+            status: proto::StatusResponse::default(),
+            rules: Vec::new(),
+        })));
+        assert_eq!(app.update(Message::TogglePaused).units(), 0);
+        app.now_ms += PROMPT_ARM_MS;
+        assert_eq!(app.update(Message::TogglePaused).units(), 1);
+    }
+
+    #[test]
+    fn a_prompt_card_is_disarmed_right_after_it_appears() {
+        let card = PromptCard::new(prompt("p", "/usr/bin/curl"), 5_000);
+        assert!(!card.armed(5_000));
+        assert!(!card.armed(5_000 + PROMPT_ARM_MS - 1));
+        assert!(card.armed(5_000 + PROMPT_ARM_MS));
     }
 }

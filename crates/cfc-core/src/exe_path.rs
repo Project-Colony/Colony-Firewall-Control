@@ -50,14 +50,6 @@ pub enum Resolved {
 }
 
 impl Resolved {
-    /// The path to store, whatever happened.
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Unchanged(p) | Self::Missing(p) | Self::Relative(p) => p,
-            Self::Rewritten { to, .. } | Self::RewrittenButMissing { to, .. } => to,
-        }
-    }
-
     /// Consumes into the path to store.
     pub fn into_path(self) -> PathBuf {
         match self {
@@ -75,34 +67,19 @@ impl Resolved {
     }
 
     /// One line for a human, or `None` when there is nothing worth saying.
+    ///
+    /// Only an `Ok` from [`resolve_policy`] reaches a human, and that is
+    /// always `Unchanged` or `Missing`: every other outcome is refused there
+    /// with its own message.
     pub fn note(&self) -> Option<String> {
         match self {
-            Self::Unchanged(_) => None,
-            Self::Rewritten { from, to } => Some(format!(
-                "resolved {} to {} (the kernel reports the second, so a rule for \
-                 the first would never match)",
-                from.display(),
-                to.display()
-            )),
-            Self::RewrittenButMissing { from, to } => Some(format!(
-                "{} resolves to {}, but nothing is installed there yet; the rule \
-                 is stored against the resolved path and will match once it is - \
-                 unless the program installs as a symlink, which would need the \
-                 rule rewritten",
-                from.display(),
-                to.display()
-            )),
             Self::Missing(p) => Some(format!(
                 "{} does not exist; the rule is stored as written, and if the \
                  path turns out to be a symlink once the program is installed \
                  it will need rewriting to the real path",
                 p.display()
             )),
-            Self::Relative(p) => Some(format!(
-                "{} is not an absolute path; /proc reports absolute paths, so \
-                 this rule can never match",
-                p.display()
-            )),
+            _ => None,
         }
     }
 }
@@ -257,15 +234,6 @@ fn resolve_via_ancestor(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Diagnostic resolution in place. Policy writes must use [`resolve_policy`].
-/// Returns `None` when the scope names no executable.
-pub fn resolve_scope(scope: &mut crate::RuleScope) -> Option<Resolved> {
-    let current = scope.exe_path.as_deref()?;
-    let outcome = resolve(current);
-    scope.exe_path = Some(outcome.path().to_path_buf());
-    Some(outcome)
-}
-
 /// Whether a *directory* on the way to an executable is sealed against
 /// non-root replacement.
 ///
@@ -409,7 +377,7 @@ mod tests {
             "got {outcome:?}"
         );
         assert_eq!(
-            outcome.path(),
+            outcome.into_path(),
             std::fs::canonicalize(realdir.join("curl")).expect("canon")
         );
     }
@@ -431,9 +399,9 @@ mod tests {
         let p = PathBuf::from("/nonexistent-8f2c1a/curl");
         let outcome = resolve(&p);
         assert_eq!(outcome, Resolved::Missing(p.clone()));
-        assert_eq!(outcome.path(), p);
         assert!(outcome.is_inert());
         assert!(outcome.note().expect("a note").contains("does not exist"));
+        assert_eq!(outcome.into_path(), p);
     }
 
     #[test]
@@ -495,13 +463,11 @@ mod tests {
         );
         // Still stored against the resolved directory, which is the point.
         assert_eq!(
-            outcome.path(),
+            outcome.into_path(),
             std::fs::canonicalize(&realdir)
                 .expect("canon")
                 .join("not-installed")
         );
-        let note = outcome.note().expect("a note");
-        assert!(note.contains("nothing is installed there yet"), "{note}");
     }
 
     #[test]
@@ -549,38 +515,17 @@ mod tests {
             !outcome.is_inert(),
             "a real file must not be reported as missing: {outcome:?}"
         );
-        assert_eq!(outcome.path(), std::fs::canonicalize(&f).expect("canon"));
+        assert_eq!(
+            outcome.into_path(),
+            std::fs::canonicalize(&f).expect("canon")
+        );
     }
 
     #[test]
-    fn a_relative_path_can_never_match_and_says_so() {
+    fn a_relative_path_can_never_match() {
         let outcome = resolve(Path::new("bin/curl"));
         assert!(matches!(outcome, Resolved::Relative(_)));
         assert!(outcome.is_inert());
-        assert!(outcome.note().expect("a note").contains("absolute"));
-    }
-
-    #[test]
-    fn resolving_a_scope_updates_it_in_place() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let real = dir.path().join("prog");
-        std::fs::write(&real, b"x").expect("write");
-        let link = dir.path().join("prog-link");
-        std::os::unix::fs::symlink(&real, &link).expect("symlink");
-
-        let mut scope = crate::RuleScope::any();
-        scope.exe_path = Some(link);
-        let outcome = resolve_scope(&mut scope).expect("the scope names an exe");
-        assert!(matches!(outcome, Resolved::Rewritten { .. }));
-        assert_eq!(
-            scope.exe_path.as_deref(),
-            Some(std::fs::canonicalize(&real).expect("canon").as_path())
-        );
-
-        // A scope with no exe is not an error and is not touched.
-        let mut empty = crate::RuleScope::any();
-        assert!(resolve_scope(&mut empty).is_none());
-        assert_eq!(empty.exe_path, None);
     }
 }
 

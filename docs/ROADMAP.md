@@ -3,9 +3,9 @@
 Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 
 Phases 0-3 are done and have since been through a hardening pass
-(Phase 3.5). The eBPF backend, the system tray and the whitelist fast
-path (opt-in, `[ebpf] fast_allow`; its latency win is still to be
-measured, see `TODO.md` 1a) have since landed too. What is left is
+(Phase 3.5). The eBPF backend and the system tray have since landed
+too; the whitelist fast path landed and was later removed (see
+`TODO.md` 1a). What is left is
 VirusTotal lookups, publishing to the AUR, and one end-to-end test that
 is still manual.
 
@@ -21,7 +21,9 @@ is still manual.
 - [x] systemd unit + nft snippet
 - [x] CI: cargo fmt + clippy + test + build
 - [x] AUR PKGBUILD draft
-- [x] Colony app store manifest (`pkg/colony.json`)
+- [x] Release tarball recipe (`pkg/colony.json`; no Colony store client reads
+      it, `scripts/tarball-installers.sh` turns it into the tarball's
+      `install.sh`)
 
 ## Phase 1 - Daemon MVP [done]
 
@@ -73,7 +75,9 @@ were wrong or missing once the happy path worked.
 ### Rule semantics
 
 - [x] Deterministic precedence (specificity, then Deny > Reject >
-      Allow, then created_at, then id)
+      Allow, then created_at, then id; a program-scoped Deny or Reject
+      beats any Allow that names no program, and `/0` adds no
+      specificity)
 - [x] `Duration` enforced at lookup; expired rules reaped periodically
 - [x] `Once` / `UntilRestart` purged at startup; persisting `Once` refused
 - [x] Forward-compatible rule serialization + frozen v0.1.0 fixtures
@@ -165,23 +169,18 @@ kernel 7.1.8.
       1,000,000-instruction complexity limit (see
       `crates/cfc-ebpf/README.md` for the full write-up)
 - [x] Whitelist fast path for already-allowed flows (`[ebpf]
-      fast_allow`). Not the shape first imagined: a cgroup *egress*
-      hook runs after NF_INET_LOCAL_OUT and cannot short-circuit
-      NFQUEUE, but the `connect()` hook runs before any packet exists.
-      A process a lasting Allow rule covers gets an entry in a kernel
-      map; its TCP connects are marked with SO_MARK at connect time
-      and `meta mark @fast_allow accept` takes them before the queue
-      rule. TCP only, grants evicted on exec and exit, the whole path
-      bounded by a heartbeat deadline so a dead daemon strips itself
-      out. Two degradations shorten the deadline instead of turning
-      the feature off; see `docs/ARCHITECTURE.md`
+      fast_allow`): removed. Allowed TCP connects were marked with
+      SO_MARK at connect time and accepted ahead of the queue rule, and
+      a socket mark does not attest which process sends, so it opened
+      bypasses; see `TODO.md` 1a
 
 ## Phase 5 - Polish
 
 - [ ] VirusTotal lookup integration (optional, opt-in)
 - [x] Profile presets: relaxed / balanced / strict
 - [x] Import rules from opensnitch JSON
-- [x] Colony app store manifest (`colony.json`)
+- [ ] Colony app store listing (needs a root `colony.json` in Colony's real
+      schema; the store installs one per-user binary, never units or tables)
 - [x] AUR PKGBUILD draft (now AUR-ready in `pkg/`; not yet published,
       signed release pending)
 - [x] Shell completions + man pages

@@ -8,23 +8,42 @@
 //!
 //! 1. **The socket file.** After bind, the daemon chowns the socket to
 //!    `root:<[ipc] group>` and chmods it `0660`. The kernel therefore
-//!    refuses `connect(2)` to anyone outside that group. Membership *is*
-//!    the credential; there is no in-band authentication. If the group
+//!    refuses `connect(2)` to anyone outside that group. If the group
 //!    cannot be resolved (package installed without the sysusers fragment)
 //!    the daemon logs a prominent warning, leaves the socket `0600`
 //!    (root-only) and keeps running, so a root CLI still works.
 //!
-//! 2. **Per-RPC peer credentials.** Mutations require uid 0 or actual
-//!    membership of the configured group. The kernel peer gid proves primary
-//!    membership. Supplementary membership requires `/proc/<peer pid>/status`
-//!    with the same effective uid and process starttime captured at accept.
-//!    Missing evidence is refused. `require_group = false` explicitly opts
-//!    out for deployments authorizing their control socket another way.
+//! 2. **Per-RPC peer identity.** Reading (status, rules, the live feed,
+//!    the event log, receiving prompts) is open to every peer that could
+//!    connect. Changing the firewall (answering a prompt, writing or deleting
+//!    rules, pause and resume, importing rules) is open to:
+//!    - **root**, and the daemon's own uid (root in production; a process
+//!      with the daemon's uid could ptrace it anyway);
+//!    - **the official app and tray**: a proved member of the group (the
+//!      kernel peer gid, or `/proc/<pid>/status` read between two matching
+//!      start-time reads) whose process passes [`crate::official::check`]:
+//!      it runs one of the installed, root-sealed `[ipc] official_clients`
+//!      binaries, ran their sealing prologue, holds this very connection, is
+//!      not traced, runs under no seccomp filter and mapped no executable
+//!      file from outside sealed directories. `require_group = false` waives the group proof for
+//!      official clients only.
 //!
-//! Consequence worth stating plainly: **every member of the configured
-//! group is fully trusted.** Group membership grants the ability to allow
-//! or deny any traffic on the host. It is not a multi-user privilege
-//! boundary; put only administrators of this machine in it.
+//!    Pause, resume and `ApplyRules` change the whole firewall at once, and
+//!    an Allow rule that names no program opens it for every program, so an
+//!    official client also needs a polkit authorization for them
+//!    ([`crate::polkit`]); root does not. Answering a prompt and editing a
+//!    rule that names a program (or denies) never ask for a password.
+//!
+//!    Every other peer is read-only: its change RPCs get PERMISSION_DENIED
+//!    with the reason, its prompt subscription does not count as a UI (so
+//!    `no_ui_action` still applies), and it never enters a prompt's audience.
+//!
+//! Consequence worth stating plainly: group membership alone no longer
+//! changes anything. It lets the desktop session read the daemon's state and
+//! lets the installed app and tray connect; changes come from those two
+//! programs or from `sudo cfc`. Code running *inside* the official app (a
+//! preloaded payload that moved itself to anonymous memory, synthetic X11
+//! input) is still trusted; see docs/HARDENING.md.
 //!
 //! # Prompt ownership
 //!
@@ -37,8 +56,9 @@
 //!    everyone. So another user's UI never even learns the prompt id.
 //! 2. **Answers are checked against who was told.** A stream records
 //!    `prompt_id -> peer uid` as it hands an event to its client
-//!    ([`PromptAudience`]); `SubmitVerdict` requires the caller's uid to
-//!    appear in that prompt's audience. Root may always answer.
+//!    ([`PromptAudience`]) - only for a stream that may answer; `SubmitVerdict`
+//!    requires the caller's uid to appear in that prompt's audience. Root may
+//!    always answer.
 //!
 //! Step 2 alone was bookkeeping without teeth - every subscriber received
 //! every prompt, so every subscriber was in every audience. Step 1 is what
@@ -55,7 +75,7 @@ use anyhow::Context;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -70,8 +90,8 @@ use tracing::{info, warn};
 
 /// Validates a rule's explicit executable target without blocking IPC.
 ///
-/// `canonicalize` is a synchronous syscall on a path any `colony-firewall`
-/// group member supplies, and this runs inside a `#[tonic::async_trait]`
+/// `canonicalize` is a synchronous syscall on a path a client supplies, and
+/// this runs inside a `#[tonic::async_trait]`
 /// handler on the shared runtime. A path under a hung NFS mount or an
 /// unreachable autofs trigger would otherwise park a worker thread with no
 /// timeout; enough concurrent calls and the prompt-delivery tasks stall, which
@@ -81,6 +101,12 @@ use tracing::{info, warn};
 ///
 /// Missing canonical targets support preinstallation; aliases, other lookup
 /// failures and worker failures refuse the policy write.
+///
+/// Advisory for paths the unit's sandbox hides: under `ProtectHome` and
+/// `PrivateTmp` an alias in `/home` or `/tmp` looks like a target that is not
+/// installed yet and is accepted. The CLI and GUI run the same check in the
+/// caller's namespace first. The stored path is still matched literally, so
+/// such a rule never applies to the alias's target.
 async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) -> Result<(), Status> {
     let Some(current) = scope.exe_path.clone() else {
         return Ok(());
@@ -98,6 +124,46 @@ async fn resolve_exe_off_thread(scope: &mut cfc_core::RuleScope) -> Result<(), S
     }
     scope.exe_path = Some(outcome.into_path());
     Ok(())
+}
+
+/// Whether `rule` sends back the executable path already stored under its id.
+///
+/// That path was validated when it was written, or predates validation, and
+/// sending it back changes nothing about what the rule matches. Validating it
+/// again refused every edit of a rule whose target had since become an alias
+/// (a package update turned it into a symlink, or a legacy `/bin/curl`), so
+/// disabling, renaming or re-importing it failed and only delete was left. A
+/// new rule or a changed path is still validated.
+fn keeps_stored_exe(stored: &cfc_core::RuleSet, rule: &cfc_core::Rule) -> bool {
+    rule.scope.exe_path.is_some()
+        && stored
+            .rules
+            .iter()
+            .any(|old| old.id == rule.id && old.scope.exe_path == rule.scope.exe_path)
+}
+
+/// Logs a rule write the daemon refused, with its reason.
+///
+/// Without it the journal held only successful writes and authorization
+/// refusals, so "the client never sent it" and "the daemon refused it" looked
+/// the same (issue #46). Authorization refusals are logged by `authorize`.
+fn log_refusal(rpc: &'static str, peer: PeerId, status: &Status) {
+    warn!(
+        rpc,
+        peer_uid = peer.uid,
+        peer_pid = ?peer.pid,
+        code = ?status.code(),
+        reason = status.message(),
+        outcome = "refused",
+        "rule write refused"
+    );
+}
+
+/// An enabled Allow that names no program: wherever it matches, every
+/// program gets through without a prompt, which is a pause for that much of
+/// the traffic. One `allow --protocol tcp` is most of one.
+fn opens_for_every_program(rule: &cfc_core::Rule) -> bool {
+    rule.enabled && rule.action == cfc_core::Action::Allow && !rule.scope.names_program()
 }
 
 fn bind_prompt_allow(
@@ -184,16 +250,53 @@ pub struct PeerId {
     pub gid: u32,
     pub pid: Option<i32>,
     pub starttime: Option<u64>,
+    /// Inode of the daemon's end of this connection, which names the
+    /// client's end through sock_diag. `None` means "never official".
+    pub sock_ino: Option<u64>,
 }
 
 /// Privilege an RPC requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Access {
-    /// Observing daemon state.
+    /// Observing daemon state: any peer that could connect.
     ReadOnly,
-    /// Changing the firewall's behaviour.
-    Mutate,
+    /// Changing the firewall's behaviour: root, or the official app or tray.
+    Control,
+    /// A change to the whole firewall at once: as `Control`, and an official
+    /// client must also get this polkit action authorized (root need not).
+    Elevated(&'static str),
 }
+
+/// Where a peer stands for [`Access::Control`], before its image is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Root, or the daemon's own uid (root in production; a process of the
+    /// daemon's uid could ptrace it anyway).
+    Privileged,
+    /// A group member (or anyone, with `require_group = false`): allowed
+    /// only when it is the installed app or tray.
+    NeedOfficial,
+    /// Not a proved member of the configured group.
+    DenyGroup,
+}
+
+fn gate(peer_uid: u32, own_uid: u32, group_ok: bool) -> Gate {
+    if peer_uid == 0 || peer_uid == own_uid {
+        Gate::Privileged
+    } else if group_ok {
+        Gate::NeedOfficial
+    } else {
+        Gate::DenyGroup
+    }
+}
+
+/// The official-client check: `official::check` in production, a stub in
+/// unit tests. Not reachable from config or from any client.
+type OfficialCheck = fn(&PeerId, &[PathBuf]) -> Result<PathBuf, String>;
+
+/// The polkit check: `polkit::check` in production, a stub in unit tests.
+type PolkitCheck =
+    fn(PeerId, &'static str) -> futures::future::BoxFuture<'static, Result<(), String>>;
 
 /// Outcome of securing the socket file, and the policy knobs that decide
 /// what it implies for callers.
@@ -205,15 +308,6 @@ struct SocketAuth {
     /// the kernel is enforcing group membership on `connect(2)`.
     group_gated: bool,
     require_group: bool,
-}
-
-/// Pure policy over membership proved from the individual peer credentials.
-fn authorize_uid(uid: u32, level: Access, group_member: bool, require_group: bool) -> bool {
-    match level {
-        // Layer 1 (socket mode) already decided who may connect at all.
-        Access::ReadOnly => true,
-        Access::Mutate => uid == 0 || !require_group || group_member,
-    }
 }
 
 /// Extracts kernel-reported peer credentials from a request.
@@ -236,6 +330,7 @@ fn peer_of<T>(req: &Request<T>) -> Result<PeerId, Status> {
             .pid()
             .and_then(|pid| u32::try_from(pid).ok())
             .and_then(crate::process_resolve::read_starttime),
+        sock_ino: None,
     })
 }
 
@@ -252,16 +347,25 @@ impl PeerStream {
             .and_then(|pid| u32::try_from(pid).ok())
             .and_then(crate::process_resolve::read_starttime);
         Ok(Self {
-            stream,
             peer: PeerId {
                 uid: credentials.uid(),
                 gid: credentials.gid(),
                 pid,
                 starttime,
+                sock_ino: socket_inode(&stream),
             },
+            stream,
         })
     }
 }
+fn socket_inode(stream: &tokio::net::UnixStream) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: zeroed stat is valid out-param storage; the fd is open for
+    // the duration of the call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(stream.as_raw_fd(), &mut st) } == 0).then_some(st.st_ino)
+}
+
 impl Connected for PeerStream {
     type ConnectInfo = PeerId;
     fn connect_info(&self) -> PeerId {
@@ -393,6 +497,49 @@ impl PromptAudience {
 // Service
 // ---------------------------------------------------------------------------
 
+/// Who may change the firewall: what [`Control::standing`] needs, apart from
+/// the service so a prompt stream can ask again while it runs.
+#[derive(Clone)]
+struct Control {
+    auth: SocketAuth,
+    /// The daemon's effective uid; see [`Gate::Privileged`].
+    own_uid: u32,
+    /// `[ipc] official_clients`, bound at startup.
+    official_clients: Arc<[PathBuf]>,
+    official: OfficialCheck,
+}
+
+impl Control {
+    /// May `peer` change the firewall? `Ok(None)` for a privileged peer,
+    /// `Ok(Some(exe))` for the official app or tray, `Err` (with the reason
+    /// the client shows) for everyone else, who is read-only.
+    async fn standing(&self, peer: PeerId) -> Result<Option<PathBuf>, Status> {
+        let group_ok = !self.auth.require_group || peer_is_group_member(peer, self.auth.group_gid);
+        match gate(peer.uid, self.own_uid, group_ok) {
+            Gate::Privileged => Ok(None),
+            Gate::DenyGroup => Err(Status::permission_denied(format!(
+                "firewall changes require root, or the installed Colony Firewall app or \
+                 tray run by a member of group '{}'",
+                self.auth.group
+            ))),
+            Gate::NeedOfficial => {
+                let (check, list) = (self.official, self.official_clients.clone());
+                tokio::task::spawn_blocking(move || check(&peer, &list))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("the identity check failed ({error})")))
+                    .map(Some)
+                    .map_err(|reason| {
+                        Status::permission_denied(format!(
+                            "read-only access: {reason}. Firewall changes are accepted only \
+                             from the installed Colony Firewall app and tray, or from root \
+                             (sudo cfc ...)."
+                        ))
+                    })
+            }
+        }
+    }
+}
+
 struct FirewallService {
     engine: Engine,
     store: RuleStore,
@@ -401,38 +548,208 @@ struct FirewallService {
     stats: Stats,
     /// Live default policy; SIGHUP swaps it, so status reflects reloads.
     policy: SharedPolicy,
-    auth: SocketAuth,
+    control: Control,
+    polkit: PolkitCheck,
     audience: Arc<PromptAudience>,
     /// Wall-clock deadline of the current pause, 0 when not paused. Held
     /// here rather than in `Stats` so the pause timer and `GetStatus` agree.
     resume_at_ms: Arc<AtomicI64>,
     pause_default_secs: u64,
     dry_run: bool,
-    mutations: Mutex<()>,
 }
 
 impl FirewallService {
-    /// Resolves the caller and checks it may perform `level`.
-    fn authorize<T>(&self, req: &Request<T>, level: Access) -> Result<PeerId, Status> {
+    /// Resolves the caller of `rpc` and checks it may perform `level`.
+    async fn authorize<T>(
+        &self,
+        req: &Request<T>,
+        rpc: &'static str,
+        level: Access,
+    ) -> Result<PeerId, Status> {
         let peer = peer_of(req)?;
-        if authorize_uid(
-            peer.uid,
-            level,
-            peer_is_group_member(peer, self.auth.group_gid),
-            self.auth.require_group,
-        ) {
+        if level == Access::ReadOnly {
             return Ok(peer);
         }
-        warn!(
+        let outcome = match self.control.standing(peer).await {
+            // Only an official client is asked; root never is.
+            Ok(Some(exe)) => match level {
+                Access::Elevated(action) => (self.polkit)(peer, action)
+                    .await
+                    .map(|()| (Some(exe), Some(action)))
+                    .map_err(|reason| {
+                        Status::permission_denied(format!("{reason} (polkit action {action})"))
+                    }),
+                _ => Ok((Some(exe), None)),
+            },
+            Ok(None) => Ok((None, None)),
+            Err(status) => Err(status),
+        };
+        match outcome {
+            Ok((official, polkit)) => {
+                info!(
+                    rpc,
+                    peer_uid = peer.uid,
+                    peer_pid = ?peer.pid,
+                    auth = if official.is_some() { "official" } else { "privileged" },
+                    official_exe = ?official,
+                    polkit = ?polkit,
+                    "authorized"
+                );
+                Ok(peer)
+            }
+            Err(status) => {
+                warn!(
+                    rpc,
+                    peer_uid = peer.uid,
+                    peer_pid = ?peer.pid,
+                    reason = status.message(),
+                    outcome = "permission_denied",
+                    "refusing a firewall change"
+                );
+                Err(status)
+            }
+        }
+    }
+
+    async fn upsert_rule_checked(
+        &self,
+        peer: PeerId,
+        req: UpsertRuleRequest,
+    ) -> Result<UpsertRuleResponse, Status> {
+        let proto = req
+            .rule
+            .ok_or_else(|| Status::invalid_argument("rule required"))?;
+        let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
+        convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
+        self.confirm_generic_allow(peer, &rule)
+            .await
+            .map_err(Status::permission_denied)?;
+        // Every caller must select the canonical mapped target explicitly.
+        // Missing targets with unchanged ancestry remain valid for preinstallation.
+        if !keeps_stored_exe(&self.engine.snapshot(), &rule) {
+            resolve_exe_off_thread(&mut rule.scope).await?;
+        }
+        // hit_count and created_at belong to the daemon: a client editing a
+        // rule must not be able to rewrite its history, deliberately or (as
+        // every read-modify-write client did) by echoing back a count that
+        // already included an unflushed delta.
+        let _mutation = self.engine.lock_mutations();
+        if rule.duration == cfc_core::Duration::Always
+            && self.engine.snapshot().rules.iter().any(|old| {
+                old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
+            })
+        {
+            return Err(Status::invalid_argument(
+                "a timed rule cannot become Always in place; delete it and create a new rule",
+            ));
+        }
+        self.engine.preserve_server_owned(&mut rule);
+        self.store
+            .upsert(&rule)
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        let id = rule.id.to_string();
+        info!(
+            rpc = "UpsertRule",
             peer_uid = peer.uid,
             peer_pid = ?peer.pid,
-            group = %self.auth.group,
-            "refusing mutating RPC: caller is not a member of the configured group"
+            rule_id = %id,
+            action = ?rule.action,
+            duration = ?rule.duration,
+            enabled = rule.enabled,
+            outcome = "ok",
+            "rule upserted"
         );
-        Err(Status::permission_denied(format!(
-            "mutating RPCs require uid 0 or membership of group '{}'",
-            self.auth.group
-        )))
+        self.engine.upsert_rule(rule);
+        Ok(UpsertRuleResponse {
+            id,
+            error: String::new(),
+        })
+    }
+
+    async fn apply_rules_checked(
+        &self,
+        peer: PeerId,
+        req: ApplyRulesRequest,
+    ) -> Result<ApplyRulesResponse, Status> {
+        if req.replace && req.rules.is_empty() {
+            return Err(Status::invalid_argument("refusing an empty replacement"));
+        }
+        let mut pending = Vec::with_capacity(req.rules.len());
+        let mut ids = HashSet::new();
+        let stored = self.engine.snapshot();
+        for proto in req.rules {
+            let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
+            convert::reject_unpersistable_duration(rule.duration)
+                .map_err(Status::invalid_argument)?;
+            if !ids.insert(rule.id) {
+                return Err(Status::invalid_argument("duplicate rule id"));
+            }
+            if !keeps_stored_exe(&stored, &rule) {
+                resolve_exe_off_thread(&mut rule.scope).await?;
+            }
+            pending.push(rule);
+        }
+        let _mutation = self.engine.lock_mutations();
+        let existing = self.engine.snapshot();
+        for rule in &mut pending {
+            if rule.duration == cfc_core::Duration::Always
+                && existing.rules.iter().any(|old| {
+                    old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
+                })
+            {
+                return Err(Status::invalid_argument(
+                    "a timed rule cannot become Always in place; delete it and create a new rule",
+                ));
+            }
+            self.engine.preserve_server_owned(rule);
+        }
+        let removed = self
+            .store
+            .apply_rules(&pending, req.replace)
+            .map_err(|e| Status::internal(format!("storage: {e}")))?;
+        let assigned: Vec<String> = pending.iter().map(|rule| rule.id.to_string()).collect();
+        info!(
+            rpc = "ApplyRules",
+            peer_uid = peer.uid,
+            peer_pid = ?peer.pid,
+            replace = req.replace,
+            applied = assigned.len(),
+            removed,
+            rule_ids = ?assigned,
+            outcome = "ok",
+            "rules applied"
+        );
+        let mut final_rules = if req.replace {
+            Vec::new()
+        } else {
+            self.engine.snapshot().rules
+        };
+        final_rules.retain(|rule| !ids.contains(&rule.id));
+        final_rules.extend(pending);
+        self.engine.replace_rules(final_rules);
+        Ok(ApplyRulesResponse {
+            ids: assigned,
+            removed: u32::try_from(removed).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// From the app or tray, an Allow that applies to every program needs
+    /// polkit's [`crate::polkit::GENERIC_ALLOW`]; root never does. `Err` is
+    /// the reason to show.
+    async fn confirm_generic_allow(
+        &self,
+        peer: PeerId,
+        rule: &cfc_core::Rule,
+    ) -> Result<(), String> {
+        if !opens_for_every_program(rule)
+            || gate(peer.uid, self.control.own_uid, true) == Gate::Privileged
+        {
+            return Ok(());
+        }
+        let action = crate::polkit::GENERIC_ALLOW;
+        (self.polkit)(peer, action)
+            .await
+            .map_err(|reason| format!("{reason} (polkit action {action})"))
     }
 
     fn policy(&self) -> crate::config::DefaultPolicy {
@@ -451,11 +768,31 @@ impl Firewall for FirewallService {
         &self,
         req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamPromptsStream>, Status> {
-        let peer = self.authorize(&req, Access::ReadOnly)?;
+        let peer = self
+            .authorize(&req, "StreamPrompts", Access::ReadOnly)
+            .await?;
+        // Every peer is shown the prompts addressed to it; only one that may
+        // answer them is counted as a UI and enters their audience.
+        let answering = match self.control.standing(peer).await {
+            Ok(_) => true,
+            Err(status) => {
+                tracing::debug!(
+                    peer_uid = peer.uid,
+                    peer_pid = ?peer.pid,
+                    reason = status.message(),
+                    "read-only prompt subscriber"
+                );
+                false
+            }
+        };
         let (tx, rx) = mpsc::channel(64);
-        let mut sub = self.router.subscribe(peer.uid);
+        let mut sub = self.router.subscribe(peer.uid, answering);
         let audience = self.audience.clone();
         let uid = peer.uid;
+        // Asked again before each prompt: an upgrade replaces the binary
+        // under a running app or tray, whose answers are then refused. Left
+        // counted as a UI, it would hold every prompt for the full timeout.
+        let recheck = answering.then(|| self.control.clone());
         tokio::spawn(async move {
             loop {
                 match sub.recv().await {
@@ -474,11 +811,22 @@ impl Firewall for FirewallService {
                             }
                             continue;
                         }
+                        if let Some(control) = &recheck {
+                            if let Err(status) = control.standing(peer).await {
+                                // Ending the stream drops this census entry;
+                                // the client resubscribes read-only and is
+                                // told why.
+                                let _ = tx.send(Err(status)).await;
+                                break;
+                            }
+                        }
                         // Record before handing the event over: this
                         // subscriber is about to learn the prompt id, so it
                         // must be entitled to answer it by the time it can.
                         if let Ok(id) = event.prompt_id.parse::<u64>() {
-                            audience.record(id, uid);
+                            if answering {
+                                audience.record(id, uid);
+                            }
                         }
                         if tx.send(Ok(event)).await.is_err() {
                             break;
@@ -500,7 +848,9 @@ impl Firewall for FirewallService {
         &self,
         req: Request<VerdictRequest>,
     ) -> Result<Response<VerdictResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        let peer = self
+            .authorize(&req, "SubmitVerdict", Access::Control)
+            .await?;
         let req = req.into_inner();
 
         // Ownership: only a peer this prompt was actually delivered to may
@@ -536,8 +886,9 @@ impl Firewall for FirewallService {
         // prompt was gone - so a click on a card whose prompt had already timed
         // out created a permanent rule while every client said "too late". For
         // "Allow always" that is standing network access granted by a click the
-        // user was told did nothing, and prompt ids restart at 1 on every daemon
-        // start, so a stale card can carry a live id. A verdict that reached
+        // user was told did nothing. Prompt ids start from a random seed each
+        // session (`nfqueue::prompt_session_seed`), which makes a stale card
+        // naming a live id unlikely, not impossible. A verdict that reached
         // nothing should leave nothing behind.
         let binding = self.router.submit(&req.prompt_id, verdict);
         let accepted = binding.is_some();
@@ -574,6 +925,18 @@ impl Firewall for FirewallService {
                 Ok(rule)
             }) {
                 Ok(mut rule) => {
+                    // "Customize" in the app can turn the answer into a rule
+                    // for every program; that needs what UpsertRule needs.
+                    if let Err(error) = self.confirm_generic_allow(peer, &rule).await {
+                        persist_error = format!("the verdict was applied, but the standing rule could not be saved: {error}");
+                        return Ok(Response::new(VerdictResponse {
+                            accepted,
+                            persisted_rule_id: String::new(),
+                            persist_error,
+                            persist_note,
+                            error: String::new(),
+                        }));
+                    }
                     // Persist only an explicit mapped target. The one-time
                     // verdict is already applied, so report a rejected standing
                     // policy through persist_error rather than retrying it.
@@ -600,7 +963,7 @@ impl Firewall for FirewallService {
                     if rule.action == cfc_core::Action::Allow && binding.hash_expected {
                         persist_note = "the allow is bound to the prompted binary's sha256; a changed file will prompt again".into();
                     }
-                    let _mutation = self.mutations.lock();
+                    let _mutation = self.engine.lock_mutations();
                     match self.store.upsert(&rule) {
                         Ok(()) => {
                             persisted_rule = Some(rule.id);
@@ -668,7 +1031,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "ListRules", Access::ReadOnly).await?;
         let snapshot = self.engine.snapshot();
         let rules = snapshot.rules.iter().map(convert::rule_to_pb).collect();
         Ok(Response::new(ListRulesResponse { rules }))
@@ -678,114 +1041,39 @@ impl Firewall for FirewallService {
         &self,
         req: Request<UpsertRuleRequest>,
     ) -> Result<Response<UpsertRuleResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
-        let proto = req
-            .into_inner()
-            .rule
-            .ok_or_else(|| Status::invalid_argument("rule required"))?;
-        let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
-        convert::reject_unpersistable_duration(rule.duration).map_err(Status::invalid_argument)?;
-        // Every caller must select the canonical mapped target explicitly.
-        // Missing targets with unchanged ancestry remain valid for preinstallation.
-        resolve_exe_off_thread(&mut rule.scope).await?;
-        // hit_count and created_at belong to the daemon: a client editing a
-        // rule must not be able to rewrite its history, deliberately or (as
-        // every read-modify-write client did) by echoing back a count that
-        // already included an unflushed delta.
-        let _mutation = self.mutations.lock();
-        if rule.duration == cfc_core::Duration::Always
-            && self.engine.snapshot().rules.iter().any(|old| {
-                old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
-            })
-        {
-            return Err(Status::invalid_argument("a timed rule cannot be changed to Always by an older read-modify-write client; delete and recreate it explicitly"));
-        }
-        self.engine.preserve_server_owned(&mut rule);
-        self.store
-            .upsert(&rule)
-            .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let id = rule.id.to_string();
-        info!(
-            rpc = "UpsertRule",
-            peer_uid = peer.uid,
-            peer_pid = ?peer.pid,
-            rule_id = %id,
-            action = ?rule.action,
-            duration = ?rule.duration,
-            enabled = rule.enabled,
-            outcome = "ok",
-            "rule upserted"
-        );
-        self.engine.upsert_rule(rule);
-        Ok(Response::new(UpsertRuleResponse {
-            id,
-            error: String::new(),
-        }))
+        let peer = self.authorize(&req, "UpsertRule", Access::Control).await?;
+        self.upsert_rule_checked(peer, req.into_inner())
+            .await
+            .map(Response::new)
+            .inspect_err(|status| log_refusal("UpsertRule", peer, status))
     }
 
     async fn apply_rules(
         &self,
         req: Request<ApplyRulesRequest>,
     ) -> Result<Response<ApplyRulesResponse>, Status> {
-        self.authorize(&req, Access::Mutate)?;
-        let req = req.into_inner();
-        if req.replace && req.rules.is_empty() {
-            return Err(Status::invalid_argument("refusing an empty replacement"));
-        }
-        let mut pending = Vec::with_capacity(req.rules.len());
-        let mut ids = HashSet::new();
-        for proto in req.rules {
-            let mut rule = convert::rule_from_pb(&proto).map_err(Status::invalid_argument)?;
-            convert::reject_unpersistable_duration(rule.duration)
-                .map_err(Status::invalid_argument)?;
-            if !ids.insert(rule.id) {
-                return Err(Status::invalid_argument("duplicate rule id"));
-            }
-            resolve_exe_off_thread(&mut rule.scope).await?;
-            pending.push(rule);
-        }
-        let _mutation = self.mutations.lock();
-        let existing = self.engine.snapshot();
-        for rule in &mut pending {
-            if rule.duration == cfc_core::Duration::Always
-                && existing.rules.iter().any(|old| {
-                    old.id == rule.id && matches!(old.duration, cfc_core::Duration::Seconds(_))
-                })
-            {
-                return Err(Status::invalid_argument(
-                    "a timed rule cannot become Always in place; delete it and create a new rule",
-                ));
-            }
-            self.engine.preserve_server_owned(rule);
-        }
-        let removed = self
-            .store
-            .apply_rules(&pending, req.replace)
-            .map_err(|e| Status::internal(format!("storage: {e}")))?;
-        let assigned = pending.iter().map(|rule| rule.id.to_string()).collect();
-        let mut final_rules = if req.replace {
-            Vec::new()
-        } else {
-            self.engine.snapshot().rules
-        };
-        final_rules.retain(|rule| !ids.contains(&rule.id));
-        final_rules.extend(pending);
-        self.engine.replace_rules(final_rules);
-        Ok(Response::new(ApplyRulesResponse {
-            ids: assigned,
-            removed: u32::try_from(removed).unwrap_or(u32::MAX),
-        }))
+        let peer = self
+            .authorize(
+                &req,
+                "ApplyRules",
+                Access::Elevated(crate::polkit::IMPORT_RULES),
+            )
+            .await?;
+        self.apply_rules_checked(peer, req.into_inner())
+            .await
+            .map(Response::new)
+            .inspect_err(|status| log_refusal("ApplyRules", peer, status))
     }
 
     async fn delete_rule(
         &self,
         req: Request<DeleteRuleRequest>,
     ) -> Result<Response<DeleteRuleResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        let peer = self.authorize(&req, "DeleteRule", Access::Control).await?;
         let id_str = req.into_inner().id;
         let id = uuid::Uuid::parse_str(&id_str)
             .map_err(|e| Status::invalid_argument(format!("bad uuid: {e}")))?;
-        let _mutation = self.mutations.lock();
+        let _mutation = self.engine.lock_mutations();
         let deleted = self
             .store
             .delete(id)
@@ -811,7 +1099,8 @@ impl Firewall for FirewallService {
         &self,
         req: Request<SubscribeRequest>,
     ) -> Result<Response<Self::StreamConnectionsStream>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "StreamConnections", Access::ReadOnly)
+            .await?;
         let (tx, rx) = mpsc::channel(256);
         let mut sub = self.observed_tx.subscribe();
         tokio::spawn(async move {
@@ -822,10 +1111,7 @@ impl Firewall for FirewallService {
                             connection: Some(convert::connection_to_pb(&obs.connection)),
                             process: Some(convert::process_to_pb(&obs.process)),
                             verdict: convert::verdict_to_pb_action(&obs.verdict) as i32,
-                            rule_id: match obs.verdict.source {
-                                cfc_core::VerdictSource::Rule(id) => id.to_string(),
-                                _ => String::new(),
-                            },
+                            rule_id: obs.rule_id().map(|id| id.to_string()).unwrap_or_default(),
                         };
                         if tx.send(Ok(ev)).await.is_err() {
                             break;
@@ -847,7 +1133,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "GetStatus", Access::ReadOnly).await?;
         let rules_count = self.engine.rule_count() as u64;
         let policy = self.policy();
         let paused = self.stats.is_paused();
@@ -880,9 +1166,6 @@ impl Firewall for FirewallService {
             enforcement: crate::ebpf::enforcement_level()
                 .map_or("starting", |l| l.as_str())
                 .to_string(),
-            fast_allow: crate::ebpf::fast_allow_level()
-                .map(|f| f.describe())
-                .unwrap_or_default(),
         }))
     }
 
@@ -890,7 +1173,11 @@ impl Firewall for FirewallService {
         &self,
         req: Request<SetPausedRequest>,
     ) -> Result<Response<SetPausedResponse>, Status> {
-        let peer = self.authorize(&req, Access::Mutate)?;
+        // Both directions: resuming is as much "the firewall now behaves
+        // differently" as pausing.
+        let peer = self
+            .authorize(&req, "SetPaused", Access::Elevated(crate::polkit::PAUSE))
+            .await?;
         let msg = req.into_inner();
 
         if !msg.paused {
@@ -962,7 +1249,7 @@ impl Firewall for FirewallService {
         &self,
         req: Request<ListEventsRequest>,
     ) -> Result<Response<ListEventsResponse>, Status> {
-        self.authorize(&req, Access::ReadOnly)?;
+        self.authorize(&req, "ListEvents", Access::ReadOnly).await?;
         let (limit, offset, filter) =
             event_query_from_pb(&req.into_inner()).map_err(Status::invalid_argument)?;
         let rows = self
@@ -1146,51 +1433,92 @@ fn secure_socket(path: &Path, ipc: &IpcConfig) -> SocketAuth {
 // Event persistence pipeline
 // ---------------------------------------------------------------------------
 
-/// Persists Allow observations. Deny/Reject are committed synchronously by
-/// the NFQUEUE delivery gate before publication and must not be duplicated.
+/// The bounded queue into the event writer.
 ///
-/// Two tasks keep Allow observation writes off the datapath:
+/// `push` never waits. The packet worker delivers its verdict first and
+/// records it second, so a slow fsync, a long `ListEvents` holding the store
+/// mutex or a full disk costs audit rows - counted and logged - and never
+/// stalls or ends the datapath. Every refusal is also logged to the journal
+/// as "connection blocked" before it is queued.
+#[derive(Clone)]
+pub struct EventSink {
+    tx: mpsc::Sender<EventRow>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl EventSink {
+    pub(crate) fn channel(depth: usize) -> (Self, mpsc::Receiver<EventRow>) {
+        let (tx, rx) = mpsc::channel(depth);
+        let sink = Self {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        (sink, rx)
+    }
+
+    /// Queues one row for the writer, or counts it as dropped.
+    pub fn push(&self, row: EventRow) {
+        if self.tx.try_send(row).is_err() {
+            count_dropped(&self.dropped, 1, "event log queue full");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// Adds `n` to the drop counter and warns on the first drop and every
+/// `EVENT_DROP_LOG_EVERY` after it, rather than once per row.
+fn count_dropped(dropped: &AtomicU64, n: u64, why: &str) {
+    let before = dropped.fetch_add(n, Ordering::Relaxed);
+    let total = before + n;
+    if before == 0 || before / EVENT_DROP_LOG_EVERY != total / EVENT_DROP_LOG_EVERY {
+        warn!(
+            dropped = total,
+            "{why}; events were not persisted (the packet path never waits for persistence)"
+        );
+    }
+}
+
+/// Starts the event persistence pipeline and returns the sink the packet
+/// worker queues its refusals into.
 ///
-/// - a *feeder* that converts broadcast items to [`EventRow`]s and
-///   `try_send`s them into a bounded queue, counting (never awaiting on)
-///   drops;
-/// - a *writer* that drains the queue in batches of `EVENT_BATCH_ROWS` or
-///   every second, whichever comes first, and trims the table to
-///   `max_rows` once a minute.
+/// - Refusals are pushed straight into the bounded queue by the worker, so
+///   they never depend on the lossy live feed.
+/// - A *feeder* converts Allow observations from the live feed to
+///   [`EventRow`]s and pushes them the same way.
+/// - A *writer* drains the queue in batches of `EVENT_BATCH_ROWS` or every
+///   second, whichever comes first, and trims the table to `max_rows` once a
+///   minute.
+///
+/// Every row lost on the way (queue full, feeder lag, failed batch commit)
+/// is counted in one counter and logged.
 pub fn spawn_event_pipeline(
     store: RuleStore,
     observed_tx: &broadcast::Sender<ObservedConnection>,
     max_rows: u32,
-) {
-    let (tx, rx) = mpsc::channel::<EventRow>(EVENT_QUEUE_DEPTH);
+) -> EventSink {
+    let (sink, rx) = EventSink::channel(EVENT_QUEUE_DEPTH);
     let mut sub = observed_tx.subscribe();
 
+    let feeder = sink.clone();
     tokio::spawn(async move {
-        let dropped = AtomicU64::new(0);
         loop {
             match sub.recv().await {
                 Ok(obs) => {
                     if obs.verdict.action != cfc_core::Action::Allow {
                         continue;
                     }
-                    let row = convert::event_row_from_observed(
-                        &obs.connection,
-                        &obs.process,
-                        &obs.verdict,
-                    );
-                    if tx.try_send(row).is_err() {
-                        let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n == 1 || n.is_multiple_of(EVENT_DROP_LOG_EVERY) {
-                            warn!(
-                                dropped = n,
-                                "event log queue full; dropping events (the packet path is \
-                                 never blocked for persistence)"
-                            );
-                        }
-                    }
+                    feeder.push(convert::event_row_from_observed(&obs));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(missed = n, "event log feeder lagged behind the live feed");
+                    count_dropped(
+                        &feeder.dropped,
+                        n,
+                        "event log feeder lagged behind the live feed",
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1198,10 +1526,16 @@ pub fn spawn_event_pipeline(
         info!("event log feeder stopped: live feed closed");
     });
 
-    tokio::spawn(event_writer_task(store, rx, max_rows));
+    tokio::spawn(event_writer_task(store, rx, sink.dropped.clone(), max_rows));
+    sink
 }
 
-async fn event_writer_task(store: RuleStore, mut rx: mpsc::Receiver<EventRow>, max_rows: u32) {
+async fn event_writer_task(
+    store: RuleStore,
+    mut rx: mpsc::Receiver<EventRow>,
+    dropped: Arc<AtomicU64>,
+    max_rows: u32,
+) {
     let mut batch: Vec<EventRow> = Vec::with_capacity(EVENT_BATCH_ROWS);
     let mut flush =
         tokio::time::interval(std::time::Duration::from_secs(EVENT_BATCH_INTERVAL_SECS));
@@ -1216,16 +1550,16 @@ async fn event_writer_task(store: RuleStore, mut rx: mpsc::Receiver<EventRow>, m
                 Some(row) => {
                     batch.push(row);
                     if batch.len() >= EVENT_BATCH_ROWS {
-                        write_batch(&store, &mut batch);
+                        write_batch(&store, &mut batch, &dropped);
                     }
                 }
                 None => {
-                    write_batch(&store, &mut batch);
+                    write_batch(&store, &mut batch, &dropped);
                     info!("event log writer stopped: queue closed");
                     return;
                 }
             },
-            _ = flush.tick() => write_batch(&store, &mut batch),
+            _ = flush.tick() => write_batch(&store, &mut batch, &dropped),
             _ = prune.tick() => match store.prune_events(max_rows) {
                 Ok(n) if n > 0 => tracing::debug!(removed = n, cap = max_rows, "pruned old events"),
                 Ok(_) => {}
@@ -1235,12 +1569,17 @@ async fn event_writer_task(store: RuleStore, mut rx: mpsc::Receiver<EventRow>, m
     }
 }
 
-fn write_batch(store: &RuleStore, batch: &mut Vec<EventRow>) {
+fn write_batch(store: &RuleStore, batch: &mut Vec<EventRow>, dropped: &AtomicU64) {
     if batch.is_empty() {
         return;
     }
     if let Err(e) = store.insert_events(batch) {
-        warn!(rows = batch.len(), "event log write failed: {e}");
+        let total = dropped.fetch_add(batch.len() as u64, Ordering::Relaxed) + batch.len() as u64;
+        warn!(
+            rows = batch.len(),
+            dropped = total,
+            "event log write failed: {e:#}"
+        );
     }
     batch.clear();
 }
@@ -1271,7 +1610,15 @@ pub async fn spawn(
 ) -> anyhow::Result<(JoinHandle<()>, PromptTx)> {
     let socket_path = opts.socket_path;
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // An explicit mode: the umask is only tightened below, and a daemon
+        // started by hand under umask 000 made this directory world-writable,
+        // so any local user could swap the socket for one of their own.
+        // Systemd's RuntimeDirectoryMode creates it 0755 before we get here.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)
+            .ok();
     }
     let _ = std::fs::remove_file(&socket_path);
 
@@ -1290,6 +1637,15 @@ pub async fn spawn(
         .with_context(|| format!("binding {}", socket_path.display()))?;
     // Tighten ownership/mode before the first client can connect.
     let auth = secure_socket(&socket_path, &opts.ipc);
+    for warning in opts.ipc.official_client_warnings() {
+        warn!("{warning}");
+    }
+    if !opts.ipc.official_clients.is_empty() {
+        let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok();
+        if let Some(warning) = crate::official::ptrace_scope_warning(scope.as_deref()) {
+            warn!("{warning}");
+        }
+    }
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds)
         .map(|stream| stream.and_then(PeerStream::new));
 
@@ -1300,12 +1656,17 @@ pub async fn spawn(
         router,
         stats,
         policy,
-        auth,
+        control: Control {
+            auth,
+            own_uid: nix::unistd::geteuid().as_raw(),
+            official_clients: opts.ipc.official_clients.clone().into(),
+            official: crate::official::check,
+        },
+        polkit: |peer, action| Box::pin(crate::polkit::check(peer, action)),
         audience: Arc::new(PromptAudience::default()),
         resume_at_ms: Arc::new(AtomicI64::new(0)),
         pause_default_secs: opts.pause_default_secs,
         dry_run: opts.dry_run,
-        mutations: Mutex::new(()),
     };
 
     info!(socket = %socket_path.display(), "IPC listening");
@@ -1347,33 +1708,604 @@ mod tests {
         assert_eq!(scope.exe_path, Some(target));
     }
 
+    #[test]
+    fn only_an_unchanged_stored_exe_skips_validation() {
+        let mut scope = cfc_core::RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/bin/curl"));
+        let old = cfc_core::Rule::new("legacy", cfc_core::Action::Deny, scope);
+        let stored = cfc_core::RuleSet {
+            rules: vec![old.clone()],
+        };
+        let mut toggled = old.clone();
+        toggled.enabled = false;
+        assert!(keeps_stored_exe(&stored, &toggled));
+        let mut moved = old.clone();
+        moved.scope.exe_path = Some(PathBuf::from("/bin/wget"));
+        assert!(!keeps_stored_exe(&stored, &moved));
+        let mut fresh = old.clone();
+        fresh.id = uuid::Uuid::new_v4();
+        assert!(!keeps_stored_exe(&stored, &fresh));
+    }
+
     // -- authorization ------------------------------------------------------
 
     #[test]
-    fn read_only_rpcs_are_open_to_any_connected_peer() {
-        for gated in [true, false] {
-            for require in [true, false] {
-                assert!(authorize_uid(1000, Access::ReadOnly, gated, require));
-                assert!(authorize_uid(0, Access::ReadOnly, gated, require));
+    fn gate_table() {
+        // (peer uid, daemon uid, group proved) -> standing
+        let cases = [
+            (0, 0, false, Gate::Privileged),
+            (0, 0, true, Gate::Privileged),
+            (1000, 1000, false, Gate::Privileged),
+            (0, 1000, false, Gate::Privileged),
+            (1000, 0, true, Gate::NeedOfficial),
+            (1000, 0, false, Gate::DenyGroup),
+        ];
+        for (peer, own, group_ok, want) in cases {
+            assert_eq!(gate(peer, own, group_ok), want, "{peer} {own} {group_ok}");
+        }
+    }
+
+    // -- the service's authorization table ---------------------------------
+
+    const OWN_UID: u32 = 999;
+    const GROUP_GID: u32 = 4242;
+    /// The pid the stub official check accepts.
+    const OFFICIAL_PID: i32 = 77;
+
+    /// An official client whose binary is replaced after its first check.
+    const UPGRADED_PID: i32 = 4243;
+
+    fn stub_official(peer: &PeerId, _: &[PathBuf]) -> Result<PathBuf, String> {
+        static UPGRADED_CHECKS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        if peer.pid == Some(UPGRADED_PID) {
+            return if UPGRADED_CHECKS.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(PathBuf::from("/usr/bin/colony-firewall-tray"))
+            } else {
+                Err("this colony-firewall-tray is not the installed one (restart it after an upgrade)".into())
+            };
+        }
+        if peer.pid == Some(OFFICIAL_PID) {
+            Ok(PathBuf::from("/usr/bin/colony-firewall"))
+        } else {
+            Err("not the installed app".into())
+        }
+    }
+
+    fn polkit_allows(
+        _: PeerId,
+        _: &'static str,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn polkit_denies(
+        _: PeerId,
+        _: &'static str,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Err("authorization dialog dismissed".to_string()) })
+    }
+
+    fn polkit_must_not_be_asked(
+        _: PeerId,
+        action: &'static str,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        panic!("polkit was asked for {action}")
+    }
+
+    fn service(require_group: bool) -> FirewallService {
+        service_with(require_group, polkit_allows)
+    }
+
+    fn service_with(require_group: bool, polkit: PolkitCheck) -> FirewallService {
+        let store = RuleStore::open_in_memory().unwrap();
+        let policy: SharedPolicy = Arc::new(std::sync::RwLock::new(crate::config::DefaultPolicy {
+            no_ui_action: cfc_core::Action::Deny,
+            timeout_action: cfc_core::Action::Deny,
+            inbound_action: cfc_core::Action::Deny,
+            prompt_timeout_secs: 3600,
+        }));
+        let engine = Engine::new(store.snapshot().unwrap(), policy.clone());
+        let stats = Stats::new();
+        let (verdict_tx, verdicts) = std::sync::mpsc::channel();
+        // Verdicts are not asserted here; keep the receiver alive.
+        std::mem::forget(verdicts);
+        FirewallService {
+            router: PromptRouter::new(policy.clone(), stats.clone(), verdict_tx),
+            engine,
+            store,
+            observed_tx: broadcast::channel(16).0,
+            stats,
+            policy,
+            control: Control {
+                auth: SocketAuth {
+                    group: "cfc-test".into(),
+                    group_gid: Some(GROUP_GID),
+                    group_gated: true,
+                    require_group,
+                },
+                own_uid: OWN_UID,
+                official_clients: Arc::from(Vec::new()),
+                official: stub_official,
+            },
+            polkit,
+            audience: Arc::new(PromptAudience::default()),
+            resume_at_ms: Arc::new(AtomicI64::new(0)),
+            pause_default_secs: 600,
+            dry_run: true,
+        }
+    }
+
+    fn peer(uid: u32, gid: u32, pid: i32) -> PeerId {
+        PeerId {
+            uid,
+            gid,
+            pid: Some(pid),
+            starttime: None,
+            sock_ino: None,
+        }
+    }
+
+    fn request<T>(message: T, peer: PeerId) -> Request<T> {
+        let mut req = Request::new(message);
+        req.extensions_mut().insert(peer);
+        req
+    }
+
+    fn rule_pb() -> RuleInfo {
+        let mut rule = cfc_core::Rule::new(
+            "smtp",
+            cfc_core::Action::Deny,
+            cfc_core::RuleScope {
+                dst_port: Some(25),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        rule.name = "smtp".into();
+        convert::rule_to_pb(&rule)
+    }
+
+    /// Which change RPCs `peer` got through, in the order UpsertRule,
+    /// DeleteRule, SetPaused, ApplyRules. A refusal must be
+    /// PERMISSION_DENIED; any other error fails the test.
+    async fn changes(svc: &FirewallService, peer: PeerId) -> [bool; 4] {
+        fn passed<T>(result: Result<T, Status>) -> bool {
+            match result {
+                Ok(_) => true,
+                Err(status) => {
+                    assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+                    false
+                }
             }
         }
+        let upsert = svc
+            .upsert_rule(request(
+                UpsertRuleRequest {
+                    rule: Some(rule_pb()),
+                },
+                peer,
+            ))
+            .await;
+        let delete = svc
+            .delete_rule(request(
+                DeleteRuleRequest {
+                    id: uuid::Uuid::new_v4().to_string(),
+                },
+                peer,
+            ))
+            .await;
+        let pause = svc
+            .set_paused(request(
+                SetPausedRequest {
+                    paused: false,
+                    duration_secs: 0,
+                },
+                peer,
+            ))
+            .await;
+        let apply = svc
+            .apply_rules(request(
+                ApplyRulesRequest {
+                    rules: vec![rule_pb()],
+                    replace: false,
+                },
+                peer,
+            ))
+            .await;
+        [passed(upsert), passed(delete), passed(pause), passed(apply)]
     }
 
-    #[test]
-    fn root_may_always_mutate() {
-        for gated in [true, false] {
-            assert!(authorize_uid(0, Access::Mutate, gated, true));
+    async fn reads(svc: &FirewallService, peer: PeerId) {
+        svc.list_rules(request(ListRulesRequest {}, peer))
+            .await
+            .unwrap();
+        svc.get_status(request(StatusRequest {}, peer))
+            .await
+            .unwrap();
+        svc.list_events(request(ListEventsRequest::default(), peer))
+            .await
+            .unwrap();
+        svc.stream_connections(request(SubscribeRequest::default(), peer))
+            .await
+            .unwrap();
+        svc.stream_prompts(request(SubscribeRequest::default(), peer))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn authorization_table() {
+        let root = peer(0, 0, 1);
+        let own = peer(OWN_UID, OWN_UID, 2);
+        let official_member = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let official_outsider = peer(1001, 1001, OFFICIAL_PID);
+        let read_only_member = peer(1000, GROUP_GID, 5);
+        let all = [true; 4];
+        let none = [false; 4];
+
+        let svc = service(true);
+        for (who, want) in [
+            (root, all),
+            (own, all),
+            (official_member, all),
+            (official_outsider, none),
+            (read_only_member, none),
+        ] {
+            reads(&svc, who).await;
+            assert_eq!(changes(&svc, who).await, want, "{who:?}");
         }
+
+        // require_group = false waives the group check, never the image check.
+        let svc = service(false);
+        assert_eq!(changes(&svc, official_outsider).await, all);
+        assert_eq!(changes(&svc, read_only_member).await, none);
+        assert_eq!(changes(&svc, peer(1002, 1002, 6)).await, none);
+
+        // Pause and import need polkit from the official client, and only
+        // from it: a refusal there leaves the single-rule edits alone.
+        let svc = service_with(true, polkit_denies);
+        assert_eq!(
+            changes(&svc, official_member).await,
+            [true, true, false, false]
+        );
+        assert_eq!(changes(&svc, root).await, all);
+        assert_eq!(changes(&svc, own).await, all);
+    }
+
+    #[tokio::test]
+    async fn polkit_is_never_asked_for_root_or_for_prompt_answers() {
+        let svc = service_with(true, polkit_must_not_be_asked);
+        for who in [peer(0, 0, 1), peer(OWN_UID, OWN_UID, 2)] {
+            assert_eq!(changes(&svc, who).await, [true; 4]);
+        }
+        let official = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let [upsert, delete, ..] = changes_without_elevation(&svc, official).await;
+        assert!(upsert && delete);
+        let _ui = pending_prompt(&svc).await;
+        assert!(
+            svc.submit_verdict(answer(official))
+                .await
+                .unwrap()
+                .into_inner()
+                .accepted
+        );
+    }
+
+    /// UpsertRule and DeleteRule only.
+    async fn changes_without_elevation(svc: &FirewallService, peer: PeerId) -> [bool; 2] {
+        let upsert = svc
+            .upsert_rule(request(
+                UpsertRuleRequest {
+                    rule: Some(rule_pb()),
+                },
+                peer,
+            ))
+            .await
+            .is_ok();
+        let delete = svc
+            .delete_rule(request(
+                DeleteRuleRequest {
+                    id: uuid::Uuid::new_v4().to_string(),
+                },
+                peer,
+            ))
+            .await
+            .is_ok();
+        [upsert, delete]
+    }
+
+    #[tokio::test]
+    async fn a_denied_polkit_leaves_the_firewall_unpaused() {
+        let svc = service_with(true, polkit_denies);
+        let official = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest {
+                    paused: true,
+                    duration_secs: 60,
+                },
+                official,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            status.message().contains("dismissed"),
+            "{}",
+            status.message()
+        );
+        assert!(status.message().contains(crate::polkit::PAUSE));
+        assert!(!svc.stats.is_paused());
+
+        let status = svc
+            .apply_rules(request(
+                ApplyRulesRequest {
+                    rules: vec![rule_pb()],
+                    replace: true,
+                },
+                official,
+            ))
+            .await
+            .unwrap_err();
+        assert!(status.message().contains(crate::polkit::IMPORT_RULES));
+        assert_eq!(svc.engine.rule_count(), 0, "the store is unchanged");
+    }
+
+    #[tokio::test]
+    async fn resume_also_requires_polkit() {
+        let svc = service_with(true, polkit_denies);
+        svc.set_paused(request(
+            SetPausedRequest {
+                paused: true,
+                duration_secs: 60,
+            },
+            peer(0, 0, 1),
+        ))
+        .await
+        .unwrap();
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest {
+                    paused: false,
+                    duration_secs: 0,
+                },
+                peer(1000, GROUP_GID, OFFICIAL_PID),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(svc.stats.is_paused(), "still paused");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_refusal_says_why_and_what_to_use_instead() {
+        let svc = service(true);
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest::default(),
+                peer(1000, GROUP_GID, 5),
+            ))
+            .await
+            .unwrap_err();
+        assert!(status
+            .message()
+            .starts_with("read-only access: not the installed app."));
+        assert!(
+            status.message().contains("sudo cfc"),
+            "{}",
+            status.message()
+        );
+        assert!(!svc.stats.is_paused());
+
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest::default(),
+                peer(1001, 1001, OFFICIAL_PID),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            status.message().contains("member of group 'cfc-test'"),
+            "{}",
+            status.message()
+        );
+    }
+
+    /// A pending prompt about uid 1000's process, with an answering UI so it
+    /// waits, and uid 1000 in its audience.
+    async fn pending_prompt(svc: &FirewallService) -> crate::prompts::PromptSubscription {
+        use std::net::{IpAddr, Ipv4Addr};
+        let ui = svc.router.subscribe(1000, true);
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(crate::prompts::run_router_task(rx, svc.router.clone()));
+        let mut process = cfc_core::Process::unknown(4321);
+        process.uid = Some(1000);
+        tx.send(PromptRequest {
+            prompt_id: 5,
+            connection: cfc_core::Connection::new(
+                cfc_core::Protocol::Tcp,
+                cfc_core::Direction::Outbound,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                40000,
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                443,
+            ),
+            process,
+            undecided: None,
+        })
+        .await
+        .unwrap();
+        while svc.stats.prompts_pending() == 0 {
+            tokio::task::yield_now().await;
+        }
+        svc.audience.record(5, 1000);
+        ui
+    }
+
+    fn answer(peer: PeerId) -> Request<VerdictRequest> {
+        request(
+            VerdictRequest {
+                prompt_id: "5".into(),
+                action: cfc_proto::v1::Action::Allow as i32,
+                duration: cfc_proto::v1::Duration::Once as i32,
+                persist_scope: None,
+            },
+            peer,
+        )
+    }
+
+    /// `allow dst_port 443` for every program, or for `exe` when given.
+    fn allow_pb(exe: Option<&str>, enabled: bool) -> RuleInfo {
+        let mut rule = cfc_core::Rule::new(
+            "https",
+            cfc_core::Action::Allow,
+            cfc_core::RuleScope {
+                dst_port: Some(443),
+                exe_sha256: exe.map(str::to_string),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        rule.enabled = enabled;
+        convert::rule_to_pb(&rule)
+    }
+
+    async fn upsert(svc: &FirewallService, rule: RuleInfo, who: PeerId) -> Result<(), Status> {
+        svc.upsert_rule(request(UpsertRuleRequest { rule: Some(rule) }, who))
+            .await
+            .map(drop)
     }
 
     #[test]
-    fn non_root_mutation_requires_proved_peer_group_membership() {
-        // Only proved peer membership authorizes a non-root mutation.
-        assert!(authorize_uid(1000, Access::Mutate, true, true));
-        // A socket mode is not membership evidence for an individual peer.
-        assert!(!authorize_uid(1000, Access::Mutate, false, true));
-        // Explicit opt-out: the admin gates the socket some other way.
-        assert!(authorize_uid(1000, Access::Mutate, false, false));
+    fn only_an_enabled_allow_naming_no_program_opens_for_every_program() {
+        let rule = |pb: RuleInfo| convert::rule_from_pb(&pb).unwrap();
+        assert!(opens_for_every_program(&rule(allow_pb(None, true))));
+        assert!(!opens_for_every_program(&rule(allow_pb(None, false))));
+        let hash = "a".repeat(64);
+        assert!(!opens_for_every_program(&rule(allow_pb(Some(&hash), true))));
+        assert!(!opens_for_every_program(&rule(rule_pb())), "a Deny");
+    }
+
+    #[tokio::test]
+    async fn an_allow_for_every_program_needs_polkit_from_the_app() {
+        let official = peer(1000, GROUP_GID, OFFICIAL_PID);
+        let svc = service_with(true, polkit_denies);
+        let status = upsert(&svc, allow_pb(None, true), official)
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            status.message().contains(crate::polkit::GENERIC_ALLOW),
+            "{}",
+            status.message()
+        );
+        assert_eq!(svc.engine.rule_count(), 0, "nothing was stored");
+
+        // Granted, it is stored; a disabled one, a program's Allow and a
+        // Deny never ask, and neither does root.
+        let svc = service_with(true, polkit_allows);
+        upsert(&svc, allow_pb(None, true), official).await.unwrap();
+        let svc = service_with(true, polkit_must_not_be_asked);
+        let hash = "a".repeat(64);
+        upsert(&svc, allow_pb(None, false), official).await.unwrap();
+        upsert(&svc, allow_pb(Some(&hash), true), official)
+            .await
+            .unwrap();
+        upsert(&svc, rule_pb(), official).await.unwrap();
+        upsert(&svc, allow_pb(None, true), peer(0, 0, 1))
+            .await
+            .unwrap();
+        assert_eq!(svc.engine.rule_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_answer_customized_to_every_program_needs_polkit() {
+        let svc = service_with(true, polkit_denies);
+        let _ui = pending_prompt(&svc).await;
+        let mut req = answer(peer(1000, GROUP_GID, OFFICIAL_PID));
+        req.get_mut().duration = cfc_proto::v1::Duration::Always as i32;
+        req.get_mut().persist_scope = allow_pb(None, true).scope;
+        let reply = svc.submit_verdict(req).await.unwrap().into_inner();
+        assert!(reply.accepted, "the answer itself still applies");
+        assert!(reply.persisted_rule_id.is_empty());
+        assert!(
+            reply.persist_error.contains(crate::polkit::GENERIC_ALLOW),
+            "{}",
+            reply.persist_error
+        );
+        assert_eq!(svc.engine.rule_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_client_stops_counting_as_a_ui_at_its_next_prompt() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let svc = service(true);
+        let mut stream = svc
+            .stream_prompts(request(
+                SubscribeRequest::default(),
+                peer(1000, GROUP_GID, UPGRADED_PID),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(svc.router.has_answering_ui(1000), "official at subscribe");
+
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(crate::prompts::run_router_task(rx, svc.router.clone()));
+        let mut process = cfc_core::Process::unknown(4321);
+        process.uid = Some(1000);
+        tx.send(PromptRequest {
+            prompt_id: 9,
+            connection: cfc_core::Connection::new(
+                cfc_core::Protocol::Tcp,
+                cfc_core::Direction::Outbound,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                40000,
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                443,
+            ),
+            process,
+            undecided: None,
+        })
+        .await
+        .unwrap();
+
+        let status = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("restart"), "{}", status.message());
+        assert!(stream.next().await.is_none(), "the stream ended");
+        for _ in 0..1000 {
+            if !svc.router.has_answering_ui(1000) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!svc.router.has_answering_ui(1000), "no longer a UI");
+        assert!(!svc.audience.allows(9, 1000), "and never told the id");
+    }
+
+    #[tokio::test]
+    async fn read_only_peer_cannot_answer_even_its_own_prompt() {
+        let svc = service(true);
+        let _ui = pending_prompt(&svc).await;
+        let status = svc
+            .submit_verdict(answer(peer(1000, GROUP_GID, 5)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(svc.stats.prompts_pending(), 1, "the prompt still waits");
+    }
+
+    #[tokio::test]
+    async fn official_peer_answers_without_password() {
+        let svc = service(true);
+        let _ui = pending_prompt(&svc).await;
+        let reply = svc
+            .submit_verdict(answer(peer(1000, GROUP_GID, OFFICIAL_PID)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.accepted);
+        assert_eq!(svc.stats.prompts_pending(), 0);
     }
 
     #[test]
@@ -1712,6 +2644,7 @@ mod tests {
                 action,
                 source: cfc_core::VerdictSource::DefaultPolicy,
             },
+            undecided: None,
         }
     }
 
@@ -1719,17 +2652,13 @@ mod tests {
     async fn event_pipeline_persists_the_live_feed() {
         let store = RuleStore::open_in_memory().unwrap();
         let (tx, _rx) = broadcast::channel(64);
-        spawn_event_pipeline(store.clone(), &tx, 1000);
+        let sink = spawn_event_pipeline(store.clone(), &tx, 1000);
 
         tx.send(observed(443, cfc_core::Action::Allow)).unwrap();
+        // The worker queues a refusal itself and then publishes it; the
+        // feeder must not record it a second time.
         let blocked = observed(80, cfc_core::Action::Deny);
-        store
-            .insert_events(&[convert::event_row_from_observed(
-                &blocked.connection,
-                &blocked.process,
-                &blocked.verdict,
-            )])
-            .unwrap();
+        sink.push(convert::event_row_from_observed(&blocked));
         tx.send(blocked).unwrap();
 
         // Well past the batch interval; paused time auto-advances.
@@ -1778,6 +2707,38 @@ mod tests {
 
         let rows = store.query_events(10, 0, EventFilter::default()).unwrap();
         assert_eq!(rows.len(), 2, "table should be trimmed to max_rows");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_store_costs_counted_rows_never_a_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let store = RuleStore::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_audit BEFORE INSERT ON events \
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let (tx, _rx) = broadcast::channel(64);
+        let sink = spawn_event_pipeline(store.clone(), &tx, 1000);
+        let blocked = observed(80, cfc_core::Action::Deny);
+        let row = convert::event_row_from_observed(&blocked);
+        for _ in 0..3 {
+            sink.push(row.clone());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            EVENT_BATCH_INTERVAL_SECS + 1,
+        ))
+        .await;
+        assert_eq!(sink.dropped(), 3);
+
+        // A full queue drops the row at once instead of waiting for room.
+        let (full, _rx) = EventSink::channel(1);
+        full.push(row.clone());
+        full.push(row);
+        assert_eq!(full.dropped(), 1);
     }
 
     #[test]

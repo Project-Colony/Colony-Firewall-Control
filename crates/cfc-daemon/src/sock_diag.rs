@@ -134,7 +134,12 @@ fn ask(req: &[u8; REQ_LEN]) -> Option<SockInfo> {
                 }
             }
         }
-        match slot.as_ref().map(|s| s.round_trip(req, seq)) {
+        let mut buf = [0u8; 8192];
+        let reply = slot.as_ref().map(|s| match s.exchange(req, seq, &mut buf) {
+            Some(n) => parse_response(&buf[..n], req[17]).map_or(Reply::NotFound, Reply::Found),
+            None => Reply::Desync,
+        });
+        match reply {
             Some(Reply::Found(info)) => Some(info),
             // A correctly-sequenced "no such socket". The socket is clean, so
             // it is kept; the caller falls back to /proc as before.
@@ -210,18 +215,23 @@ fn reply_seq(buf: &[u8]) -> Option<u32> {
 }
 
 /// answer with a single SOCK_DIAG_BY_FAMILY message or an NLMSG_ERROR.
-fn parse_response(buf: &[u8]) -> Option<SockInfo> {
+fn parse_response(buf: &[u8], protocol: u8) -> Option<SockInfo> {
     if buf.len() < NLMSG_HDR_LEN {
         return None;
     }
     let msg_len = u32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
     let msg_type = u16::from_ne_bytes(buf[4..6].try_into().ok()?);
-    if msg_type != SOCK_DIAG_BY_FAMILY || msg_len > buf.len() {
+    if msg_type != SOCK_DIAG_BY_FAMILY || msg_len < NLMSG_HDR_LEN || msg_len > buf.len() {
         // NLMSG_ERROR (no such socket, EPERM, ...) or truncated reply.
         return None;
     }
     let payload = &buf[NLMSG_HDR_LEN..msg_len];
     if payload.len() < INET_DIAG_MSG_LEN {
+        return None;
+    }
+    // A listener is not the connected socket that emitted an outbound flow.
+    // UDP's unconnected state remains valid and is checked by the caller.
+    if protocol == libc::IPPROTO_TCP as u8 && payload[1] == 0x0A {
         return None;
     }
     // struct inet_diag_msg: id.idiag_cookie sits at payload offset 44
@@ -278,7 +288,9 @@ impl DiagSocket {
         Ok(sock)
     }
 
-    fn round_trip(&self, req: &[u8], seq: u32) -> Reply {
+    /// Sends `req` and receives its answer into `buf`. `Some(len)` only for
+    /// an answer carrying `seq`; `None` means the socket's state is unknown.
+    fn exchange(&self, req: &[u8], seq: u32, buf: &mut [u8]) -> Option<usize> {
         let fd = self.0.as_raw_fd();
 
         // SAFETY: zeroed sockaddr_nl is a valid "to the kernel" address.
@@ -302,10 +314,9 @@ impl DiagSocket {
                 "sock_diag send failed ({}); falling back to /proc",
                 std::io::Error::last_os_error()
             );
-            return Reply::Desync;
+            return None;
         }
 
-        let mut buf = [0u8; 8192];
         // SAFETY: buf is a valid writable buffer of the stated length.
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
         if n <= 0 {
@@ -313,21 +324,107 @@ impl DiagSocket {
                 "sock_diag recv failed ({}); falling back to /proc",
                 std::io::Error::last_os_error()
             );
-            return Reply::Desync;
+            return None;
         }
-        let buf = &buf[..n as usize];
+        let n = n as usize;
         // The answer must be to *this* request. Anything else means a previous
         // request's answer arrived after its timeout, and this socket cannot
         // be trusted to be at a message boundary any more.
-        if reply_seq(buf) != Some(seq) {
+        if reply_seq(&buf[..n]) != Some(seq) {
             trace!("sock_diag answered a different request; discarding the socket");
-            return Reply::Desync;
+            return None;
         }
-        match parse_response(buf) {
-            Some(info) => Reply::Found(info),
-            None => Reply::NotFound,
-        }
+        Some(n)
     }
+}
+
+// ---------------------------------------------------------------------------
+// AF_UNIX: the other end of a connection
+// ---------------------------------------------------------------------------
+
+const UNIX_DIAG_REQ_LEN: usize = 24;
+const UNIX_REQ_LEN: usize = NLMSG_HDR_LEN + UNIX_DIAG_REQ_LEN;
+/// Fixed part of struct unix_diag_msg (before the attributes).
+const UNIX_DIAG_MSG_LEN: usize = 16;
+const UDIAG_SHOW_PEER: u32 = 0x4;
+const UNIX_DIAG_PEER: u16 = 2;
+const NLMSG_ERROR: u16 = 2;
+
+/// Inode of the socket at the other end of the AF_UNIX socket `inode`.
+///
+/// One exact UNIX_DIAG query with `UDIAG_SHOW_PEER`. The daemon passes the
+/// inode of its own end of a control connection and gets the client's end,
+/// which it then looks for among the client's descriptors. Errors are the
+/// kernel's (`ENOENT` for a socket that is gone, `EOPNOTSUPP` or
+/// `EPROTONOSUPPORT` without the `unix_diag` module) or `InvalidData` for an
+/// answer without a peer.
+pub fn unix_peer_inode(inode: u64) -> std::io::Result<u64> {
+    use std::io::{Error, ErrorKind};
+    let inode = u32::try_from(inode)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "socket inode out of range"))?;
+    let seq = 1;
+    let req = build_unix_request(inode, seq);
+    let socket = DiagSocket::open()?;
+    let mut buf = [0u8; 8192];
+    let n = socket
+        .exchange(&req, seq, &mut buf)
+        .ok_or_else(|| Error::new(ErrorKind::TimedOut, "no answer from sock_diag"))?;
+    parse_unix_peer(&buf[..n], inode)
+}
+
+fn build_unix_request(inode: u32, seq: u32) -> [u8; UNIX_REQ_LEN] {
+    let mut buf = [0u8; UNIX_REQ_LEN];
+    buf[0..4].copy_from_slice(&(UNIX_REQ_LEN as u32).to_ne_bytes());
+    buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    buf[6..8].copy_from_slice(&(libc::NLM_F_REQUEST as u16).to_ne_bytes());
+    buf[8..12].copy_from_slice(&seq.to_ne_bytes());
+    // struct unix_diag_req: family, protocol, pad, states, ino, show, cookie.
+    buf[16] = libc::AF_UNIX as u8;
+    buf[20..24].copy_from_slice(&u32::MAX.to_ne_bytes());
+    buf[24..28].copy_from_slice(&inode.to_ne_bytes());
+    buf[28..32].copy_from_slice(&UDIAG_SHOW_PEER.to_ne_bytes());
+    buf[32..40].copy_from_slice(&[0xFF; 8]); // NOCOOKIE
+    buf
+}
+
+fn parse_unix_peer(buf: &[u8], inode: u32) -> std::io::Result<u64> {
+    use std::io::{Error, ErrorKind};
+    let bad = || Error::new(ErrorKind::InvalidData, "malformed unix_diag answer");
+    let header = buf.get(..NLMSG_HDR_LEN).ok_or_else(bad)?;
+    let msg_len = u32::from_ne_bytes(header[0..4].try_into().map_err(|_| bad())?) as usize;
+    let msg_type = u16::from_ne_bytes(header[4..6].try_into().map_err(|_| bad())?);
+    let msg = buf.get(NLMSG_HDR_LEN..msg_len).ok_or_else(bad)?;
+    if msg_type == NLMSG_ERROR {
+        let errno = i32::from_ne_bytes(
+            msg.get(..4)
+                .ok_or_else(bad)?
+                .try_into()
+                .map_err(|_| bad())?,
+        );
+        return Err(Error::from_raw_os_error(-errno));
+    }
+    if msg_type != SOCK_DIAG_BY_FAMILY || msg.len() < UNIX_DIAG_MSG_LEN {
+        return Err(bad());
+    }
+    if u32::from_ne_bytes(msg[4..8].try_into().map_err(|_| bad())?) != inode {
+        return Err(bad());
+    }
+    let mut attrs = &msg[UNIX_DIAG_MSG_LEN..];
+    while attrs.len() >= 4 {
+        let len = u16::from_ne_bytes([attrs[0], attrs[1]]) as usize;
+        let kind = u16::from_ne_bytes([attrs[2], attrs[3]]);
+        if len < 4 || len > attrs.len() {
+            break;
+        }
+        if kind == UNIX_DIAG_PEER && len >= 8 {
+            let peer = u32::from_ne_bytes(attrs[4..8].try_into().map_err(|_| bad())?);
+            if peer != 0 {
+                return Ok(u64::from(peer));
+            }
+        }
+        attrs = &attrs[(len + 3) & !3..];
+    }
+    Err(Error::new(ErrorKind::InvalidData, "the socket has no peer"))
 }
 
 #[cfg(test)]
@@ -442,12 +539,33 @@ mod tests {
         buf[NLMSG_HDR_LEN + 64..NLMSG_HDR_LEN + 68].copy_from_slice(&1000u32.to_ne_bytes());
         buf[NLMSG_HDR_LEN + 68..NLMSG_HDR_LEN + 72].copy_from_slice(&31337u32.to_ne_bytes());
         assert_eq!(
-            parse_response(&buf),
+            parse_response(&buf, libc::IPPROTO_TCP as u8),
             Some(SockInfo {
                 inode: 31337,
                 cookie: None,
                 uid: 1000
             })
+        );
+    }
+
+    #[test]
+    fn outbound_tcp_diag_rejects_listeners_without_rejecting_udp() {
+        let mut buf = vec![0u8; NLMSG_HDR_LEN + INET_DIAG_MSG_LEN];
+        let len = buf.len() as u32;
+        buf[0..4].copy_from_slice(&len.to_ne_bytes());
+        buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+        buf[NLMSG_HDR_LEN + 68..NLMSG_HDR_LEN + 72].copy_from_slice(&31337u32.to_ne_bytes());
+        for state in [0x01, 0x02, 0x0A] {
+            buf[NLMSG_HDR_LEN + 1] = state;
+            assert_eq!(
+                parse_response(&buf, libc::IPPROTO_TCP as u8).map(|i| i.inode),
+                (state != 0x0A).then_some(31337)
+            );
+        }
+        buf[NLMSG_HDR_LEN + 1] = 0x07;
+        assert_eq!(
+            parse_response(&buf, libc::IPPROTO_UDP as u8).map(|i| i.inode),
+            Some(31337)
         );
     }
 
@@ -459,17 +577,19 @@ mod tests {
         buf[0..4].copy_from_slice(&len.to_ne_bytes());
         buf[4..6].copy_from_slice(&2u16.to_ne_bytes());
         buf[NLMSG_HDR_LEN..].copy_from_slice(&(-2i32).to_ne_bytes()); // -ENOENT
-        assert_eq!(parse_response(&buf), None);
+        assert_eq!(parse_response(&buf, libc::IPPROTO_TCP as u8), None);
     }
 
     #[test]
     fn truncated_reply_is_none() {
-        assert_eq!(parse_response(&[0u8; 8]), None);
+        assert_eq!(parse_response(&[0u8; 8], libc::IPPROTO_TCP as u8), None);
         let mut buf = vec![0u8; NLMSG_HDR_LEN + 8];
         let len = buf.len() as u32;
         buf[0..4].copy_from_slice(&len.to_ne_bytes());
         buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
-        assert_eq!(parse_response(&buf), None);
+        assert_eq!(parse_response(&buf, libc::IPPROTO_TCP as u8), None);
+        buf[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        assert_eq!(parse_response(&buf, libc::IPPROTO_TCP as u8), None);
     }
 
     #[test]
@@ -484,6 +604,63 @@ mod tests {
             1,
         );
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn unix_peer_reply_parsing() {
+        let mut buf = vec![0u8; NLMSG_HDR_LEN + UNIX_DIAG_MSG_LEN + 8 + 8];
+        let len = buf.len() as u32;
+        buf[0..4].copy_from_slice(&len.to_ne_bytes());
+        buf[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+        buf[NLMSG_HDR_LEN + 4..NLMSG_HDR_LEN + 8].copy_from_slice(&41u32.to_ne_bytes());
+        let attrs = NLMSG_HDR_LEN + UNIX_DIAG_MSG_LEN;
+        // An unrelated attribute first (RQLEN), then the peer.
+        buf[attrs..attrs + 2].copy_from_slice(&8u16.to_ne_bytes());
+        buf[attrs + 2..attrs + 4].copy_from_slice(&4u16.to_ne_bytes());
+        buf[attrs + 8..attrs + 10].copy_from_slice(&8u16.to_ne_bytes());
+        buf[attrs + 10..attrs + 12].copy_from_slice(&UNIX_DIAG_PEER.to_ne_bytes());
+        buf[attrs + 12..attrs + 16].copy_from_slice(&42u32.to_ne_bytes());
+        assert_eq!(parse_unix_peer(&buf, 41).unwrap(), 42);
+        assert!(
+            parse_unix_peer(&buf, 40).is_err(),
+            "an answer about another socket"
+        );
+
+        let mut error = vec![0u8; NLMSG_HDR_LEN + 4];
+        let error_len = error.len() as u32;
+        error[0..4].copy_from_slice(&error_len.to_ne_bytes());
+        error[4..6].copy_from_slice(&NLMSG_ERROR.to_ne_bytes());
+        error[NLMSG_HDR_LEN..].copy_from_slice(&(-libc::ENOENT).to_ne_bytes());
+        assert_eq!(
+            parse_unix_peer(&error, 41).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        let req = build_unix_request(41, 9);
+        assert_eq!(reply_seq(&req), Some(9));
+        assert_eq!(&req[24..28], &41u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn unix_peer_inode_names_the_other_end() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let inode = |fd: i32| {
+            // SAFETY: zeroed stat is valid out-param storage; fd is open.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+            st.st_ino
+        };
+        match unix_peer_inode(inode(a.as_raw_fd())) {
+            Ok(peer) => assert_eq!(peer, inode(b.as_raw_fd())),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM | libc::ENOENT | libc::EOPNOTSUPP | libc::EPROTONOSUPPORT)
+                ) =>
+            {
+                eprintln!("skipped: unix_diag unavailable here ({error})");
+            }
+            Err(error) => panic!("unix_peer_inode: {error}"),
+        }
     }
 
     fn socket_inode(sock: &UdpSocket) -> u64 {

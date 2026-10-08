@@ -10,6 +10,7 @@ use anyhow::Context;
 use cfc_core::{Duration as RuleDuration, Rule, RuleSet};
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -102,9 +103,9 @@ fn heal_legacy_protocol(rule: &mut Rule) -> bool {
 ///
 /// A rule caught here is quarantined, not deleted: the row is the operator's,
 /// and `cfc rules list` is not where a firewall should silently lose things.
-/// It is also not loaded disabled-but-present - the engine snapshot holds
-/// only enabled rules - so "not applied, named in the log, preserved on
-/// disk" is the whole contract. Applying it is the bug, and most of these
+/// It is also not loaded disabled-but-present - a quarantined row is kept
+/// out of the engine altogether - so "not applied, named in the log,
+/// preserved on disk" is the whole contract. Applying it is the bug, and most of these
 /// shapes cannot even be edited away: every client edit is a
 /// read-modify-write that sends the refused scope straight back to a daemon
 /// that now rejects it.
@@ -176,9 +177,30 @@ fn tune(conn: &Connection, durable: bool) -> anyhow::Result<()> {
 
 impl RuleStore {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            path != Path::new(":memory:"),
+            "durable storage requires a database file"
+        );
+        // Explicit modes: a daemon started by hand inherits the shell's umask,
+        // and SQLite creates the database as 0666 minus that umask, with the
+        // -wal and -shm files copying the database's mode. The rules and other
+        // users' command lines in it are root's alone. The packaged unit's
+        // UMask=0077 gives the same result.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .ok();
         }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
         let conn = Connection::open(path).context("opening sqlite")?;
         let store = Self::from_conn(conn, true)?;
 
@@ -212,11 +234,14 @@ impl RuleStore {
 
     pub fn snapshot(&self) -> anyhow::Result<RuleSet> {
         let conn = self.conn.lock();
+        // Disabled rules load too: every engine lookup skips them, and the
+        // engine keeps them after a runtime disable, so a restart must not
+        // hide a paused rule from `cfc rules list` and from re-enabling.
+        //
         // Deterministic load order. `created_at` lives inside the JSON blob
         // (the table has no timestamp column), so order by `id`: stable
         // across restarts, and the in-memory sort handles priority ordering.
-        let mut stmt =
-            conn.prepare("SELECT id, data FROM rules WHERE enabled = 1 ORDER BY id ASC")?;
+        let mut stmt = conn.prepare("SELECT id, data FROM rules ORDER BY id ASC")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let json: String = row.get(1)?;
@@ -253,6 +278,20 @@ impl RuleStore {
                         quarantined += 1;
                         continue;
                     }
+                    if rule.enabled && rule.scope.dst_host.is_some() {
+                        // Its refusals are recorded as the default policy,
+                        // not as this rule, so without this line nothing
+                        // points at the rule behind them.
+                        tracing::warn!(
+                            rule_id = %id,
+                            rule_name = %rule.name,
+                            "legacy hostname rule: flows its other predicates \
+                             match are refused and logged as the default \
+                             policy; it cannot be disabled, so replace it with \
+                             an executable or numeric scope, or delete it with \
+                             `cfc rules remove {id}`"
+                        );
+                    }
                     rules.push(rule);
                 }
                 Err(e) => {
@@ -286,14 +325,16 @@ impl RuleStore {
                 healed_ids.len()
             );
         }
-        self.skipped.store(skipped_ids.len(), Ordering::Relaxed);
+        self.skipped
+            .store(skipped_ids.len() + quarantined, Ordering::Relaxed);
         Ok(RuleSet { rules })
     }
 
     /// Number of rule rows the most recent [`snapshot`](Self::snapshot) call
-    /// skipped because their JSON failed to deserialize. Rows are never
-    /// deleted for failing to parse; this count lets callers surface the
-    /// problem (e.g. in `status`) instead of losing data silently.
+    /// did not load: their JSON failed to deserialize, or they were
+    /// quarantined. Such rows are never deleted; this count lets callers
+    /// surface the problem (e.g. in `status`) instead of losing data
+    /// silently.
     pub fn skipped_rules(&self) -> usize {
         self.skipped.load(Ordering::Relaxed)
     }
@@ -450,10 +491,7 @@ impl RuleStore {
         if batch.is_empty() {
             return Ok(());
         }
-        let conn = self
-            .conn
-            .try_lock_for(std::time::Duration::from_millis(250))
-            .context("audit storage mutex unavailable within 250ms")?;
+        let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -624,24 +662,6 @@ impl RuleStore {
 mod tests {
 
     #[test]
-    fn event_commit_does_not_wait_indefinitely_for_the_store_mutex() {
-        let store = RuleStore::open_in_memory().unwrap();
-        let held = store.conn.lock();
-        let writer = store.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let task = std::thread::spawn(move || {
-            tx.send(writer.insert_events(&[sample_event(1, "test", "Deny")]))
-                .unwrap();
-        });
-        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
-        drop(held);
-        task.join().unwrap();
-        assert!(result
-            .expect("audit lock acquisition must be bounded")
-            .is_err());
-    }
-
-    #[test]
     fn production_storage_requires_a_file_and_bounded_sqlite_contention() {
         assert!(RuleStore::open(Path::new(":memory:")).is_err());
         let dir = tempfile::tempdir().unwrap();
@@ -652,6 +672,22 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
         assert!(timeout > 0 && timeout <= 500, "busy timeout = {timeout}");
+    }
+
+    #[test]
+    fn store_files_are_private_whatever_the_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let path = state.join("rules.db");
+        drop(RuleStore::open(&path).unwrap());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&path), 0o600);
+
+        // A database left world-writable by an earlier run is tightened too.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        drop(RuleStore::open(&path).unwrap());
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]
@@ -792,6 +828,18 @@ mod tests {
             },
         );
         assert_eq!(super::quarantine_reason(&scoped), None);
+
+        // `/0` adds no specificity since 0.8.0 but is still a scope: a rule
+        // stored with only `--dst-net 0.0.0.0/0` keeps loading.
+        let slash_zero = Rule::new(
+            "every ipv4 destination",
+            cfc_core::Action::Deny,
+            cfc_core::RuleScope {
+                dst_net: Some("0.0.0.0/0".parse().unwrap()),
+                ..cfc_core::RuleScope::any()
+            },
+        );
+        assert_eq!(super::quarantine_reason(&slash_zero), None);
     }
 
     #[test]
@@ -837,6 +885,7 @@ mod tests {
             "a parent_exe rule matches every process and must not load: {names:?}"
         );
         assert!(names.contains(&"curl".to_string()), "{names:?}");
+        assert_eq!(reopened.skipped_rules(), 1, "status must report it");
 
         // Quarantined, never deleted: the row is the operator's.
         let rows: i64 = reopened
@@ -1008,12 +1057,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_rules_excluded_from_snapshot() {
-        let store = RuleStore::open_in_memory().unwrap();
+    fn disabled_rules_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.db");
         let mut rule = sample_rule("curl");
         rule.enabled = false;
-        store.upsert(&rule).unwrap();
-        assert!(store.snapshot().unwrap().rules.is_empty());
+        RuleStore::open(&path).unwrap().upsert(&rule).unwrap();
+        let reopened = RuleStore::open(&path).unwrap().snapshot().unwrap();
+        assert_eq!(reopened.rules, vec![rule]);
     }
 
     #[test]

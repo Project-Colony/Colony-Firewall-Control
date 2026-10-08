@@ -31,6 +31,7 @@ const PROGRAM_LABEL: &str = "Program";
 
 pub fn view<'a>(
     prompts: &'a [PromptCard],
+    rules: &'a [proto::RuleInfo],
     status: Option<&'a proto::StatusResponse>,
     now_ms: i64,
 ) -> Element<'a, Message> {
@@ -38,8 +39,8 @@ pub fn view<'a>(
         return container(
             column![
                 text("No pending prompts").size(18),
-                text("Outbound flows without a matching rule will appear here for you to allow or block.").size(12),
-                text("Keyboard: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(11),
+                text("Outbound flows that no rule decides will appear here for you to allow or block.").size(12),
+                text("Keyboard, on the top prompt: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(11),
             ]
             .spacing(8),
         )
@@ -54,9 +55,22 @@ pub fn view<'a>(
         .unwrap_or(proto::Action::Unspecified as i32);
     let timeout_secs = status.map(|s| s.prompt_timeout_secs).unwrap_or(0);
 
+    // The top card not already being answered is the one the A/D keys
+    // answer (see `App::answer_key_target`), so it carries the marker.
+    let target = prompts.iter().position(|c| !c.submitting);
     let cards: Vec<Element<'a, Message>> = prompts
         .iter()
-        .map(|c| prompt_card(c, timeout_action, timeout_secs, now_ms))
+        .enumerate()
+        .map(|(i, c)| {
+            prompt_card(
+                c,
+                rules,
+                timeout_action,
+                timeout_secs,
+                now_ms,
+                Some(i) == target,
+            )
+        })
         .collect();
 
     container(scrollable(column(cards).spacing(12).padding(8)).height(Length::Fill))
@@ -102,9 +116,11 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
     if let Some(p) = ev.process.as_ref() {
         if !p.exe.is_empty() {
             rows.push(plain(PROGRAM_LABEL, convert::process_display(p)));
+            // Display values go through `display_safe`; the copy keeps the
+            // raw string.
             rows.push(DetailRow {
                 label: "Path",
-                value: p.exe.clone(),
+                value: convert::display_safe(&p.exe),
                 note: "",
                 copy: Some(p.exe.clone()),
             });
@@ -117,7 +133,7 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         if !cmdline.is_empty() && cmdline != p.exe && cmdline != convert::process_display(p) {
             rows.push(DetailRow {
                 label: "Command line",
-                value: format::ellipsize(&cmdline, CMDLINE_MAX_CHARS),
+                value: format::ellipsize(&convert::display_safe(&cmdline), CMDLINE_MAX_CHARS),
                 note: "",
                 copy: Some(cmdline),
             });
@@ -134,7 +150,7 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         }
 
         if !p.cwd.is_empty() {
-            rows.push(plain("Working dir", p.cwd.clone()));
+            rows.push(plain("Working dir", convert::display_safe(&p.cwd)));
         }
 
         // Before the buttons, because it changes what Allow means here:
@@ -185,7 +201,18 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
 
         let remote = format::remote_display(&c.dst_host, &c.dst_ip, c.dst_port);
         if !remote.is_empty() {
-            rows.push(plain("Remote", remote));
+            // Same trust label as the tray bubble: a name from an observed
+            // DNS answer is whatever the answering server said.
+            rows.push(DetailRow {
+                label: "Remote",
+                value: remote,
+                note: match (c.dst_host.is_empty(), c.dst_host_verified) {
+                    (true, _) => "",
+                    (false, true) => "(verified name)",
+                    (false, false) => "(unverified name)",
+                },
+                copy: None,
+            });
         }
 
         if !matches!(
@@ -207,6 +234,24 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
     }
 
     rows
+}
+
+/// Why this flow was asked about although a rule may cover it: the daemon
+/// could not fully identify the program, so it could not decide that rule.
+/// Names the rule from the loaded list, or by id when it is not there.
+pub fn undecided_warning(ev: &proto::PromptEvent, rules: &[proto::RuleInfo]) -> Option<String> {
+    if ev.undecided_rule_id.is_empty() {
+        return None;
+    }
+    let rule = rules
+        .iter()
+        .find(|r| r.id == ev.undecided_rule_id)
+        .map(|r| convert::display_safe(&r.name))
+        .unwrap_or_else(|| convert::display_safe(&ev.undecided_rule_id));
+    Some(format!(
+        "Rule \"{rule}\" may apply, but the program could not be fully identified; \
+         your answer applies to this connection."
+    ))
 }
 
 /// `"pid 4242 (parent pid 1310)"`.
@@ -354,16 +399,35 @@ pub fn action_consequence(choice: PromptAction, program: &str) -> String {
 
 type ButtonStyle = fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style;
 
-fn prompt_card(
-    card: &PromptCard,
+fn prompt_card<'a>(
+    card: &'a PromptCard,
+    rules: &[proto::RuleInfo],
     timeout_action: i32,
     timeout_secs: u32,
     now_ms: i64,
-) -> Element<'_, Message> {
+    key_target: bool,
+) -> Element<'a, Message> {
     let ev = &card.event;
     let program = program_label(ev);
+    // Disabled for a moment after the card appears, so a click aimed at
+    // whatever was here before cannot land on a verdict, and while its
+    // verdict is on the way.
+    let armed = card.armed(now_ms);
 
-    let header = text(heading(ev)).size(16);
+    let marker: Element<'a, Message> = if key_target {
+        text("A / D answer this prompt")
+            .size(10)
+            .color(crate::theme::PARCHMENT_MUTED)
+            .into()
+    } else {
+        Space::new().into()
+    };
+    let header = row![
+        text(heading(ev)).size(16),
+        Space::new().width(Length::Fill),
+        marker
+    ]
+    .align_y(iced::Alignment::Center);
     let countdown = countdown_row(card, timeout_action, timeout_secs, now_ms);
 
     let table = column(
@@ -385,35 +449,39 @@ fn prompt_card(
             ev,
             &program,
             iced::widget::button::success,
-            true
+            true,
+            armed
         ),
         action_row(
             PromptAction::BlockProgram,
             ev,
             &program,
             iced::widget::button::danger,
-            true
+            true,
+            armed
         ),
         action_row(
             PromptAction::BlockOnce,
             ev,
             &program,
             iced::widget::button::secondary,
-            true
+            true,
+            armed
         ),
         action_row(
             PromptAction::AllowOnce,
             ev,
             &program,
             crate::theme::action_secondary,
-            false
+            false,
+            armed
         ),
     ]
     .spacing(6);
 
     // Without an exe path the two program rows are dead: say why, once,
     // rather than leaving the user clicking a button that does nothing.
-    let unscopable: Element<'_, Message> = if verdict_for(PromptAction::AllowProgram, ev).is_some()
+    let unscopable: Element<'a, Message> = if verdict_for(PromptAction::AllowProgram, ev).is_some()
     {
         Space::new().into()
     } else {
@@ -426,10 +494,20 @@ fn prompt_card(
         .into()
     };
 
-    container(column![header, countdown, table, customize, actions, unscopable].spacing(9))
-        .padding(12)
-        .style(crate::theme::panel)
-        .into()
+    let undecided: Element<'a, Message> = match undecided_warning(ev, rules) {
+        Some(warning) => text(warning)
+            .size(11)
+            .color(crate::theme::BURGUNDY_DARK)
+            .into(),
+        None => Space::new().into(),
+    };
+
+    container(
+        column![header, countdown, undecided, table, customize, actions, unscopable].spacing(9),
+    )
+    .padding(12)
+    .style(crate::theme::panel)
+    .into()
 }
 
 fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
@@ -470,20 +548,24 @@ fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
 
 /// A full-width choice: what it does on line one, what it persists on line
 /// two. `prominent` is the difference between one of the three decisions
-/// and the subordinate "Allow once" beneath them.
+/// and the subordinate "Allow once" beneath them. Rendered disabled until
+/// `armed`.
 fn action_row<'a>(
     choice: PromptAction,
     ev: &proto::PromptEvent,
     program: &str,
     style: ButtonStyle,
     prominent: bool,
+    armed: bool,
 ) -> Element<'a, Message> {
-    let press = verdict_for(choice, ev).map(|v| Message::SubmitVerdict {
-        prompt_id: ev.prompt_id.clone(),
-        action: v.action,
-        scope: v.scope,
-        duration: v.duration,
-    });
+    let press = verdict_for(choice, ev)
+        .filter(|_| armed)
+        .map(|v| Message::SubmitVerdict {
+            prompt_id: ev.prompt_id.clone(),
+            action: v.action,
+            scope: v.scope,
+            duration: v.duration,
+        });
 
     let (title_size, sub_size) = if prominent { (14, 11) } else { (12, 10) };
     let padding: iced::Padding = if prominent {
@@ -512,13 +594,13 @@ fn countdown_row<'a>(
     timeout_secs: u32,
     now_ms: i64,
 ) -> Element<'a, Message> {
-    let Some(left) = format::remaining_secs(card.deadline_unix_ms, now_ms) else {
+    let Some(left) = format::remaining_secs(card.event.deadline_unix_ms, now_ms) else {
         return text("no deadline - waiting for your answer")
             .size(10)
             .into();
     };
 
-    let fraction = format::countdown_fraction(card.deadline_unix_ms, now_ms, timeout_secs);
+    let fraction = format::countdown_fraction(card.event.deadline_unix_ms, now_ms, timeout_secs);
     let style = if left <= URGENT_SECS {
         crate::theme::countdown_bar_urgent
     } else {
@@ -593,6 +675,7 @@ mod tests {
             process: Some(process()),
             deadline_unix_ms: 1_700_000_015_000,
             binds_to_hash: false,
+            undecided_rule_id: String::new(),
         }
     }
 
@@ -637,6 +720,42 @@ mod tests {
         assert_eq!(value_of(&ev, "Working dir").unwrap(), "/home/user");
         assert_eq!(value_of(&ev, "Source").unwrap(), "10.0.0.2:54321");
         assert_eq!(value_of(&ev, "Protocol").unwrap(), "tcp");
+    }
+
+    #[test]
+    fn untrusted_strings_render_on_one_line_without_bidi() {
+        let mut ev = event();
+        let p = ev.process.as_mut().unwrap();
+        p.exe = "/home/u/\u{202e}gpj.sh".into();
+        p.cmdline = vec!["x".into(), "\nPath   /usr/bin/firefox".into()];
+        p.cwd = "/tmp/\u{2066}a".into();
+        ev.connection.as_mut().unwrap().dst_host = "evil\n.example".into();
+        for row in detail_rows(&ev) {
+            assert!(!row.value.contains('\n'), "{}: {}", row.label, row.value);
+            assert!(
+                !row.value.contains(['\u{202e}', '\u{2066}']),
+                "{}: {}",
+                row.label,
+                row.value
+            );
+        }
+        let path = detail_rows(&ev)
+            .into_iter()
+            .find(|r| r.label == "Path")
+            .unwrap();
+        assert_eq!(
+            path.copy.unwrap(),
+            "/home/u/\u{202e}gpj.sh",
+            "the copy stays raw"
+        );
+        assert_eq!(
+            detail_rows(&ev)
+                .into_iter()
+                .find(|r| r.label == "Remote")
+                .unwrap()
+                .note,
+            "(unverified name)"
+        );
     }
 
     #[test]
@@ -814,6 +933,26 @@ mod tests {
             heading(&proto::PromptEvent::default()),
             "Outgoing connection"
         );
+    }
+
+    #[test]
+    fn an_undecided_prompt_names_the_rule_it_could_not_decide() {
+        assert_eq!(undecided_warning(&event(), &[]), None);
+        let ev = proto::PromptEvent {
+            undecided_rule_id: "r1".into(),
+            ..event()
+        };
+        let rules = [proto::RuleInfo {
+            id: "r1".into(),
+            name: "block telemetry".into(),
+            ..Default::default()
+        }];
+        let line = undecided_warning(&ev, &rules).unwrap();
+        assert!(line.contains("\"block telemetry\""), "{line}");
+        assert!(line.contains("could not be fully identified"), "{line}");
+        assert!(line.contains("this connection"), "{line}");
+        // A rule not in the loaded list is still named, by its id.
+        assert!(undecided_warning(&ev, &[]).unwrap().contains("\"r1\""));
     }
 
     #[test]

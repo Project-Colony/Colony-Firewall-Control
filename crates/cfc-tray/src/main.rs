@@ -8,6 +8,7 @@
 //! same control socket as the GUI and CLI - quitting the tray never
 //! touches the daemon.
 
+mod answers;
 mod icon;
 mod model;
 mod theme;
@@ -17,7 +18,7 @@ use cfc_client::{proto, Client, StreamItem};
 use ksni::menu::{StandardItem, SubMenu};
 use ksni::{MenuItem, TrayMethods as _};
 use model::{DaemonView, NotifyGate, PauseControl, PromptChoice, PromptPresentation};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -106,6 +107,12 @@ enum Cmd {
         exe: String,
         key: String,
     },
+    /// An actionable prompt notification was shown; `id` is the server id
+    /// needed to close it once its prompt is over.
+    PromptShown {
+        prompt_id: String,
+        id: u32,
+    },
     /// The collapsed overflow notification was shown; `id` is the server
     /// id needed to update its count in place later.
     OverflowShown {
@@ -115,6 +122,8 @@ enum Cmd {
     OverflowResult {
         key: String,
     },
+    /// A pause or resume request finished; `Err` is the reason to show.
+    PauseDone(Result<(), String>),
 }
 
 struct TrayApp {
@@ -351,31 +360,38 @@ async fn refresh(
 }
 
 /// Ask the daemon to pause (`duration_secs`, 0 = daemon default) or
-/// resume. Failures are logged, never fatal - the next poll will show the
-/// truth either way.
-async fn set_paused(client: &mut Option<Client>, socket: &Path, paused: bool, duration_secs: u32) {
-    let verb = if paused { "pause" } else { "resume" };
-    if client.is_none() {
-        match Client::connect(socket).await {
-            Ok(c) => *client = Some(c),
-            Err(e) => {
-                warn!("cannot {verb}: {e}");
-                return;
+/// resume, on a task of its own: the daemon asks polkit first, and the
+/// password dialog may stay open for up to two minutes, during which the
+/// main loop must keep showing prompts. The outcome comes back as
+/// [`Cmd::PauseDone`].
+fn spawn_set_paused(
+    tx: mpsc::UnboundedSender<Cmd>,
+    socket: PathBuf,
+    paused: bool,
+    duration_secs: u32,
+) {
+    tokio::spawn(async move {
+        let verb = if paused { "pause" } else { "resume" };
+        let result = async {
+            let mut client = Client::connect_interactive(&socket).await?;
+            client.set_paused(paused, duration_secs).await
+        }
+        .await;
+        let _ = tx.send(Cmd::PauseDone(match result {
+            Ok(resp) => {
+                debug!(
+                    paused = resp.paused,
+                    resume_at_unix_ms = resp.resume_at_unix_ms,
+                    "{verb} acknowledged"
+                );
+                Ok(())
             }
-        }
-    }
-    let c = client.as_mut().expect("connected above");
-    match c.set_paused(paused, duration_secs).await {
-        Ok(resp) => debug!(
-            paused = resp.paused,
-            resume_at_unix_ms = resp.resume_at_unix_ms,
-            "{verb} acknowledged"
-        ),
-        Err(e) => {
-            warn!("{verb} failed: {e}");
-            *client = None;
-        }
-    }
+            Err(e) => {
+                warn!("{verb} failed: {e}");
+                Err(model::pause_failed_body(verb, &e))
+            }
+        }));
+    });
 }
 
 /// Launches the GUI, detached: resolved via PATH, environment (including
@@ -483,13 +499,14 @@ fn with_note(mut msg: String, note: &Option<String>) -> String {
 }
 
 /// A short, non-actionable follow-up ("rule created", "too late"). 5s,
-/// normal urgency.
+/// normal urgency. The body is escaped like a prompt's (see
+/// [`model::body_markup`]).
 fn notify_brief(body: String) {
     on_notification_thread(move || {
         let mut n = notify_rust::Notification::new();
         let _ = brand(&mut n)
             .summary("Colony Firewall")
-            .body(&body)
+            .body(&model::body_markup(&body))
             .timeout(notify_rust::Timeout::Milliseconds(5000))
             .show();
     });
@@ -510,8 +527,8 @@ enum OverflowBubble {
 /// Live actionable-notification bookkeeping, owned by the main loop.
 struct PromptNotifier {
     tx: mpsc::UnboundedSender<Cmd>,
-    /// Prompt ids with an actionable notification currently on screen.
-    active: HashSet<String>,
+    /// Prompts with an actionable notification currently on screen.
+    active: HashMap<String, model::Slot>,
     /// Prompts folded into the overflow bubble since it appeared.
     overflow_count: u64,
     bubble: OverflowBubble,
@@ -521,7 +538,7 @@ impl PromptNotifier {
     fn new(tx: mpsc::UnboundedSender<Cmd>) -> Self {
         Self {
             tx,
-            active: HashSet::new(),
+            active: HashMap::new(),
             overflow_count: 0,
             bubble: OverflowBubble::Down,
         }
@@ -530,6 +547,7 @@ impl PromptNotifier {
     /// One prompt arrived: its own actionable notification while a slot
     /// is free, otherwise folded into the single overflow bubble.
     fn on_prompt(&mut self, ev: &proto::PromptEvent) {
+        self.reclaim_expired();
         match model::present_prompt(self.active.len(), self.overflow_count) {
             PromptPresentation::Actionable => self.show_actionable(ev),
             PromptPresentation::Overflow { count } => {
@@ -542,53 +560,59 @@ impl PromptNotifier {
     fn show_actionable(&mut self, ev: &proto::PromptEvent) {
         let n = model::prompt_notification(ev, now_unix_ms());
         let prompt_id = ev.prompt_id.clone();
-        self.active.insert(prompt_id.clone());
+        self.active.insert(
+            prompt_id.clone(),
+            model::Slot {
+                deadline_unix_ms: ev.deadline_unix_ms,
+                server_id: None,
+            },
+        );
         let exe = ev
             .process
             .as_ref()
             .map(|p| p.exe.clone())
             .unwrap_or_default();
         let tx = self.tx.clone();
-        // One blocking task per shown notification: show() and
-        // wait_for_action() both block on D-Bus, and the wait lasts until
-        // the user acts or the bubble expires.
-        on_notification_thread(move || {
-            let mut notification = notify_rust::Notification::new();
-            brand(&mut notification)
-                .summary(&n.summary)
-                .body(&n.body)
-                .timeout(notify_rust::Timeout::Milliseconds(n.timeout_ms))
-                // Verdicts first and short: these are what the user came
-                // for, and long labels wrap the button row onto a second
-                // line. "Details" is the freedesktop `default` action, so
-                // clicking the bubble body opens the GUI too.
-                .action(model::KEY_ALLOW_ONCE, "Allow once");
-            if n.offer_block {
-                notification.action(model::KEY_ALLOW, "Always allow app");
-            }
-            notification.action(model::KEY_DENY, "Deny");
-            if n.offer_block {
-                notification.action(model::KEY_BLOCK, "Block app");
-            }
-            notification.action(model::KEY_DEFAULT, "Details");
-            let done = move |key: &str| {
-                // Failing only means the main loop is gone; the process
-                // is on its way out.
-                let _ = tx.send(Cmd::PromptResult {
-                    prompt_id,
-                    exe,
-                    key: key.to_string(),
-                });
-            };
-            match notification.show() {
-                Ok(handle) => handle.wait_for_action(done),
+        let mut notification = notify_rust::Notification::new();
+        brand(&mut notification)
+            .summary(&n.summary)
+            .body(&n.body)
+            .timeout(notify_rust::Timeout::Milliseconds(n.timeout_ms))
+            // Verdicts first and short: these are what the user came
+            // for, and long labels wrap the button row onto a second
+            // line. "Details" is the freedesktop `default` action, so
+            // clicking the bubble body opens the GUI too.
+            .action(model::KEY_ALLOW_ONCE, "Allow once");
+        if n.offer_block {
+            notification.action(model::KEY_ALLOW, "Always allow app");
+        }
+        notification.action(model::KEY_DENY, "Deny");
+        if n.offer_block {
+            notification.action(model::KEY_BLOCK, "Block app");
+        }
+        notification.action(model::KEY_DEFAULT, "Details");
+        // Waited for past the prompt's deadline: by then the slot is
+        // reclaimed and the bubble closed, so this only ends a wait whose
+        // server vanished without saying so.
+        let wait = Duration::from_millis(
+            u64::try_from(ev.deadline_unix_ms.saturating_sub(now_unix_ms())).unwrap_or(0),
+        ) + ANSWER_GRACE;
+        tokio::spawn(async move {
+            let key = match await_answer(notification, &prompt_id, &tx, wait).await {
+                Ok(key) => key,
                 Err(e) => {
-                    warn!("showing prompt notification: {e}");
-                    // Free the slot; the daemon's timeout_action covers
-                    // the prompt itself.
-                    done(model::KEY_CLOSED);
+                    // The daemon's timeout_action covers the prompt itself.
+                    warn!("prompt notification: {e}");
+                    model::KEY_CLOSED.to_string()
                 }
-            }
+            };
+            // Failing only means the main loop is gone; the process is on
+            // its way out.
+            let _ = tx.send(Cmd::PromptResult {
+                prompt_id,
+                exe,
+                key,
+            });
         });
     }
 
@@ -607,6 +631,8 @@ impl PromptNotifier {
                     match shown {
                         Ok(handle) => {
                             let _ = tx.send(Cmd::OverflowShown { id: handle.id() });
+                            // notify-rust takes this answer from any sender
+                            // (see `answers`); here that can only open the GUI.
                             handle.wait_for_action(|key: &str| {
                                 let _ = tx.send(Cmd::OverflowResult {
                                     key: key.to_string(),
@@ -656,6 +682,88 @@ impl PromptNotifier {
         self.active.clear();
         self.overflow_count = 0;
     }
+
+    /// Frees the slots of prompts past their deadline and closes their
+    /// bubbles (see [`model::reclaim_expired`]).
+    fn reclaim_expired(&mut self) {
+        close_notifications(model::reclaim_expired(&mut self.active, now_unix_ms()));
+    }
+
+    /// The bubble for `prompt_id` is on screen as `id`. If its slot was
+    /// already reclaimed, the prompt is over and the bubble goes too.
+    fn on_prompt_shown(&mut self, prompt_id: &str, id: u32) {
+        match self.active.get_mut(prompt_id) {
+            Some(slot) => slot.server_id = Some(id),
+            None => close_notifications(vec![id]),
+        }
+    }
+}
+
+/// How long past a prompt's deadline its bubble's answer is waited for.
+const ANSWER_GRACE: Duration = Duration::from_secs(10);
+
+/// Shows `notification` and returns the key the user picked, as told by the
+/// notification server only (see [`answers`]); [`model::KEY_CLOSED`] when it
+/// closed or `wait` ran out.
+async fn await_answer(
+    notification: notify_rust::Notification,
+    prompt_id: &str,
+    tx: &mpsc::UnboundedSender<Cmd>,
+    wait: Duration,
+) -> anyhow::Result<String> {
+    let conn = zbus::Connection::session().await?;
+    let mut answers = answers::Answers::subscribe(&conn).await?;
+    // show() blocks on D-Bus through zbus's own runtime, which must not be
+    // entered from this one: a plain thread does it.
+    let (shown_tx, shown) = tokio::sync::oneshot::channel();
+    on_notification_thread(move || {
+        let _ = shown_tx.send(notification.show().map(|handle| handle.id()));
+    });
+    let id = shown
+        .await
+        .context("no thread to show the notification")?
+        .context("showing the notification")?;
+    let _ = tx.send(Cmd::PromptShown {
+        prompt_id: prompt_id.to_string(),
+        id,
+    });
+    Ok(tokio::time::timeout(wait, answers.next_for(id))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| model::KEY_CLOSED.to_string()))
+}
+
+/// Closes notification bubbles by server id, off the main loop.
+///
+/// The bubble's handle is consumed by the thread waiting on it, so this is
+/// the D-Bus `CloseNotification` call made directly. The server then emits
+/// `NotificationClosed`, which ends that wait.
+fn close_notifications(ids: Vec<u32>) {
+    if ids.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let close = async {
+            let conn = zbus::Connection::session().await?;
+            for id in ids {
+                conn.call_method(
+                    Some("org.freedesktop.Notifications"),
+                    "/org/freedesktop/Notifications",
+                    Some("org.freedesktop.Notifications"),
+                    "CloseNotification",
+                    &(id,),
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        match tokio::time::timeout(CAPABILITY_PROBE_TIMEOUT, close).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => debug!("closing an expired prompt notification: {e}"),
+            Err(_) => debug!("closing an expired prompt notification timed out"),
+        }
+    });
 }
 
 /// The collapsed "N more connections waiting" notification. Actionable
@@ -776,6 +884,9 @@ async fn submit_prompt_verdict(
         }
         Err(e) => {
             warn!("submitting verdict: {e}");
+            if let Some(body) = model::verdict_refused_body(&e) {
+                notify_brief(body);
+            }
             *client = None;
         }
     }
@@ -869,21 +980,27 @@ fn warm_notification_spec_version() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // First, before D-Bus or the runtime exist: the daemon accepts answers
+    // and pause requests only from a sealed, installed copy of this tray.
+    let sealed = cfc_client::seal_official_process();
     warm_notification_spec_version();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building the tokio runtime")?
-        .block_on(run())
+        .block_on(run(sealed))
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    if let Err(error) = sealed {
+        warn!("could not seal the process ({error}); the daemon will treat this tray as read-only");
+    }
 
     let socket = socket_path_from_env();
     info!(socket = %socket.display(), "starting colony-firewall-tray");
@@ -892,6 +1009,10 @@ async fn run() -> anyhow::Result<()> {
     // Notification wait tasks route their results over the same channel
     // as menu clicks; the main loop is the only place the client lives.
     let handle_tx = tx.clone();
+    let pause_tx = tx.clone();
+    // A pause or resume is waiting on the daemon (and maybe on a password
+    // dialog); further clicks are ignored until it answers.
+    let mut pause_in_flight = false;
     let tray = TrayApp {
         view: DaemonView::Connecting,
         tx,
@@ -941,12 +1062,23 @@ async fn run() -> anyhow::Result<()> {
     let mut notifier = PromptNotifier::new(handle_tx);
     let mut was_reachable: Option<bool> = None;
     let generic = !actions_supported;
+    // Set once the tray has said its binary was replaced under it.
+    let mut told_replaced = false;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                notifier.reclaim_expired();
+                // After an upgrade the daemon refuses this process: say so
+                // instead of failing every answer and pause quietly.
+                if !told_replaced
+                    && std::fs::read_link("/proc/self/exe").is_ok_and(|exe| model::replaced_on_disk(&exe))
+                {
+                    told_replaced = true;
+                    notify_brief(model::REPLACED_BODY.into());
+                }
                 if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
                     break;
                 }
@@ -974,16 +1106,24 @@ async fn run() -> anyhow::Result<()> {
                     break;
                 }
                 Some(Cmd::OpenGui) => open_gui(),
+                Some(Cmd::Pause(_) | Cmd::Resume) if pause_in_flight => {
+                    debug!("pause or resume already waiting; click ignored");
+                }
                 Some(Cmd::Pause(secs)) => {
-                    set_paused(&mut client, &socket, true, secs).await;
-                    // Refresh immediately so the menu flips to "Resume
-                    // now" without waiting out the poll interval.
-                    if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
-                        break;
-                    }
+                    pause_in_flight = true;
+                    spawn_set_paused(pause_tx.clone(), socket.clone(), true, secs);
                 }
                 Some(Cmd::Resume) => {
-                    set_paused(&mut client, &socket, false, 0).await;
+                    pause_in_flight = true;
+                    spawn_set_paused(pause_tx.clone(), socket.clone(), false, 0);
+                }
+                Some(Cmd::PauseDone(result)) => {
+                    pause_in_flight = false;
+                    if let Err(body) = result {
+                        notify_brief(body);
+                    }
+                    // Refresh immediately so the menu flips to "Resume
+                    // now" without waiting out the poll interval.
                     if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
                         break;
                     }
@@ -991,7 +1131,7 @@ async fn run() -> anyhow::Result<()> {
                 Some(Cmd::PromptResult { prompt_id, exe, key }) => {
                     // Slot freed regardless of outcome. After a stream
                     // drop the id is already gone; remove is a no-op.
-                    let current = notifier.active.remove(&prompt_id);
+                    let current = notifier.active.remove(&prompt_id).is_some();
                     if key == model::KEY_DEFAULT {
                         open_gui();
                     } else if current {
@@ -1002,6 +1142,7 @@ async fn run() -> anyhow::Result<()> {
                     // KEY_CLOSED / anything else: dismissed or expired -
                     // the daemon's timeout_action covers it.
                 }
+                Some(Cmd::PromptShown { prompt_id, id }) => notifier.on_prompt_shown(&prompt_id, id),
                 Some(Cmd::OverflowShown { id }) => notifier.on_overflow_shown(id),
                 Some(Cmd::OverflowResult { key }) => {
                     notifier.on_overflow_result();

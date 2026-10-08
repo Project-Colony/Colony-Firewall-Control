@@ -54,8 +54,9 @@ TimeoutStopSec=15
 #   without CAP_DAC_READ_SEARCH  every connection resolves to `exe=<unknown>
 #                                pid=0`, so no exe-scoped rule can ever match
 #                                and a fail-closed ruleset denies the whole
-#                                machine's traffic. No warning at all: from the
-#                                daemon's side, nothing failed.
+#                                machine's non-loopback traffic. No warning
+#                                at all: from the daemon's side, nothing
+#                                failed.
 #
 # CAP_DAC_OVERRIDE is deliberately NOT granted: read-and-search is all this
 # needs, and the write half is what would let the daemon edit files it does not
@@ -93,21 +94,28 @@ NoNewPrivileges=true
 # Filesystem
 ProtectSystem=strict
 ProtectHome=true
-# /sys/fs/bpf is listed because ProtectKernelTunables below remounts /sys
-# read-only, and the enforcement links are *pinned* into the bpffs mounted
-# there. Without this line the pin fails with EROFS, the daemon falls back to
+# /sys/fs/bpf must stay writable: the enforcement links are *pinned* into the
+# bpffs mounted there. This line alone does not achieve that against
+# ProtectKernelTunables, which is why that setting is replaced by hand below.
+# A read-only bpffs fails the pin with EROFS, the daemon falls back to
 # process-lifetime links, and `kill -9` on this unit lifts every in-kernel deny
 # it holds - which is the one thing that layer exists to prevent. The daemon
 # only ever creates /sys/fs/bpf/colony-firewall/; it writes nothing else there.
-ReadWritePaths=/var/lib/colony-firewall /run/colony-firewall /var/log/colony-firewall /sys/fs/bpf
+# StateDirectory= and RuntimeDirectory= below are writable without a line here.
+# The daemon logs to the journal and owns no log directory.
+ReadWritePaths=/sys/fs/bpf
 RuntimeDirectory=colony-firewall
 RuntimeDirectoryMode=0755
 StateDirectory=colony-firewall
 StateDirectoryMode=0750
-LogsDirectory=colony-firewall
 
 # Sandboxing
 PrivateTmp=true
+# The daemon opens no device node. Without this, uid 0 owns the block devices
+# through plain DAC (root:disk 0660) and could write the disks underneath
+# ProtectSystem. It also drops CAP_MKNOD, CAP_SYS_RAWIO and @raw-io. The nft
+# and rpm children only need /dev/null, which the private /dev keeps.
+PrivateDevices=true
 # ProtectKernelTunables is deliberately OFF, and replaced by hand below.
 #
 # It does the right thing and one wrong thing: it remounts /sys read-only
@@ -119,8 +127,8 @@ PrivateTmp=true
 # logged at info, on a machine that was perfectly capable of pinning - which is
 # to say the "denials survive kill -9" property was silently absent.
 #
-# The ReadOnlyPaths below reproduce what ProtectKernelTunables covers, minus
-# the one directory that has to be writable. Every entry of /sys is listed
+# The ReadOnlyPaths below reproduce what ProtectKernelTunables makes
+# read-only, minus the one directory that has to be writable. Every entry of /sys is listed
 # individually rather than /sys as a whole, because listing the parent and then
 # excepting the child is exactly what does not work: systemd makes the parent
 # writable to reach it.
@@ -129,9 +137,14 @@ PrivateTmp=true
 # read-only, /sys/kernel is read-only, and /sys/kernel/btf and
 # /sys/kernel/tracing remain readable - which the eBPF loader needs.
 #
-# A new top-level directory in a future kernel's sysfs would be writable to
-# this unit until it is added here. That is the cost of the trade, and it is
-# smaller than losing the pin.
+# A new top-level directory in a future kernel's sysfs, or a /sys/fs or /proc
+# entry not listed here, would be writable to this unit until it is added
+# here. That is the cost of the trade, and it is smaller than losing the pin.
+#
+# ProtectKernelTunables also hides /proc/kallsyms and /proc/kcore; this list
+# does not. Opening /proc/kcore needs CAP_SYS_RAWIO, which the bounding set
+# drops, and without CAP_SYSLOG /proc/kallsyms shows this unit addresses only
+# when it shows them to every process.
 #
 # EVERY path is prefixed with "-", and that is not defensive tidiness. Without
 # it, systemd treats a missing path as a fatal error and the unit dies at
@@ -151,10 +164,13 @@ PrivateTmp=true
 # is the half that was missed.
 ProtectKernelTunables=false
 ReadOnlyPaths=-/proc/sys -/proc/sysrq-trigger -/proc/irq -/proc/acpi -/proc/fs
+ReadOnlyPaths=-/proc/apm -/proc/asound -/proc/bus -/proc/latency_stats -/proc/mtrr
+ReadOnlyPaths=-/proc/scsi -/proc/timer_list -/proc/timer_stats
 ReadOnlyPaths=-/sys/block -/sys/bus -/sys/class -/sys/dev -/sys/devices -/sys/firmware
 ReadOnlyPaths=-/sys/hypervisor -/sys/kernel -/sys/module -/sys/power
 ReadOnlyPaths=-/sys/fs/btrfs -/sys/fs/cgroup -/sys/fs/ext4 -/sys/fs/fuse
 ReadOnlyPaths=-/sys/fs/pstore -/sys/fs/resctrl -/sys/fs/tmpfs -/sys/fs/virtiofs
+ReadOnlyPaths=-/sys/fs/erofs -/sys/fs/f2fs -/sys/fs/selinux -/sys/fs/xfs
 ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictNamespaces=true
@@ -210,10 +226,11 @@ MemoryDenyWriteExecute=true
 # else about this unit is compatible with that child - ProtectSystem=strict
 # leaves /var/lib/rpm readable, and rpm needs no writable-executable memory. If
 # it ever is not compatible, the failure is a warning and an empty provenance
-# index, never a failure to filter. The other child is nft(8), run at start
-# and at stop to flush legacy Fast Allow state. The same fork/execve and
-# CAP_NET_ADMIN netlink operations are needed. Failed cleanup is reported
-# explicitly because an older installed ruleset may still accept old marks.
+# index, never a failure to filter. The other child is nft(8), run once at
+# start to flush the legacy Fast Allow set and once a minute to probe the
+# table. The same fork/execve and CAP_NET_ADMIN netlink operations are needed.
+# A failed flush is reported explicitly because an older installed ruleset
+# may still accept old marks.
 SystemCallFilter=@system-service
 SystemCallFilter=bpf perf_event_open
 SystemCallErrorNumber=EPERM
@@ -222,8 +239,17 @@ SystemCallArchitectures=native
 # (root:colony-firewall 0660); a tight umask closes the pre-chmod window.
 UMask=0077
 
-# Required for NFQUEUE
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+# AF_NETLINK carries NFQUEUE, sock_diag and nftables; AF_INET/AF_INET6 the
+# Reject raw sockets; AF_UNIX the control socket. Nothing opens a packet
+# socket, and AF_PACKET with CAP_NET_RAW would sniff or inject below netfilter.
+#
+# AF_UNIX also carries the polkit check (pause, resume and rule import from
+# the app or tray) to the system bus, and no other directive is needed for
+# it: connect(2) to /run/dbus/system_bus_socket is not blocked by
+# ProtectSystem=strict (a read-only mount does not stop connecting to a
+# socket inode), sendmsg/recvmsg are in @system-service, and the connection
+# is opened lazily on the first such request, so no After=dbus ordering.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

@@ -2,6 +2,33 @@
 
 use cfc_proto::v1 as pb;
 
+/// Renders an untrusted value (a path, a command line, a DNS name) as one
+/// line that cannot rearrange what is around it.
+///
+/// Control characters (newlines included) and the bidi embedding, override
+/// and isolate characters are written as escapes. Process strings are
+/// chosen by the program being judged, or by whoever named its file, and DNS
+/// names by whoever answers the query: a U+202E in a directory name reverses
+/// the rest of a Path row, and an embedded newline adds a fake line to a
+/// prompt. The backslash is escaped too, so a literal `\n` in a name cannot
+/// pass for an escaped newline. Escape once: a second pass doubles every
+/// backslash. Only for display; rules and copies keep the raw value.
+pub fn display_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| {
+            if character.is_control()
+                || character == '\\'
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect()
+}
+
 pub fn action_label(a: i32) -> &'static str {
     match pb::Action::try_from(a).unwrap_or(pb::Action::Unspecified) {
         pb::Action::Allow => "allow",
@@ -126,14 +153,15 @@ pub fn uid_label(uid: Option<u32>) -> String {
     }
 }
 
+/// The program's basename for display, made [`display_safe`].
 pub fn process_display(p: &pb::ProcessInfo) -> String {
     if p.exe.is_empty() {
         format!("pid:{}", p.pid)
     } else {
-        match std::path::Path::new(&p.exe).file_name() {
+        display_safe(&match std::path::Path::new(&p.exe).file_name() {
             Some(n) => n.to_string_lossy().into_owned(),
             None => p.exe.clone(),
-        }
+        })
     }
 }
 
@@ -149,7 +177,10 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
     let target = scope
         .and_then(|s| {
             if !s.dst_host.is_empty() {
-                Some(format!("{} [legacy hostname; uncertain]", s.dst_host))
+                Some(format!(
+                    "{} [legacy hostname; uncertain]",
+                    display_safe(&s.dst_host)
+                ))
             } else if !s.dst_net.is_empty() {
                 Some(s.dst_net.clone())
             } else {
@@ -157,16 +188,32 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
             }
         })
         .unwrap_or_else(|| "*".into());
-    let port = scope
-        .and_then(|s| s.has_dst_port.then_some(s.dst_port))
-        .map(|p| format!(":{p}"))
-        .unwrap_or_default();
+    // Protocol, uid and a pinned digest narrow the rule too; left out, a
+    // `deny uid 1000 udp/53` read as DNS blocked for everyone.
+    let port = scope.map_or_else(String::new, |s| {
+        let mut port = if s.has_dst_port {
+            format!(":{}", s.dst_port)
+        } else {
+            String::new()
+        };
+        if s.has_protocol {
+            port.push(' ');
+            port.push_str(protocol_label(s.protocol));
+        }
+        if s.has_uid {
+            port.push_str(&format!(" uid={}", s.uid));
+        }
+        if !s.exe_sha256.is_empty() {
+            port.push_str(" [pinned]");
+        }
+        port
+    });
     let exe = scope
         .and_then(|s| {
             if s.exe_path.is_empty() {
                 None
             } else {
-                Some(s.exe_path.clone())
+                Some(display_safe(&s.exe_path))
             }
         })
         .unwrap_or_else(|| "*".into());
@@ -223,6 +270,19 @@ pub fn rule_summary(r: &pb::RuleInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_safe_escapes_controls_and_bidi_only() {
+        assert_eq!(display_safe("line\nnext\tcell"), "line\\nnext\\tcell");
+        assert_eq!(display_safe("x\\n"), "x\\\\n");
+        assert!(display_safe("\u{202e}\u{2066}").is_ascii());
+        assert_eq!(display_safe("/usr/bin/caf\u{e9}"), "/usr/bin/caf\u{e9}");
+        let p = pb::ProcessInfo {
+            exe: "/tmp/\u{202e}gpj.sh".into(),
+            ..Default::default()
+        };
+        assert!(process_display(&p).is_ascii());
+    }
 
     fn proc(package: &str, provenance: pb::Provenance) -> pb::ProcessInfo {
         pb::ProcessInfo {
@@ -331,6 +391,21 @@ mod tests {
         assert!(s.contains("in "), "{s}");
         assert!(s.contains("192.168.0.0/16"), "{s}");
         assert!(s.contains(":22"), "{s}");
+    }
+
+    #[test]
+    fn protocol_uid_and_pinned_digest_are_not_hidden() {
+        let s = rule_summary(&rule(pb::RuleScope {
+            exe_sha256: "ab".repeat(32),
+            uid: 1000,
+            has_uid: true,
+            protocol: pb::Protocol::Udp as i32,
+            has_protocol: true,
+            dst_port: 53,
+            has_dst_port: true,
+            ..Default::default()
+        }));
+        assert_eq!(s, "allow   * -> *:53 udp uid=1000 [pinned]");
     }
 
     #[test]

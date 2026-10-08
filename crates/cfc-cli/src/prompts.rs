@@ -126,6 +126,9 @@ struct PromptJson<'a> {
     dst_port: u32,
     dst_host: Option<&'a str>,
     binds_to_hash: bool,
+    /// A rule that may apply but could not be decided because the program
+    /// is only partly identified; null when no rule is about the flow.
+    undecided_rule_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verdict: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,9 +170,22 @@ fn to_json<'a>(
         dst_port: conn.map(|c| c.dst_port).unwrap_or(0),
         dst_host: conn.and_then(|c| opt(&c.dst_host)),
         binds_to_hash: ev.binds_to_hash,
+        undecided_rule_id: opt(&ev.undecided_rule_id),
         verdict,
         accepted,
     }
+}
+
+/// The human line for a prompt about a flow a rule may cover but could not
+/// decide, because the program is only partly identified.
+fn undecided_line(ev: &proto::PromptEvent) -> Option<String> {
+    opt(&ev.undecided_rule_id).map(|id| {
+        format!(
+            "  rule     {} may apply, but the program could not be fully identified; \
+             the answer applies to this connection",
+            output::terminal_safe(id)
+        )
+    })
 }
 
 /// The destination line: hostname when known, otherwise the IP, always
@@ -247,7 +263,7 @@ struct Term {
     line_mode: bool,
     /// True when stdout is a terminal and an in-place countdown is useful.
     countdown: bool,
-    _raw: Option<RawMode>,
+    raw: Option<RawMode>,
 }
 
 enum Input {
@@ -291,8 +307,21 @@ impl Term {
             keys: tty::spawn_key_reader(),
             line_mode: raw.is_none(),
             countdown: tty::stdout_is_tty(),
-            _raw: raw,
+            raw,
         })
+    }
+
+    /// Drops keys typed while no prompt was on screen, and what is left of
+    /// an escape sequence, so they cannot answer a prompt nobody has read
+    /// yet. Line mode keeps them: piped input answers prompts in order.
+    fn discard_typeahead(&mut self) {
+        if self.line_mode {
+            return;
+        }
+        if let Some(raw) = &self.raw {
+            raw.discard_input();
+        }
+        while self.keys.try_recv().is_ok() {}
     }
 
     /// Waits for one of `valid` keys, redrawing a countdown until the
@@ -506,6 +535,7 @@ async fn handle_prompt(
         return Ok(false);
     };
 
+    term.discard_typeahead();
     print_prompt(ev);
 
     let label = "answer: [a]llow [d]eny [r]eject [s]kip [q]uit";
@@ -587,6 +617,11 @@ async fn handle_prompt(
                 Input::Key('1') => Scope::ExeAndPort,
                 Input::Key('2') => Scope::Exe,
                 Input::Key('3') => Scope::Destination,
+                // Escape, which an arrow key also starts.
+                Input::Key('s') => {
+                    println!("  skipped (the daemon will apply {timeout_action} at the deadline)");
+                    return Ok(false);
+                }
                 Input::Key(_) | Input::Interrupted | Input::Closed => return Ok(true),
                 Input::TimedOut => {
                     println!("  expired (daemon applied {timeout_action})");
@@ -705,11 +740,34 @@ fn print_prompt(ev: &proto::PromptEvent) {
             println!("  binding  image hash unavailable; persistent allow cannot be saved");
         }
     }
+    if let Some(line) = undecided_line(ev) {
+        println!("{line}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keys typed while no prompt was shown, such as "a32" after one expired or
+    // the "[A" an Up arrow leaves, must not answer the next prompt.
+    #[test]
+    fn typeahead_is_dropped_before_a_new_prompt_in_raw_mode_only() {
+        for line_mode in [false, true] {
+            let (tx, keys) = tokio::sync::mpsc::unbounded_channel();
+            for byte in *b"a32[A" {
+                tx.send(byte).unwrap();
+            }
+            let mut term = Term {
+                keys,
+                line_mode,
+                countdown: false,
+                raw: None,
+            };
+            term.discard_typeahead();
+            assert_eq!(term.keys.try_recv().is_ok(), line_mode);
+        }
+    }
 
     fn process() -> proto::ProcessInfo {
         proto::ProcessInfo {
@@ -909,8 +967,20 @@ mod tests {
             process: Some(process()),
             deadline_unix_ms: 1_700_000_030_000,
             binds_to_hash: false,
+            undecided_rule_id: String::new(),
         };
         let v = serde_json::to_value(to_json(&ev, None, None)).unwrap();
+        assert_eq!(v["undecided_rule_id"], serde_json::Value::Null);
+        assert_eq!(undecided_line(&ev), None);
+        let undecided = proto::PromptEvent {
+            undecided_rule_id: "r1".into(),
+            ..ev.clone()
+        };
+        let u = serde_json::to_value(to_json(&undecided, None, None)).unwrap();
+        assert_eq!(u["undecided_rule_id"], "r1");
+        let line = undecided_line(&undecided).unwrap();
+        assert!(line.contains("r1 may apply"), "{line}");
+        assert!(line.contains("could not be fully identified"), "{line}");
         assert_eq!(v["prompt_id"], "17");
         assert_eq!(v["exe"], "/usr/bin/curl");
         assert_eq!(v["uid"], 1000);

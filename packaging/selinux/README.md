@@ -12,7 +12,7 @@ are built around. So: a real module.
 make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
 sudo semodule -i colony_firewall.pp
 sudo restorecon -RvF /usr/bin/colony-firewalld /etc/colony-firewall \
-    /var/lib/colony-firewall /var/log/colony-firewall /run/colony-firewall
+    /var/lib/colony-firewall /run/colony-firewall
 ```
 
 `selinux-policy-devel` provides that Makefile. The `.spec` in `packaging/rpm`
@@ -31,7 +31,7 @@ tells you which kind of trouble you are in.
 
 | group | denial costs |
 |---|---|
-| netlink_netfilter, raw sockets | **everything.** The daemon exits before `READY=1`, and the ruleset is fail-closed, so the machine loses outbound network |
+| netlink_netfilter, raw sockets | **everything.** The daemon exits before `READY=1`, and the ruleset is fail-closed (except new loopback flows), so the machine loses non-loopback outbound network |
 | unix socket under `/run` | the CLI, tray and GUI cannot reach the daemon; filtering continues, unattended |
 | `bpf`, `perf_event`, tracefs, cgroup | the ring-0 layer. Attribution falls back to `sock_diag` + `/proc`, hostnames to PTR lookups. Logged once, then filtering continues |
 | bpffs (`/sys/fs/bpf`) | in-kernel denials no longer survive the daemon being killed. Silent apart from `enforcement=process` in the startup line |

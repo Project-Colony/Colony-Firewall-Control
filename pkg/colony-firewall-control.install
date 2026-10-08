@@ -7,17 +7,24 @@ post_install() {
     1. Enable the daemon and the persistent nftables rules:
            systemctl enable --now colony-firewalld colony-firewall-nft
        (colony-firewall-nft loads 'table inet colony_firewall'; it is
-        fail-closed while loaded and survives daemon restarts/stops.
-        Stop colony-firewall-nft explicitly to remove filtering.)
+        fail-closed while loaded, except new loopback flows, and survives
+        daemon restarts/stops. To remove filtering, run
+        'systemctl disable --now colony-firewalld colony-firewall-nft';
+        a plain stop also stops NetworkManager/systemd-networkd.)
 
-    2. Let your desktop user talk to the daemon socket:
+    2. Seed sensible default rules right away (until they exist, unmatched
+       DHCP, DNS and NTP flows are denied):
+           sudo cfc rules bootstrap-defaults
+
+    3. Let your desktop session read the daemon and the Colony Firewall
+       app and tray connect to it:
            usermod -aG colony-firewall <your-user>
        then log out/in. The 'colony-firewall' group is created by
        systemd-sysusers from /usr/lib/sysusers.d/colony-firewall.conf
-       (applied automatically by the pacman sysusers hook).
-
-    3. Seed sensible default rules:
-           cfc rules bootstrap-defaults
+       (applied automatically by the pacman sysusers hook). Changes come
+       from the app and tray (pause, resume and rule import ask for an
+       administrator password through polkit) or from sudo cfc; any other
+       program of yours, including cfc without sudo, is read-only.
 
 ==> The GUI autostarts for all desktop users via
     /etc/xdg/autostart/colony-firewall.desktop; per-user opt-out: copy it
@@ -30,8 +37,10 @@ post_upgrade() {
     # Refresh active units only; inbound remains opt-in. ExecReload applies
     # the new snippet atomically and removes old Fast Allow acceptance.
     systemctl daemon-reload
-    # Recreate native network-manager dependencies for enabled deployments.
-    for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do
+    # Recreate native network-manager dependencies for enabled nft units. Never
+    # reenable the daemon: its Also= would enable an nft unit the admin
+    # disabled, together with the network managers' Requires= on it.
+    for unit in colony-firewall-nft.service colony-firewall-nft-inbound.service; do
         if systemctl is-enabled --quiet "$unit"; then
             systemctl reenable "$unit" || return 1
         fi
@@ -40,7 +49,17 @@ post_upgrade() {
         echo "Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering." >&2
         return 1
     }
+    if [ "$(vercmp "$2" 0.8.0)" -lt 0 ]; then
+        cat <<'EOF'
+==> 0.8.0: pause/resume, rule import and Allow rules that name no program
+    ask for an administrator password through polkit. cfc without sudo is
+    read-only: use sudo cfc for changes.
+EOF
+    fi
     cat <<'EOF'
+==> Restart Colony Firewall and its tray now (quit the tray from its menu,
+    then start both again). The daemon trusts only the binaries now
+    installed, so until then it refuses their answers and changes.
 ==> colony-firewall-control upgraded.
     Changes: /usr/share/doc/colony-firewall-control/README.md and
     https://github.com/Project-Colony/Colony-Firewall-Control/blob/main/CHANGELOG.md
@@ -51,7 +70,7 @@ EOF
 pre_remove() {
     # Stop enforcement BEFORE the binaries and the snippet disappear, so
     # the fail-closed NFQUEUE table can never outlive the daemon and
-    # blackhole all new outbound traffic.
+    # blackhole all new non-loopback outbound traffic.
     #
     # The inbound pair belongs here too, and used not to be. Removing the
     # package on a host where the inbound chain had been enabled left

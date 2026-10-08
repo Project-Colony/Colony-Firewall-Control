@@ -42,40 +42,23 @@ struct EngineInner {
     /// it a `Weak` capture on the caller's side is what stops the cycle
     /// (the observer holds this `Engine`).
     on_change: RwLock<Option<Box<dyn Fn() + Send + Sync>>>,
-}
-
-/// What [`Engine::process_wide_verdict`] found: the action that holds for a
-/// process wherever it connects, and the rule that says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessWideVerdict {
-    pub action: cfc_core::Action,
-    pub rule_id: uuid::Uuid,
-    pub duration: cfc_core::Duration,
-}
-
-impl ProcessWideVerdict {
-    /// Whether this verdict may be handed to the in-kernel fast path.
-    ///
-    /// An allow, from a rule that lasts. `Once` never reaches here (it is
-    /// not stored), and a timed rule is excluded on purpose: the fast path
-    /// re-checks grants only on flow starts and rule changes, so a timed
-    /// allow would keep marking sockets until the next flush noticed its
-    /// deadline - up to thirty seconds past the moment the user chose.
-    /// Denies never qualify either way; they have their own map.
-    pub fn fast_allow_eligible(&self) -> bool {
-        self.action == cfc_core::Action::Allow
-            && matches!(
-                self.duration,
-                cfc_core::Duration::Always | cfc_core::Duration::UntilRestart
-            )
-    }
+    /// Serializes every write that touches both the store and these rules.
+    /// See [`Engine::lock_mutations`].
+    mutations: Mutex<()>,
 }
 
 pub enum Decision {
     /// A persistent rule matched. Return the verdict immediately.
     Resolved(Verdict),
-    /// No rule matched. Caller should prompt the user.
-    NeedsPrompt { fallback: Verdict },
+    /// No rule answered. Caller should prompt the user, and apply `fallback`
+    /// (no_ui_action) when nobody can be asked.
+    NeedsPrompt {
+        fallback: Verdict,
+        /// A rule that may apply but cannot be decided, because the process
+        /// identity (exe, uid or digest) is incomplete. `None` when no rule is
+        /// about this flow.
+        undecided: Option<uuid::Uuid>,
+    },
 }
 
 impl Engine {
@@ -90,8 +73,24 @@ impl Engine {
                 default_policy,
                 hits: Mutex::new(HashMap::new()),
                 on_change: RwLock::new(None),
+                mutations: Mutex::new(()),
             }),
         }
+    }
+
+    /// Held across any change that writes the rule store and this engine
+    /// together: the IPC rule writes, and the flush task's hit merge and
+    /// expiry.
+    ///
+    /// The store and the engine are two copies of one rule set, and without a
+    /// shared lock their writers interleave. The flush drains hit deltas into
+    /// these rules, then adds them to the stored rows; an UpsertRule landing in
+    /// between stored the already-folded count, and the merge added the delta
+    /// a second time, inflating the count for good.
+    ///
+    /// Never taken on the packet path. Lock order: this before `rules`.
+    pub fn lock_mutations(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.inner.mutations.lock()
     }
 
     /// Registers the callback invoked after every rule-set change.
@@ -137,14 +136,6 @@ impl Engine {
         self.notify_changed();
     }
 
-    /// Credits a hit to `rule_id` for a flow the packet path never saw - a
-    /// fast-allowed connection reported by the kernel. The same counter
-    /// `evaluate` bumps, so the busiest allow rule stops reading as dead the
-    /// day its traffic skips the queue.
-    pub fn record_hit(&self, rule_id: uuid::Uuid) {
-        *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
-    }
-
     fn notify_changed(&self) {
         if let Some(f) = self.inner.on_change.read().as_ref() {
             f();
@@ -152,34 +143,56 @@ impl Engine {
     }
 
     /// Evaluate without blocking. Returns `Resolved` if a rule matches,
-    /// otherwise `NeedsPrompt`.
+    /// otherwise `NeedsPrompt`, and counts a hit for the matched rule.
     pub fn evaluate(&self, conn: &Connection, proc: &Process) -> Decision {
+        let decision = self.peek(conn, proc);
+        if let Decision::Resolved(Verdict {
+            source: cfc_core::VerdictSource::Rule(id),
+            ..
+        }) = decision
+        {
+            self.count_hit(id);
+        }
+        decision
+    }
+
+    /// Credits one match to a rule.
+    pub fn count_hit(&self, rule_id: uuid::Uuid) {
+        *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
+    }
+
+    /// [`Self::evaluate`] without counting a hit, for a caller that may not
+    /// apply the answer: a parked packet released with the user's verdict
+    /// must not credit the rule it did not follow.
+    pub fn peek(&self, conn: &Connection, proc: &Process) -> Decision {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let rule_match = {
-            let rules = self.inner.rules.read();
-            match rules.lookup(conn, proc, now_unix_ms) {
-                cfc_core::rule::Match::Rule(r) => Some((r.id, r.action)),
-                // Missing identity cannot authorize traffic or be overridden
-                // by pause, a permissive fallback, or a prompt response.
-                cfc_core::rule::Match::Undecidable(r) => {
-                    tracing::debug!(
-                        rule = %r.name,
-                        exe = %proc.exe.display(),
-                        "policy identity is incomplete; refusing this flow"
-                    );
-                    return Decision::Resolved(Verdict::from_policy(cfc_core::Action::Deny));
-                }
-                cfc_core::rule::Match::None => None,
-            }
-        };
-        if let Some((rule_id, action)) = rule_match {
-            *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
+        let rules = self.inner.rules.read();
+        let undecided = match rules.lookup(conn, proc, now_unix_ms) {
             // Verbatim: a Reject rule must reach the datapath as Reject so
             // the refusal is actually injected, not silently downgraded.
-            return Decision::Resolved(Verdict::from_rule(action, rule_id));
-        }
+            cfc_core::rule::Match::Rule(r) => {
+                return Decision::Resolved(Verdict::from_rule(r.action, r.id));
+            }
+            // No answer can establish a legacy hostname, so it stays refused.
+            cfc_core::rule::Match::Undecidable(r) if r.scope.dst_host.is_some() => {
+                tracing::debug!(rule = %r.name, "legacy hostname rule cannot be decided; refusing this flow");
+                return Decision::Resolved(Verdict::from_policy(cfc_core::Action::Deny));
+            }
+            // Incomplete identity is uncertainty, not a refusal: ask the user.
+            cfc_core::rule::Match::Undecidable(r) => {
+                tracing::debug!(
+                    rule = %r.name,
+                    exe = %proc.exe.display(),
+                    "process identity is incomplete; prompting for this flow"
+                );
+                Some(r.id)
+            }
+            cfc_core::rule::Match::None => None,
+        };
+        drop(rules);
         Decision::NeedsPrompt {
             fallback: self.fallback_verdict(),
+            undecided,
         }
     }
 
@@ -206,20 +219,18 @@ impl Engine {
     /// [`RuleScope::undecidable_for`] - also ends the walk with `None`, for
     /// the same reason: it might have been the one that mattered.
     ///
+    /// An Allow that names no program is walked past, because `lookup` lets a
+    /// program Deny or Reject below it win anyway. The first other rule that
+    /// applies then answers as above if it is such a refusal. If it is
+    /// anything else and a generic Allow was passed, the answer depends on
+    /// the destination (that Allow, or what lies below it), so `None`.
+    ///
     /// `None` means "ask the packet path", which is always a safe answer: it
     /// is what happened before this existed.
     pub fn process_wide_action(&self, proc: &Process) -> Option<cfc_core::Action> {
-        self.process_wide_verdict(proc).map(|v| v.action)
-    }
-
-    /// [`process_wide_action`](Self::process_wide_action) with the rule that
-    /// answered: its id, for crediting a hit the packet path will never see,
-    /// and its duration, because the fast path is offered only to rules that
-    /// last. A timed allow (`--for 1h`) keeps the packet path, so its expiry
-    /// is exact rather than "within the next flush tick".
-    pub fn process_wide_verdict(&self, proc: &Process) -> Option<ProcessWideVerdict> {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
+        let mut saw_generic_allow = false;
         for rule in rules
             .rules
             .iter()
@@ -247,99 +258,34 @@ impl Engine {
             if !rule.scope.matches_process(proc) {
                 continue;
             }
-            return (!rule.scope.constrains_destination()).then_some(ProcessWideVerdict {
-                action: rule.action,
-                rule_id: rule.id,
-                duration: rule.duration,
-            });
+            if is_generic_allow(rule) {
+                saw_generic_allow = true;
+                continue;
+            }
+            if saw_generic_allow && !is_program_refusal(rule) {
+                return None;
+            }
+            return (!rule.scope.constrains_destination()).then_some(rule.action);
         }
         None
     }
 
-    /// Whether any enabled rule could grant the fast path to *some* process.
+    /// Whether the kernel should refuse every `connect()` of this process:
+    /// exactly when [`Self::process_wide_action`] answers Deny or Reject.
     ///
-    /// The same predicate `process_wide_verdict` applies per process, asked of
-    /// the rule set as a whole: outbound, not flow-scoped, and eligible - an
-    /// `Allow` that lasts. Reuses [`ProcessWideVerdict::fast_allow_eligible`]
-    /// rather than restating it, so there is one definition of "could grant".
-    ///
-    /// For `sweep_fast_allow`, which otherwise walks /proc on every rule
-    /// change to reach a conclusion this answers in a few comparisons.
-    pub fn any_fast_allow_rule(&self) -> bool {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let rules = self.inner.rules.read();
-        rules
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
-            .filter(|r| !r.scope.constrains_destination())
-            .any(|r| {
-                ProcessWideVerdict {
-                    action: r.action,
-                    rule_id: r.id,
-                    duration: r.duration,
-                }
-                .fast_allow_eligible()
-            })
-    }
-
-    /// Whether some resolution of the rules this caller cannot decide would
-    /// still deny this process outright - the question that separates the two
-    /// meanings of `process_wide_action`'s `None`.
-    ///
-    /// The in-kernel sweeps turn on this distinction. `None` covers two
-    /// opposite situations: an abstention (a hash-scoped rule the caller
-    /// cannot decide) and a rule that was simply *deleted* (nobody replaces a
-    /// deny with an explicit allow, they delete it - and keeping the entry
-    /// then means the kernel goes on refusing a program no rule denies).
-    ///
-    /// An earlier version of this answered "is any rule undecidable?", which
-    /// conflates a third case: when the only undecidable rule is an *allow*,
-    /// both resolutions of the ambiguity end without a deny (the hash
-    /// matches and the process is allowed, or it does not and no rule
-    /// speaks), yet the old answer kept a standing kernel DENY on the
-    /// strength of a rule that could never justify one. So this walks the
-    /// rules in precedence order, the same filters as `process_wide_action`
-    /// (the inbound skip included, so the two cannot disagree about which
-    /// rules are in play), and answers whether a deny is still *reachable*:
-    ///
-    /// * an undecidable deny that constrains no destination: reachable - the
-    ///   matching resolution denies process-wide. Answer yes.
-    /// * an undecidable allow, or an undecidable rule the packet path would
-    ///   own anyway (destination-scoped): the deny-reachable resolution is
-    ///   the one where it does not match. Walk on.
-    /// * a decidable match ends the walk exactly as `process_wide_action`
-    ///   does: its action (or the packet path, for a destination-scoped
-    ///   rule) is the whole answer, and nothing below it can matter.
-    pub fn deny_still_possible_for(&self, proc: &Process) -> bool {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        let rules = self.inner.rules.read();
-        for rule in rules
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter(|r| r.scope.direction != Some(cfc_core::Direction::Inbound))
-        {
-            if rule.scope.undecidable_for(proc) {
-                if matches!(
-                    rule.action,
-                    cfc_core::Action::Deny | cfc_core::Action::Reject
-                ) && !rule.scope.constrains_destination()
-                {
-                    return true;
-                }
-                continue;
-            }
-            if !rule.scope.matches_process(proc) {
-                continue;
-            }
-            return matches!(
-                rule.action,
-                cfc_core::Action::Deny | cfc_core::Action::Reject
-            ) && !rule.scope.constrains_destination();
-        }
-        false
+    /// The one question every in-kernel writer asks (exec, both resync
+    /// sweeps, the exe table), so they cannot disagree. An abstention is not
+    /// a refusal: the packet path decides that flow, with the digest in hand
+    /// when it can hash the image, and prompts when the identity stays
+    /// incomplete. Keeping a kernel entry there instead (what the sweeps did
+    /// until 0.8.0) refused in silence, with EPERM at `connect()`, a flow the
+    /// packet path would have asked about, so the prompt never came. A rule
+    /// that was deleted reads the same way and clears too.
+    pub fn denies_process_wide(&self, proc: &Process) -> bool {
+        matches!(
+            self.process_wide_action(proc),
+            Some(cfc_core::Action::Deny | cfc_core::Action::Reject)
+        )
     }
 
     /// How many rules are loaded, without copying any of them.
@@ -350,29 +296,6 @@ impl Engine {
     /// once a second per connected client, forever.
     pub fn rule_count(&self) -> usize {
         self.inner.rules.read().rules.len()
-    }
-
-    /// The distinct executables enabled rules name, under one read lock.
-    ///
-    /// `snapshot()` would answer this too, and answer it expensively: it deep
-    /// clones every rule - names, `PathBuf`s, every `Option<String>` in every
-    /// scope - and merges hit counts on the way, none of which the caller
-    /// wants. This clones the paths it is actually asked for and nothing else.
-    ///
-    /// Deliberately does not evaluate anything while holding the lock: the
-    /// caller re-enters through `process_wide_action`, which takes its own read
-    /// lock, and nesting reads on a `std::sync::RwLock` can deadlock against a
-    /// waiting writer.
-    pub fn enabled_exe_paths(&self) -> std::collections::BTreeSet<std::path::PathBuf> {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        self.inner
-            .rules
-            .read()
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter_map(|r| r.scope.exe_path.clone())
-            .collect()
     }
 
     /// Executables safe to compile into the kernel's table, and the ones that
@@ -386,6 +309,11 @@ impl Engine {
     /// A synthetic process with no uid cannot decide a uid-scoped rule.
     /// Excluding every executable such a rule could touch preserves the
     /// per-user decision in the packet path, where the uid is available.
+    ///
+    /// Returns owned paths and evaluates nothing under the lock: the caller
+    /// re-enters through `process_wide_action`, which takes its own read lock,
+    /// and nesting reads on a `std::sync::RwLock` can deadlock against a
+    /// waiting writer.
     pub fn compilable_exe_paths(&self) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
@@ -412,42 +340,6 @@ impl Engine {
                 .cloned()
                 .collect(),
         )
-    }
-
-    /// Whether any live rule scoped to a uid could apply to `exe`.
-    ///
-    /// The mirror of [`Self::compilable_exe_paths`], for the grant map rather
-    /// than the deny map, and it exists for the same reason turned around.
-    ///
-    /// The two deciders do not read the same uid. The packet path takes the
-    /// uid from the kernel's exec record when it has one - the uid at
-    /// `execve` - and does not read `/proc/<pid>/status` at all. The grant
-    /// path resolves through `/proc` and gets the uid the process holds
-    /// *now*. For a program that drops privileges after exec - `named`,
-    /// `postfix`, a browser entering its sandbox - those are different, so
-    /// `deny --exe X --uid 0` above `allow --exe X` can be answered "deny" by
-    /// the packet path and "allow" by the grant path. A grant is process-wide
-    /// and destination-blind, so that disagreement is not a slower answer, it
-    /// is the deny never being applied at all.
-    ///
-    /// Rather than decide which uid is the right one - a semantic change to
-    /// what every existing uid-scoped rule means - the fast path simply
-    /// abstains wherever a uid could matter. Those flows take the queue,
-    /// where the uid question has one answer and it is the packet path's.
-    /// Hosts with no uid-scoped rule, which is nearly all of them, pay
-    /// nothing: the walk stops at the first predicate.
-    pub fn uid_scoped_may_apply(&self, exe: &std::path::Path) -> bool {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        self.inner
-            .rules
-            .read()
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter(|r| r.scope.uid.is_some())
-            // A uid-scoped rule that names no executable can apply to any
-            // program, exactly as in `compilable_exe_paths`.
-            .any(|r| r.scope.exe_path.as_deref().is_none_or(|p| p == exe))
     }
 
     /// What an inbound flow gets when no rule matches.
@@ -590,6 +482,18 @@ impl Engine {
     }
 }
 
+/// An Allow that names no program: the rule `lookup` lets a program refusal
+/// override, whatever its rank.
+fn is_generic_allow(rule: &Rule) -> bool {
+    rule.action == cfc_core::Action::Allow && !rule.scope.names_program()
+}
+
+/// A Deny or Reject that names a program: the rule that overrides a generic
+/// Allow.
+fn is_program_refusal(rule: &Rule) -> bool {
+    rule.action != cfc_core::Action::Allow && rule.scope.names_program()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +553,13 @@ mod tests {
         Rule::new(format!("allow-{port}"), Action::Allow, scope)
     }
 
+    /// Two predicates, so it outranks a one-predicate rule of any action.
+    fn allow_tcp_port_rule(port: u16) -> Rule {
+        let mut rule = allow_port_rule(port);
+        rule.scope.protocol = Some(Protocol::Tcp);
+        rule
+    }
+
     fn deny_port_rule(port: u16) -> Rule {
         let mut scope = RuleScope::any();
         scope.dst_port = Some(port);
@@ -665,83 +576,6 @@ mod tests {
         Engine::new(RuleSet { rules }, shared(dp_deny()))
     }
 
-    // --- the uid guard on the grant path --------------------------------
-
-    #[test]
-    fn a_uid_scoped_rule_takes_its_program_off_the_fast_path() {
-        let exe = std::path::Path::new("/usr/sbin/named");
-        let other = std::path::Path::new("/usr/bin/curl");
-
-        // The shape that made the fast path grant what the packet path denies:
-        // the program execs as root and drops to its own uid, so the grant
-        // path reads 53 and the packet path reads 0, and only one of them
-        // sees the deny.
-        let mut denied_as_root = RuleScope::any();
-        denied_as_root.exe_path = Some(PathBuf::from(exe));
-        denied_as_root.uid = Some(0);
-        let mut allowed = RuleScope::any();
-        allowed.exe_path = Some(PathBuf::from(exe));
-        let engine = engine_with(vec![
-            Rule::new("deny-as-root".to_string(), Action::Deny, denied_as_root),
-            Rule::new("allow".to_string(), Action::Allow, allowed),
-        ]);
-        assert!(
-            engine.uid_scoped_may_apply(exe),
-            "a uid-scoped rule names this program, so the fast path must stand aside"
-        );
-        assert!(
-            !engine.uid_scoped_may_apply(other),
-            "a program no uid-scoped rule names is unaffected"
-        );
-
-        // A rule set with no uid predicate at all costs nothing: this is the
-        // common case and it must not be taken off the fast path.
-        let mut plain = RuleScope::any();
-        plain.exe_path = Some(PathBuf::from(exe));
-        let engine = engine_with(vec![Rule::new("a".to_string(), Action::Allow, plain)]);
-        assert!(!engine.uid_scoped_may_apply(exe));
-    }
-
-    #[test]
-    fn a_uid_rule_naming_no_program_takes_everything_off_the_fast_path() {
-        // It could apply to anything, and nothing here can tell whether it
-        // would - the same reasoning `compilable_exe_paths` uses to return
-        // `None` rather than a list.
-        let mut any_program = RuleScope::any();
-        any_program.uid = Some(1000);
-        let engine = engine_with(vec![Rule::new(
-            "per-user".to_string(),
-            Action::Deny,
-            any_program,
-        )]);
-        for exe in ["/usr/bin/curl", "/usr/sbin/named", "/opt/whatever"] {
-            assert!(
-                engine.uid_scoped_may_apply(std::path::Path::new(exe)),
-                "{exe} must not be granted while a uid rule can reach any program"
-            );
-        }
-    }
-
-    #[test]
-    fn a_disabled_or_expired_uid_rule_does_not_hold_the_fast_path_back() {
-        let exe = std::path::Path::new("/usr/sbin/named");
-        let mut scope = RuleScope::any();
-        scope.exe_path = Some(PathBuf::from(exe));
-        scope.uid = Some(0);
-
-        let mut disabled = Rule::new("off".to_string(), Action::Deny, scope.clone());
-        disabled.enabled = false;
-        assert!(!engine_with(vec![disabled]).uid_scoped_may_apply(exe));
-
-        let mut expired = Rule::new("gone".to_string(), Action::Deny, scope);
-        expired.duration = cfc_core::Duration::Seconds(1);
-        expired.created_at = chrono::Utc::now() - chrono::Duration::hours(1);
-        assert!(
-            !engine_with(vec![expired]).uid_scoped_may_apply(exe),
-            "an expired rule constrains nothing"
-        );
-    }
-
     // --- process_wide_action -------------------------------------------
     //
     // This is what the `cgroup/connect4|6` programs are steered by, and it
@@ -750,74 +584,68 @@ mod tests {
     // never get to revise?
 
     #[test]
-    fn a_deleted_rule_is_distinguishable_from_an_abstention() {
-        // The two meanings of `None`, which the orphan sweep must not conflate.
+    fn the_kernel_refuses_only_what_process_wide_action_denies() {
+        // A hash-scoped deny the caller cannot decide abstains, and an
+        // abstention installs no kernel entry: the packet path decides it.
         let mut hashed = RuleScope::any();
         hashed.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         hashed.exe_sha256 = Some("aa".repeat(32));
         let engine = engine_with(vec![Rule::new("h".to_string(), Action::Deny, hashed)]);
-
-        let no_hash = Process {
-            exe: PathBuf::from("/usr/bin/curl"),
-            ..Process::unknown(1)
-        };
-        // Abstention on a deny: the matching resolution refuses, so a
-        // standing kernel entry must survive. Keep.
+        let no_hash = proc("/usr/bin/curl");
         assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(engine.deny_still_possible_for(&no_hash));
+        assert!(!engine.denies_process_wide(&no_hash));
 
-        // The same rule pinned to a DIFFERENT binary is decidable for this
-        // process, so it must not block the sweep from clearing.
-        let other = Process {
-            exe: PathBuf::from("/usr/bin/wget"),
-            ..Process::unknown(1)
-        };
-        assert_eq!(engine.process_wide_action(&other), None);
-        assert!(!engine.deny_still_possible_for(&other));
-
-        // And a rule set with nothing in it - the deleted-rule case - is the
-        // one the sweep exists for: None, no deny reachable, clear.
-        let empty = engine_with(vec![]);
-        assert_eq!(empty.process_wide_action(&no_hash), None);
-        assert!(!empty.deny_still_possible_for(&no_hash));
+        // A decidable program deny does reach the kernel, Reject included.
+        for action in [Action::Deny, Action::Reject] {
+            let engine = engine_with(vec![exe_rule("d", "/usr/bin/curl", action)]);
+            assert!(engine.denies_process_wide(&no_hash), "{action:?}");
+        }
+        // And an empty rule set (the deleted-rule case) refuses nothing.
+        assert!(!engine_with(vec![]).denies_process_wide(&no_hash));
     }
 
     #[test]
-    fn an_undecidable_allow_cannot_prop_up_a_kernel_deny() {
-        // The case the old any-undecidable answer got backwards: the only
-        // rule naming this exe is a hash-scoped ALLOW. Whichever way the
-        // unknown hash resolves - it matches and the process is allowed, or
-        // it does not and no rule speaks - no deny is reachable, so a
-        // standing kernel DENY (from a deny rule since deleted) must clear.
+    fn deleting_a_program_deny_lifts_the_kernel_refusal_under_a_digest_deny() {
+        // `deny --exe slack` plus a digest-only blocklist rule. The sweep
+        // reads no digest, so the blocklist rule is undecidable for slack.
+        let slack = "/usr/lib/slack/slack";
+        let mut digest = RuleScope::any();
+        digest.exe_sha256 = Some("bb".repeat(32));
+        let deny_slack = exe_rule("deny-slack", slack, Action::Deny);
+        let mut blocklist = Rule::new("blocklist".to_string(), Action::Deny, digest);
+        // Imported later, so the program deny ranks first and answers.
+        blocklist.created_at = deny_slack.created_at + chrono::Duration::seconds(1);
+        let engine = engine_with(vec![deny_slack.clone(), blocklist.clone()]);
+        let p = proc(slack);
+        assert!(engine.denies_process_wide(&p));
+
+        // Once the program deny is gone, the kernel must stop refusing:
+        // the packet path asks about this flow instead, naming the rule it
+        // could not decide, and a standing kernel DENY would refuse the
+        // connect() before the queue ever saw it.
+        engine.remove_rule(deny_slack.id);
+        assert!(!engine.denies_process_wide(&p));
+        assert!(matches!(
+            engine.peek(&conn(443), &p),
+            Decision::NeedsPrompt { undecided: Some(id), .. } if id == blocklist.id
+        ));
+    }
+
+    #[test]
+    fn an_undecidable_allow_over_a_deny_installs_no_kernel_refusal() {
+        // Whether the deny below fires depends on a digest the sweep does
+        // not read, so the packet path owns the flow (it hashes the image,
+        // or prompts when it cannot).
         let mut hashed_allow = RuleScope::any();
         hashed_allow.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         hashed_allow.exe_sha256 = Some("aa".repeat(32));
-        let engine = engine_with(vec![Rule::new(
-            "pin".to_string(),
-            Action::Allow,
-            hashed_allow.clone(),
-        )]);
-
-        let no_hash = Process {
-            exe: PathBuf::from("/usr/bin/curl"),
-            ..Process::unknown(1)
-        };
-        assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(
-            !engine.deny_still_possible_for(&no_hash),
-            "an allow-only abstention pinned a stale deny"
-        );
-
-        // But the same allow layered over a plain deny is the textbook
-        // reason to keep: if the hash does not match, the deny below fires.
-        let mut plain_deny = RuleScope::any();
-        plain_deny.exe_path = Some(PathBuf::from("/usr/bin/curl"));
         let engine = engine_with(vec![
             Rule::new("pin".to_string(), Action::Allow, hashed_allow),
-            Rule::new("deny".to_string(), Action::Deny, plain_deny),
+            exe_rule("deny", "/usr/bin/curl", Action::Deny),
         ]);
+        let no_hash = proc("/usr/bin/curl");
         assert_eq!(engine.process_wide_action(&no_hash), None);
-        assert!(engine.deny_still_possible_for(&no_hash));
+        assert!(!engine.denies_process_wide(&no_hash));
     }
 
     #[test]
@@ -869,186 +697,29 @@ mod tests {
         assert_eq!(engine.process_wide_action(&without), None);
     }
 
-    /// The eligibility predicate, reached the way the daemon reaches it: through
-    /// `process_wide_verdict` on a real engine with a real rule, one case per
-    /// shape of answer.
+    /// A rule that says anything about the flow must never become a
+    /// process-wide answer.
     ///
-    /// The exhaustive version further down tests the predicate on its own over
-    /// the whole Action x Duration space; this one is the through-the-engine
-    /// complement, and the pair is deliberate. (The doc comment that used to
-    /// sit here described a rule-expiry test that lives elsewhere - a leftover
-    /// from a move, and a reader looking for the expiry test would have been
-    /// sent to the wrong function.)
+    /// `deny --dst-port 443` means "this program may not reach 443", and an
+    /// in-kernel verdict means "every `connect()` this program makes is
+    /// refused". Conflating them would refuse everything the rule never
+    /// named, so each predicate that makes a rule flow-scoped is checked on
+    /// its own - a missing one would only show up as a rule type that quietly
+    /// denies everything.
     #[test]
-    fn only_lasting_allows_are_fast_allow_eligible() {
-        // The fast path re-checks grants on flow starts and rule changes, not
-        // on a clock, so a timed allow would outlive its deadline by up to a
-        // flush tick. Denies have their own map and never qualify.
-        let mut scope = RuleScope::any();
-        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
-        let eligible = |action: Action, duration: cfc_core::Duration| {
-            let mut rule = Rule::new("r".to_string(), action, scope.clone());
-            rule.duration = duration;
-            let engine = engine_with(vec![rule]);
-            let proc = Process {
-                exe: PathBuf::from("/usr/bin/curl"),
-                ..Process::unknown(1)
-            };
-            engine
-                .process_wide_verdict(&proc)
-                .map(|v| v.fast_allow_eligible())
-        };
-        assert_eq!(
-            eligible(Action::Allow, cfc_core::Duration::Always),
-            Some(true)
-        );
-        assert_eq!(
-            eligible(Action::Allow, cfc_core::Duration::UntilRestart),
-            Some(true)
-        );
-        assert_eq!(
-            eligible(Action::Allow, cfc_core::Duration::Seconds(3600)),
-            Some(false),
-            "a timed allow keeps the packet path so its expiry is exact"
-        );
-        assert_eq!(
-            eligible(Action::Deny, cfc_core::Duration::Always),
-            Some(false)
-        );
-        assert_eq!(
-            eligible(Action::Reject, cfc_core::Duration::Always),
-            Some(false)
-        );
-    }
-
-    /// The rule-set-wide question `sweep_fast_allow` asks before walking /proc:
-    /// one case per way a rule set can fail to grant anyone, and one that can.
-    #[test]
-    fn a_rule_set_that_cannot_grant_anyone_says_so() {
-        use cfc_core::Duration;
-        let exe = || Some(PathBuf::from("/usr/bin/curl"));
-        let rule = |action: Action, duration: Duration, f: fn(&mut RuleScope)| {
-            let mut scope = RuleScope::any();
-            scope.exe_path = exe();
-            f(&mut scope);
-            let mut r = Rule::new("r".to_string(), action, scope);
-            r.duration = duration;
-            r
-        };
-        let none = |_: &mut RuleScope| {};
-
-        assert!(!engine_with(vec![]).any_fast_allow_rule(), "no rules");
-        assert!(
-            !engine_with(vec![rule(Action::Deny, Duration::Always, none)]).any_fast_allow_rule(),
-            "only denies"
-        );
-        assert!(
-            !engine_with(vec![rule(Action::Allow, Duration::Seconds(3600), none)])
-                .any_fast_allow_rule(),
-            "only a timed allow"
-        );
-        assert!(
-            !engine_with(vec![rule(Action::Allow, Duration::Always, |s| s
-                .dst_port =
-                Some(443))])
-            .any_fast_allow_rule(),
-            "only a flow-scoped allow"
-        );
-        let mut disabled = rule(Action::Allow, Duration::Always, none);
-        disabled.enabled = false;
-        assert!(
-            !engine_with(vec![disabled]).any_fast_allow_rule(),
-            "only a disabled allow"
-        );
-
-        assert!(
-            engine_with(vec![
-                rule(Action::Deny, Duration::Always, none),
-                rule(Action::Allow, Duration::Always, none),
-            ])
-            .any_fast_allow_rule(),
-            "one lasting outright allow among denies is enough"
-        );
-    }
-
-    /// The one predicate the fast path's safety rests on, over its whole
-    /// input space rather than a sample: three actions and four durations is
-    /// all of it.
-    ///
-    /// The expected answers are a table, not the implementation's own
-    /// expression rewritten - a test that recomputes what it is checking
-    /// passes for a wrong implementation too. Adding a variant to either enum
-    /// breaks this test, which is the point: a new action or a new duration is
-    /// a decision about whether it may mark a socket, and it should not be
-    /// possible to make it by accident.
-    #[test]
-    fn only_a_lasting_allow_may_ever_mark_a_socket() {
-        use cfc_core::{Action, Duration};
-
-        // Everything that may. Everything else may not.
-        let may_mark = [
-            (Action::Allow, Duration::Always),
-            (Action::Allow, Duration::UntilRestart),
-        ];
-
-        let every_action = [Action::Allow, Action::Deny, Action::Reject];
-        let every_duration = [
-            Duration::Once,
-            Duration::UntilRestart,
-            Duration::Always,
-            // Both ends of the timed range: a timed allow must never mark,
-            // because the mark outlives the second it expires on - nothing
-            // re-passes a hook just because a clock ticked.
-            Duration::Seconds(0),
-            Duration::Seconds(u32::MAX),
-        ];
-
-        for action in every_action {
-            for duration in every_duration {
-                let verdict = ProcessWideVerdict {
-                    action,
-                    rule_id: uuid::Uuid::nil(),
-                    duration,
-                };
-                let expected = may_mark.contains(&(action, duration));
-                assert_eq!(
-                    verdict.fast_allow_eligible(),
-                    expected,
-                    "{action:?} + {duration:?} must {} be fast-allow eligible",
-                    if expected { "" } else { "not" }
-                );
-            }
-        }
-    }
-
-    /// A rule that says anything about the flow must never become a blanket
-    /// mark on a process's sockets.
-    ///
-    /// `allow --dst-port 443` means "this program may reach 443", and a mark
-    /// means "every packet this program sends skips the queue". Conflating
-    /// them would be the widest possible failure of this feature, so each
-    /// predicate that makes a rule flow-scoped is checked on its own - a
-    /// missing one would only show up as a rule type that quietly grants
-    /// everything.
-    #[test]
-    fn a_flow_scoped_allow_never_grants_the_fast_path() {
+    fn a_flow_scoped_rule_never_yields_a_process_wide_action() {
         let exe = PathBuf::from("/usr/bin/curl");
         let proc = Process {
             exe: exe.clone(),
             ..Process::unknown(1)
         };
 
-        // The unconstrained rule does grant - otherwise the cases below would
+        // The unconstrained rule does answer - otherwise the cases below would
         // pass for the wrong reason.
         let mut open = RuleScope::any();
         open.exe_path = Some(exe.clone());
-        let engine = engine_with(vec![Rule::new("open".to_string(), Action::Allow, open)]);
-        assert!(
-            engine
-                .process_wide_verdict(&proc)
-                .is_some_and(|v| v.fast_allow_eligible()),
-            "an exe-only allow is the case this feature exists for"
-        );
+        let engine = engine_with(vec![Rule::new("open".to_string(), Action::Deny, open)]);
+        assert_eq!(engine.process_wide_action(&proc), Some(Action::Deny));
 
         // Named, because clippy is right that the bare tuple is a mouthful -
         // and because the name says what the table is: one way each of making
@@ -1074,34 +745,13 @@ mod tests {
             let mut scope = RuleScope::any();
             scope.exe_path = Some(exe.clone());
             constrain(&mut scope);
-            let engine = engine_with(vec![Rule::new(what.to_string(), Action::Allow, scope)]);
-            let granted = engine
-                .process_wide_verdict(&proc)
-                .is_some_and(|v| v.fast_allow_eligible());
-            assert!(
-                !granted,
-                "an allow scoped by {what} must not mark every socket this process opens"
+            let engine = engine_with(vec![Rule::new(what.to_string(), Action::Deny, scope)]);
+            assert_eq!(
+                engine.process_wide_action(&proc),
+                None,
+                "a deny scoped by {what} must not refuse every connect() this process makes"
             );
         }
-    }
-
-    #[test]
-    fn process_wide_verdict_names_the_rule_that_answered() {
-        // The allow consumer credits hits by this id; the wrong id would
-        // credit the wrong rule, which is worse than crediting none.
-        let mut scope = RuleScope::any();
-        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
-        let rule = Rule::new("mine".to_string(), Action::Allow, scope);
-        let id = rule.id;
-        let engine = engine_with(vec![rule]);
-        let proc = Process {
-            exe: PathBuf::from("/usr/bin/curl"),
-            ..Process::unknown(1)
-        };
-        let v = engine.process_wide_verdict(&proc).expect("a verdict");
-        assert_eq!(v.rule_id, id);
-        assert_eq!(v.action, Action::Allow);
-        assert_eq!(engine.process_wide_action(&proc), Some(Action::Allow));
     }
 
     /// An expired rule must drop out of what gets compiled into the kernel.
@@ -1239,6 +889,55 @@ mod tests {
             Some(Action::Deny)
         );
         assert_eq!(engine.process_wide_action(&proc("/usr/bin/wget")), None);
+    }
+
+    #[test]
+    fn process_wide_action_applies_the_program_deny_over_a_generic_allow() {
+        // `lookup` lets the program Deny beat the higher-ranked generic Allow,
+        // so the connect hooks may refuse X outright: the packet path would
+        // refuse every flow of X too. Both must agree.
+        let engine = engine_with(vec![
+            exe_rule("deny-x", "/usr/bin/x", Action::Deny),
+            allow_tcp_port_rule(443),
+        ]);
+        let x = proc("/usr/bin/x");
+        assert_eq!(engine.process_wide_action(&x), Some(Action::Deny));
+        assert!(engine.denies_process_wide(&x));
+        assert!(matches!(
+            engine.peek(&conn(443), &x),
+            Decision::Resolved(v) if v.action == Action::Deny
+        ));
+
+        let y = proc("/usr/bin/y");
+        assert_eq!(engine.process_wide_action(&y), None);
+        assert!(!engine.denies_process_wide(&y));
+    }
+
+    #[test]
+    fn a_generic_allow_above_a_generic_deny_keeps_process_wide_none() {
+        // No rule names a program, so the override does not apply and the
+        // old order stands: the generic Allow wins, and a lower destination-
+        // free generic Deny is never reachable.
+        let mut user = RuleScope::any();
+        user.uid = Some(1000);
+        let engine = engine_with(vec![
+            allow_tcp_port_rule(443),
+            Rule::new("deny-user", Action::Deny, user),
+        ]);
+        let p = proc("/usr/bin/curl");
+        assert_eq!(engine.process_wide_action(&p), None);
+        assert!(!engine.denies_process_wide(&p));
+    }
+
+    #[test]
+    fn a_program_allow_under_a_generic_allow_is_no_process_wide_answer() {
+        let engine = engine_with(vec![
+            exe_rule("allow-x", "/usr/bin/x", Action::Allow),
+            allow_tcp_port_rule(443),
+        ]);
+        let x = proc("/usr/bin/x");
+        assert_eq!(engine.process_wide_action(&x), None);
+        assert!(!engine.denies_process_wide(&x));
     }
 
     #[test]
@@ -1384,10 +1083,52 @@ mod tests {
     fn no_rules_returns_needs_prompt() {
         let engine = Engine::new(RuleSet::default(), shared(dp_allow()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
-            Decision::NeedsPrompt { fallback } => {
+            Decision::NeedsPrompt { fallback, .. } => {
                 assert_eq!(fallback.action, Action::Allow);
             }
             _ => panic!("expected NeedsPrompt"),
+        }
+    }
+
+    #[test]
+    fn incomplete_identity_needs_a_prompt_naming_the_rule() {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+        let rule = Rule::new("deny-curl", Action::Deny, scope);
+        let id = rule.id;
+        let engine = Engine::new(RuleSet { rules: vec![rule] }, shared(dp_allow()));
+        match engine.evaluate(&conn(443), &Process::unknown(0)) {
+            Decision::NeedsPrompt {
+                fallback,
+                undecided,
+            } => {
+                assert_eq!(undecided, Some(id));
+                assert_eq!(fallback, Verdict::from_policy(Action::Allow));
+            }
+            _ => panic!("expected NeedsPrompt"),
+        }
+        assert!(matches!(
+            engine.evaluate(&conn(443), &proc("/usr/bin/wget")),
+            Decision::NeedsPrompt {
+                undecided: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_hostname_policy_still_refuses() {
+        let mut scope = RuleScope::any();
+        scope.dst_host = Some("example.org".into());
+        let engine = Engine::new(
+            RuleSet {
+                rules: vec![Rule::new("legacy", Action::Deny, scope)],
+            },
+            shared(dp_allow()),
+        );
+        match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
+            Decision::Resolved(v) => assert_eq!(v, Verdict::from_policy(Action::Deny)),
+            _ => panic!("expected Resolved"),
         }
     }
 
@@ -1420,7 +1161,7 @@ mod tests {
     fn fallback_respects_default_policy_deny() {
         let engine = Engine::new(RuleSet::default(), shared(dp_deny()));
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
-            Decision::NeedsPrompt { fallback } => {
+            Decision::NeedsPrompt { fallback, .. } => {
                 assert_eq!(fallback.action, Action::Deny);
             }
             _ => panic!("expected NeedsPrompt"),
@@ -1495,7 +1236,7 @@ mod tests {
         *policy.write().unwrap() = dp_deny();
         assert_eq!(engine.fallback_verdict().action, Action::Deny);
         match engine.evaluate(&conn(443), &proc("/usr/bin/curl")) {
-            Decision::NeedsPrompt { fallback } => {
+            Decision::NeedsPrompt { fallback, .. } => {
                 assert_eq!(fallback.action, Action::Deny);
             }
             _ => panic!("expected NeedsPrompt"),
@@ -1522,7 +1263,7 @@ mod tests {
         let original = allow_port_rule(80);
         let id = original.id;
         let engine = engine_with(vec![original]);
-        engine.record_hit(id);
+        engine.evaluate(&conn(80), &proc("/usr/bin/curl"));
         let mut batch = engine.snapshot().rules;
         batch.push(allow_port_rule(443));
         engine.replace_rules(batch);

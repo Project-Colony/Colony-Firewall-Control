@@ -124,6 +124,16 @@ mod tests {
     }
 
     #[test]
+    fn a_denial_prints_the_daemons_reason_verbatim_with_exit_1() {
+        let reason = "read-only access: the caller is being traced. Firewall changes are \
+                      accepted only from the installed Colony Firewall app and tray, or \
+                      from root (sudo cfc ...).";
+        let err: CliError = ClientError::from(tonic::Status::permission_denied(reason)).into();
+        assert_eq!(err.exit_code(), EXIT_RUNTIME);
+        assert_eq!(err.to_string(), reason);
+    }
+
+    #[test]
     fn anyhow_context_chain_is_preserved_on_one_line() {
         use anyhow::Context;
         let e: anyhow::Error = Err::<(), _>(std::io::Error::other("disk on fire"))

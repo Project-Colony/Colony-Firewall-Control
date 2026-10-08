@@ -6,7 +6,6 @@
 use std::fs::File;
 
 /// A sealed, rewound native cBPF file for bubblewrap's `--seccomp` option.
-#[cfg(target_arch = "x86_64")]
 pub fn sealed_filter() -> anyhow::Result<File> {
     use anyhow::Context;
     use std::io::{Seek, Write};
@@ -45,23 +44,12 @@ pub fn sealed_filter() -> anyhow::Result<File> {
     Ok(file)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-pub fn sealed_filter() -> anyhow::Result<File> {
-    anyhow::bail!("application confinement currently requires native x86_64")
-}
-
-#[cfg(target_arch = "x86_64")]
 const ALLOW: u32 = 0x7fff_0000;
-#[cfg(target_arch = "x86_64")]
 const KILL: u32 = 0x8000_0000;
-#[cfg(target_arch = "x86_64")]
 const ENOSYS: u32 = 0x0005_0000 | libc::ENOSYS as u32;
-#[cfg(target_arch = "x86_64")]
 const DENY: u32 = 0x0005_0000 | libc::EPERM as u32;
-#[cfg(target_arch = "x86_64")]
 const NATIVE_ARCH: u32 = 0xc000_003e;
 
-#[cfg(target_arch = "x86_64")]
 fn filter_program() -> Vec<libc::sock_filter> {
     let mut program = vec![
         statement(0x20, 4), // seccomp_data.arch
@@ -345,7 +333,6 @@ fn filter_program() -> Vec<libc::sock_filter> {
     program
 }
 
-#[cfg(target_arch = "x86_64")]
 fn statement(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter {
         code,
@@ -355,12 +342,10 @@ fn statement(code: u16, k: u32) -> libc::sock_filter {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn conditional(
     program: &mut Vec<libc::sock_filter>,
     nr: libc::c_long,
@@ -371,7 +356,6 @@ fn conditional(
     program.extend(body);
 }
 
-#[cfg(target_arch = "x86_64")]
 fn argument_options(index: u32, options: &[u32]) -> Vec<libc::sock_filter> {
     // These syscall parameters are native int/unsigned int; the kernel uses
     // their low 32 bits. Clone flags below are an unsigned long, checked whole.
@@ -384,7 +368,6 @@ fn argument_options(index: u32, options: &[u32]) -> Vec<libc::sock_filter> {
     body
 }
 
-#[cfg(target_arch = "x86_64")]
 fn socket_policy() -> Vec<libc::sock_filter> {
     vec![
         statement(0x20, 16),
@@ -409,7 +392,6 @@ fn socket_policy() -> Vec<libc::sock_filter> {
     ]
 }
 
-#[cfg(target_arch = "x86_64")]
 fn clone_policy() -> Vec<libc::sock_filter> {
     let ordinary = libc::CLONE_VM
         | libc::CLONE_FS
@@ -434,7 +416,7 @@ fn clone_policy() -> Vec<libc::sock_filter> {
     ]
 }
 
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;

@@ -45,26 +45,6 @@ interface(`colony_firewall_stream_connect',`
 
 ########################################
 ## <summary>
-##	Read the Colony Firewall Control log directory.
-## </summary>
-## <param name="domain">
-##	<summary>
-##	Domain allowed access.
-##	</summary>
-## </param>
-#
-interface(`colony_firewall_read_log',`
-	gen_require(`
-		type colony_firewall_log_t;
-	')
-
-	logging_search_logs($1)
-	list_dirs_pattern($1, colony_firewall_log_t, colony_firewall_log_t)
-	read_files_pattern($1, colony_firewall_log_t, colony_firewall_log_t)
-')
-
-########################################
-## <summary>
 ##	All of the rights needed to administer Colony Firewall Control.
 ## </summary>
 ## <param name="domain">
@@ -86,7 +66,6 @@ interface(`colony_firewall_admin',`
 		type colony_firewall_conf_t;
 		type colony_firewall_var_lib_t;
 		type colony_firewall_runtime_t;
-		type colony_firewall_log_t;
 		type colony_firewall_unit_file_t;
 		type var_run_t;
 	')
@@ -105,7 +84,4 @@ interface(`colony_firewall_admin',`
 
 	allow $1 var_run_t:dir search;
 	admin_pattern($1, colony_firewall_runtime_t)
-
-	logging_search_logs($1)
-	admin_pattern($1, colony_firewall_log_t)
 ')

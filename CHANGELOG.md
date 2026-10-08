@@ -6,6 +6,412 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: a Deny or Reject rule scoped to a program wins over every
+  Allow rule that names no program**, whatever their predicate counts.
+  `deny --exe /opt/agent` used to lose to `allow --protocol tcp
+  --dst-port 443` because the Allow carried more predicates; it now
+  refuses the agent there too, and the in-kernel connect hooks refuse it
+  outright. Rules that name a program keep their specificity order among
+  themselves, so `allow --exe X --dst-port 443` still beats `deny --exe X`.
+  Under a generic Allow, a matching program Allow is the rule that answers
+  and is credited with the hit, so the carve-out keeps a hit count.
+  A `/0` network (`--dst-net 0.0.0.0/0`, `::/0`) no longer counts as a
+  predicate when rules are ranked; it still limits a rule to one address
+  family, and stored rules that carry only a `/0` keep loading. Some flows
+  change verdict on upgrade: review `cfc rules list`.
+- **Breaking: a flow whose process identity is incomplete is prompted
+  instead of silently refused** when a program rule may apply to it: an
+  unattributed socket (ambiguous UDP, an expired attribution budget), a
+  binary too large to hash, a process that exited first. The prompt names
+  the rule that could not be decided (`PromptEvent.undecided_rule_id`) and
+  the app, tray and `cfc prompts` show the program as unknown. With no UI
+  connected the flow takes `no_ui_action` (Deny on every shipped profile),
+  and prompt caps send overflow there too; pause and the loopback allowance
+  no longer let such flows through without asking. The in-kernel connect
+  hooks follow: a running program whose only remaining refusal depends on a
+  digest the kernel side does not read (a `deny --sha256` rule, once a
+  `deny --exe` for that program is deleted or expires) no longer keeps a
+  kernel refusal that failed its `connect()` with no prompt; the packet
+  path decides it. One "allow
+  this program" rule no longer blocks every unattributed flow that a
+  generic rule allows.
+  The reverse holds: once any program Deny or Reject exists, a flow whose
+  program is unknown no longer passes a generic Allow it matches (that Deny
+  may be about it), and no Allow rule can settle it; scope the Deny to
+  destinations or make attribution succeed. A `--sha256` Deny without
+  `--exe` does this to every image over 64 MiB (Chromium, Electron, VS
+  Code); add `--exe` to it.
+  The event log and live feed record the undecided rule in `rule_id` with a
+  source other than `rule`. A legacy hostname rule that cannot be decided is
+  still refused. With `no_ui_action = "Allow"`, a program can reach that
+  fallback by making its own attribution fail, so keep it at Deny where
+  program denies matter.
+- New loopback flows now go through the queue instead of being accepted
+  outright (`oifname "lo" accept` is gone from the outbound table). While the
+  daemon runs, explicit rules apply to them, so a loopback Deny that 0.7.0
+  never enforced now takes effect, and unmatched local IPC is still allowed
+  without a prompt. Each new loopback connection pays the queue round trip.
+- Socket attribution is stricter. TCP needs an exact connected tuple and never
+  selects a listening socket, so an outbound flow no longer inherits a
+  listener's rules. UDP accepts zero-remote and wildcard-local sockets only
+  when every compatible socket agrees on its owner. The process and
+  descriptor found must still hold the socket after the executable is read;
+  otherwise the identity is unknown.
+- GUI: "make rule" on a Live row seeds the program, port and protocol, the
+  scope `cfc rules add --exe --dst-port --protocol` builds, instead of
+  pinning the one address seen, which left the app denied on its next
+  address (#46). A row without an identified program pins the address and
+  never seeds `<unknown>`; an inbound row keeps its direction and is scoped
+  on the peer seen and the local port, since the daemon refuses our own
+  address as an inbound destination. "Customize" on a prompt seeds the same
+  way. A saved rule logs the scope it stored, and a rule the editor refuses
+  is also reported in the footer.
+- GUI: a prompt arriving while others are pending no longer switches to the
+  Prompts tab; only the first one does, and raises the window.
+- `cfc rules import-opensnitch` stops before changing anything when a source
+  rule cannot be converted (hostname and regexp rules among them), because
+  dropping a narrow deny next to a broad allow imported a wider policy than
+  the source with only a skip count to show for it. `--skip-unconvertible`
+  imports the rest, naming each skipped file. **Breaking** for scripts that
+  relied on the old additive behaviour.
+- Bundles name the binary that connects. The rules for Firefox on Arch, git,
+  cargo under rustup and apt pinned a launcher or front end that never shows
+  up as the connecting executable, so they never fired. `web` and `dev` drop
+  Epiphany, npm and pip, whose traffic comes from a shared WebKit helper or
+  an interpreter. Hosts that installed `web`, `dev` or `updates` before keep
+  the old rules: `cfc rules bundle remove NAME` then `bundle add NAME`
+  replaces them, and `bundle add` names each one that pins an old path.
+- Rule summaries in the GUI and `cfc rules list` show the protocol, a uid and
+  `[pinned]` for a hash-pinned rule, so a scoped rule no longer reads as
+  global.
+- `cfc rules export` writes `expires_at_unix_ms` for timed rules, and import
+  keeps that deadline instead of starting the full lifetime again. Older
+  versions refuse an export that contains the field.
+- Confinement: a refused launch exits 125 and its reason is in
+  `journalctl -u cfc-app-ID.service`; it used to be discarded and reported
+  as the application's status 1.
+
+- The release tarball ships `install.sh` and `uninstall.sh`, generated from
+  `pkg/colony.json`. No Colony app store client ever read that manifest or
+  ran its `postInstall`/`preRemove`, so the tarball had no installer and the
+  documented store channel did not exist; the docs now say so.
+- Lifting filtering is `systemctl disable --now colony-firewall-nft` (plus
+  `colony-firewalld` to keep it off), not a plain stop. A stop or restart
+  propagates through the network managers' `Requires=` to NetworkManager and
+  systemd-networkd. The docs now carry ruleset changes as a local copy loaded
+  through a unit drop-in: a same-named table from `/etc/nftables.conf` is
+  replaced at boot, on daemon start and on every upgrade.
+
+### Security
+
+- **Breaking: only root and the installed app and tray may change the
+  firewall.** Group membership no longer grants control. A non-root peer may
+  answer prompts, add, edit or delete rules, pause, resume or import only when
+  its process runs the installed, root-sealed `/usr/bin/colony-firewall` or
+  `/usr/bin/colony-firewall-tray` (by device and inode), sealed itself at
+  startup (inherited descriptors closed, non-dumpable), holds the connection
+  itself, is not traced, runs under no seccomp filter (one installed before
+  `exec` can fake the descriptor closing), runs in the host namespaces and
+  mapped no executable file from outside root-owned directories. Every other
+  program of the
+  desktop user, a non-root `cfc` included, is read-only: its changes are
+  refused with the reason (exit 1 in `cfc`), its prompt subscription does not
+  count as a connected UI and it cannot answer prompts. A peer with the
+  daemon's own uid keeps full control (root in production). New
+  `[ipc] official_clients` key; `require_group` now waives the group check
+  for the app and tray only. See docs/HARDENING.md for what this still
+  trusts. One of those routes is a program that starts the app or tray
+  under `ptrace` and patches it before it seals itself, which the default
+  Yama `ptrace_scope = 1` allows; the daemon warns at startup until
+  `kernel.yama.ptrace_scope` is 2.
+  The tray now takes a prompt notification's answer only from the
+  notification server's own bus connection: the button signal is one any
+  session-bus program can emit, and the tray, trusted by the daemon, used to
+  act on it, so a program could press "Always allow app" on its own prompt.
+- **Breaking: pause, resume and rule import from the app or tray ask for an
+  administrator password** through polkit
+  (`org.projectcolony.firewall.pause`, asked every time, and
+  `org.projectcolony.firewall.import-rules`, kept a few minutes). Pause is
+  not kept because any program of the user can click the tray's menu over
+  D-Bus. Storing an enabled Allow rule that names no program
+  (`allow --protocol tcp`), from the rule editor or a customized prompt
+  answer, asks too (`org.projectcolony.firewall.allow-every-program`, kept a
+  few minutes): it lets every program through, which is what a pause does,
+  and it was the way around the pause password. The policy file is
+  installed by every package; polkit is an optional dependency. Root is
+  never asked, and answering a prompt or editing a rule that names a
+  program, or a Deny, never asks. The tray no longer blocks its prompt
+  notifications while the dialog is open.
+
+  Upgrading from 0.7.0:
+  1. Scripts that ran `cfc` as a regular user to change rules, pause or
+     answer prompts must use `sudo cfc`. Reading (`status`, `rules list`,
+     `log`, `live`) is unchanged.
+  2. Restart Colony Firewall and its tray after the upgrade, and after every
+     later one. The 0.7 processes, and any process still running a replaced
+     binary, are read-only until relaunched: the tray says so in a
+     notification, a refused prompt answer shows the daemon's reason, and
+     such a process stops counting as a UI at the next prompt, so later
+     prompts are not held for the full timeout. The pacman and RPM scriptlets print
+     this on every upgrade.
+  3. Pausing from the app or tray needs a polkit agent in the session
+     (most desktops run one; on Hyprland, `hyprpolkitagent`). Without one
+     the request is refused with that reason and `sudo cfc pause` works.
+  4. A non-root `cfc prompts` no longer counts as a UI: on a headless machine
+     run `sudo cfc prompts`, or `no_ui_action` applies.
+  5. A user-wide `LD_PRELOAD` or a Vulkan layer loaded from your home
+     directory makes the app read-only; the refusal names the library.
+- `cfc prompts`: keys typed while no prompt was shown, such as an answer
+  typed just as a prompt expired, answered the next prompt as soon as it was
+  printed, and an arrow key skipped one prompt and left `A` or `D` to answer
+  the next. On a terminal, pending input is now discarded before each prompt.
+- The CLI printed the daemon's reason for not saving a rule raw, and that
+  reason can quote an executable path a local user named, escape sequences
+  included. The client now escapes it for every front end, and escapes the
+  backslash in every escaped string so a literal `\n` cannot pass for an
+  escaped newline.
+- Confinement: on kernels 6.17 to 7.1 the root gate's `BPF_PROG_QUERY`
+  attribute was 32 bytes and the kernel wrote 8 bytes past it on the stack.
+  The attribute now has its full size.
+- GUI: `A`, `D`, `Shift+A` and `Shift+D` answered the newest prompt, the
+  bottom card and often off-screen, from any tab and with Ctrl, Alt or Super
+  held, so `Shift+A` on the card being read could write an always-allow rule
+  for another program. They now answer the marked top card, only on the
+  Prompts tab and without those modifiers. The keys are disarmed for one
+  second whenever their target changes, and a card's buttons for one second
+  after it appears or moves up, so input already on its way when the window
+  was raised or a card moved, such as the second click of a double-click on
+  the card above, does not answer it.
+- GUI and tray: executable paths, command lines, working directories and DNS
+  names were shown raw, so bidi and control characters could reorder or add
+  lines to a prompt, and the tray's notification body was parsed as markup
+  by dunst and mako, so a path could hide part of itself. They are now
+  escaped as the CLI already did. The GUI's Remote row says whether the name
+  is verified.
+- An observed DNS answer could name an address with spaces and brackets,
+  such as `google.com (1.2.3.4; verified hostname)`, and every client printed
+  it before the real address and trust label. Observed names with anything
+  but letters, digits, `-`, `_` and `.` are now dropped.
+- While no daemon listens on the queue, new loopback flows are allowed
+  (`oifname "lo" ct state new queue num 0 bypass`), so local services keep
+  working when the daemon is down. Loopback Deny rules are not enforced then.
+  Every other new flow stays fail-closed.
+
+- The daemon unit sets `PrivateDevices=` (uid 0 could otherwise open block
+  devices and write underneath `ProtectSystem=`), drops `AF_PACKET`, which
+  nothing used, and lists more of the `/proc` and `/sys/fs` entries
+  `ProtectKernelTunables=` covers. `docs/HARDENING.md` no longer claims
+  `ProtectKernelTunables=` is set.
+- The release tarball carries a Sigstore-signed build provenance
+  attestation; `SECURITY.md` explains how to verify it and what
+  `SHA256SUMS` and the attached `PKGBUILD` checksum do not prove.
+
+- A running program whose file was literally named `curl (deleted)`, for
+  instance in a user's own mount namespace, matched the rules for `curl`:
+  the kernel's `" (deleted)"` suffix was dropped by text alone. It is now
+  dropped only from an image with no link left.
+- A daemon started by hand created its rule store with the shell's umask, so
+  rules and other users' command lines were world-readable (or writable
+  under umask 000). The store directory is now created 0700 and the database
+  0600.
+- The BPF object was vetted through its symlinks and then read through them
+  again, so whoever controlled a link could swap it in between. The vetted
+  target is what gets read now.
+- The Arch build recipes and the prompt demo used fixed `/tmp` directories
+  another local user could create first; they use `mktemp -d` now.
+
+### Removed
+
+- The Fast Allow userspace path, disabled since 0.7.0 because a socket mark
+  cannot prove which process sends and so opened bypasses. `cfc --json status`
+  no longer has a `fast_allow` key, `StatusResponse` field 16 is reserved, and
+  the `[ebpf] fast_allow` and `fast_allow_mark` keys are ignored with a
+  warning. For hosts upgrading from 0.4-0.6, startup still flushes the legacy
+  nftables set. When the eBPF layer loads, it also disarms the legacy pinned
+  maps and removes the old sendmsg link pins; with the layer off, without the
+  object or after a failed load, those stay until reboot.
+- The `cfc_sendmsg4`/`cfc_sendmsg6` programs, which nothing had attached since
+  the Fast Allow userspace path went. The eBPF ABI is unchanged.
+- `LogsDirectory=colony-firewall` and the `/var/log/colony-firewall` write
+  access in the unit and the SELinux module (the `colony_firewall_log_t` type
+  and the `colony_firewall_read_log` interface). The daemon logs to the
+  journal and never wrote there. An existing directory is left in place.
+- Unused library items: `cfc_core::CoreError`, `cfc_core::Result`,
+  `cfc_core::ResolvedExe`, `exe_path::resolve_scope` and `Resolved::path`,
+  together with dependencies no crate used.
+
+### Fixed
+
+- Since 0.7.0 the outbound table dropped IPv6 neighbour discovery and MLD,
+  which conntrack marks untracked, so IPv6 stopped working on hosts that load
+  it. Both tables now accept neighbour discovery, MLD and IGMP membership
+  traffic in the kernel, limited to the hop limits and sources the RFCs
+  require, so the inbound table no longer drops MLD or refuses IGMP queries
+  either. Other untracked traffic, including explicit `notrack` flows, still
+  drops; TROUBLESHOOTING.md says how to keep it.
+- On kernels booted with `ipv6.disable=1` the missing `/proc/net/udp6` left
+  every IPv4 UDP flow unattributed, so executable-scoped Allows such as the
+  DNS, NTP and DHCP bootstrap rules refused. An absent table now counts as
+  empty.
+- Every refused packet was committed to SQLite with an fsync on the single
+  packet thread before its verdict, so a flood of refused traffic stalled
+  every new flow on the machine, and a store mutex held for 250 ms (a long
+  `cfc log` query, the minute prune) or a full disk ended the daemon and
+  dropped all new connections until systemd restarted it. Refusals are now
+  queued after their verdict to the same bounded batch writer as Allow rows.
+  Rows it cannot take are counted and logged instead of stopping anything.
+- A disabled rule vanished from `cfc rules list` and the GUI after a daemon
+  restart, so it could not be re-enabled or removed. Disabled rules now load
+  at startup; lookups already skip them.
+- Rules quarantined at load were reported only in the journal. `cfc status`
+  and the GUI now count them with the rows that could not be loaded, and
+  `cfc rules remove <id>` with the full id deletes such an unlisted row.
+- `ApplyRules`, behind `cfc rules import` and `import --replace`, was the
+  only mutating RPC that left no journal line. It now logs the caller's uid
+  and pid, whether it replaced the rule set, and the applied and removed
+  counts as "rules applied".
+- Packets parked on a prompt that timed out were refused even when an
+  "Allow always" given meanwhile for the same program now allowed them. A
+  rule's Allow now takes precedence over the timeout or no-UI fallback; an
+  explicit user answer still stands.
+- Every new flow from an executable that was not root-sealed (anything under
+  a home directory, and any program still running after its package was
+  upgraded) reread and rehashed up to 64 MiB on the single packet thread, so
+  one such program opening connections in a loop stalled new flows for the
+  whole machine. Digests are cached again by device, inode, size, mtime and
+  ctime, and only once ctime is two seconds old, so a changed file is always
+  rehashed and an unchanged one never is.
+- A process in its own mount namespace (`unshare -rm`, a container) could
+  mount its own bytes at a host path such as `/usr/bin/curl` and match every
+  path-only rule for the host's program, including prompt-created Allows that
+  skip hash binding for root-sealed paths. An executable path that names a
+  different file in the daemon's view is now reported as unknown. Container
+  and Flatpak runtime binaries at such paths therefore lose their executable
+  identity instead of borrowing the host's.
+- The same namespace could still borrow the host's path by deleting its
+  bytes once running: the kernel's `" (deleted)"` suffix was dropped, and a
+  deleted image names no file to compare with. The suffix is now dropped only
+  for a process in the daemon's user namespace whose image sits on a mount of
+  its own mount namespace, since a process can also run such bytes through
+  `/proc/<pid>/root` or a passed descriptor. A program in another user
+  namespace (`unshare -U`, a rootless container) that runs across its own
+  upgrade matches its rules again only after a restart.
+- Executables over 64 MiB, such as Chromium, Electron apps and VS Code, have
+  no digest, so every queued packet from them, each retransmit and parallel
+  connection, opened its own prompt. On a root-sealed path they now share one
+  prompt per destination like any other program.
+- The package-index warmer held the index's write lock for a whole rebuild,
+  so the packet thread blocked behind it on the first flow from any newly
+  seen binary: about 120 ms with pacman, up to 10 s with rpm during a `dnf`
+  transaction. The packet thread now skips a busy or stale index, and that
+  "not ready" answer is no longer cached for an hour as "not from a package";
+  it shows as unknown until the index is ready.
+- A failed `rpm -qa` (a query timing out at boot, for instance) left an
+  empty package index that counted as current, so every binary showed as
+  "not from a package" until the next package transaction. The index from a
+  failed query is now retried at the next refresh, every two minutes, and
+  provenance shows as unknown meanwhile.
+- A refused `UpsertRule` or `ApplyRules` left nothing in the journal unless
+  authorization refused it, so "never sent" and "sent and refused" looked the
+  same (#46). Every refusal now logs the RPC, the caller's uid and pid, the
+  status code and its message. Refusal messages no longer echo a client
+  value of unbounded length.
+- Rule hit counts drifted upward: a rule write between the 30 s flush's drain
+  and merge stored the drained hits twice, and releasing a prompt credited a
+  matching rule even when the user's answer was the one applied.
+- A rule whose stored executable path later became an alias (a legacy
+  `/bin/curl`, or a target a package turned into a symlink) could not be
+  disabled, renamed or re-imported, only deleted. A path sent back unchanged
+  is accepted by the daemon, the GUI's toggle and editor, and
+  `cfc rules import`; new and changed paths are still checked.
+- A new timed rule took its creation date from the client, so a date in the
+  future kept "allow for 90s" alive indefinitely. Dates are clamped to now.
+- Enabled legacy hostname rules refuse flows that are logged as the default
+  policy. The daemon now names each one in a warning at startup.
+- eBPF: exit events usually arrived before the parent reaped the process and
+  were dropped, so on kernels without `group_dead` an in-kernel deny outlived
+  its process until a rule change or restart, where a recycled pid could
+  inherit it. Candidates are now checked again until their group is gone.
+  Overlapping verdict resyncs could also leave the older rule set's answers
+  in the kernel, and a rule changed during the startup resync never reached
+  it.
+- A daemon started by hand under umask 000 created its socket directory
+  world-writable, so a local user could replace the socket.
+- GUI: a prompt card was dropped before its verdict reached the daemon, so a
+  failed verdict left the flow to the timeout default with nothing to retry.
+  The card now stays until the daemon answers. A customization whose prompt
+  expired was closed with the user's edits; it now stays open as a new rule.
+  Footer errors are no longer pushed out by a burst of warnings.
+- GUI: Pause replaced Reconnect under the cursor as soon as the daemon came
+  back, and Resume as soon as enforcement resumed, so a double-click on
+  either paused enforcement. Pause now stays disabled for one second after
+  connecting and after resuming.
+- Tray: on GNOME, three expired prompt bubbles held every actionable slot,
+  so later prompts only reached the overflow bubble, which cannot answer
+  them. Slots are freed once their prompt's deadline has passed, and the
+  stale bubbles are closed.
+- Confinement refused every launch while the daemon's DNS observer, on by
+  default, was attached at the cgroup root, because the gate required the
+  unit's effective filters to be exactly its own pair. Programs inherited
+  from ancestors are now accepted; the unit's own pair must still be exact.
+- Confinement: Ctrl-C while systemctl ran, a closed terminal or a dropped
+  SSH session killed the launcher and left the tree running with its
+  grants. SIGINT, SIGHUP, SIGQUIT and SIGTERM now stop the tree at any
+  point, and its identity is printed before it starts.
+- `cfc rules bootstrap-defaults` and `bundle add` failed on hosts seeded
+  before 0.7.0, calling the bundle's own rules outside it. A same-named rule
+  identical to what the entry installs here now, or to what 0.3.0 through
+  0.7.0 installed here (the old path, Epiphany, npm and pip included), counts
+  as present, and `bundle remove` removes it; a different one still stops
+  the command.
+- `cfc rules bundle remove` deleted a bundle rule the user had edited into a
+  deny. It now keeps any of its rules that is no longer an allow.
+- OpenSnitch import passed `dest.ip` networks (`10.0.0.0/8/32`), bad CIDRs
+  and ports above 65535 to the daemon, which refused the whole import
+  without naming the file. They now fail their own file.
+- The GUI's prompt subscription stayed open after the GUI dropped it, so the
+  daemon held the next prompt for an absent listener until it timed out.
+
+- RPM erase stopped NetworkManager: `%systemd_preun` stops the nft units
+  with `--no-reload`, under the managers' loaded `Requires=`. `%preun` now
+  disables them with a reload first.
+- Package upgrades re-enabled an nft unit the admin had disabled, because
+  reenabling the daemon follows its `Also=`. Only enabled nft units are
+  reenabled now (pacman, RPM and the tarball).
+- `pkg/PKGBUILD` refuses the `SKIP` checksum in `build()` too, so
+  `makepkg --noprepare` cannot build an unverified archive.
+- The release's LLVM pairing check compared against a version
+  `bpf-linker --version` does not print, so it never fired; it now runs the
+  same checks as `ebpf.yml`. A dispatched release's draft now tags the commit
+  it was built from.
+
+- A process's arguments were read whole, up to several MiB, and copied into
+  every prompt, observation and client message. At most 4 KiB is kept now;
+  a cut argument ends in `...`.
+- GUI: saving a rule trimmed its executable path, retargeting a rule for a
+  file whose name ends in a space.
+- HARDENING.md says that with inbound filtering off a program outbound rules
+  deny still answers inbound connections, that a deleted image is matched by
+  its former path, and what a readable FUSE filesystem controls.
+- TROUBLESHOOTING.md told remote administrators to add `tcp dport 22 accept`
+  to a `policy accept` copy of the outbound chain. That let every process
+  reach any host on port 22 unjudged, accepted INVALID and UNTRACKED traffic,
+  dropped the loopback rule, and did nothing for reaching the box, since
+  inbound SSH replies are never queued. The guide now names the real lockout
+  risks (the inbound table, network lookups the login makes) and its
+  dead-man's switch removes both tables.
+- The docs now say what the 64 MiB hashing limit costs (hash-pinned rules
+  refuse such a program; outside a root-owned path "Allow always" is not
+  saved), that Docker grants `CAP_NET_RAW` by default, and that `cfc pause`,
+  not a profile switch, lets unmatched flows through while debugging.
+  SECURITY.md links the documented non-goals.
+- HARDENING.md no longer says the unit's hand-written `ReadOnlyPaths`
+  cover everything `ProtectKernelTunables` does: they leave `/proc/kallsyms`
+  and `/proc/kcore` visible and any `/sys/fs` filesystem they do not name
+  writable.
+
 ## [0.7.0] - 2026-09-30
 
 ### Added

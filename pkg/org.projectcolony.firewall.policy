@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+        "https://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<!--
+  Colony Firewall Control: actions the daemon asks polkit about when the
+  installed app or tray requests them. Root (sudo cfc) is never asked.
+  Installed to /usr/share/polkit-1/actions/; polkitd picks it up by itself.
+
+  Pause asks every time, without the few minutes a kept authorization would
+  give: the tray's menu can be clicked over D-Bus by any program of the
+  user, and a kept authorization would let such a click pause silently.
+-->
+
+<policyconfig>
+  <vendor>Project Colony</vendor>
+  <vendor_url>https://github.com/Project-Colony/Colony-Firewall-Control</vendor_url>
+  <icon_name>colony-firewall</icon_name>
+
+  <action id="org.projectcolony.firewall.pause">
+    <description>Pause or resume Colony Firewall filtering</description>
+    <message>Authentication is required to pause or resume the firewall</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.projectcolony.firewall.import-rules">
+    <description>Import or replace Colony Firewall rules</description>
+    <message>Authentication is required to import or replace the firewall rules</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.projectcolony.firewall.allow-every-program">
+    <description>Allow Colony Firewall traffic for every program</description>
+    <message>Authentication is required to let every program through the firewall</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

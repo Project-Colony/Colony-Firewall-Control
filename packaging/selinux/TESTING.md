@@ -11,8 +11,9 @@ protocol for whoever has such a host. Run it once, report what you see, and
 ## What you need
 
 - A Rocky 9 or Fedora VM with SELinux enforcing (`getenforce` says
-  `Enforcing`). A VM, not your workstation: the ruleset is fail-closed, and a
-  policy gap in the wrong group takes the machine's outbound network down.
+  `Enforcing`). A VM, not your workstation: the ruleset is fail-closed
+  (except new loopback flows), and a policy gap in the wrong group takes the
+  machine's outbound network down.
   For the same reason, have **console access**, not just SSH.
 - The audit tooling: `dnf install audit policycoreutils-python-utils`.
   `semanage` and `audit2allow` live in the second package, and on a minimal
@@ -37,8 +38,9 @@ AVC in the audit log **without being enforced** - observed, not suffered.
 Why that ordering matters here more than for most policies, in the module's
 own words: a denied `netlink_netfilter` socket is not a degraded feature, it
 is a daemon that exits before `READY=1` - and because the nftables ruleset is
-fail-closed (`ct state new queue num 0`, no `bypass`), a daemon that does not
-come up takes the machine's outbound network with it. Running the first pass
+fail-closed for everything except new loopback flows, which are allowed while
+no daemon listens, a daemon that does not come up takes the machine's
+non-loopback outbound network with it. Running the first pass
 permissive converts that outage into a log line.
 
 Dontaudit rules hide denials, and this module carries some
@@ -68,7 +70,7 @@ this directory):
 make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
 sudo semodule -i colony_firewall.pp
 sudo restorecon -RvF /usr/bin/colony-firewalld /etc/colony-firewall \
-    /var/lib/colony-firewall /var/log/colony-firewall /run/colony-firewall
+    /var/lib/colony-firewall /run/colony-firewall
 ```
 
 Verify the label took - this is the single most common way a policy "fails"
@@ -109,8 +111,9 @@ chance to be needed.
 | bpf/perf ring 0 | **degraded by design in the RPM**: no eBPF object ships (see the spec's `%build` comment), so the journal says `ring0=unavailable degrade=object_missing` once at startup and the bpf/perf/bpffs/tracefs rules are never reached. That log line *is* the expected result. To exercise the group for real: build the object (`cargo xtask build-ebpf`, pinned nightly + bpf-linker), drop it at `/usr/lib/colony-firewall/cfc-ebpf.o`, restart, and expect `ring0=active` | with the object installed: `degrade=not_permitted` where `object_missing` was, and AVCs on `bpf`, `perf_event`, `tracefs_t`/`debugfs_t` or `bpf_t` |
 | /proc attribution walk | `curl` from a second user account; the prompt must name curl's real path and pid | every prompt says `exe=<unknown> pid=0`; AVCs from `domain_read_all_domains_state` targets. Enforcing, this is the outage mode: no exe rule can ever match |
 | rpm provenance | automatic: one `rpm -qa` at startup and after any `dnf install`. Install any small package, wait ~2 minutes, then check a prompt or `cfc log` shows package names | everything reports `Unpackaged` plus one provenance warning in the journal; AVC on `rpm_exec_t` or `rpm_var_lib_t` |
-| nft, the fast-allow set | needs ring 0 up (the object installed as in the bpf/perf row) and `[ebpf] fast_allow = true`, then both units running. Fast-allow armed: `cfc status` shows fast_allow live, `sudo nft list set inet colony_firewall fast_allow` shows one element. Then set `fast_allow = false` and `systemctl restart colony-firewalld`: the set is empty while the table is still loaded, which is the unconditional start-up flush. (Do **not** test this by stopping the daemon - `colony-firewall-nft.service` is `PartOf=` it and tears the whole table down first, so `list set` answers "No such file or directory" and tells you nothing about the flush.) | `cfc status` shows fast_allow off with an nft error as the reason, and the set stays empty; AVC on `iptables_exec_t` (execute) - the `netlink_netfilter_socket` nft needs is the filtering group's, already exercised by the first row |
 | control socket, unconfined client | `cfc status` and `cfc rules list` as a normal logged-in user in the `colony-firewall` group (not root, not sudo) | connection refused/denied; AVC with the client's domain (`unconfined_t`) and `colony_firewall_runtime_t` |
+| official clients | run the installed `colony-firewall` GUI as a group member, then delete a rule from it; then run `cfc rules remove <id>` without sudo, which must be refused with "read-only access" | the GUI's change is refused with a reason naming a stat or "unix_diag"; AVCs with `getattr` on `bin_t`/`lib_t`/`usr_t` or on `netlink_tcpdiag_socket` |
+| polkit over D-Bus | press Pause in the GUI: your polkit agent must show "Authentication is required to pause or resume the firewall"; cancel it, then press Pause again and authenticate | "system D-Bus is unreachable" or "polkit check failed" instead of the dialog; AVCs on `system_dbusd_t` (`unix_stream_socket connectto`, `dbus send_msg`) or `policykit_t` |
 | sqlite WAL in /var/lib | answer any prompt with a persistent choice (**a**, then `3`=always), then `ls /var/lib/colony-firewall/` - `rules.db-wal` and `rules.db-shm` must exist while the daemon runs | the `map` denial is the quiet one: no error anywhere, just journal-mode SQLite and a 2.5x write regression. An AVC with class `file` permission `map` on `colony_firewall_var_lib_t` is the tell |
 
 Let the daemon run for at least a few minutes of normal use - browse

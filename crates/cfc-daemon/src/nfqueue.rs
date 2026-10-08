@@ -64,13 +64,13 @@
 use crate::config::NfqConfig;
 use crate::decision::{Decision, Engine};
 use crate::dns::DnsCache;
+use crate::ipc::EventSink;
 use crate::packet;
 use crate::process_resolve;
 use crate::reject::Rejecter;
 use crate::stats::Stats;
-use crate::storage::RuleStore;
 use anyhow::Context as _;
-use cfc_core::{Action, Connection, Direction, Process, Protocol, Verdict};
+use cfc_core::{Action, Connection, Direction, Process, Protocol, Verdict, VerdictSource};
 use nfq::{Message, Queue, Verdict as NfqVerdict};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -187,6 +187,9 @@ pub struct PromptRequest {
     pub prompt_id: u64,
     pub connection: Connection,
     pub process: Process,
+    /// A rule that may apply but cannot be decided, because the process
+    /// identity is incomplete. See [`Decision::NeedsPrompt`].
+    pub undecided: Option<uuid::Uuid>,
 }
 
 /// A resolved prompt flowing back from the router to the worker.
@@ -202,9 +205,25 @@ pub struct ObservedConnection {
     pub connection: Connection,
     pub process: Process,
     pub verdict: Verdict,
+    /// The rule that could not be decided for this flow, when that is why it
+    /// was prompted. See [`Decision::NeedsPrompt`].
+    pub undecided: Option<uuid::Uuid>,
 }
 
-/// Record refusals before the bounded, lossy live-feed channel.
+impl ObservedConnection {
+    /// The rule recorded with this flow: the one that answered, or else the
+    /// one that could not be decided. A rule id with a source other than
+    /// `rule` therefore means "this rule could not be decided".
+    pub fn rule_id(&self) -> Option<uuid::Uuid> {
+        match self.verdict.source {
+            cfc_core::VerdictSource::Rule(id) => Some(id),
+            _ => self.undecided,
+        }
+    }
+}
+
+/// Logs a refusal to the journal, then publishes to the bounded, lossy live
+/// feed.
 pub fn publish_observation(tx: &broadcast::Sender<ObservedConnection>, obs: ObservedConnection) {
     if obs.verdict.action != Action::Allow {
         info!(
@@ -214,6 +233,7 @@ pub fn publish_observation(tx: &broadcast::Sender<ObservedConnection>, obs: Obse
             pid = obs.process.pid,
             uid = ?obs.process.uid,
             dst = %format_args!("{}:{}", obs.connection.dst_ip, obs.connection.dst_port),
+            undecided_rule = ?obs.undecided,
             "connection blocked"
         );
     }
@@ -240,6 +260,8 @@ trait PacketMessage {
     /// addresses - and guessing would be wrong on a multi-homed or routed
     /// host. This is what makes one queue able to serve both chains.
     fn hook(&self) -> u8;
+    /// Kernel output interface index; zero means it was not reported.
+    fn outdev(&self) -> u32;
     fn set_verdict(&mut self, verdict: NfqVerdict);
 }
 
@@ -276,6 +298,10 @@ impl PacketMessage for Message {
 
     fn hook(&self) -> u8 {
         self.get_hook()
+    }
+
+    fn outdev(&self) -> u32 {
+        self.get_outdev()
     }
 
     fn set_verdict(&mut self, verdict: NfqVerdict) {
@@ -344,12 +370,21 @@ pub fn spawn(
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
-    store: RuleStore,
+    events: EventSink,
     dns_cache: DnsCache,
 ) -> anyhow::Result<NfqHandles> {
     anyhow::ensure!(
         !cfg.fail_open,
         "NFQUEUE fail_open bypasses mandatory verdict auditing"
+    );
+    // Interface metadata, rather than destination addresses, includes every
+    // local host address routed over lo. A missing index cannot grant access.
+    // SAFETY: the C string is terminated and valid for this read-only query.
+    let loopback_ifindex = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+    anyhow::ensure!(
+        loopback_ifindex != 0,
+        "resolving loopback output interface: {}",
+        std::io::Error::last_os_error()
     );
     let queue_num = cfg.queue_num;
     info!(queue_num, "opening NFQUEUE");
@@ -408,13 +443,14 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let worker = Worker {
         queue,
+        loopback_ifindex,
         engine,
         rejecter,
         prompt_tx,
         verdict_rx,
         observed_tx,
         stats,
-        store,
+        events,
         dns: Box::new(dns_cache),
         resolver: Box::new(ProcfsResolver),
         waiters: HashMap::new(),
@@ -456,7 +492,11 @@ struct FlowKey {
 /// Only a known image may share a prompt; uncertain identities never do.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FlowOrigin {
-    Exe { path: PathBuf, sha256: String },
+    /// `sha256` is `None` only for a root-sealed path.
+    Exe {
+        path: PathBuf,
+        sha256: Option<String>,
+    },
     Unattributed(uuid::Uuid),
 }
 
@@ -465,8 +505,22 @@ impl FlowKey {
         let origin = match (&proc.sha256, proc.exe_is_known(), proc.uid) {
             (Some(sha256), true, Some(_)) => FlowOrigin::Exe {
                 path: proc.exe.clone(),
-                sha256: sha256.clone(),
+                sha256: Some(sha256.clone()),
             },
+            // Images over 64 MiB (Chromium, Electron, VS Code) have no
+            // digest. A root-sealed path still names one image only root can
+            // change, and the resolver publishes it only when it names the
+            // mapped file here, which is why a standing Allow for it is
+            // path-only. Without this every packet, retransmits included,
+            // opened its own prompt.
+            (None, true, Some(_))
+                if cfc_core::exe_path::is_root_sealed(&proc.exe).unwrap_or(false) =>
+            {
+                FlowOrigin::Exe {
+                    path: proc.exe.clone(),
+                    sha256: None,
+                }
+            }
             // Neither a PID nor a path identifies an unknown execution.
             // Such packets must receive independent authorization.
             _ => FlowOrigin::Unattributed(uuid::Uuid::new_v4()),
@@ -533,6 +587,7 @@ impl Default for Tuning {
 ///   for why the earlier blocking-when-idle mode had to go).
 struct Worker<Q: PacketQueue> {
     queue: Q,
+    loopback_ifindex: u32,
     engine: Engine,
     /// Injects the TCP RST / ICMP port-unreachable that makes
     /// [`Action::Reject`] differ from [`Action::Deny`]. Inert (drop-only)
@@ -542,7 +597,8 @@ struct Worker<Q: PacketQueue> {
     verdict_rx: VerdictRx,
     observed_tx: broadcast::Sender<ObservedConnection>,
     stats: Stats,
-    store: RuleStore,
+    /// Refusal rows go here, after the verdict; see [`Worker::deliver`].
+    events: EventSink,
     /// Reverse-DNS / self-identification seam; [`DnsCache`] in production.
     dns: Box<dyn HostCache + Send>,
     /// Process attribution seam; [`ProcfsResolver`] in production.
@@ -558,9 +614,9 @@ struct Worker<Q: PacketQueue> {
     /// Set by main's shutdown path; observed at the top of every iteration.
     stop: Arc<AtomicBool>,
     /// Watchdog liveness cell shared with main's heartbeat task: the
-    /// unix-ms at which the loop last turned. The idle wait is bounded;
-    /// packet processing also includes the durable audit commit. A stale
-    /// stamp means main must withhold the WATCHDOG=1 heartbeat.
+    /// unix-ms at which the loop last turned. The idle wait is bounded and
+    /// nothing on this thread waits for storage. A stale stamp means main
+    /// must withhold the WATCHDOG=1 heartbeat.
     last_activity: Arc<AtomicI64>,
 }
 
@@ -572,10 +628,11 @@ impl<Q: PacketQueue> Worker<Q> {
 
         // This thread is the datapath, and it is the only one. Saying so once
         // here covers everything reached from it, however deep: in particular
-        // a provenance lookup that finds the package index stale now answers
-        // "no package" rather than rebuilding it, which reads every installed
-        // package's file list. Measured cold on the owner's machine, that
-        // rebuild took 123 ms - and since this loop is a single thread, that
+        // a provenance lookup that finds the package index stale or being
+        // rebuilt answers "not ready" rather than rebuilding it or waiting
+        // for the rebuild, which reads every installed package's file list.
+        // Measured cold on the owner's machine, that rebuild took 123 ms -
+        // and since this loop is a single thread, that
         // is not one slow packet, it is every flow on the machine stopping
         // together. `provenance::warm` does the build off this thread.
         crate::provenance::mark_datapath_thread();
@@ -696,16 +753,42 @@ impl<Q: PacketQueue> Worker<Q> {
             // Per packet, not per prompt: a Reject response is derived from
             // the individual segment (its sequence numbers, its source
             // port), and parallel connections share one prompt.
-            let verdict = match self.engine.evaluate(&packet.connection, &packet.process) {
+            let mut undecided = None;
+            let verdict = match self.engine.peek(&packet.connection, &packet.process) {
+                // A refusal decided since the prompt opened always wins.
                 Decision::Resolved(current) if current.action != Action::Allow => current,
+                // So does a rule's Allow over a fallback nobody chose: a rule
+                // added while this prompt waited (another prompt's "Allow
+                // always" for the same program) must not lose to the timeout
+                // Deny. A user's own answer stands.
+                Decision::Resolved(current)
+                    if matches!(current.source, VerdictSource::Rule(_))
+                        && matches!(
+                            pv.verdict.source,
+                            VerdictSource::DefaultPolicy | VerdictSource::Timeout
+                        ) =>
+                {
+                    current
+                }
+                // The user's answer applies to a flow whose identity is
+                // incomplete: no rule can decide it, that is why it was asked.
+                Decision::NeedsPrompt { undecided: u, .. } => {
+                    undecided = u;
+                    pv.verdict
+                }
                 _ => pv.verdict,
             };
+            // Only a rule whose answer was applied gets the hit.
+            if let VerdictSource::Rule(id) = verdict.source {
+                self.engine.count_hit(id);
+            }
             self.deliver(
                 packet.message,
                 ObservedConnection {
                     connection: packet.connection,
                     process: packet.process,
                     verdict,
+                    undecided,
                 },
             )?;
         }
@@ -717,6 +800,9 @@ impl<Q: PacketQueue> Worker<Q> {
             uid: msg.uid(),
             gid: msg.gid(),
             direction: direction_for_hook(msg.hook()),
+            loopback: msg.hook() == NF_INET_LOCAL_OUT
+                && self.loopback_ifindex != 0
+                && msg.outdev() == self.loopback_ifindex,
         };
         let deps = PipelineDeps {
             engine: &self.engine,
@@ -736,13 +822,15 @@ impl<Q: PacketQueue> Worker<Q> {
                     connection,
                     process,
                     verdict,
+                    undecided: None,
                 },
             ),
             PacketOutcome::Prompt {
                 connection,
                 process,
                 fallback,
-            } => self.park_for_prompt(msg, connection, process, fallback),
+                undecided,
+            } => self.park_for_prompt(msg, connection, process, fallback, undecided),
         }
     }
 
@@ -756,6 +844,7 @@ impl<Q: PacketQueue> Worker<Q> {
         connection: Connection,
         process: Process,
         fallback: Verdict,
+        undecided: Option<uuid::Uuid>,
     ) -> anyhow::Result<()> {
         let flow = FlowKey::for_flow(&connection, &process);
         if let Some(&prompt_id) = self.pending_flows.get(&flow) {
@@ -775,7 +864,7 @@ impl<Q: PacketQueue> Worker<Q> {
                         parked = pending.packets.len(),
                         "prompt already holds its packet cap; applying the fallback"
                     );
-                    return self.deliver_fallback(msg, connection, process, fallback);
+                    return self.deliver_fallback(msg, connection, process, fallback, undecided);
                 }
                 trace!(
                     prompt_id,
@@ -817,7 +906,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 parked = self.waiters.len(),
                 "prompt backlog at its cap; applying the fallback rather than parking"
             );
-            return self.deliver_fallback(msg, connection, process, fallback);
+            return self.deliver_fallback(msg, connection, process, fallback, undecided);
         }
 
         let prompt_id = self.next_prompt_id;
@@ -829,6 +918,7 @@ impl<Q: PacketQueue> Worker<Q> {
             prompt_id,
             connection: connection.clone(),
             process: process.clone(),
+            undecided,
         };
         match self.prompt_tx.try_send(req) {
             Ok(()) => {
@@ -850,7 +940,7 @@ impl<Q: PacketQueue> Worker<Q> {
                 // Router saturated or gone: apply the default policy now
                 // rather than stranding the packet.
                 trace!("prompt channel unavailable ({e}); applying fallback");
-                return self.deliver_fallback(msg, connection, process, fallback);
+                return self.deliver_fallback(msg, connection, process, fallback, undecided);
             }
         }
         Ok(())
@@ -870,6 +960,7 @@ impl<Q: PacketQueue> Worker<Q> {
         connection: Connection,
         process: Process,
         fallback: Verdict,
+        undecided: Option<uuid::Uuid>,
     ) -> anyhow::Result<()> {
         self.deliver(
             msg,
@@ -877,29 +968,26 @@ impl<Q: PacketQueue> Worker<Q> {
                 connection,
                 process,
                 verdict: fallback,
+                undecided,
             },
         )
     }
 
-    /// Commit parsed refusals before releasing the packet or publishing it.
-    /// Storage failure drops this packet and propagates out of the worker,
-    /// so a later packet cannot receive Allow after an unaudited refusal.
+    /// Verdicts the packet, then records it. A refusal row goes straight
+    /// into the event writer's bounded queue rather than through the lossy
+    /// live feed. Nothing here waits for storage: an fsync per refusal on
+    /// this single thread let a deny flood stall every new flow on the
+    /// machine, and a failed commit used to end the worker, which took all
+    /// networking down until systemd restarted the daemon. A row the queue
+    /// cannot take is counted and logged by [`EventSink`]; the journal line
+    /// from [`publish_observation`] still names the refusal.
     fn deliver(&mut self, msg: Q::Msg, obs: ObservedConnection) -> anyhow::Result<()> {
-        if obs.verdict.action != Action::Allow {
-            let row = crate::convert::event_row_from_observed(
-                &obs.connection,
-                &obs.process,
-                &obs.verdict,
-            );
-            if let Err(e) = self.store.insert_events(&[row]) {
-                self.send_verdict(msg, NfqVerdict::Drop)
-                    .context("dropping packet after verdict audit failure")?;
-                return Err(e).context("committing verdict audit before NFQUEUE delivery");
-            }
-        }
         self.apply_action(msg, obs.verdict.action)?;
         if obs.verdict.action == Action::Allow {
             self.dns.enqueue(obs.connection.dst_ip);
+        } else {
+            self.events
+                .push(crate::convert::event_row_from_observed(&obs));
         }
         record(&self.stats, obs.verdict.action);
         publish_observation(&self.observed_tx, obs);
@@ -950,7 +1038,7 @@ impl<Q: PacketQueue> Worker<Q> {
 /// live /proc.
 trait ProcessResolver {
     #[allow(clippy::too_many_arguments)] // socket tuple plus kernel UID attribution
-    fn pid_for_socket(
+    fn socket_owner(
         &self,
         protocol: Protocol,
         direction: Direction,
@@ -959,15 +1047,15 @@ trait ProcessResolver {
         dst_ip: IpAddr,
         dst_port: u16,
         uid: Option<u32>,
-    ) -> Option<u32>;
-    fn resolve(&self, pid: u32) -> Process;
+    ) -> Option<process_resolve::SocketOwner>;
+    fn resolve(&self, owner: &process_resolve::SocketOwner) -> Process;
 }
 
 /// Production resolver backed by /proc.
 struct ProcfsResolver;
 
 impl ProcessResolver for ProcfsResolver {
-    fn pid_for_socket(
+    fn socket_owner(
         &self,
         protocol: Protocol,
         direction: Direction,
@@ -976,14 +1064,12 @@ impl ProcessResolver for ProcfsResolver {
         dst_ip: IpAddr,
         dst_port: u16,
         uid: Option<u32>,
-    ) -> Option<u32> {
-        process_resolve::pid_for_socket(
-            protocol, direction, src_ip, src_port, dst_ip, dst_port, uid,
-        )
+    ) -> Option<process_resolve::SocketOwner> {
+        process_resolve::socket_owner(protocol, direction, src_ip, src_port, dst_ip, dst_port, uid)
     }
 
-    fn resolve(&self, pid: u32) -> Process {
-        process_resolve::resolve(pid)
+    fn resolve(&self, owner: &process_resolve::SocketOwner) -> Process {
+        owner.resolve()
     }
 }
 
@@ -1021,6 +1107,8 @@ struct PacketMeta {
     gid: Option<u32>,
     /// Which way this packet is going, from the netfilter hook.
     direction: Direction,
+    /// Kernel OUTPUT interface is lo; includes local non-loopback addresses.
+    loopback: bool,
 }
 
 /// Environment for [`handle_packet`].
@@ -1037,19 +1125,21 @@ enum PacketOutcome {
     /// Immediate verdict with nothing to observe (self traffic, packets we
     /// can't parse). Not counted in stats.
     Silent(NfqVerdict),
-    /// Parsed decision, committed and counted by the final delivery gate.
+    /// Parsed decision, verdicted, recorded and counted by [`Worker::deliver`].
     Deliver {
         connection: Connection,
         process: Process,
         verdict: Verdict,
     },
-    /// No rule matched and prompting is enabled: ask the user, applying
+    /// No rule answered and prompting is enabled: ask the user, applying
     /// `fallback` if no prompt can be delivered. Stats are recorded when
-    /// the prompt resolves.
+    /// the prompt resolves. `undecided` names the rule that may apply but
+    /// could not be decided, if that is why.
     Prompt {
         connection: Connection,
         process: Process,
         fallback: Verdict,
+        undecided: Option<uuid::Uuid>,
     },
 }
 
@@ -1081,7 +1171,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
 
     // Inbound is not asked, rather than asked and told nothing.
     //
-    // `pid_for_socket` searches for a socket already holding this 4-tuple.
+    // `socket_owner` searches for a socket already holding this 4-tuple.
     // An inbound SYN has none - nothing has accepted it yet - so the search
     // could only ever miss, and missing meant reading /proc/net/tcp and
     // /proc/net/tcp6: 2.40 ms per packet for an answer of `None`.
@@ -1090,10 +1180,10 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
     // one is silent: the verdict is identical either way, so nothing would
     // have failed - the firewall would just be fourteen times slower on the
     // inbound side and say nothing about it.
-    let pid_hint = if conn.direction == Direction::Inbound {
+    let owner = if conn.direction == Direction::Inbound {
         None
     } else {
-        deps.resolver.pid_for_socket(
+        deps.resolver.socket_owner(
             conn.protocol,
             conn.direction,
             conn.src_ip,
@@ -1103,6 +1193,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
             meta.uid,
         )
     };
+    let pid_hint = owner.as_ref().map(process_resolve::SocketOwner::pid);
 
     // Always allow our own traffic. Otherwise the daemon's reverse DNS
     // resolver would itself be intercepted, deadlocking on a verdict
@@ -1113,8 +1204,8 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
         }
     }
 
-    let mut proc = match pid_hint {
-        Some(pid) => deps.resolver.resolve(pid),
+    let mut proc = match owner.as_ref() {
+        Some(owner) => deps.resolver.resolve(owner),
         None => Process::unknown(0),
     };
     // The kernel-reported socket uid/gid come from the sk_buff itself and
@@ -1147,7 +1238,10 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
             process: proc,
             verdict,
         },
-        Decision::NeedsPrompt { fallback } => {
+        Decision::NeedsPrompt {
+            fallback,
+            undecided,
+        } => {
             // Inbound never asks.
             //
             // The decision the owner took, and it is not a shortcut: nothing
@@ -1174,7 +1268,17 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                     verdict,
                 };
             }
-            if deps.stats.is_paused() {
+            // Preserve desktop IPC for unmatched local flows after explicit
+            // policy has had its say. Neither this nor pause lifts a flow a
+            // rule may be about: its identity is incomplete, so it is asked.
+            if meta.loopback && undecided.is_none() {
+                return PacketOutcome::Deliver {
+                    connection: conn,
+                    process: proc,
+                    verdict: Verdict::default_allow(),
+                };
+            }
+            if deps.stats.is_paused() && undecided.is_none() {
                 // Paused means "stop prompting", not "stop filtering":
                 // rules above still applied; only unmatched flows pass
                 // without a prompt.
@@ -1190,6 +1294,7 @@ fn handle_packet(payload: &[u8], meta: &PacketMeta, deps: &PipelineDeps) -> Pack
                 connection: conn,
                 process: proc,
                 fallback,
+                undecided,
             }
         }
     }
@@ -1223,6 +1328,13 @@ mod tests {
     use std::time::Instant;
 
     const IPPROTO_TCP: u8 = 6;
+
+    /// A card left over from an earlier session must not name the id this
+    /// session hands out first, so ids do not restart at a fixed value.
+    #[test]
+    fn each_session_starts_prompt_ids_from_a_fresh_seed() {
+        assert_ne!(prompt_session_seed(), prompt_session_seed());
+    }
 
     /// Minimal IPv4/TCP packet: 1.2.3.4:5555 -> 5.6.7.8:`dst_port`.
     fn tcp_packet(dst_port: u16) -> Vec<u8> {
@@ -1291,7 +1403,7 @@ mod tests {
     }
 
     impl ProcessResolver for StubResolver {
-        fn pid_for_socket(
+        fn socket_owner(
             &self,
             _protocol: Protocol,
             _direction: Direction,
@@ -1300,13 +1412,13 @@ mod tests {
             _dst_ip: IpAddr,
             _dst_port: u16,
             _uid: Option<u32>,
-        ) -> Option<u32> {
+        ) -> Option<process_resolve::SocketOwner> {
             self.socket_lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.pid
+            self.pid.map(process_resolve::SocketOwner::for_test)
         }
 
-        fn resolve(&self, _pid: u32) -> Process {
+        fn resolve(&self, _owner: &process_resolve::SocketOwner) -> Process {
             self.process.clone()
         }
     }
@@ -1346,6 +1458,7 @@ mod tests {
         uid: None,
         gid: None,
         direction: Direction::Outbound,
+        loopback: false,
     };
 
     /// The same, for a packet the kernel queued from the input hook.
@@ -1353,6 +1466,7 @@ mod tests {
         uid: None,
         gid: None,
         direction: Direction::Inbound,
+        loopback: false,
     };
 
     struct TestEnv {
@@ -1425,6 +1539,7 @@ mod tests {
                     conn_to(1024 + i as u16, 1111),
                     test_process(4242, "/usr/bin/curl"),
                     Verdict::default_deny(),
+                    None,
                 )
                 .unwrap();
             // Drain as we go: the harness channel holds 16, and a full channel
@@ -1443,6 +1558,7 @@ mod tests {
                 conn_to(9000, 1111),
                 test_process(4242, "/usr/bin/curl"),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
 
@@ -1495,6 +1611,7 @@ mod tests {
                     conn_to(443, 1111 + i as u16),
                     test_process(4242, "/usr/bin/curl"),
                     Verdict::default_deny(),
+                    None,
                 )
                 .unwrap();
         }
@@ -1510,6 +1627,7 @@ mod tests {
                 conn_to(443, 9999),
                 test_process(4242, "/usr/bin/curl"),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
 
@@ -1811,6 +1929,7 @@ mod tests {
                 connection,
                 process,
                 fallback,
+                ..
             } => {
                 assert_eq!(fallback.action, Action::Deny);
                 assert_eq!(connection.pid, Some(4242));
@@ -1943,7 +2062,7 @@ mod tests {
             .unwrap()
             .handle_message(FakeMsg::new(7, tcp_packet(443)))
             .unwrap();
-        let rows = h.store.query_events(10, 0, Default::default()).unwrap();
+        let rows: Vec<_> = std::iter::from_fn(|| h.events.try_recv().ok()).collect();
         assert_eq!(
             rows.len(),
             1,
@@ -1960,7 +2079,7 @@ mod tests {
         let meta = PacketMeta {
             uid: Some(0),
             gid: Some(0),
-            direction: Direction::Outbound,
+            ..NO_META
         };
         match env.handle(&tcp_packet(443), &meta) {
             PacketOutcome::Prompt {
@@ -1984,7 +2103,7 @@ mod tests {
         let meta = PacketMeta {
             uid: Some(1000),
             gid: None,
-            direction: Direction::Outbound,
+            ..NO_META
         };
         match env.handle(&tcp_packet(443), &meta) {
             PacketOutcome::Prompt {
@@ -2109,6 +2228,7 @@ mod tests {
                 first,
                 process.clone(),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
         h.worker()
@@ -2117,6 +2237,7 @@ mod tests {
                 second,
                 process,
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
         let request = h.prompt_rx.try_recv().unwrap();
@@ -2135,16 +2256,79 @@ mod tests {
         );
     }
 
+    fn exe_rule(action: Action, exe: &str) -> Rule {
+        let mut scope = RuleScope::any();
+        scope.exe_path = Some(PathBuf::from(exe));
+        Rule::new(format!("{action:?} {exe}"), action, scope)
+    }
+
+    /// Minimal IPv4/UDP packet: 1.2.3.4:5555 -> 5.6.7.8:`dst_port`.
+    fn udp_packet(dst_port: u16) -> Vec<u8> {
+        let mut pkt = tcp_packet(dst_port);
+        pkt.truncate(28);
+        pkt[9] = 17;
+        pkt
+    }
+
+    /// The process could not be attributed: no socket owner was found, as for
+    /// ambiguous UDP or an expired attribution budget.
+    fn unattributed(env: &mut TestEnv) {
+        env.resolver.pid = None;
+    }
+
+    fn expect_undecided_prompt(outcome: PacketOutcome, rule: &Rule, fallback: Action) {
+        match outcome {
+            PacketOutcome::Prompt {
+                undecided,
+                fallback: f,
+                ..
+            } => {
+                assert_eq!(undecided, Some(rule.id));
+                assert_eq!(f.action, fallback);
+                assert_eq!(f.source, VerdictSource::DefaultPolicy);
+            }
+            other => panic!("expected an undecided prompt, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn missing_executable_cannot_lift_a_deny_when_paused() {
+    fn an_unattributed_flow_under_a_program_allow_is_prompted_not_dropped() {
+        let rule = exe_rule(Action::Allow, "/usr/bin/firefox");
+        for policy in [dp_allow(), dp_deny()] {
+            let no_ui_action = policy.no_ui_action;
+            let mut env = TestEnv::new(vec![rule.clone()], policy);
+            unattributed(&mut env);
+            expect_undecided_prompt(env.handle(&tcp_packet(443), &NO_META), &rule, no_ui_action);
+        }
+    }
+
+    #[test]
+    fn an_undecided_flow_is_prompted_while_paused() {
+        // Pause means "stop asking about flows no rule is about"; a program
+        // rule may be about this one.
         let mut rule = deny_port_rule(443);
         rule.scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
-        let mut env = TestEnv::new(vec![rule], dp_allow());
-        env.resolver.pid = None;
+        let mut env = TestEnv::new(vec![rule.clone()], dp_allow());
+        unattributed(&mut env);
         env.stats.set_paused(true);
-        match env.handle(&tcp_packet(443), &NO_META) {
-            PacketOutcome::Deliver { verdict, .. } => assert_eq!(verdict.action, Action::Deny),
-            other => panic!("expected closed policy, got {other:?}"),
+        expect_undecided_prompt(env.handle(&tcp_packet(443), &NO_META), &rule, Action::Allow);
+    }
+
+    #[test]
+    fn ambiguous_udp_under_a_program_deny_is_prompted() {
+        let rule = exe_rule(Action::Deny, "/usr/bin/x");
+        let mut env = TestEnv::new(vec![rule.clone()], dp_deny());
+        unattributed(&mut env);
+        expect_undecided_prompt(env.handle(&udp_packet(53), &NO_META), &rule, Action::Deny);
+    }
+
+    #[test]
+    fn ambiguous_udp_with_no_rules_is_prompted() {
+        let mut env = TestEnv::new(vec![], dp_deny());
+        unattributed(&mut env);
+        match env.handle(&udp_packet(53), &NO_META) {
+            PacketOutcome::Prompt { undecided, .. } => assert_eq!(undecided, None),
+            other => panic!("expected a prompt, got {other:?}"),
         }
     }
 
@@ -2172,6 +2356,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn digest_less_images_share_a_prompt_only_on_a_sealed_path() {
+        let sealed = "/usr/bin/env";
+        if !cfc_core::exe_path::is_root_sealed(std::path::Path::new(sealed)).unwrap_or(false) {
+            return;
+        }
+        let conn = conn_to(443, 1111);
+        let digest_less = |pid, exe: &str| Process {
+            sha256: None,
+            ..test_process(pid, exe)
+        };
+        // Over 64 MiB, so no digest: retransmits and siblings still share.
+        assert_eq!(
+            FlowKey::for_flow(&conn, &digest_less(1, sealed)),
+            FlowKey::for_flow(&conn, &digest_less(2, sealed))
+        );
+        let other_user = Process {
+            uid: Some(1001),
+            ..digest_less(2, sealed)
+        };
+        assert_ne!(
+            FlowKey::for_flow(&conn, &digest_less(1, sealed)),
+            FlowKey::for_flow(&conn, &other_user)
+        );
+        // A path its user can rewrite is no identity without the digest.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"user image").unwrap();
+        let tool = tool.to_str().unwrap();
+        assert_ne!(
+            FlowKey::for_flow(&conn, &digest_less(1, tool)),
+            FlowKey::for_flow(&conn, &digest_less(1, tool))
+        );
+    }
+
     // ---- Worker loop, driven through the PacketQueue seam ----
     //
     // These exercise the parts the pure pipeline tests above cannot reach:
@@ -2189,6 +2408,7 @@ mod tests {
         uid: Option<u32>,
         gid: Option<u32>,
         hook: u8,
+        outdev: u32,
         verdict: Option<NfqVerdict>,
     }
 
@@ -2200,12 +2420,17 @@ mod tests {
                 uid: None,
                 gid: None,
                 hook: NF_INET_LOCAL_OUT,
+                outdev: 0,
                 verdict: None,
             }
         }
     }
 
     impl PacketMessage for FakeMsg {
+        fn outdev(&self) -> u32 {
+            self.outdev
+        }
+
         fn hook(&self) -> u8 {
             self.hook
         }
@@ -2238,8 +2463,6 @@ mod tests {
         modes: Vec<bool>,
         /// recv calls, so a test can tell a turning loop from a stuck one.
         recv_calls: u64,
-        audit_probe: Option<crate::storage::RuleStore>,
-        audited_at_verdict: Vec<usize>,
     }
 
     struct FakeQueue {
@@ -2265,15 +2488,7 @@ mod tests {
 
         fn verdict(&mut self, msg: FakeMsg) -> std::io::Result<()> {
             let verdict = msg.verdict.expect("worker verdicted without a verdict");
-            let mut log = self.log.lock().unwrap();
-            if let Some(store) = &log.audit_probe {
-                let count = store
-                    .query_events(100, 0, Default::default())
-                    .unwrap()
-                    .len();
-                log.audited_at_verdict.push(count);
-            }
-            log.verdicts.push((msg.id, verdict));
+            self.log.lock().unwrap().verdicts.push((msg.id, verdict));
             Ok(())
         }
     }
@@ -2303,7 +2518,8 @@ mod tests {
         verdict_tx: Option<VerdictTx>,
         prompt_rx: mpsc::Receiver<PromptRequest>,
         observed_rx: broadcast::Receiver<ObservedConnection>,
-        store: crate::storage::RuleStore,
+        /// The event writer's end of the worker's [`EventSink`].
+        events: mpsc::Receiver<crate::storage::EventRow>,
     }
 
     impl LoopHarness {
@@ -2317,20 +2533,21 @@ mod tests {
             let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
             let (observed_tx, observed_rx) = broadcast::channel(16);
             let stats = Stats::new();
-            let store = RuleStore::open_in_memory().unwrap();
+            let (sink, events) = EventSink::channel(256);
             let stop = Arc::new(AtomicBool::new(false));
             let worker = Worker {
                 queue: FakeQueue {
                     script: script.into(),
                     log: log.clone(),
                 },
+                loopback_ifindex: 1,
                 engine: Engine::new(RuleSet { rules }, Arc::new(std::sync::RwLock::new(policy))),
                 rejecter: Rejecter::open(),
                 prompt_tx,
                 verdict_rx,
                 observed_tx,
                 stats: stats.clone(),
-                store: store.clone(),
+                events: sink,
                 dns: Box::new(StubDns {
                     self_pid: None,
                     host: None,
@@ -2357,15 +2574,20 @@ mod tests {
                 verdict_tx: Some(verdict_tx),
                 prompt_rx,
                 observed_rx,
-                store,
+                events,
             }
         }
 
-        fn with_store(mut self, store: crate::storage::RuleStore) -> Self {
-            self.log.lock().unwrap().audit_probe = Some(store.clone());
-            self.worker().store = store.clone();
-            self.store = store;
+        fn with_event_queue_depth(mut self, depth: usize) -> Self {
+            let (sink, events) = EventSink::channel(depth);
+            self.worker().events = sink;
+            self.events = events;
             self
+        }
+
+        /// Every row the worker has queued for the event writer so far.
+        fn audited(&mut self) -> Vec<crate::storage::EventRow> {
+            std::iter::from_fn(|| self.events.try_recv().ok()).collect()
         }
 
         fn with_tuning(mut self, tuning: Tuning) -> Self {
@@ -2448,25 +2670,22 @@ mod tests {
     }
 
     #[test]
-    fn parsed_refusals_commit_before_the_verdict_and_live_feed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.db");
-        let store = crate::storage::RuleStore::open(&path).unwrap();
+    fn parsed_refusals_are_queued_for_the_event_writer() {
         let mut reject = deny_port_rule(80);
         reject.action = Action::Reject;
-        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443), reject], dp_deny())
-            .with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443), reject], dp_deny());
         h.worker()
             .handle_message(FakeMsg::new(1, tcp_packet(443)))
             .unwrap();
         h.worker()
             .handle_message(FakeMsg::new(2, tcp_packet(80)))
             .unwrap();
-        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1, 2]);
         assert_eq!(
             h.verdicts(),
             vec![(1, NfqVerdict::Drop), (2, NfqVerdict::Drop)]
         );
+        let actions: Vec<_> = h.audited().into_iter().map(|r| r.action).collect();
+        assert_eq!(actions, vec!["Deny", "Reject"]);
         assert_eq!(
             h.observed_rx.try_recv().unwrap().verdict.action,
             Action::Deny
@@ -2475,65 +2694,40 @@ mod tests {
             h.observed_rx.try_recv().unwrap().verdict.action,
             Action::Reject
         );
-        let reader = rusqlite::Connection::open(&path).unwrap();
-        let count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            count, 2,
-            "commits must be visible to an independent connection"
-        );
-        drop(reader);
-        drop(h);
-        drop(store);
-        assert_eq!(
-            crate::storage::RuleStore::open(&path)
-                .unwrap()
-                .query_events(10, 0, Default::default())
-                .unwrap()
-                .len(),
-            2
-        );
     }
 
     #[test]
-    fn failed_audit_commit_drops_current_packet_and_stops_before_next_allow() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit.db");
-        let store = crate::storage::RuleStore::open(&path).unwrap();
-        let writer = rusqlite::Connection::open(&path).unwrap();
-        writer
-            .execute_batch(
-                "CREATE TRIGGER refuse_audit BEFORE INSERT ON events \
-            BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
-            )
-            .unwrap();
+    fn a_full_event_queue_costs_the_row_not_the_packet_or_the_worker() {
         let mut h = LoopHarness::new(
             vec![
                 Ok(FakeMsg::new(1, tcp_packet(443))),
-                Ok(FakeMsg::new(2, tcp_packet(80))),
+                Ok(FakeMsg::new(2, tcp_packet(443))),
+                Ok(FakeMsg::new(3, tcp_packet(80))),
             ],
             vec![deny_port_rule(443), allow_port_rule(80)],
             dp_deny(),
         )
-        .with_store(store);
+        .with_event_queue_depth(1);
+        let sink = h.worker().events.clone();
         let done = h.start();
-        let result = done.recv_timeout(Duration::from_secs(1));
-        if result.is_err() {
-            h.stop_and_expect_ok(&done);
-        }
-        assert!(result
-            .expect("audit failure must terminate the worker")
-            .is_err());
-        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
-        assert_eq!(h.stats.connections_total(), 0);
-        assert!(h.observed_rx.try_recv().is_err(), "no unaudited live entry");
+        assert!(wait_until(|| h.verdicts().len() == 3));
+        h.stop_and_expect_ok(&done);
+        assert_eq!(
+            h.verdicts(),
+            vec![
+                (1, NfqVerdict::Drop),
+                (2, NfqVerdict::Drop),
+                (3, NfqVerdict::Accept)
+            ]
+        );
+        assert_eq!(sink.dropped(), 1);
+        assert_eq!(h.audited().len(), 1);
+        assert_eq!(h.stats.connections_total(), 3);
     }
 
     #[test]
     fn prompt_refusals_and_unavailable_router_use_the_same_audit_gate() {
-        let store = crate::storage::RuleStore::open_in_memory().unwrap();
-        let mut h = LoopHarness::new(vec![], vec![], dp_deny()).with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![], dp_deny());
         h.worker()
             .handle_message(FakeMsg::new(1, tcp_packet(443)))
             .unwrap();
@@ -2548,31 +2742,240 @@ mod tests {
         h.worker()
             .handle_message(FakeMsg::new(2, tcp_packet(80)))
             .unwrap();
-        assert_eq!(h.log.lock().unwrap().audited_at_verdict, vec![1, 2]);
-        let rows = store.query_events(10, 0, Default::default()).unwrap();
+        assert_eq!(
+            h.verdicts(),
+            vec![(1, NfqVerdict::Drop), (2, NfqVerdict::Drop)]
+        );
+        let rows = h.audited();
         assert!(rows.iter().any(|r| r.action == "Reject"));
         assert!(rows.iter().any(|r| r.action == "Deny"));
         assert_eq!(h.stats.connections_denied(), 2);
     }
 
     #[test]
-    fn allowed_delivery_enriches_and_counts_once_without_a_refusal_audit() {
-        struct CountingDns(Arc<std::sync::atomic::AtomicUsize>);
-        impl HostCache for CountingDns {
-            fn is_self(&self, _: u32) -> bool {
-                false
-            }
-            fn cached_host(&self, _: IpAddr) -> Option<(String, bool)> {
-                None
-            }
-            fn enqueue(&self, _: IpAddr) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
+    fn a_rule_allow_added_while_parked_beats_the_fallback_but_not_the_user() {
+        for (answer, expected) in [
+            (Verdict::from_policy(Action::Deny), NfqVerdict::Accept),
+            (
+                Verdict {
+                    action: Action::Deny,
+                    source: VerdictSource::UserPrompt,
+                },
+                NfqVerdict::Drop,
+            ),
+        ] {
+            let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+            h.worker()
+                .handle_message(FakeMsg::new(1, tcp_packet(443)))
+                .unwrap();
+            let prompt = h.prompt_rx.try_recv().unwrap();
+            let rule = allow_port_rule(443);
+            let id = rule.id;
+            h.worker().engine.upsert_rule(rule);
+            h.worker()
+                .resolve_prompt(PromptVerdict {
+                    prompt_id: prompt.prompt_id,
+                    verdict: answer,
+                })
+                .unwrap();
+            assert_eq!(h.verdicts(), vec![(1, expected)], "{answer:?}");
+            // The rule is credited only when its answer was the one applied.
+            let hits = h.worker().engine.snapshot().rules[0].hit_count;
+            assert_eq!(
+                hits,
+                u64::from(expected == NfqVerdict::Accept),
+                "{answer:?}"
+            );
+            assert_eq!(h.worker().engine.snapshot().rules[0].id, id);
         }
+    }
+
+    #[test]
+    fn loopback_unmatched_flows_keep_the_nonprompting_local_default() {
+        // The output interface, including local host addresses, defines this
+        // exception. IPv4 loopback, IPv6 loopback, and a local host address
+        // must all retain the same desktop IPC behavior.
+        let mut ipv4 = tcp_packet(53);
+        ipv4[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        ipv4[16..20].copy_from_slice(&[127, 0, 0, 53]);
+        let mut ipv6 = vec![0u8; 44];
+        ipv6[0] = 0x60;
+        ipv6[6] = 6;
+        ipv6[23] = 1;
+        ipv6[39] = 1;
+        ipv6[40..42].copy_from_slice(&5555u16.to_be_bytes());
+        ipv6[42..44].copy_from_slice(&53u16.to_be_bytes());
+        for payload in [ipv4, ipv6, tcp_packet(53)] {
+            let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+            let mut msg = FakeMsg::new(1, payload);
+            msg.outdev = 1;
+            h.worker().handle_message(msg).unwrap();
+            assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+            assert!(h.prompt_rx.try_recv().is_err(), "local IPC must not prompt");
+            assert_eq!(h.stats.connections_allowed(), 1);
+        }
+    }
+
+    #[test]
+    fn loopback_addresses_without_the_local_output_interface_still_prompt() {
+        for outdev in [0, 2] {
+            let mut h = LoopHarness::new(vec![], vec![], dp_deny());
+            let mut payload = tcp_packet(53);
+            payload[16..20].copy_from_slice(&[127, 0, 0, 53]);
+            let mut msg = FakeMsg::new(1, payload);
+            msg.outdev = outdev;
+            h.worker().handle_message(msg).unwrap();
+            assert!(h.verdicts().is_empty());
+            assert!(h.prompt_rx.try_recv().is_ok());
+        }
+    }
+
+    #[test]
+    fn loopback_closed_rules_are_audited_even_when_paused() {
+        for action in [Action::Deny, Action::Reject] {
+            let mut scope = RuleScope::any();
+            scope.exe_path = Some(PathBuf::from("/usr/bin/curl"));
+            let rule = Rule::new("local application refusal", action, scope);
+            let mut h = LoopHarness::new(vec![], vec![rule], dp_deny());
+            h.stats.set_paused(true);
+            let mut payload = tcp_packet(53);
+            // Policy needs only ports. No complete TCP header keeps refusal
+            // injection inert while testing the real verdict and audit path.
+            payload.truncate(24);
+            let mut msg = FakeMsg::new(1, payload);
+            msg.outdev = 1;
+            h.worker().handle_message(msg).unwrap();
+            assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
+            assert_eq!(h.audited().len(), 1);
+            assert_eq!(h.observed_rx.try_recv().unwrap().verdict.action, action);
+            assert!(h.prompt_rx.try_recv().is_err());
+        }
+    }
+
+    /// A [`LoopHarness`] whose resolver attributes nothing.
+    fn unattributed_harness(rules: Vec<Rule>, policy: DefaultPolicy) -> LoopHarness {
+        let mut h = LoopHarness::new(vec![], rules, policy);
+        h.worker().resolver = Box::new(StubResolver {
+            pid: None,
+            process: Process::unknown(0),
+            socket_lookups: std::sync::atomic::AtomicUsize::new(0),
+        });
+        h
+    }
+
+    #[test]
+    fn an_undecided_loopback_flow_is_prompted() {
+        let rule = exe_rule(Action::Deny, "/usr/bin/curl");
+        let mut h = unattributed_harness(vec![rule.clone()], dp_deny());
+        h.stats.set_paused(true);
+        let mut msg = FakeMsg::new(1, tcp_packet(53));
+        msg.outdev = 1;
+        h.worker().handle_message(msg).unwrap();
+        assert!(h.verdicts().is_empty(), "the packet waits for the answer");
+        let req = h.prompt_rx.try_recv().expect("prompt dispatched");
+        assert_eq!(req.undecided, Some(rule.id));
+    }
+
+    #[test]
+    fn resolve_prompt_applies_the_users_allow_to_an_undecided_flow() {
+        // Before, the per-packet re-check turned an undecided flow into a
+        // Deny whatever the user answered.
+        let rule = exe_rule(Action::Deny, "/usr/bin/curl");
+        let mut h = unattributed_harness(vec![rule.clone()], dp_deny());
+        h.worker()
+            .handle_message(FakeMsg::new(1, tcp_packet(443)))
+            .unwrap();
+        let req = h.prompt_rx.try_recv().expect("prompt dispatched");
+        h.send_verdict(
+            req.prompt_id,
+            Verdict {
+                action: Action::Allow,
+                source: VerdictSource::UserPrompt,
+            },
+        );
+        h.worker().drain_verdicts().unwrap();
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+        let observed = h.observed_rx.try_recv().unwrap();
+        assert_eq!(observed.undecided, Some(rule.id));
+        assert_eq!(observed.rule_id(), Some(rule.id));
+    }
+
+    #[test]
+    fn an_undecided_prompt_past_the_cap_takes_no_ui_action() {
+        let rule = exe_rule(Action::Deny, "/usr/bin/curl");
+        let mut h = unattributed_harness(vec![rule.clone()], dp_deny());
+        // Unknown identities never share a prompt, so every packet parks its
+        // own until the backlog cap.
+        for i in 0..MAX_PARKED_PROMPTS {
+            h.worker()
+                .handle_message(FakeMsg::new(i as u32, tcp_packet(443)))
+                .unwrap();
+            while h.prompt_rx.try_recv().is_ok() {}
+        }
+        assert!(h.verdicts().is_empty());
+        let overflow = MAX_PARKED_PROMPTS as u32;
+        h.worker()
+            .handle_message(FakeMsg::new(overflow, tcp_packet(443)))
+            .unwrap();
+        assert_eq!(h.verdicts(), vec![(overflow, NfqVerdict::Drop)]);
+        let audited = h.audited();
+        assert_eq!(audited.len(), 1);
+        assert_eq!(audited[0].source, "default");
+        assert_eq!(audited[0].rule_id, Some(rule.id.to_string()));
+    }
+
+    #[test]
+    fn loopback_keeps_the_root_daemon_dns_exception() {
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(53)], dp_deny());
+        h.worker().dns = Box::new(StubDns {
+            self_pid: Some(4242),
+            ..Default::default()
+        });
+        let mut msg = FakeMsg::new(1, tcp_packet(53));
+        msg.outdev = 1;
+        msg.uid = Some(0);
+        h.worker().handle_message(msg).unwrap();
+        assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Accept)]);
+        assert!(h.prompt_rx.try_recv().is_err());
+        assert_eq!(h.stats.connections_total(), 0);
+    }
+
+    /// Counts reverse-DNS lookups `deliver` asks for.
+    struct CountingDns(Arc<std::sync::atomic::AtomicUsize>);
+    impl HostCache for CountingDns {
+        fn is_self(&self, _: u32) -> bool {
+            false
+        }
+        fn cached_host(&self, _: IpAddr) -> Option<(String, bool)> {
+            None
+        }
+        fn enqueue(&self, _: IpAddr) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn refused_deliveries_ask_for_no_reverse_dns() {
+        // A refused process must not make the daemon resolve an address it
+        // chose: that is a DNS side channel out of a denied program.
+        let mut reject = deny_port_rule(443);
+        reject.action = Action::Reject;
+        for rule in [deny_port_rule(443), reject] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut h = LoopHarness::new(vec![], vec![rule], dp_deny());
+            h.worker().dns = Box::new(CountingDns(calls.clone()));
+            h.worker()
+                .handle_message(FakeMsg::new(1, tcp_packet(443)))
+                .unwrap();
+            assert_eq!(h.verdicts(), vec![(1, NfqVerdict::Drop)]);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn allowed_delivery_enriches_and_counts_once_without_a_refusal_audit() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let store = RuleStore::open_in_memory().unwrap();
-        let mut h = LoopHarness::new(vec![], vec![allow_port_rule(443)], dp_deny())
-            .with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![allow_port_rule(443)], dp_deny());
         h.worker().dns = Box::new(CountingDns(calls.clone()));
         h.worker()
             .handle_message(FakeMsg::new(1, tcp_packet(443)))
@@ -2584,17 +2987,12 @@ mod tests {
             h.observed_rx.try_recv().unwrap().verdict.action,
             Action::Allow
         );
-        assert!(store
-            .query_events(10, 0, Default::default())
-            .unwrap()
-            .is_empty());
+        assert!(h.audited().is_empty(), "Allow rows come off the live feed");
     }
 
     #[test]
     fn live_feed_lag_does_not_lose_parsed_refusal_audits() {
-        let store = RuleStore::open_in_memory().unwrap();
-        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443)], dp_deny())
-            .with_store(store.clone());
+        let mut h = LoopHarness::new(vec![], vec![deny_port_rule(443)], dp_deny());
         for id in 0..64 {
             h.worker()
                 .handle_message(FakeMsg::new(id, tcp_packet(443)))
@@ -2604,13 +3002,7 @@ mod tests {
             h.observed_rx.try_recv(),
             Err(broadcast::error::TryRecvError::Lagged(_))
         ));
-        assert_eq!(
-            store
-                .query_events(100, 0, Default::default())
-                .unwrap()
-                .len(),
-            64
-        );
+        assert_eq!(h.audited().len(), 64);
         assert_eq!(h.verdicts().len(), 64);
     }
 
@@ -2807,6 +3199,7 @@ mod tests {
                 conn_to(443, 1111),
                 test_process(4242, "/usr/bin/curl"),
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
         let req = h.prompt_rx.try_recv().expect("prompt dispatched");
@@ -2929,6 +3322,7 @@ mod tests {
                 conn,
                 proc,
                 Verdict::default_deny(),
+                None,
             )
             .unwrap();
 

@@ -18,6 +18,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const CONTROL: &str = "/run/colony-firewall-apps";
+/// Exit status of a gate that refused to release the application. Its reason
+/// goes to the unit's journal; the application itself never gets that stream.
+pub(super) const GATE_REFUSED: i32 = 125;
 const UNITS: &str = "/run/systemd/system";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,8 +217,9 @@ fn manager(args: &[&str]) -> Result<String> {
         .context("calling systemd")?;
     ensure!(
         result.status.success(),
+        // main() escapes the whole error once.
         "systemd rejected the application operation: {}",
-        crate::output::terminal_safe(&String::from_utf8_lossy(&result.stderr))
+        String::from_utf8_lossy(&result.stderr)
     );
     Ok(String::from_utf8(result.stdout)?.trim().to_owned())
 }
@@ -247,7 +251,7 @@ fn unit_text(manifest: &Manifest, launcher: &Path) -> Result<String> {
         .map(|ip| format!("{ip}/{}", if ip.is_ipv4() { 32 } else { 128 }))
         .collect::<Vec<_>>()
         .join(" ");
-    Ok(format!("[Unit]\nDescription=CFC confined application\n[Service]\nType=exec\nSlice=system.slice\nDynamicUser=yes\nUser={}\nExecStart=+:\"{}\" __cfc_application_gate {}\nIPAddressDeny=any\nIPAddressAllow={}\nIPAccounting=no\nRestrictNetworkInterfaces=~lo\nDelegate=no\nStandardInput=null\nStandardOutput=null\nStandardError=null\nKillMode=control-group\nTimeoutStopSec=5s\nNoNewPrivileges=yes\nRestart=no\nFileDescriptorStoreMax=0\nNotifyAccess=none\nUMask=0077\n", user(&manifest.id), launcher, manifest.id, peers))
+    Ok(format!("[Unit]\nDescription=CFC confined application\n[Service]\nType=exec\nSlice=system.slice\nDynamicUser=yes\nUser={}\nExecStart=+:\"{}\" __cfc_application_gate {}\nIPAddressDeny=any\nIPAddressAllow={}\nIPAccounting=no\nRestrictNetworkInterfaces=~lo\nDelegate=no\nStandardInput=null\nStandardOutput=null\nStandardError=journal\nKillMode=control-group\nTimeoutStopSec=5s\nNoNewPrivileges=yes\nRestart=no\nFileDescriptorStoreMax=0\nNotifyAccess=none\nUMask=0077\n", user(&manifest.id), launcher, manifest.id, peers))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -350,8 +354,14 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
             fs::create_dir_all(CONTROL)?;
             sealed_directory(Path::new(CONTROL))?;
             sealed_directory(Path::new(UNITS))?;
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            // Installed before anything is provisioned, so a signal that arrives
+            // while systemctl runs, or a closed terminal or SSH session, ends in
+            // stop() instead of the default action leaving the tree running.
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut interrupt = signal(SignalKind::interrupt())?;
+            let mut terminate = signal(SignalKind::terminate())?;
+            let mut hangup = signal(SignalKind::hangup())?;
+            let mut quit = signal(SignalKind::quit())?;
             let manifest = Manifest {
                 id: uuid::Uuid::new_v4().simple().to_string(),
                 runtime,
@@ -377,6 +387,11 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
                     "application preparation failed; cleanup: {cleanup:?}"
                 )));
             }
+            // Before the start job, so the identity is known even if this
+            // process is killed outright while the tree runs.
+            if matches!(format, OutputFormat::Human) {
+                eprintln!("Confined application: {}", manifest.id);
+            }
             let application = unit(&manifest.id);
             let started =
                 manager(&["daemon-reload"]).and_then(|_| manager(&["start", &application]));
@@ -385,9 +400,6 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
                 return Err(
                     error.context(format!("application setup failed; cleanup: {cleanup:?}"))
                 );
-            }
-            if matches!(format, OutputFormat::Human) {
-                eprintln!("Confined application: {}", manifest.id);
             }
             let outcome = async {
                 let completed = loop {
@@ -409,8 +421,10 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
                         "unexpected application state: {state}"
                     );
                     tokio::select! {
-                        result = tokio::signal::ctrl_c() => { result?; break false; },
+                        _ = interrupt.recv() => break false,
                         _ = terminate.recv() => break false,
+                        _ = hangup.recv() => break false,
+                        _ = quit.recv() => break false,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
                     }
                 };
@@ -439,6 +453,10 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
                     serde_json::json!({"id": manifest.id, "completed": completed, "application_status": status})
                 );
             }
+            ensure!(
+                !completed || status != GATE_REFUSED.to_string(),
+                "confined application exited with status {GATE_REFUSED}, which the gate uses when it refuses a launch; the reason is in `journalctl -u {application}`"
+            );
             ensure!(
                 !completed || status == "0",
                 "confined application failed with status {status}"
@@ -535,84 +553,81 @@ pub(super) fn gate(id: &str) -> Result<()> {
     check_runtime(&manifest.runtime, &manifest.command)?;
     let bwrap = trusted_binary(Path::new("/usr/bin/bwrap"))?;
     let (uid, gid) = native::verify(&unit(id), &user(id), &manifest.allow)?;
-    #[cfg(target_arch = "x86_64")]
-    {
-        let seccomp = filter::sealed_filter()?;
-        drop_privileges(uid, gid)?;
-        let mut launch = Command::new(bwrap);
-        launch
-            .env_clear()
-            .args([
-                "--unshare-user",
-                "--unshare-pid",
-                // Keep setup helpers outside the payload's PID view, including before seccomp.
-                "--as-pid-1",
-                "--unshare-ipc",
-                "--unshare-uts",
-                "--unshare-cgroup",
-                "--disable-userns",
-                "--assert-userns-disabled",
-                "--uid",
-                "65534",
-                "--gid",
-                "65534",
-                "--cap-drop",
-                "ALL",
-                "--new-session",
-                "--die-with-parent",
-                "--clearenv",
-                "--setenv",
-                "HOME",
-                "/home/cfc",
-                "--setenv",
-                "PATH",
-                "/usr/bin:/bin",
-                "--chdir",
-                "/home/cfc",
-                "--ro-bind",
-            ])
-            .arg(&manifest.runtime)
-            .arg("/")
-            .args([
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--tmpfs",
-                "/tmp",
-                "--tmpfs",
-                "/run",
-                "--tmpfs",
-                "/home",
-                "--dir",
-                "/home/cfc",
-                "--seccomp",
-                "3",
-                "--",
-            ])
-            .args(&manifest.command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let fd = seccomp.as_raw_fd();
-        // pre_exec uses only async-signal-safe syscalls, and the gate has no runtime threads.
-        unsafe {
-            launch.pre_exec(move || {
-                if fd != 3 && libc::dup2(fd, 3) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let error = launch.exec();
-        bail!("mandatory application isolation failed: {error}");
+    let seccomp = filter::sealed_filter()?;
+    drop_privileges(uid, gid)?;
+    let mut launch = Command::new(bwrap);
+    launch
+        .env_clear()
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            // Keep setup helpers outside the payload's PID view, including before seccomp.
+            "--as-pid-1",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--disable-userns",
+            "--assert-userns-disabled",
+            "--uid",
+            "65534",
+            "--gid",
+            "65534",
+            "--cap-drop",
+            "ALL",
+            "--new-session",
+            "--die-with-parent",
+            "--clearenv",
+            "--setenv",
+            "HOME",
+            "/home/cfc",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--chdir",
+            "/home/cfc",
+            "--ro-bind",
+        ])
+        .arg(&manifest.runtime)
+        .arg("/")
+        .args([
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/run",
+            "--tmpfs",
+            "/home",
+            "--dir",
+            "/home/cfc",
+            "--seccomp",
+            "3",
+            "--",
+        ])
+        .args(&manifest.command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let fd = seccomp.as_raw_fd();
+    // pre_exec uses only async-signal-safe syscalls, and the gate has no runtime threads.
+    unsafe {
+        launch.pre_exec(move || {
+            if fd != 3 && libc::dup2(fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
+    let error = launch.exec();
+    bail!("mandatory application isolation failed: {error}");
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -668,6 +683,8 @@ mod tests {
         let text = unit_text(&manifest, Path::new("/usr/bin/cfc%$name")).unwrap();
         assert!(text.contains("\nIPAddressDeny=any\nIPAddressAllow=\n"));
         assert!(text.contains("\nRestrictNetworkInterfaces=~lo\n"));
+        // The gate's refusal reason reaches the journal; bwrap gets /dev/null.
+        assert!(text.contains("\nStandardOutput=null\nStandardError=journal\n"));
         assert!(text.contains("ExecStart=+:\"/usr/bin/cfc%%$name\" __cfc_application_gate "));
         manifest.allow = vec![
             "203.0.113.7".parse().unwrap(),

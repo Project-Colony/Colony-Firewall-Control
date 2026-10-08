@@ -41,8 +41,8 @@ const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// moved.
 /// How often to ask nftables whether the table that feeds NFQUEUE is loaded.
 ///
-/// One minute, matching the fast-allow set check: both are a fork and an exec,
-/// and both bound how long `cfc status` may be stale by the same amount.
+/// One minute: it is a fork and an exec, and it bounds how long `cfc status`
+/// may be stale.
 const NFT_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 const PROVENANCE_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
@@ -103,11 +103,10 @@ fn main() -> anyhow::Result<()> {
         // would be a much worse bug than the one this fixes.
         .worker_threads(4)
         // And a ceiling on the blocking pool, which tokio leaves at 512.
-        // `dns.rs` hands it one `getaddrinfo` per new destination address, and
-        // a stalled resolver blocks each for the resolv.conf default of two
-        // five-second attempts. At the worker's flow rate that queues
-        // thousands of lookups and spawns threads to match: 512 x 2 MiB of
-        // stack reservation, plus an arena apiece. Sixteen is plenty - the
+        // `dns.rs` runs its blocking resolver calls here, at most eight at
+        // once (`LOOKUP_MAX_IN_FLIGHT`), and rule validation and provenance
+        // use the same pool. Nothing should ever need 512 threads at 2 MiB of
+        // stack reservation plus an arena apiece. Sixteen is plenty - the
         // packet worker permanently occupies one of them - and excess calls
         // then queue instead of spawning.
         .max_blocking_threads(16)
@@ -162,9 +161,10 @@ async fn run() -> anyhow::Result<()> {
     let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
     let router = prompts::PromptRouter::new(policy.clone(), stats.clone(), verdict_tx);
 
-    // Allow observations use the bounded async event pipeline. NFQUEUE
-    // refusals commit synchronously before verdict delivery and publication.
-    ipc::spawn_event_pipeline(store.clone(), &observed_tx, cfg.events.max_rows);
+    // Every verdict is persisted by the bounded async event pipeline: the
+    // worker queues its refusals into `events` after the verdict, and Allow
+    // rows come off the live feed. No packet waits for the database.
+    let events = ipc::spawn_event_pipeline(store.clone(), &observed_tx, cfg.events.max_rows);
 
     let (mut ipc_handle, prompt_tx) = ipc::spawn(
         ipc::IpcOptions {
@@ -196,7 +196,7 @@ async fn run() -> anyhow::Result<()> {
             verdict_rx,
             observed_tx.clone(),
             stats.clone(),
-            store.clone(),
+            events,
             // Cloned rather than moved: the eBPF consumers write observed DNS
             // answers into the same cache, and they are started after READY=1
             // (see below) so the handle has to outlive this call.
@@ -216,6 +216,9 @@ async fn run() -> anyhow::Result<()> {
         tick.tick().await; // skip immediate fire
         loop {
             tick.tick().await;
+            // The whole tick: a rule write between the drain and the merge
+            // would count the drained hits twice (see `lock_mutations`).
+            let _mutation = flush_engine.lock_mutations();
             let deltas = flush_engine.drain_hits();
             if !deltas.is_empty() {
                 if let Err(e) = flush_store.merge_hit_counts(&deltas) {
@@ -263,9 +266,9 @@ async fn run() -> anyhow::Result<()> {
     // is immediate so a fresh daemon has provenance within a second; after
     // that it is a poll, because the trigger is the package database's mtime
     // changing under us and there is no cheap way to be told about that. Two
-    // minutes is chosen against what it costs to be wrong: a package installed
-    // just now shows as unpackaged for at most that long, in a field that
-    // decorates an event and decides nothing.
+    // minutes is chosen against what it costs to be wrong: a binary first seen
+    // after a package transaction shows provenance unknown for at most that
+    // long, in a field that decorates an event and decides nothing.
     tokio::spawn(async {
         let mut tick = tokio::time::interval(PROVENANCE_WARM_INTERVAL);
         loop {
@@ -289,10 +292,8 @@ async fn run() -> anyhow::Result<()> {
     // A packet counter cannot tell "nothing is filtered" from "nothing is
     // happening" - an idle laptop looks identical to an unprotected one. So
     // ask nftables instead. Once a minute, on the blocking pool because it is
-    // a fork and an exec, which is the same cadence and the same reasoning as
-    // the fast-allow set check that already runs there. An error leaves the
-    // previous answer standing: "could not ask" must never render as "the
-    // firewall is gone".
+    // a fork and an exec. An error leaves the previous answer standing: "could
+    // not ask" must never render as "the firewall is gone".
     {
         let stats = stats.clone();
         tokio::spawn(async move {
@@ -365,12 +366,12 @@ async fn run() -> anyhow::Result<()> {
     // sock_diag + /proc alone, which is exactly what the daemon does when the
     // layer is unavailable anyway.
     //
-    // The loader flushes a predecessor's fast-allow mark at the top of every
-    // load. With the layer switched off in the config that flush is never
-    // reached, and the nftables set outlives daemons - so it is done here for
-    // exactly that case. Not under --dry-run, which touches nothing.
-    if !args.dry_run && !cfg.ebpf.enabled.wants_load() {
-        ebpf::flush_stale_fast_allow();
+    // Flush the legacy fast_allow nftables set before the layer comes up,
+    // whatever its mode and whether or not it is compiled in: a mark an older
+    // daemon left there would otherwise stay accepted. Not under --dry-run,
+    // which touches nothing.
+    if !args.dry_run {
+        ebpf::flush_legacy_fast_allow_set();
     }
 
     // Held for the daemon's lifetime: dropping it detaches the programs.
@@ -395,8 +396,6 @@ async fn run() -> anyhow::Result<()> {
         // direction of the dependency the same as everywhere else: the eBPF
         // layer is handed what it may read, and owns nothing the daemon needs.
         Some(engine.clone()),
-        observed_tx.clone(),
-        stats.clone(),
     );
     _ebpf.report.log();
     // Publish it so `cfc status` can say where enforcement lives without anyone

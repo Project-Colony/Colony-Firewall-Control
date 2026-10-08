@@ -113,7 +113,9 @@ const _: () = {
 /// has seen `exec`, so a default deny here would blackhole every process that
 /// started before the daemon did - including the ones that bring the network
 /// up. The fail-closed guarantee stays where it already was, in the nftables
-/// ruleset (`ct state new queue num 0`, no `bypass`).
+/// ruleset: fail-closed for everything except new loopback flows, which are
+/// allowed while no daemon listens (the final `ct state new queue num 0` has
+/// no `bypass`).
 ///
 /// The point of this layer is the *opposite* direction: a deny written here
 /// keeps being enforced after the daemon is gone, because the link is pinned.

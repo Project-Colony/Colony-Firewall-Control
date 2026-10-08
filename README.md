@@ -21,7 +21,7 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 - iced GUI with parchment / burgundy theme, four tabs (Prompts / Rules /
   Live / Stats), a countdown on every prompt, and desktop notifications
   when the window is hidden
-- **Answer prompts from a terminal** (`cfc prompts`) - headless servers
+- **Answer prompts from a terminal** (`sudo cfc prompts`) - headless servers
   and SSH sessions are not second-class citizens
 - **Persistent verdict log** (`cfc log`): what did this app contact, and
   what did we do about it
@@ -68,17 +68,22 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 +--------------------------------------------------+
 ```
 
-Seven workspace crates:
+Ten crates: nine workspace members, plus the kernel-side `cfc-ebpf`, which
+is its own workspace (pinned nightly + bpf-linker, built by `cargo xtask
+build-ebpf`) so stable builds never see it:
 
-| Crate         | Role                                                     |
-|---------------|----------------------------------------------------------|
-| `cfc-core`    | Shared types: `Rule`, `Verdict`, `Connection`, `Process` |
-| `cfc-proto`   | gRPC schema (tonic + tonic-prost)                        |
-| `cfc-client`  | Shared UDS gRPC client wrapper                           |
-| `cfc-daemon`  | Privileged daemon                                        |
-| `cfc-ui`      | iced GUI                                                 |
-| `cfc-cli`     | Terminal control tool                                    |
-| `cfc-tray`    | System-tray companion (StatusNotifierItem)               |
+| Crate             | Role                                                                       |
+|-------------------|----------------------------------------------------------------------------|
+| `cfc-core`        | Shared types and rule matching: `Rule`, `Verdict`, `Connection`, `Process` |
+| `cfc-proto`       | gRPC schema (tonic + tonic-prost)                                          |
+| `cfc-client`      | Shared UDS gRPC client wrapper                                             |
+| `cfc-daemon`      | Privileged daemon                                                          |
+| `cfc-ui`          | iced GUI                                                                   |
+| `cfc-cli`         | Terminal control tool                                                      |
+| `cfc-tray`        | System-tray companion (StatusNotifierItem)                                 |
+| `cfc-ebpf-common` | POD types and pure parsers shared by eBPF and userspace                    |
+| `cfc-ebpf`        | Kernel-side programs of the optional eBPF backend                          |
+| `xtask`           | Build automation (eBPF object build)                                       |
 
 More docs:
 
@@ -98,10 +103,10 @@ Not on the AUR yet. Two recipes ship in `pkg/`; the `-git` one works
 today, without a published release:
 
 ```sh
-mkdir -p /tmp/cfc-build
-cp pkg/PKGBUILD-git /tmp/cfc-build/PKGBUILD
-cp pkg/colony-firewall-control.install /tmp/cfc-build/
-cd /tmp/cfc-build && makepkg -si
+build=$(mktemp -d)
+cp pkg/PKGBUILD-git "$build"/PKGBUILD
+cp pkg/colony-firewall-control.install "$build"/
+cd "$build" && makepkg -si
 ```
 
 `pkg/PKGBUILD` is the AUR release recipe instead: it builds from the
@@ -162,7 +167,9 @@ sudo install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
 sudo systemctl daemon-reload
 
 # The control socket is root:colony-firewall 0660. Join the group, then
-# log out and back in, or the GUI and cfc get "permission denied".
+# log out and back in, or the GUI, the tray and cfc get "permission denied".
+# Membership gives read access and lets the installed app and tray connect;
+# changes come from those two or from sudo cfc (see Who can change what).
 sudo usermod -aG colony-firewall "$USER"
 ```
 
@@ -171,7 +178,7 @@ Enable the installed daemon and enforcement in First run below.
 ## First run
 
 A fresh install has **zero rules**: once enforcement is on, every new
-outbound connection prompts (or falls back to the profile default). Do
+remote outbound connection prompts (or falls back to the profile default). Do
 these three things, in order:
 
 **1. Enable enforcement persistently.** A companion unit loads the
@@ -195,20 +202,20 @@ without prompting:
 sudo cfc rules bootstrap-defaults   # same as: cfc rules bundle add system
 ```
 
-(`sudo` because group membership from `usermod -aG colony-firewall` only
-takes effect in a new login session. After logging out and back in, plain
-`cfc` works.)
+(`sudo` because `cfc` run as a regular user is read-only: it can show status,
+rules and the logs, but only root, or the installed Colony Firewall app and
+tray, can change the firewall.)
 
 This installs twelve allow rules - systemd-resolved DNS (:53),
 systemd-timesyncd and chronyd NTP (:123/udp), the DHCP clients (dhcpcd,
 NetworkManager and systemd-networkd, :67 and :547/udp), pacman and paru
 HTTPS mirrors (:443/tcp), and the SSH client (:22/tcp) - and is
-idempotent (already-present rules are skipped by name; `--dry-run`
-previews). **Do not skip this step.** No profile allows anything on its
-own, so on a machine with no rules and no UI connected nothing outbound
-gets through - including the DHCP lease. Filtering starts before the
-network is configured (see below), and these rules are what let the
-machine come up at all.
+idempotent (rules it installed are skipped, as are identical same-named
+rules seeded before 0.7.0, which `bundle remove` also removes; a different rule with one of its names stops it
+before anything changes; `--dry-run` previews). **Do not skip this step.** No profile allows unmatched remote flows
+on its own. With no rules and no UI connected, unmatched queued remote
+connections are denied. Filtering starts before the network is configured
+(see below), and these rules keep DHCP, DNS and NTP usable.
 
 For everything else, there are bundles:
 
@@ -216,7 +223,7 @@ For everything else, there are bundles:
 cfc rules bundle list                 # what there is, and what applies here
 cfc rules bundle add web --dry-run    # preview
 sudo cfc rules bundle add web         # installed browsers -> 443 and 80
-sudo cfc rules bundle add dev         # git, cargo, npm, pip, docker
+sudo cfc rules bundle add dev         # git, ssh, cargo, docker/podman
 sudo cfc rules bundle add updates     # apt, dnf, flatpak, yay
 sudo cfc rules bundle remove web      # exactly the rules that bundle owns
 ```
@@ -225,8 +232,10 @@ Two properties worth knowing. **Every rule names an executable** - there
 is no way to write "allow tcp/443" here, because a payload phoning home
 uses 443 exactly like a browser does and a port-shaped rule cannot tell
 them apart. And entries whose program is not installed on this machine
-are **skipped and reported**, so "4 added, 10 skipped" is the normal
-outcome of `bundle add web` on a box with two browsers.
+are **skipped and reported**, so "4 added, 8 skipped" is the normal
+outcome of `bundle add web` on a box with two browsers. Each rule names the
+binary that actually connects, never a launcher script, so tools where only
+an interpreter connects (npm, pip) have no bundle entry.
 
 **3. Give prompts somewhere to go.** On a desktop, launch the GUI:
 
@@ -237,19 +246,24 @@ colony-firewall
 On a headless machine, answer them from the terminal instead:
 
 ```sh
-cfc prompts
+sudo cfc prompts
 ```
 
-With no subscriber at all the daemon applies `no_ui_action` to every
-unmatched flow without asking anyone. **That is a denial under every
+With no subscriber at all the daemon applies `no_ui_action` to unmatched
+remote flows without asking anyone. **That is a denial under every
 profile.** "Nobody is connected" is a permanent condition on a headless
 box, not a passing one, and answering it with an allow would mean those
 hosts had no outbound firewall whatsoever. Stored rules are what such a
-machine runs on; `cfc prompts` is how you add more without a GUI.
+machine runs on; `sudo cfc prompts` is how you add more without a GUI. A
+`cfc prompts` without sudo only watches: the daemon neither counts it as a UI
+nor accepts its answers.
 
-This cannot lock you out of a remote machine: the ruleset hooks `output`
-on `ct state new` only, so an inbound SSH session's replies are
-`ct state established` and are never queued.
+This does not refuse inbound SSH: the ruleset hooks `output` on
+`ct state new` only, so an inbound SSH session's replies are
+`ct state established` and are never queued. Outbound lookups the login
+itself makes (reverse DNS, LDAP or Kerberos from `sshd`'s PAM stack) are
+new flows and are judged like any other; see
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out).
 
 **Boot behaviour.** The nft units load independently before the daemon,
 `network-pre.target`, NetworkManager and systemd-networkd, after the
@@ -257,9 +271,13 @@ distribution's `nftables.service` when it is in the same boot transaction.
 Enabling enforcement creates native requirements from those two network
 managers: a failed nft load blocks their startup. A failed daemon start leaves
 the loaded tables dropping new flows. The daemon also requires the outbound
-table before initialization. Tables survive daemon stops and restarts; stop
-the nft unit explicitly to remove its table. Inbound stays opt-in. Its lockout
-guard reads saved SQLite rules without a running daemon.
+table before initialization. Tables survive daemon stops and restarts; to
+remove one, `sudo systemctl disable --now` its nft unit (a plain stop also
+stops the network managers that require it). Inbound stays opt-in. Its lockout
+guard reads saved SQLite rules without a running daemon. With inbound
+enabled, ping and other ICMP requests need a rule like any other inbound
+flow, so allow your monitoring hosts:
+`cfc rules add --direction in --action allow --protocol icmp --src-net <monitor> --name monitoring`.
 
 This contract covers systemd-managed NetworkManager and systemd-networkd
 after enforcement is enabled. It does not cover networking configured in an
@@ -267,13 +285,39 @@ initramfs, interfaces already configured before these units, other network
 managers, or a later external ruleset flush. Early unmatched flows use
 `no_ui_action`; bootstrap DHCP/DNS/NTP rules keep strict configurations usable.
 
-**Scope.** Rules decide new tracked flows; established and related traffic
-retains its connection-wide authorization. Passed or inherited sockets and
-local DNS/proxy relays are not confined to their original executable.
-Loopback is exempt, and packet-layer traffic from applications with
-`CAP_NET_RAW` is outside these IP hooks. Use OS containment for those cases.
-Fast Allow is disabled even when `fast_allow = true` is configured; allowed
-flows use the normal NFQUEUE path.
+**Scope.** Normal mode decides new tracked IP flows from socket attribution;
+established and related traffic retains its connection-wide authorization.
+With inbound filtering off (the default) a connection a remote peer opens is
+never judged at all, so a program that outbound rules deny still answers on
+any port it listens on.
+Passed or inherited sockets are not reauthorized for each sending executable.
+A current descriptor holder does not prove which process sent a packet.
+While the daemon runs, new direct loopback flows follow explicit rules;
+unmatched local IPC is allowed without prompting. While no daemon listens on
+the queue, new loopback flows are allowed (`queue ... bypass` on `lo` only), so
+local services keep working; resolving names that are not cached still needs
+the daemon. An allowed local resolver or proxy can still relay remote
+traffic. CFC cannot establish the originating application's identity from
+remote flows delegated through local brokers, including AF_UNIX and D-Bus.
+
+Applications with `CAP_NET_RAW` can use AF_PACKET outside the `inet OUTPUT`
+hook. Raw IP packets can also coincide with another socket's tuple; socket
+attribution does not prove their origin. Use explicit application confinement
+or OS containment for those cases. Docker grants `CAP_NET_RAW` to containers
+by default, so a `--network=host` container has it; drop it with
+`--cap-drop NET_RAW` for workloads CFC should govern.
+
+Executables over 64 MiB (Chromium, Electron apps, VS Code) are never hashed.
+A hash-pinned rule naming one cannot be decided, so its flows are prompted
+(or take `no_ui_action` with no UI connected), and outside a root-owned
+path an "Allow always" for one cannot be saved, so it prompts for every new
+flow. See [docs/HARDENING.md](docs/HARDENING.md#rule-design-principles).
+The complete list of non-goals is in
+[docs/HARDENING.md](docs/HARDENING.md#what-this-firewall-does-not-protect-against).
+
+Fast Allow was removed: a socket mark cannot prove which process sends, so it
+opened bypasses. The old `[ebpf] fast_allow` and `fast_allow_mark` keys are
+ignored with a warning, and allowed flows use the normal NFQUEUE path.
 
 Then confirm it is really filtering:
 
@@ -282,14 +326,20 @@ cfc status     # "enforcing yes", and it warns on stderr when it is not
 ```
 
 > **WARNING - remote / SSH machines:** the shipped nftables snippet is
-> fail-closed. If the daemon is down while the rule is loaded, **all new
-> outbound connections drop**, and a mistake can lock you out of a box you
-> only reach over SSH. Read
-> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - specifically the
-> SSH exemption and dead-man's-switch patterns - *before* enabling
-> enforcement remotely.
+> fail-closed for everything except new loopback flows, which are allowed
+> while no daemon listens. If the daemon is down while the rule is loaded,
+> **all new non-loopback outbound connections drop**. Inbound SSH still
+> connects, but a login that needs the network (LDAP, Kerberos, reverse DNS)
+> can fail, and the opt-in inbound table drops new SSH sessions outright
+> while the daemon is down. Read
+> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out) -
+> specifically the dead-man's switch - *before* enabling enforcement
+> remotely.
 
 ### Explicit application confinement
+
+**Experimental.** This mode is new in 0.7.0, has not been externally
+audited, and its interface and platform requirements may change.
 
 `cfc applications run` starts a separate, headless application tree with an
 empty network permission list. Administrators may approve exact numeric peer
@@ -303,7 +353,8 @@ The initial supported platform is x86_64 Linux with cgroup v2, systemd 262 or
 newer, a working system D-Bus, Bubblewrap 0.13.0 or newer, and libbpf-backed
 interface filtering. CFC verifies actual IP/interface BPF attachments, their
 policy maps and synthetic decisions before starting the application. Missing
-support or failed verification refuses the launch. Local routes through `lo`
+support or failed verification refuses the launch: the launcher reports
+status 125 and the reason is in `journalctl -u cfc-app-ID.service`. Local routes through `lo`
 remain blocked even when an approved address later belongs to the host.
 
 Prepare an administrator-owned runtime containing the executable and all its
@@ -326,7 +377,9 @@ an external filesystem broker or concealed lower storage.
 To approve a peer, repeat the launch with `--allow IP` before `--`; repeat the
 flag for additional peers. The launcher prints the tree identity. Use
 `sudo cfc applications stop ID` to terminate it from another terminal, or
-Ctrl-C in the launching terminal.
+Ctrl-C in the launching terminal; closing that terminal or losing its SSH
+session also stops the tree. A launcher killed outright (SIGKILL) cannot
+clean up: the tree keeps running until `cfc applications stop ID`.
 
 Each active tree receives a reserved host UID and private PID, mount, user,
 IPC, UTS and cgroup namespaces. Its writable state is private and its runtime
@@ -344,6 +397,12 @@ edited. Stop the tree to revoke its permissions. Approving a peer approves
 that endpoint, including any remote relay it provides. Trusted host root,
 the operating system and kernel vulnerabilities are outside this boundary.
 
+The tree shares the host network namespace. An approved peer may also
+connect in to anything the tree listens on, a listener takes the port from
+the whole host, and `/proc/net` shows the host's sockets and connections.
+Nor is the tree resource-isolated: memory, including its tmpfs directories,
+is not capped, and only systemd's default `TasksMax` bounds its processes.
+
 ## Quick start
 
 Open the GUI:
@@ -360,14 +419,14 @@ cfc status
 
 # Answer prompts from this terminal - no GUI needed.
 # a=allow d=deny r=reject s=skip q=quit, then duration and scope.
-cfc prompts
+sudo cfc prompts
 
-# Add a rule from the command line
-cfc rules add --action allow --exe /usr/bin/curl --dst-port 443
+# Add a rule from the command line (changes need sudo; reading does not)
+sudo cfc rules add --action allow --exe /usr/bin/curl --dst-port 443
 
 # Rules take an id, a unique id prefix, or the rule's name
 cfc rules show curl-https
-cfc rules disable 3f2a
+sudo cfc rules disable 3f2a
 
 # Watch traffic decisions in real time (colorized), with filters
 cfc live --denied
@@ -377,16 +436,32 @@ cfc live --exe firefox --follow
 cfc log --since 24h
 cfc log --exe firefox --action deny
 
-# Pause enforcement for a bounded window (the daemon auto-resumes)
-cfc pause --for 30m
-cfc resume
+# Pause enforcement for a bounded window (the daemon auto-resumes).
+# From the app or tray, Pause asks for an administrator password instead.
+sudo cfc pause --for 30m
+sudo cfc resume
 
 # Back up rules
 cfc rules export --out rules.json
 
-# Migrate from an existing opensnitch install
-cfc rules import-opensnitch /etc/opensnitchd/rules
+# Migrate from an existing opensnitch install. A rule with no equivalent
+# here (hostname, regexp) stops it; --skip-unconvertible imports the rest.
+sudo cfc rules import-opensnitch /etc/opensnitchd/rules
 ```
+
+### Who can change what
+
+| who | read status, rules, logs, live view, prompts | answer prompts, add/edit/delete rules | pause, resume, import rules, Allow rules that name no program |
+|---|---|---|---|
+| root (`sudo cfc`) | yes | yes | yes |
+| the installed Colony Firewall app and tray, run by a `colony-firewall` group member | yes | yes | after an administrator password (polkit; asked for every pause or resume, kept a few minutes for the others) |
+| any other program of a group member, including `cfc` without sudo | yes | no | no |
+
+The daemon recognises the app and tray by the running image: it must be the
+installed, root-owned `/usr/bin/colony-firewall` or `colony-firewall-tray`,
+started normally (not traced, no seccomp filter, no library preloaded from
+your files). After an upgrade, restart both; until then they are read-only.
+Details and limits are in [docs/HARDENING.md](docs/HARDENING.md).
 
 Executable rules require the canonical mapped target explicitly. An alias
 such as `/bin/tool` on a system where `/bin` links to `/usr/bin` is refused;
@@ -444,7 +519,7 @@ Every profile denies on timeout: a prompt you were shown and did not
 answer must not become an allow. The profiles differ in how long they
 wait, and in what happens when there is nobody subscribed to ask.
 
-Use `strict` only when you always have the UI running (or `cfc prompts`),
+Use `strict` only when you always have the UI running (or `sudo cfc prompts`),
 otherwise you lose network when the daemon starts before a subscriber
 does (fail-closed posture).
 

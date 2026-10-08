@@ -13,9 +13,8 @@ mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /run
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
-# bpffs, unlike the CI guests: with it the exec/exit links pin, which is what
-# lets the fast path run with its full sixty-second deadline rather than the
-# shortened one. The measurement should see the feature as a host sees it.
+# bpffs, unlike the CI guests: with it the connect and exec/exit links pin,
+# so the measurement sees the in-kernel layer as a host sees it.
 mount -t bpf bpf /sys/fs/bpf
 mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
 

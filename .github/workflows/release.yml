@@ -21,6 +21,9 @@ jobs:
 
       - name: Resolve version and verify it matches the tag
         id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
           if [ -z "${VERSION}" ]; then
@@ -30,8 +33,8 @@ jobs:
           # The release is named after the tag, but every asset filename is
           # built from the Cargo version. A mismatch publishes "v0.3.0"
           # containing colony-firewall-control-0.2.0-*.tar.zst. Refuse.
-          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "v${VERSION}" ]; then
-            echo "::error::tag ${{ github.ref_name }} does not match Cargo.toml [workspace.package] version ${VERSION} (expected tag v${VERSION}). Bump Cargo.toml or retag."
+          if [ "${REF_TYPE}" = "tag" ] && [ "${REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag ${REF_NAME} does not match Cargo.toml [workspace.package] version ${VERSION} (expected tag v${VERSION}). Bump Cargo.toml or retag."
             exit 1
           fi
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
@@ -90,11 +93,13 @@ jobs:
       # down, because the assert below requires the two to be equal and a
       # second hardcoded number could only drift away from the first.
       - name: Install bpf-linker
+        id: linker
         run: |
           LLVM_MAJOR="$(rustc +${{ steps.bpfpins.outputs.nightly }} -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
           if [ -z "${LLVM_MAJOR}" ]; then
             echo "::error::could not read rustc's LLVM version"; exit 1
           fi
+          echo "llvm_major=${LLVM_MAJOR}" >> "${GITHUB_OUTPUT}"
           echo "pinned nightly uses LLVM ${LLVM_MAJOR}; building bpf-linker against it"
 
           sudo apt-get update
@@ -122,15 +127,22 @@ jobs:
       # whatever libLLVM the system provides -- so assert it rather than assume.
       - name: Assert the LLVM versions pair
         run: |
-          RUSTC_LLVM="$(rustc +${{ steps.bpfpins.outputs.nightly }} -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
-          LINKER_LLVM="$(bpf-linker --version 2>/dev/null | sed -n 's/.*LLVM \([0-9]*\).*/\1/p')"
-          echo "rustc LLVM=${RUSTC_LLVM}  bpf-linker LLVM=${LINKER_LLVM}"
-          if [ -z "${RUSTC_LLVM}" ]; then
-            echo "::error::could not determine rustc's LLVM version"
+          # The same two checks as ebpf.yml. `bpf-linker --version` prints no
+          # LLVM version in 0.11, so comparing against it never fired.
+          # (1) The system LLVM must be the major requested from apt.llvm.org.
+          WANT="${{ steps.linker.outputs.llvm_major }}"
+          GOT="$("/usr/lib/llvm-${WANT}/bin/llvm-config" --version 2>/dev/null | cut -d. -f1 || true)"
+          echo "requested LLVM=${WANT}  system llvm-config says=${GOT}"
+          if [ "${GOT}" != "${WANT}" ]; then
+            echo "::error::asked apt.llvm.org for LLVM ${WANT} but /usr/lib/llvm-${WANT} answers '${GOT}' - the pinned nightly's LLVM is not installable here, so the bitcode handoff to bpf-linker will fail with 'Invalid record'. Bump crates/cfc-ebpf/bpf-linker-version or move the nightly pin back."
             exit 1
           fi
-          if [ -n "${LINKER_LLVM}" ] && [ "${RUSTC_LLVM}" -gt "${LINKER_LLVM}" ]; then
-            echo "::error::rustc LLVM ${RUSTC_LLVM} is newer than bpf-linker's ${LINKER_LLVM}; the link will fail with 'Invalid record'. Bump crates/cfc-ebpf/bpf-linker-version or move the nightly pin back."
+          # (2) What the installed binary actually links, read from the binary.
+          LINKED="$(ldd "$(command -v bpf-linker)" 2>/dev/null | grep -oE 'libLLVM[-.so]*[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)"
+          if [ -z "${LINKED}" ]; then
+            echo "::warning::could not read a libLLVM major from the bpf-linker binary (static link or layout change); relying on check (1) only"
+          elif [ "${LINKED}" != "${WANT}" ]; then
+            echo "::error::bpf-linker links libLLVM ${LINKED} but was requested against LLVM ${WANT}"
             exit 1
           fi
 
@@ -155,19 +167,19 @@ jobs:
             "${STAGE}/"
 
           # Executable, and not a binary: systemd execs it as the inbound
-          # unit's ExecStartPre. colony.json re-applies 0755 on install, but
+          # unit's ExecStartPre. install.sh re-applies 0755 on install, but
           # staging it 644 here would be a lie about what it is.
           install -m755 \
             scripts/inbound-lockout-guard.sh \
             "${STAGE}/"
 
           # Everything pkg/colony.json's postInstall installs. The tarball
-          # layout is FLAT: postInstall runs with the extracted directory
-          # as its working directory, so each file must be present under
+          # layout is FLAT: install.sh, generated from postInstall, runs
+          # from the extracted directory, so each file must be present under
           # its own basename. scripts/check-release-assets.sh gates this
           # list against the manifest on every push, so a file added to
           # postInstall but not staged here fails CI instead of silently
-          # vanishing on the Colony channel.
+          # vanishing from tarball installs.
           install -m644 \
             systemd/colony-firewalld.service \
             systemd/colony-firewall-nft.service \
@@ -180,16 +192,16 @@ jobs:
             pkg/colony-firewall-autostart.desktop \
             pkg/colony-firewall-tray-autostart.desktop \
             pkg/colony-firewall.svg \
+            pkg/org.projectcolony.firewall.policy \
             "${STAGE}/"
 
-          # The kernel-side object. Fatal if absent: colony.json's postInstall
-          # cannot express an optional file, so a tarball without it produces a
-          # package whose install step fails outright.
+          # The kernel-side object. Fatal if absent: install.sh cannot express
+          # an optional file, so a tarball without it would fail to install.
           install -m644 \
             crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o \
             "${STAGE}/"
 
-          # Docs, for parity with what the AUR package puts in
+          # Docs, for parity with what pkg/PKGBUILD puts in
           # /usr/share/doc. `cfc status` points users at TROUBLESHOOTING.md
           # by name, so it has to actually ship.
           install -m644 \
@@ -200,6 +212,9 @@ jobs:
             docs/HARDENING.md \
             docs/TROUBLESHOOTING.md \
             "${STAGE}/"
+
+          # The tarball's installer and uninstaller, from the same manifest.
+          ./scripts/tarball-installers.sh "${STAGE}"
 
           tar --zstd -C "$(dirname "${STAGE}")" -cf "${NAME}.tar.zst" "${NAME}"
           sha256sum "${NAME}.tar.zst" > SHA256SUMS
@@ -236,8 +251,9 @@ jobs:
             SHA256SUMS
             RELEASE_BODY.md
 
-  # Build pkg/PKGBUILD for real against the freshly pushed tag, and produce
-  # the AUR-submittable artifacts (PKGBUILD with real checksums + .SRCINFO).
+  # Build pkg/PKGBUILD for real against the freshly pushed tag, and attach
+  # the Arch packaging recipe (PKGBUILD with real checksums + .SRCINFO) to
+  # the release. The project is not published on the AUR.
   #
   # Hard gate, no continue-on-error: at tag time the source= URL
   # (.../archive/v$pkgver.tar.gz) resolves, because GitHub generates the
@@ -246,7 +262,9 @@ jobs:
   pkgbuild:
     if: github.ref_type == 'tag'
     # Package only after the main build succeeds. Publishing runs separately
-    # with write permission after both builds complete.
+    # with write permission after both builds complete. build has already
+    # refused a tag other than v<Cargo version> and run check-versions.sh,
+    # which holds pkgver to that version, so pkgver matches the tag here.
     needs: build
     runs-on: ubuntu-latest
     container: archlinux:base-devel
@@ -274,20 +292,12 @@ jobs:
           useradd -m builder
           chown -R builder: .
 
-      - name: Verify pkgver matches the tag
-        run: |
-          PKGVER="$(sed -n 's/^pkgver=//p' pkg/PKGBUILD | head -n1)"
-          if [ "${{ github.ref_name }}" != "v${PKGVER}" ]; then
-            echo "::error::pkg/PKGBUILD pkgver=${PKGVER} does not match tag ${{ github.ref_name }}"
-            exit 1
-          fi
-
       - name: updpkgsums - replace the SKIP placeholder with real checksums
         working-directory: pkg
         run: |
           runuser -u builder -- updpkgsums PKGBUILD
           # A remote (non-VCS) source with sha256sums=('SKIP') is not
-          # acceptable AUR practice: it disables integrity checking of the
+          # acceptable Arch packaging practice: it disables integrity checking of the
           # release tarball entirely.
           if grep -qE "^sha256sums=\(.*'SKIP'" PKGBUILD; then
             echo "::error::pkg/PKGBUILD still has a SKIP checksum after updpkgsums"
@@ -308,8 +318,8 @@ jobs:
           # An undotted copy is what gets attached: GitHub renames dot-leading
           # asset filenames (`.SRCINFO` became `default.SRCINFO`), so the
           # published name never matched what the README told people to
-          # download. Ship a name GitHub keeps; the AUR checkout renames it
-          # back to `.SRCINFO` locally.
+          # download. Ship a name GitHub keeps; whoever builds from it renames
+          # it back to `.SRCINFO` locally.
           cp .SRCINFO SRCINFO
 
       - name: namcap the PKGBUILD
@@ -359,7 +369,7 @@ jobs:
             exit 1
           fi
 
-      - name: Upload AUR artifacts
+      - name: Upload Arch packaging artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aur-assets
@@ -374,11 +384,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Signed build provenance for the tarball (actions/attest below).
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-assets
           path: release-assets
+      # SHA256SUMS is uploaded beside the tarball, so whoever can edit the
+      # release can replace both. This Sigstore-signed SLSA provenance binds
+      # the tarball's digest to this repository's release workflow and commit
+      # instead: `gh attestation verify <tarball> --repo
+      # Project-Colony/Colony-Firewall-Control`. It runs here rather than in
+      # build so no build script can mint the job's OIDC token.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/colony-firewall-control-*.tar.zst
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: github.ref_type == 'tag'
         with:
@@ -389,12 +411,16 @@ jobs:
         with:
           draft: true
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.build.outputs.version) }}
+          # A dispatch has no tag yet: publishing the draft creates it, and
+          # without this it would point at the default branch rather than
+          # the commit the assets were built from. Ignored when the tag exists.
+          target_commitish: ${{ github.sha }}
           name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.build.outputs.version) }}
           body_path: release-assets/RELEASE_BODY.md
           files: |
             release-assets/colony-firewall-control-*.tar.zst
             release-assets/SHA256SUMS
-      - name: Attach AUR artifacts
+      - name: Attach Arch packaging artifacts
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:

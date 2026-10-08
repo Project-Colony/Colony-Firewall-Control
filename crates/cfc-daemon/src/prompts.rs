@@ -104,8 +104,9 @@ struct RouterInner {
     /// resolution path to remove an id sends the verdict.
     pending: Mutex<HashMap<u64, PromptBinding>>,
     broadcast_tx: broadcast::Sender<pb::PromptEvent>,
-    /// Census of live `StreamPrompts` subscribers: peer uid -> how many
-    /// streams that uid has open. Maintained by [`PromptSubscription`],
+    /// Census of live *answering* `StreamPrompts` subscribers (root, or the
+    /// official app and tray): peer uid -> how many streams that uid has
+    /// open. Read-only watchers are not counted. Maintained by [`PromptSubscription`],
     /// which registers on creation and deregisters on drop, so it tracks
     /// the broadcast receivers exactly as closely as
     /// `broadcast_tx.receiver_count()` did - a stream whose client has gone
@@ -180,15 +181,30 @@ impl PromptRouter {
     ///
     /// The uid is the kernel-reported `SO_PEERCRED` uid of the client, not
     /// anything the client said about itself; it decides which prompts the
-    /// subscription may see (see [`should_deliver`]) and is counted in the
-    /// router's census until the returned value is dropped.
-    pub fn subscribe(&self, peer_uid: u32) -> PromptSubscription {
-        self.inner.register(peer_uid);
+    /// subscription may see (see [`should_deliver`]).
+    ///
+    /// `answering` says whether this peer may answer what it is shown (root,
+    /// or the official app and tray). Only such a subscription is counted in
+    /// the router's census, until the returned value is dropped: a read-only
+    /// watcher sees prompts but is not a UI, so it must not hold a prompt for
+    /// `prompt_timeout_secs` that nobody can answer instead of letting
+    /// `no_ui_action` apply now.
+    pub fn subscribe(&self, peer_uid: u32, answering: bool) -> PromptSubscription {
+        if answering {
+            self.inner.register(peer_uid);
+        }
         PromptSubscription {
             rx: self.inner.broadcast_tx.subscribe(),
             inner: self.inner.clone(),
-            uid: peer_uid,
+            uid: answering.then_some(peer_uid),
         }
+    }
+
+    /// Whether an answering subscriber may see a prompt about `uid`'s
+    /// process.
+    #[cfg(test)]
+    pub(crate) fn has_answering_ui(&self, uid: u32) -> bool {
+        self.inner.has_audience(Some(uid))
     }
 
     /// Resolves a pending prompt with the user's verdict. Returns what the
@@ -247,6 +263,7 @@ impl PromptRouter {
             // Said before the user answers, because "your allow will follow
             // the hash, not the path" changes what clicking Allow means.
             binds_to_hash: binding.hash_expected,
+            undecided_rule_id: req.undecided.map(|id| id.to_string()).unwrap_or_default(),
         };
 
         self.inner.pending.lock().insert(prompt_id, binding);
@@ -292,7 +309,8 @@ impl PromptRouter {
 pub struct PromptSubscription {
     rx: broadcast::Receiver<pb::PromptEvent>,
     inner: Arc<RouterInner>,
-    uid: u32,
+    /// The census entry this subscription holds; `None` for a read-only one.
+    uid: Option<u32>,
 }
 
 impl PromptSubscription {
@@ -307,7 +325,9 @@ impl PromptSubscription {
 
 impl Drop for PromptSubscription {
     fn drop(&mut self) {
-        self.inner.unregister(self.uid);
+        if let Some(uid) = self.uid {
+            self.inner.unregister(uid);
+        }
     }
 }
 
@@ -342,6 +362,8 @@ fn compute_binding(process: &cfc_core::Process) -> PromptBinding {
     // certainly not root-sealed. Never re-read a PID here: it may have exec'd
     // or been recycled since the worker recorded this process.
     // The sealed check rejects symlinks instead of re-resolving this snapshot.
+    // The resolver publishes a path only if it names the mapped image here or
+    // names nothing here, so a sealed path is the host file that was running.
     if cfc_core::exe_path::is_root_sealed(&exe).unwrap_or(false) {
         return PromptBinding {
             exe: Some(exe),
@@ -437,6 +459,7 @@ mod tests {
                 443,
             ),
             process: Process::unknown(1),
+            undecided: None,
         }
     }
 
@@ -496,7 +519,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stats = Stats::new();
         let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
-        let _sub = router.subscribe(1000);
+        let _sub = router.subscribe(1000, true);
 
         router.enqueue(req_owned_by(5, 1001), PromptBinding::default());
 
@@ -510,11 +533,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_read_only_subscriber_does_not_count_as_a_ui() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stats = Stats::new();
+        let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
+        let mut watcher = router.subscribe(1000, false);
+
+        // Only a watcher: no_ui_action now, nothing held for the timeout.
+        router.enqueue(req_owned_by(1, 1000), PromptBinding::default());
+        let pv = rx.try_recv().expect("no_ui_action applies immediately");
+        assert_eq!(pv.verdict.source, VerdictSource::DefaultPolicy);
+        assert_eq!(stats.prompts_pending(), 0);
+
+        // With an answering UI it waits, and the watcher sees it too.
+        let _ui = router.subscribe(1000, true);
+        router.enqueue(req_owned_by(2, 1000), PromptBinding::default());
+        assert!(
+            rx.try_recv().is_err(),
+            "an answering UI makes the prompt wait"
+        );
+        assert_eq!(watcher.recv().await.unwrap().prompt_id, "2");
+    }
+
+    #[tokio::test]
     async fn a_prompt_a_subscriber_may_see_is_broadcast() {
         let (tx, rx) = std::sync::mpsc::channel();
         let stats = Stats::new();
         let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
-        let mut sub = router.subscribe(1000);
+        let mut sub = router.subscribe(1000, true);
 
         router.enqueue(req_owned_by(6, 1000), PromptBinding::default());
 
@@ -527,7 +573,7 @@ mod tests {
     async fn a_root_subscriber_is_an_audience_for_every_prompt() {
         let (tx, rx) = std::sync::mpsc::channel();
         let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
-        let mut sub = router.subscribe(0);
+        let mut sub = router.subscribe(0, true);
 
         router.enqueue(req_owned_by(8, 1001), PromptBinding::default());
 
@@ -542,8 +588,8 @@ mod tests {
 
         // Two windows for the same uid: the first drop must not deregister
         // the session.
-        let sub_a = router.subscribe(1000);
-        let sub_b = router.subscribe(1000);
+        let sub_a = router.subscribe(1000, true);
+        let sub_b = router.subscribe(1000, true);
         drop(sub_a);
         router.enqueue(req_owned_by(1, 1000), PromptBinding::default());
         assert!(rx.try_recv().is_err(), "uid 1000 still has a UI open");
@@ -591,11 +637,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_undecided_prompt_carries_its_rule_id() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+        let mut ui = router.subscribe(1000, true);
+        let rule = uuid::Uuid::new_v4();
+        router.enqueue(
+            PromptRequest {
+                undecided: Some(rule),
+                ..req(3)
+            },
+            PromptBinding::default(),
+        );
+        router.enqueue(req(4), PromptBinding::default());
+        assert_eq!(ui.recv().await.unwrap().undecided_rule_id, rule.to_string());
+        assert_eq!(ui.recv().await.unwrap().undecided_rule_id, "");
+    }
+
+    #[tokio::test]
+    async fn with_no_answering_ui_an_undecided_prompt_gets_no_ui_action() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
+        let _watcher = router.subscribe(1000, false);
+        router.enqueue(
+            PromptRequest {
+                undecided: Some(uuid::Uuid::new_v4()),
+                ..req(9)
+            },
+            PromptBinding::default(),
+        );
+        let pv = rx.try_recv().expect("no_ui_action applies immediately");
+        assert_eq!(pv.prompt_id, 9);
+        assert_eq!(pv.verdict.source, VerdictSource::DefaultPolicy);
+    }
+
+    #[tokio::test]
     async fn user_answer_resolves_exactly_once() {
         let (tx, rx) = std::sync::mpsc::channel();
         let stats = Stats::new();
         let router = PromptRouter::new(shared(dp(3600)), stats.clone(), tx);
-        let mut sub = router.subscribe(1000);
+        let mut sub = router.subscribe(1000, true);
 
         router.enqueue(req(1), PromptBinding::default());
         let event = sub.recv().await.unwrap();
@@ -643,7 +724,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let stats = Stats::new();
         let router = PromptRouter::new(shared(dp(1)), stats.clone(), tx);
-        let _sub = router.subscribe(1000); // keep a UI "connected"
+        let _sub = router.subscribe(1000, true); // keep a UI "connected"
 
         router.enqueue(req(9), PromptBinding::default());
         assert_eq!(stats.prompts_pending(), 1);
@@ -746,7 +827,7 @@ mod tests {
         // returns - the three legs the persist path stands on.
         let (tx, _rx) = std::sync::mpsc::channel();
         let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
-        let mut sub = router.subscribe(1000);
+        let mut sub = router.subscribe(1000, true);
 
         let binding = PromptBinding {
             exe: Some(std::path::PathBuf::from("/home/u/.local/bin/tool")),
@@ -770,7 +851,7 @@ mod tests {
     async fn a_sealed_prompt_does_not_announce_a_binding() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let router = PromptRouter::new(shared(dp(3600)), Stats::new(), tx);
-        let mut sub = router.subscribe(1000);
+        let mut sub = router.subscribe(1000, true);
         router.enqueue(req_owned_by(10, 1000), PromptBinding::default());
         let event = sub.recv().await.unwrap();
         assert!(!event.binds_to_hash);

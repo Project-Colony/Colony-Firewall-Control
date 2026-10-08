@@ -29,7 +29,12 @@ Exit codes:
   4  daemon unreachable (not running, stale socket, or no socket permission)
 
 Anywhere a rule id is accepted you may also pass a unique id prefix or the
-rule's name.";
+rule's name.
+
+Changing the firewall (adding, editing, removing or importing rules, pause and
+resume, answering prompts) needs root: run cfc with sudo, or use the Colony
+Firewall app or tray. As a regular user cfc is read-only and the daemon
+answers a change with the reason it refused it (exit 1).";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -40,7 +45,7 @@ rule's name.";
 )]
 struct Cli {
     #[arg(long, global = true, default_value = cfc_proto::DEFAULT_SOCKET_PATH)]
-    socket: Option<PathBuf>,
+    socket: PathBuf,
 
     /// Output format. `json` is machine-readable; streaming commands emit
     /// NDJSON (one object per line).
@@ -63,12 +68,6 @@ impl Cli {
             self.output.unwrap_or(OutputFormat::Human)
         }
     }
-
-    fn socket(&self) -> PathBuf {
-        self.socket
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH))
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -80,15 +79,17 @@ enum Command {
     },
     /// Show daemon status.
     Status,
-    /// Rules CRUD.
+    /// Rules CRUD (changes need sudo).
     Rules {
         #[command(subcommand)]
         cmd: RulesCmd,
     },
-    /// Answer connection prompts from this terminal.
+    /// Answer connection prompts from this terminal (needs sudo).
     ///
     /// Without a subscriber the daemon applies its no-UI action to every
-    /// prompt, so this is how a headless machine gets a say.
+    /// prompt, so this is how a headless machine gets a say: run it as
+    /// `sudo cfc prompts`. As a regular user it only watches; the daemon
+    /// neither counts it as a UI nor accepts its answers.
     ///
     /// Keys: a=allow, d=deny, r=reject, s=skip (let it time out), q=quit.
     /// Then a duration (1=once, 2=until restart, 3=always) and, for the
@@ -113,15 +114,16 @@ enum Command {
     },
     /// Query the persisted verdict log ("what did this app contact?").
     Log(events::LogArgs),
-    /// Temporarily allow all flows.
+    /// Temporarily allow all flows (needs sudo; the app and tray ask for an
+    /// administrator password instead).
     Pause {
         /// How long to stay paused, e.g. 30m, 2h. Omitted means the
         /// daemon's configured default; the daemon clamps the maximum.
         #[arg(long = "for", value_name = "DURATION",
-              value_parser = humantime::parse_duration_arg)]
+              value_parser = humantime::parse_duration)]
         duration: Option<std::time::Duration>,
     },
-    /// Resume normal filtering immediately.
+    /// Resume normal filtering immediately (needs sudo).
     Resume,
     /// Print a shell completion script.
     #[command(hide = true)]
@@ -146,15 +148,15 @@ enum RulesCmd {
     List,
     /// Show every field of one rule.
     Show { id: String },
-    /// Delete a rule.
+    /// Delete a rule (needs sudo).
     Remove { id: String },
-    /// Flip a rule's enabled state.
+    /// Flip a rule's enabled state (needs sudo).
     Toggle { id: String },
-    /// Enable a rule (idempotent).
+    /// Enable a rule (idempotent; needs sudo).
     Enable { id: String },
-    /// Disable a rule (idempotent).
+    /// Disable a rule (idempotent; needs sudo).
     Disable { id: String },
-    /// Add a new rule.
+    /// Add a new rule (needs sudo).
     Add(rules::AddArgs),
     /// Export all rules as JSON to stdout.
     Export {
@@ -162,7 +164,7 @@ enum RulesCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Import rules from a JSON file (or stdin if omitted).
+    /// Import rules from a JSON file, or stdin if omitted (needs sudo).
     Import {
         /// File to read; reads stdin if omitted.
         file: Option<PathBuf>,
@@ -170,15 +172,23 @@ enum RulesCmd {
         #[arg(long)]
         replace: bool,
     },
-    /// Import rules from an opensnitch rules directory or single JSON file.
+    /// Import rules from an opensnitch rules directory or single JSON file (needs sudo).
+    ///
+    /// Rules with no faithful equivalent here (hostnames, regexps, unknown
+    /// operands) cannot be converted. By default one of them stops the import
+    /// before anything changes, because dropping a narrow deny while importing
+    /// a broad allow imports a wider policy than the source.
     ImportOpensnitch {
         /// Path to opensnitch rules dir (e.g. /etc/opensnitchd/rules) or a single .json.
         path: PathBuf,
         /// Replace mode: make the rule set match the source in one atomic batch. Every source rule must validate before anything changes.
         #[arg(long)]
         replace: bool,
+        /// Import the rules that convert and skip, with a reason, those that do not.
+        #[arg(long, conflicts_with = "replace")]
+        skip_unconvertible: bool,
     },
-    /// Install a small set of sensible starter rules: system DNS, NTP
+    /// Install a small set of sensible starter rules (needs sudo): system DNS, NTP
     /// (timesyncd/chrony), DHCP clients (dhcpcd/NetworkManager/networkd),
     /// pacman/paru HTTPS, and the SSH client.
     BootstrapDefaults {
@@ -186,7 +196,7 @@ enum RulesCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install or remove a named set of allow rules.
+    /// Install or remove a named set of allow rules (needs sudo).
     ///
     /// Every outbound rule in a bundle names an executable - there is no way
     /// to write "allow tcp/443" here, because a payload phoning home uses 443
@@ -219,8 +229,11 @@ enum BundleCmd {
     },
     /// Remove the rules a bundle installed.
     ///
-    /// Matches the bundle's exact rule names, never a prefix, so a rule you
-    /// wrote yourself is never caught by it.
+    /// Matches the ids the bundle gave its rules, never a name or a prefix,
+    /// so a rule you wrote yourself is never caught by it. Rules seeded
+    /// before 0.7.0 are removed only while identical to what the entry
+    /// installs now or installed then.
+    /// A bundle rule you edited into a deny or reject is kept.
     Remove {
         /// Bundle name (see `cfc rules bundle list`).
         name: String,
@@ -238,10 +251,11 @@ fn main() {
             (Some(id), None) => confinement::gate(id),
             _ => Err(anyhow::anyhow!("invalid application gate invocation")),
         };
+        // The unit sends this stream to the journal; the launcher points there.
         if let Err(error) = result {
-            eprintln!("cfc: {}", output::terminal_safe(&error.to_string()));
+            eprintln!("cfc: {}", output::terminal_safe(&format!("{error:#}")));
         }
-        std::process::exit(error::EXIT_RUNTIME);
+        std::process::exit(confinement::GATE_REFUSED);
     }
     cli_main();
 }
@@ -300,7 +314,7 @@ async fn cli_main() {
 
 async fn run(cli: Cli) -> CliResult {
     let format = cli.format();
-    let socket = cli.socket();
+    let socket = cli.socket;
 
     match cli.cmd {
         Command::Applications { cmd } => confinement::run(cmd, format).await.map_err(Into::into),
@@ -360,9 +374,11 @@ async fn dispatch(
             RulesCmd::Import { file, replace } => {
                 rules::import(client, file, replace, format).await
             }
-            RulesCmd::ImportOpensnitch { path, replace } => {
-                rules::import_opensnitch(client, path, replace, format).await
-            }
+            RulesCmd::ImportOpensnitch {
+                path,
+                replace,
+                skip_unconvertible,
+            } => rules::import_opensnitch(client, path, replace, skip_unconvertible, format).await,
             RulesCmd::Bundle { cmd } => match cmd {
                 BundleCmd::List => rules::bundle_list(client, format).await,
                 BundleCmd::Add { name, dry_run } => {
@@ -397,7 +413,6 @@ struct StatusJson {
     uptime_seconds: u64,
     enforcing: bool,
     enforcement: String,
-    fast_allow: String,
     paused: bool,
     resume_at_unix_ms: i64,
     resume_at: Option<String>,
@@ -420,7 +435,6 @@ fn status_json(s: &proto::StatusResponse, now_unix_ms: i64) -> StatusJson {
         uptime_seconds: s.uptime_seconds,
         enforcing: s.enforcing,
         enforcement: s.enforcement.clone(),
-        fast_allow: s.fast_allow.clone(),
         paused: s.paused,
         resume_at_unix_ms: s.resume_at_unix_ms,
         resume_at: output::rfc3339(s.resume_at_unix_ms),
@@ -481,19 +495,6 @@ fn enforcement_cell(level: &str) -> String {
     }
 }
 
-/// The fast-allow cell: the daemon's own sentence, or why there is none.
-///
-/// The daemon already spells this one out (`live`, or `off: ` and the reason
-/// the path is inert), so the CLI only has to name the value the daemon cannot
-/// send: the proto3 default, which is what a daemon without the field answers
-/// and also what a daemon whose startup has not decided yet answers.
-fn fast_allow_cell(level: &str) -> String {
-    match level {
-        "" => "unknown (still starting, or this daemon is too old to say)".to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn paused_cell(s: &proto::StatusResponse, now_unix_ms: i64) -> String {
     if !s.paused {
         return "no".to_string();
@@ -527,7 +528,6 @@ async fn cmd_status(client: &mut Client, format: OutputFormat) -> CliResult {
         if s.enforcing { "yes" } else { "no" }
     );
     println!("  in-kernel      {}", enforcement_cell(&s.enforcement));
-    println!("  fast-allow     {}", fast_allow_cell(&s.fast_allow));
     println!("paused           {}", paused_cell(&s, now));
     println!("rules            {}", s.rules_count);
     println!("prompts pending  {}", s.prompts_pending);
@@ -614,7 +614,6 @@ mod tests {
             skipped_rules: 0,
             enforcing: true,
             enforcement: "pinned".to_string(),
-            fast_allow: "live".to_string(),
         }
     }
 
@@ -640,7 +639,7 @@ mod tests {
     fn global_flags_work_after_the_subcommand() {
         let cli = Cli::parse_from(["cfc", "rules", "list", "--json", "--socket", "/tmp/x.sock"]);
         assert!(cli.format().is_json());
-        assert_eq!(cli.socket(), PathBuf::from("/tmp/x.sock"));
+        assert_eq!(cli.socket, PathBuf::from("/tmp/x.sock"));
     }
 
     #[test]
@@ -688,7 +687,7 @@ mod tests {
     #[test]
     fn socket_defaults_to_the_shared_constant() {
         let cli = Cli::parse_from(["cfc", "status"]);
-        assert_eq!(cli.socket(), PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH));
+        assert_eq!(cli.socket, PathBuf::from(cfc_proto::DEFAULT_SOCKET_PATH));
     }
 
     #[test]
@@ -772,34 +771,12 @@ mod tests {
         assert_eq!(v["warnings"].as_array().unwrap().len(), 2);
     }
 
-    /// The daemon's sentence passes through untouched in both output modes;
-    /// only its absence gets words, and those must not read as an answer.
+    /// The proto3 default is what an older daemon sends, and what a new one
+    /// sends before startup has answered; the text mode must say what the
+    /// blank means rather than print nothing.
     #[test]
-    fn fast_allow_passes_through_and_names_its_own_absence() {
-        let now = 1_700_000_000_000;
-        let mut s = status(false, 0);
-        let v = serde_json::to_value(status_json(&s, now)).unwrap();
-        assert_eq!(v["fast_allow"], "live");
-
-        s.fast_allow = "off: [ebpf] fast_allow is not set".to_string();
-        let v = serde_json::to_value(status_json(&s, now)).unwrap();
-        assert_eq!(v["fast_allow"], "off: [ebpf] fast_allow is not set");
-        assert_eq!(fast_allow_cell(&s.fast_allow), s.fast_allow);
-        assert_eq!(fast_allow_cell("live"), "live");
-
-        // The proto3 default is what an older daemon sends, and what a new
-        // one sends before startup has answered. JSON keeps it verbatim so a
-        // script can tell "" from a real value; the text mode says what the
-        // blank means, as the enforcement cell does for its own.
-        s.fast_allow = String::new();
-        let v = serde_json::to_value(status_json(&s, now)).unwrap();
-        assert_eq!(v["fast_allow"], "");
-        let cell = fast_allow_cell("");
-        assert!(cell.starts_with("unknown ("), "{cell}");
-        assert!(
-            enforcement_cell("").starts_with("unknown ("),
-            "the two cells must agree on how an absent answer reads"
-        );
+    fn an_absent_enforcement_level_reads_as_unknown() {
+        assert!(enforcement_cell("").starts_with("unknown ("));
     }
 
     #[test]

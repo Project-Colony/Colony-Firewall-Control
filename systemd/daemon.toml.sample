@@ -87,9 +87,9 @@ profile = "balanced"
 [nfqueue]
 # NFQUEUE number. Must match the `queue num N` in the nftables/iptables rule
 # that enqueues packets. If they disagree, packets queue to a number nobody
-# consumes - which under the shipped fail-closed rule is a total outbound
-# lockout. Bind failure is fatal: the daemon exits non-zero rather than
-# running while enforcing nothing.
+# consumes - which under the shipped fail-closed rule is an outbound lockout
+# for everything except new loopback flows. Bind failure is fatal: the
+# daemon exits non-zero rather than running while enforcing nothing.
 queue_num = 0
 # Kernel queue length: how many packets may wait for a verdict before the
 # queue overflows. Raise it on a busy host that prompts a lot; each queued
@@ -98,7 +98,7 @@ queue_max_len = 4096
 # What the KERNEL does with packets when this queue overflows: false drops
 # them (fail-closed, default), true lets them through unfiltered
 # (fail-open). This setting must be false: true is rejected so overflow
-# cannot bypass policy or durable refusal auditing.
+# cannot bypass policy or refusal auditing.
 #
 # Not to be confused with the `bypass` keyword on the nftables rule, which
 # decides what happens when NO daemon is attached to the queue at all. This
@@ -206,10 +206,9 @@ enabled = true
 # #
 # # WHAT IT DOES NOT DO
 # # A process-wide Deny can refuse connect() in the kernel. Allow decisions and
-# # conditional rules still use NFQUEUE. Fast Allow is disabled in every
-# # configuration because a socket mark cannot identify the current sender.
-# # Neither this layer nor NFQUEUE confines inherited sockets, local relays or
-# # packet-layer traffic with CAP_NET_RAW.
+# # conditional rules still use NFQUEUE. Neither this layer nor NFQUEUE
+# # confines inherited sockets, local relays or packet-layer traffic with
+# # CAP_NET_RAW.
 # #
 # # REQUIREMENTS - all of which degrade to a warning, never to a failure to
 # # start. If any of this is missing the daemon logs what it could not do and
@@ -238,12 +237,8 @@ enabled = true
 # # /usr/lib/colony-firewall/cfc-ebpf.o. Point it at
 # # `cargo xtask ebpf-path` output when working on the programs themselves.
 # object_path = "/usr/lib/colony-firewall/cfc-ebpf.o"
-# # Compatibility settings retained for existing configuration files.
-# # Fast Allow is disabled. Setting true logs a warning and creates no grants;
-# # allowed connections continue through NFQUEUE. Keep this false.
-# fast_allow = false
-# # An old configured mark has no runtime effect while Fast Allow is disabled.
-# fast_allow_mark = 0x00033331
+# # fast_allow and fast_allow_mark are legacy keys from the removed Fast Allow
+# # path: ignored, and a warning is logged if either is set. Delete them.
 
 # Needs a restart (the socket is secured once, right after bind).
 [ipc]
@@ -256,20 +251,25 @@ enabled = true
 #
 #   1. The socket file. After bind the daemon chowns it to root:<group> and
 #      chmods it 0660, so the kernel refuses connect(2) to anyone outside
-#      the group. Group membership IS the credential - there is no in-band
-#      authentication, no per-user identity, no password.
-#   2. Peer credentials. Every connection carries SO_PEERCRED, and the
-#      daemon logs the calling uid/pid for every mutating RPC. Mutating
-#      RPCs (UpsertRule, DeleteRule, SetPaused, SubmitVerdict) need uid 0
-#      or a socket that is genuinely group-gated. Read-only RPCs
+#      the group. Membership is what lets a process connect at all.
+#   2. Peer identity. Every connection carries SO_PEERCRED. Read-only RPCs
 #      (ListRules, GetStatus, ListEvents, StreamConnections, StreamPrompts)
-#      are open to any peer that got through layer 1.
+#      are open to any peer that got through layer 1. Changes (SubmitVerdict,
+#      UpsertRule, DeleteRule, SetPaused, ApplyRules) are accepted only from:
+#        - root (sudo cfc ...);
+#        - the installed Colony Firewall app and tray (official_clients
+#          below), run by a member of the group: the daemon checks that the
+#          calling process runs that exact installed, root-owned binary, is
+#          not traced, holds the connection itself and loaded no executable
+#          code from outside root-owned directories.
+#      Every other program of the desktop user is READ-ONLY, including a
+#      non-root `cfc`. Its prompt subscription is not counted as a UI, so
+#      no_ui_action still applies when only it is listening.
 #
-# Say it plainly: EVERY MEMBER OF THIS GROUP IS FULLY TRUSTED. Membership
-# grants the ability to allow or deny any traffic on this host. This is not
-# a multi-user privilege boundary - add only administrators of this machine.
+# Group membership therefore no longer grants control by itself: it gives
+# the desktop session read access and lets the app and tray connect.
 #
-# One exception to "any group member can do anything": prompt answers.
+# Prompt answers have one more check.
 # Prompts are addressed by the uid that owns the process they are about.
 # A StreamPrompts subscription is only handed a prompt when the subscriber's
 # uid matches that owner, and only a peer a prompt was actually handed to
@@ -292,9 +292,17 @@ enabled = true
 # `usermod -aG colony-firewall <your-user>` and log back in.
 group = "colony-firewall"
 
-# Whether a non-root peer must reach the daemon through a genuinely
-# group-gated socket before it may change anything. Leave this true. Set it
-# to false only if you gate the socket some other way (e.g. filesystem
-# ACLs); with it false, any process that manages to connect can rewrite
-# your firewall rules.
+# Whether the official app and tray must be run by a proved member of the
+# group before they may change anything. Leave this true. Setting it to false
+# waives only the group check, never the official-client check: every other
+# non-root program stays read-only either way.
 require_group = true
+
+# The only non-root programs that may answer prompts, edit rules and ask to
+# pause: absolute paths of the installed GUI and tray. Each must be a
+# root-owned file that only root can write, in root-owned directories that
+# only root can write; an entry that is not is reported at startup and that
+# program stays read-only. After an upgrade, restart the app and tray: a
+# process still running the replaced binary is read-only until then.
+# Bound at startup (restart the daemon to change it).
+#official_clients = ["/usr/bin/colony-firewall", "/usr/bin/colony-firewall-tray"]

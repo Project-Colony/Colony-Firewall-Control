@@ -5,10 +5,19 @@ package cfc.v1;
 // Colony Firewall Control IPC schema.
 // Spoken between the root daemon (server) and UI/CLI clients over a Unix
 // domain socket.
+//
+// Authorization: reading (ListRules, GetStatus, ListEvents, the two streams)
+// is open to any peer that can connect. Changes (SubmitVerdict, UpsertRule,
+// DeleteRule, ApplyRules, SetPaused) are accepted from root and from the
+// installed Colony Firewall app and tray only; every other peer gets
+// PERMISSION_DENIED with the reason. ApplyRules and SetPaused from the app or
+// tray also need a polkit authorization, which may keep the call waiting on
+// a password dialog for up to 120 s.
 
 service Firewall {
   // The UI subscribes once and receives a streaming feed of new connections
-  // that need a verdict from the user.
+  // that need a verdict from the user. Any peer may subscribe; only one that
+  // may answer (root, the official app or tray) counts as a connected UI.
   rpc StreamPrompts(SubscribeRequest) returns (stream PromptEvent);
 
   // The UI returns a verdict for a specific prompt id.
@@ -18,7 +27,8 @@ service Firewall {
   rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
   rpc UpsertRule(UpsertRuleRequest) returns (UpsertRuleResponse);
   rpc DeleteRule(DeleteRuleRequest) returns (DeleteRuleResponse);
-  // Validate and apply a complete import atomically.
+  // Validate and apply a complete import atomically. From the app or tray
+  // it needs polkit action org.projectcolony.firewall.import-rules.
   rpc ApplyRules(ApplyRulesRequest) returns (ApplyRulesResponse);
 
   // Live observed connections (for the live view, no verdict requested).
@@ -32,7 +42,8 @@ service Firewall {
   // flow no rule matched is allowed straight through instead of raising a
   // prompt. A pause always ends by itself: duration_secs (or the daemon's
   // [pause] default_secs when 0) is clamped to at most 24h, and the
-  // response reports the resume deadline.
+  // response reports the resume deadline. Pausing and resuming from the app
+  // or tray need polkit action org.projectcolony.firewall.pause.
   rpc SetPaused(SetPausedRequest) returns (SetPausedResponse);
 
   // Persisted verdict/audit log, newest first. Read-only.
@@ -55,6 +66,11 @@ message PromptEvent {
   // hash-bound deny is one file swap away from not applying, while the
   // path-bound one covers whatever bytes sit there next.
   bool binds_to_hash = 5;
+  // Set when a rule may apply but the process identity (exe, uid or digest)
+  // is incomplete, so the rule could not be decided: the UI shows the
+  // identity as unknown and names this rule. The answer applies to this
+  // connection. Empty when no rule is about the flow.
+  string undecided_rule_id = 6;
 }
 
 message VerdictRequest {
@@ -88,6 +104,9 @@ message ConnectionEvent {
   ConnectionInfo connection = 1;
   ProcessInfo process = 2;
   Action verdict = 3;
+  // The rule that answered, or, when `verdict` did not come from a rule, the
+  // rule that could not be decided because the process identity was
+  // incomplete (see PromptEvent.undecided_rule_id). Empty otherwise.
   string rule_id = 4;
 }
 
@@ -227,8 +246,10 @@ message StatusResponse {
   Action no_ui_action = 11;
   uint32 prompt_timeout_secs = 12;
 
-  // Rule rows the last storage load could not deserialize. Non-zero means
-  // rules exist on disk that are NOT being enforced.
+  // Rule rows the last storage load did not load: they could not be
+  // deserialized, or they fail the API's own rule checks and were
+  // quarantined. Non-zero means rules exist on disk that are NOT being
+  // enforced.
   uint64 skipped_rules = 13;
 
   // Best-effort "packets are actually reaching us" signal. False means the
@@ -251,17 +272,10 @@ message StatusResponse {
   // "pinned" and "inherited" are the two that survive the daemon.
   string enforcement = 15;
 
-  // Whether process-wide allows are skipping the queue: "live", "off: <why>",
-  // or empty when the daemon predates this field or startup has not answered
-  // yet.
-  //
-  // It carries its reason because the path has several ways to be inert
-  // with nothing else changing - the switch left off, an attach inherited
-  // from a build without it, a kernel whose verifier lacks bpf_setsockopt on
-  // sock_addr, exit tracking without group_dead, an nftables set the snippet
-  // does not declare - and an allow that quietly takes the slow path looks
-  // exactly like one that is working, only later.
-  string fast_allow = 16;
+  // Field 16 was `fast_allow`, the state of the removed Fast Allow path.
+  // Never reuse the number or the name.
+  reserved 16;
+  reserved "fast_allow";
 }
 
 message SetPausedRequest {
@@ -294,6 +308,9 @@ message Event {
   Action action = 11;
   // Verdict provenance: "rule" | "user" | "default" | "timeout".
   string source = 12;
+  // The rule that answered when `source` is "rule". With any other source, a
+  // non-empty id names the rule that could not be decided because the
+  // process identity was incomplete.
   string rule_id = 13;
 }
 

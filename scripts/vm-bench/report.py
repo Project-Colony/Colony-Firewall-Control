@@ -56,7 +56,7 @@ def main(path):
         return sorted(int(k.rsplit("-", 1)[1]) for k in out
                       if k.rsplit("-", 1)[0] == prefix and k.rsplit("-", 1)[1].isdigit())
 
-    q, f, fl, po = (counts(x) for x in ("queue", "fast", "floor", "poll200us"))
+    q, fl, po = (counts(x) for x in ("queue", "floor", "poll200us"))
     print("\nreadings (p50 of the `out` direction, the one that meets the queue)")
     if len(q) > 1:
         pair(f"queue-{q[-1]}", f"queue-{q[0]}",
@@ -64,10 +64,6 @@ def main(path):
     for n in po:
         pair(f"poll200us-{n}", f"queue-{n}",
              f"{n} flows: a 200us idle beat against the 5ms one")
-    for n in f:
-        pair(f"fast-{n}", f"queue-{n}", f"{n} flows: the fast path against the queue")
-    for n in sorted(set(f) & set(fl)):
-        pair(f"fast-{n}", f"floor-{n}", f"{n} flows: what the fast path costs over nothing")
     if len(fl) > 1:
         pair(f"floor-{fl[-1]}", f"floor-{fl[0]}",
              f"the floor itself, {fl[-1]} flows against {fl[0]}")

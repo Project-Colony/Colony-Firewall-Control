@@ -78,10 +78,10 @@ profile = "balanced"
 [storage]
 path = "${DB}"
 [ipc]
-# This test runs unprivileged against a socket in a temp dir, so it can be
-# neither root-owned nor gated by the colony-firewall group. Without this
-# the daemon (correctly) refuses every mutating RPC and the test can only
-# exercise the read-only half of the CLI. Production keeps the default.
+# This test runs the daemon and cfc as the same unprivileged user, and a
+# client with the daemon's own uid has full control, so writes pass without
+# this. The key only waives the group check for the installed app and tray;
+# it is kept as a harmless reminder that this socket is not group-gated.
 require_group = false
 EOF
 

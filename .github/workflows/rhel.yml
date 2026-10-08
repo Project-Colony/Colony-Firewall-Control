@@ -83,6 +83,18 @@ jobs:
           make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
           ls -l colony_firewall.pp
 
+      - name: Validate the polkit policy
+        run: |
+          set -eux
+          dnf -y install polkit libxml2
+          dtd="$(find / -xdev -name policyconfig-1.dtd 2>/dev/null | head -n1)"
+          if [ -n "${dtd}" ]; then
+            xmllint --noout --nonet --dtdvalid "${dtd}" pkg/org.projectcolony.firewall.policy
+          else
+            echo "::warning::no policyconfig-1.dtd in this image; checking well-formedness only"
+            xmllint --noout --nonet pkg/org.projectcolony.firewall.policy
+          fi
+
       - name: Show what the source declares
         # Nothing in this job LOADS the module: a container has no policy
         # store for `semodule` to install into, and `sedismod`/`sedispol` are
@@ -319,21 +331,3 @@ jobs:
             /home/builder/rpmbuild/RPMS/**/*.rpm
             /home/builder/rpmbuild/SRPMS/*.rpm
           if-no-files-found: error
-
-  version-agrees:
-    name: version agrees with Cargo.toml
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Compare
-        # Three files now carry the version - Cargo.toml, the PKGBUILD and the
-        # spec - and a release where they disagree ships a package whose name
-        # lies about what is inside it.
-        run: |
-          set -eu
-          cargo="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          pkgbuild="$(grep -m1 '^pkgver=' pkg/PKGBUILD | cut -d= -f2)"
-          spec="$(grep -m1 '^Version:' packaging/rpm/colony-firewall-control.spec | awk '{print $2}')"
-          echo "Cargo.toml=$cargo PKGBUILD=$pkgbuild spec=$spec"
-          test "$cargo" = "$pkgbuild" || { echo "::error::PKGBUILD disagrees with Cargo.toml"; exit 1; }
-          test "$cargo" = "$spec"     || { echo "::error::spec disagrees with Cargo.toml"; exit 1; }

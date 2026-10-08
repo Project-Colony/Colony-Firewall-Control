@@ -13,8 +13,9 @@ Two long-running processes:
    [iced](https://iced.rs/).
 
 The CLI tool `cfc` shares the same gRPC client path as the UI, and covers
-the same surface: it can answer prompts (`cfc prompts`), which is how a
-headless machine gets a say.
+the same surface: it can answer prompts (`sudo cfc prompts`), which is how a
+headless machine gets a say. Run without sudo it is read-only (see
+[IPC and the trust model](#ipc-and-the-trust-model)).
 
 ```
 +----------------------------+     +----------------+
@@ -24,7 +25,7 @@ headless machine gets a say.
 +------------+---------------+     +-------+--------+
              |                             |
              |  tonic gRPC over UDS, 0660 root:colony-firewall
-             |  (SO_PEERCRED checked per RPC)
+             |  (peer process checked per change RPC)
              v                             v
 +--------------------------------------------------+
 |  colony-firewalld  (systemd, root)                |
@@ -50,7 +51,8 @@ headless machine gets a say.
 ```
 kernel (nftables OUTPUT hook)
    |
-   |  loopback / established,related / daemon refusal packets accepted
+   |  established,related / daemon refusal packets accepted
+   |  oifname lo ct state new   queue num 0 bypass  (accepted if no daemon)
    |  ct state new   queue num 0
    |  all other traffic dropped
    v
@@ -94,7 +96,9 @@ The worker keeps two maps that are created and destroyed together:
 
 - `waiters: HashMap<prompt_id, PendingPrompt>` holds the fallback and each
   parked packet's connection and process snapshot. A prompt answer is
-  checked against current policy for every packet; a new refusal takes precedence.
+  checked against current policy for every packet; a new refusal takes
+  precedence, and a rule's Allow takes precedence over a timeout or no-UI
+  fallback, though not over a user's own answer.
 - `pending_flows: HashMap<FlowKey, prompt_id>` - the deduplication index.
 
 Verdicts arrive asynchronously on a separate channel and are applied out of
@@ -115,12 +119,14 @@ lands just after the worker committed to a fresh wait. `scripts/vm-bench`
 attributes it - 4.90 ms of 5.67 at 300 flows, 5.24 ms of 7.61 at 3000, by
 building the same daemon with the constant at 200 us and measuring both in one
 boot. These are historical measurements, not a current performance guarantee.
-Fast Allow is disabled, so allowed flows also pay the queue round trip.
+Fast Allow was removed, so allowed flows also pay the queue round trip.
 
 **Prompt deduplication** requires the same UID, executable path, image digest,
 destination IP, destination port and protocol. Source address and port are
-excluded, so equivalent parallel connections may share a prompt. An incomplete
-identity never shares authorization. Persistent prompt Allows use the queued
+excluded, so equivalent parallel connections may share a prompt. An image over
+64 MiB has no digest; it shares by its path when that path is root-sealed, the
+same identity a path-only Allow for it uses. Any other incomplete identity
+never shares authorization. Persistent prompt Allows use the queued
 image digest; they never rehash a later image at a reused PID. A retargeted
 pathname cannot suppress the required hash binding.
 
@@ -133,8 +139,9 @@ disconnects entirely, every outstanding prompt gets its fallback applied so
 no packet is stranded.
 
 **Pause is not a kill switch.** Rules are still evaluated while paused;
-only the prompt is skipped, and only for flows that matched no rule. An
-explicit Deny or Reject rule keeps blocking. Pause has a deadline: the
+only the prompt is skipped, and only for flows that no rule is about. An
+explicit Deny or Reject rule keeps blocking, and a flow that a rule may be
+about but cannot be decided (see below) is still prompted. Pause has a deadline: the
 daemon clamps the requested duration (24h maximum), reports the real resume
 time, and auto-resumes.
 
@@ -155,8 +162,14 @@ hundred microseconds before the packet's latency becomes visible.
 2. **`/proc/net/{tcp,udp}{,6}` fallback**, silently, whenever the fast path
    misses. UDP always reads all relevant tables first and requires one unique
    compatible inode: exact or wildcard local address, with exact or zero
-   remote address. Missing tables, an exhausted lookup budget or several
-   compatible inodes leave attribution unknown. The packet's socket UID,
+   remote address. An unreadable table, an exhausted lookup budget or
+   several compatible inodes leave attribution unknown (with `--debug` the
+   journal says which: "table unreadable", "attribution budget expired",
+   "udp attribution ambiguous"); an absent table (`udp6` under
+   `ipv6.disable=1`) counts as empty. An unknown owner is judged like any
+   other incomplete identity: rules that name no program still answer, and
+   where a program rule may apply the flow is prompted with the identity
+   shown as unknown. The packet's socket UID,
    when present, filters candidates. All comparisons run on canonical form,
    so `::ffff:a.b.c.d`
    rows in the v6 tables match plain IPv4 flows - which is what dual-stack
@@ -166,12 +179,12 @@ hundred microseconds before the packet's latency becomes visible.
    walking `/proc/*/fd` for a `socket:[inode]` link. A shared or passed socket
    descriptor still does not identify which holder sent a packet.
 
-Two bounded caches avoid repeated socket walks and sealed-image hashing:
+Two bounded caches avoid repeated socket walks and image hashing:
 
 | Cache          | Key                                         | Lifetime |
 |----------------|---------------------------------------------|----------|
 | inode -> pid   | socket inode                                | 2s       |
-| sealed exe digest | dev, inode, length, mtime and ctime with nanoseconds | key change or eviction |
+| exe digest     | dev, inode, length, mtime and ctime with nanoseconds | key change or eviction |
 
 A complete process record is read on every resolution: exec changes policy
 identity without changing pid or start time. A cache hit on the inode cache
@@ -182,9 +195,18 @@ The binary's SHA-256 is read through `/proc/<pid>/exe`, so it hashes the
 image actually running even if the file on disk was replaced or deleted.
 The same opened file supplies metadata and bytes. Content changes during
 hashing are rejected; the mapped link, metadata and process start time must
-still agree before publishing executable identity. Mutable images are never
-served from the digest cache. Files over 64 MiB retain their path but have no
-digest. This remains a read-time snapshot: an exec after the final check can
+still agree before publishing executable identity. The link is rendered in
+the process's own mount namespace, so a path that names a different file in
+the daemon's view leaves the executable unknown. A deleted image's
+`" (deleted)"` suffix is dropped only for a process in the daemon's user
+namespace whose image sits on a mount of its own mount namespace; elsewhere
+the former path cannot be checked. A digest is cached only
+when the image's ctime was at least 2 seconds old as hashing began. Userspace
+cannot set ctime and any write moves it, so a changed image misses the cache;
+an unchanged one is never rehashed per packet on the single worker. The
+exception is a store through a shared writable mapping, which moves ctime only
+when the page is first dirtied; it needs write access to the file. Files over
+64 MiB retain their path but have no digest. This remains a read-time snapshot: an exec after the final check can
 change the process before the queued packet receives its verdict.
 
 The kernel also reports the originating uid and gid with each queued packet
@@ -235,14 +257,51 @@ migration cannot recover that intent. This is a policy-entry contract; it
 does not pin an inode, follow aliases at exec time, or attest future pathname
 changes. Legacy alias intent loss is not repaired by this validation.
 
-`RuleSet` is kept sorted so that lookup is a linear scan that returns the
-first match, and the order does not depend on what SQLite happened to
-return:
+`RuleSet` is kept sorted so that lookup is a linear scan, and the order does
+not depend on what SQLite happened to return:
 
-1. specificity descending (how many scope predicates are set)
+1. specificity descending (how many scope predicates are set; a `/0`
+   network is not counted, since it narrows nothing within its address
+   family)
 2. Deny, then Reject, then Allow
 3. oldest `created_at` first
 4. `id`, as a total-order tiebreak
+
+One override is applied during the scan rather than in the sort: a Deny or
+Reject rule that names a program (`exe_path` or `exe_sha256`) wins over
+every Allow rule that names none, whatever their predicate counts. Rules that
+name a program keep their specificity order among themselves, so
+`allow --exe X --dst-port 443` still beats `deny --exe X`. Everything else
+keeps the order above. The scan holds the first matching generic Allow
+instead of returning it, and only a lower program rule can still change the
+answer: a program Deny or Reject replaces it, and a program Allow answers in
+its place with the same action (it is credited with the hit, since it is what
+keeps a lower program Deny from winning). The
+relation is not a total order (program Allow 3 > program Deny 2 > generic
+Allow 5 > generic Deny 4 > program Allow 3), so no sort key could express
+it. The in-kernel precompute (`Engine::process_wide_action`) walks the same
+way, and every kernel writer (exec, both resync sweeps, the exe table) asks
+`Engine::denies_process_wide`, so the connect hooks refuse a process only when
+the packet path would refuse every flow of it. When the walk abstains (a rule
+the hash-blind kernel side cannot decide), the kernel entry is cleared and
+the packet path decides, prompting if the identity stays incomplete.
+
+**Incomplete identity is asked, not refused.** When the process's
+executable, uid or digest is unknown (an unattributed socket, a binary over
+the hashing cap, a process gone before `/proc` was read), a rule that tests
+the missing field can be neither matched nor excluded. The scan walks past
+such a rule and remembers whether it was an Allow or a refusal. If the rule
+that then answers agrees with every rule passed that way (all allow, or all
+refuse), it answers. Otherwise the flow is prompted, the prompt names the
+first rule that could not be decided (`PromptEvent.undecided_rule_id`), and
+the UIs show the identity as unknown. The user's answer applies to that
+connection; an "always" answer for an unknown program is refused as before.
+With no answering UI connected the flow takes `no_ui_action`, and the prompt
+caps send overflow to the same fallback. Neither pause nor the loopback
+allowance lifts such a flow. The recorded event and the live feed carry the
+undecided rule's id in `rule_id` with a source other than `rule`. A legacy
+hostname rule (`dst_host`) that cannot be decided is still refused, since no
+answer can establish the name.
 
 Disabled and expired rules are filtered at lookup, so a `Seconds(n)` rule
 stops matching the instant it expires rather than when the reaper next runs.
@@ -274,22 +333,28 @@ merged at the very last step, when the kernel is told to DROP.
 
 ## Event log
 
-Parsed NFQUEUE policy refusals commit to SQLite with WAL/FULL before verdict
-delivery, the journald message and live publication. Commit failure drops the
-current packet and ends the worker, so later queued packets cannot be allowed
-by that worker after an unaudited refusal.
+Every verdict is persisted off the packet path. The worker verdicts a parsed
+refusal first, logs it to the journal, then queues its row straight into the
+event writer's bounded queue with `try_send`. Allow rows reach the same queue
+through a feeder on the live feed. The writer commits in batches with WAL and
+synchronous=FULL.
 
 ```
-parsed Deny/Reject --> durable events commit --> verdict --> journal/live feed
+parsed Deny/Reject --> verdict --> journal --> bounded queue --> async writer
+                                   \-> live feed
 Allow             --> verdict --> live feed --> bounded queue --> async writer
 ```
 
-The live feed and async Allow history can lose observations under load. The
-feeder uses `try_send` and logs lag or drops; it skips already committed refusals.
-Refusal commits can delay delivery. Database mutex and SQLite busy waits are
-each limited to 250 ms; filesystem I/O and fsync are not bounded by these limits.
-This gate does not audit malformed packets, nftables drops or kernel-ring
-refusals. It is not a universal lossless audit or protection against root
+Nothing on the worker thread waits for the database. An fsync per refusal
+there let a flood of refused packets stall every new flow on the machine, and
+a failed or slow commit used to end the worker, which dropped all new
+non-loopback traffic until systemd restarted the daemon. Now a full queue,
+feeder lag or a failed batch commit (full disk, I/O error) costs rows instead:
+they are counted and logged ("events were not persisted", "event log write
+failed"), and the journal line still names each refusal. Rows still in the
+writer's batch, at most about a second of them, are lost on a crash, a power
+cut or a stop. This does not audit malformed packets, nftables drops or
+kernel-ring refusals. It is not a lossless audit or protection against root
 rewriting the database.
 The table is pruned to `[events] max_rows` every 60 seconds. `ListEvents`
 queries it with executable-substring, action and since filters; `cfc log` is
@@ -305,24 +370,45 @@ the entire attack surface. Two layers:
    is never briefly group-readable by the wrong group. If the group does not
    exist the daemon does not refuse to start: it warns with the exact fix and
    leaves the socket 0600, root-only.
-2. **Peer credentials.** Every connection carries `SO_PEERCRED`. Mutating
-   RPCs (`UpsertRule`, `DeleteRule`, `SetPaused`, `SubmitVerdict`) require
-   uid 0 or a socket that is genuinely group-gated. Read-only RPCs
-   (`ListRules`, `GetStatus`, `ListEvents`, `StreamConnections`,
-   `StreamPrompts`) are open to any peer that got past layer 1.
+2. **Who the peer process is.** Read-only RPCs (`ListRules`, `GetStatus`,
+   `ListEvents`, `StreamConnections`, `StreamPrompts`) are open to any peer
+   that got past layer 1. Change RPCs (`SubmitVerdict`, `UpsertRule`,
+   `DeleteRule`, `ApplyRules`, `SetPaused`) are accepted from root (or the
+   daemon's own uid) and from the installed app and tray only. From
+   `SO_PEERCRED`'s pid, `official.rs` checks, between two start-time reads,
+   that the process runs in the host namespaces, is not traced, runs under
+   no seccomp filter (one can fake the prologue's `close_range`), has sealed
+   itself (`cfc_client::seal_official_process`: inherited descriptors closed,
+   non-dumpable), runs one of the root-sealed `[ipc] official_clients`
+   binaries by device and inode, holds this connection's client end itself
+   (`UNIX_DIAG` names it) and mapped no executable file from outside sealed
+   directories. The check runs on the blocking pool.
+3. **polkit.** `SetPaused` (pause and resume), `ApplyRules`, and an
+   `UpsertRule` (or a customized prompt answer) storing an enabled Allow that
+   names no program, from the app or tray, also need `CheckAuthorization`
+   for `org.projectcolony.firewall.pause`,
+   `org.projectcolony.firewall.import-rules` or
+   `org.projectcolony.firewall.allow-every-program`
+   (`polkit.rs`, one system-bus connection per call, 120 s timeout, the
+   dialog cancelled on expiry). Root is never asked.
 
-Group membership *is* the credential - there is no in-band authentication.
-Everyone in the group is fully trusted. The one exception is prompt
-ownership: the daemon records which subscriber uids actually received each
-prompt and refuses a verdict from anyone else, so one desktop session cannot
-answer another's. Root is exempt.
+Every other peer is read-only. Its prompt subscription is not counted in the
+router's census, so `no_ui_action` still applies when only such peers
+listen, and it never enters a prompt's audience. An answering subscription
+is checked again before each prompt it is handed; one that fails (an app or
+tray whose binary an upgrade replaced) ends with the reason, which drops it
+from the census. Prompt ownership comes on
+top: the daemon records which answering subscriber uids actually received
+each prompt and refuses a verdict from anyone else, so one desktop session
+cannot answer another's. Root is exempt.
 
 Values arriving over the wire are decoded strictly. An unspecified or
 out-of-range action or duration is an `InvalidArgument` error, not a silent
 fall-through to the zero value - which happened to be Allow.
 
-Every mutating RPC and every Deny/Reject verdict is logged to the journal
-with the calling uid and pid. See [HARDENING.md](HARDENING.md).
+Every change RPC (allowed or refused, with the official image and the polkit
+action) and every Deny/Reject verdict is logged to the journal with the
+calling uid and pid. See [HARDENING.md](HARDENING.md).
 
 ## Threading model
 
@@ -338,14 +424,12 @@ with the calling uid and pid. See [HARDENING.md](HARDENING.md).
   Prompts go out on a broadcast channel; verdicts come back on a dedicated
   channel the worker polls.
 - **ipc server** - tonic gRPC over the Unix socket.
-- **event writer** - batches Allow observations into SQLite and prunes on a timer.
-  Parsed NFQUEUE Deny/Reject decisions commit synchronously before their verdict
-  and live publication. Audit failure drops the packet and ends the worker.
+- **event writer** - batches every verdict into SQLite and prunes on a timer.
+  The worker queues refusals into it after their verdict and never waits for
+  it; rows it cannot take are counted and logged.
 - **storage** - sqlite behind a mutex. Reads are served from the in-memory
-  `RuleSet`. Production startup requires WAL with synchronous=FULL. Refusal
-  commits are on the packet path; lock and SQLite busy waits are each limited
-  to 250 ms. These limits do not bound filesystem I/O or fsync. Kernel/nftables
-  drops and malformed packets are not covered by this durable delivery gate.
+  `RuleSet`. Production startup requires WAL with synchronous=FULL. The packet
+  path never touches it.
 
 ## Lifecycle and systemd integration
 
@@ -392,26 +476,37 @@ inert as one built with `--no-default-features`.
 | `tracepoint/sched/sched_process_exit` | `sched:sched_process_exit` | evicts only on confirmed thread-group death |
 | `cgroup_skb/ingress` | cgroup v2 root | copies received DNS response payloads for diagnostics, never policy identity |
 | `cgroup/connect4`, `cgroup/connect6` | cgroup v2 root, link **pinned** | refuse `connect()` for pids the daemon has denied outright, before a packet exists |
-| `cgroup/sendmsg4`, `cgroup/sendmsg6` | cgroup v2 root, link pinned | legacy mark-clearing support; Fast Allow stays disabled |
 
 **In-kernel denials.** The connect hooks refuse an executable denied
 process-wide with `EPERM`. Pinned denials outlive the daemon. Conditional rules,
 prompts and Allow decisions remain on the normal NFQUEUE path.
 
-**Fast Allow is disabled in every runtime configuration.** A socket mark cannot
+**Fast Allow was removed.** It marked the sockets of a process a lasting Allow
+covered so that nftables accepted them ahead of the queue. A socket mark cannot
 prove the current sender's identity, and lifecycle checks do not repair that
-property. `fast_allow = true` produces a warning and no grants or heartbeat.
-The nft snippet has no mark-set accept rule. Startup flushes legacy accepted
-marks, and package upgrades reload active nft units with one atomic transaction
-to remove old acceptance rules. A failed cleanup emits an error and requires
-operator action before filtering can be relied upon.
+property, so it opened bypasses; it was disabled in 0.7.0 and its userspace
+side is gone. The `[ebpf] fast_allow` keys still parse and only log a warning.
+The kernel object still carries the Fast Allow maps until an ABI bump, so
+startup flushes the legacy nft set once and, when the eBPF layer loads,
+disarms the pinned maps (unarmed mark, zero deadline, no grants) and removes
+the old `sendmsg4`/`sendmsg6` link pins, which detaches those hooks. With the
+layer off, without the object or after a failed load, the old pins stay until
+reboot; they can strip a socket mark equal to the old random value, but the
+snippet accepts no packet on an application-set mark, so they open nothing. The nft snippet has no mark-set accept rule, and
+package upgrades reload active nft units with one atomic transaction. A failed
+flush emits an error and requires operator action before filtering can be
+relied upon.
 
 **Compatibility exit handling.** When `sched_process_exit` exposes `group_dead`,
 the kernel evicts only on confirmed process death. Without that field, it
-preserves identity and deny entries on thread or leader exit. The daemon can
-remove a candidate only after `/proc/<pid>/task` is absent. A leader may exit
-before its workers, so this conservative fallback can leave stale denials until
-exec or reconciliation; it cannot guarantee immediate cleanup after group death.
+preserves identity and deny entries on thread or leader exit and reports the
+leader's exit as a candidate. The daemon evicts a candidate once
+`/proc/<pid>/task` is absent or lists only a zombie leader. The event usually
+arrives before that, while the leader is still exiting or its workers still
+run, so such a candidate is checked again every two seconds until its group is
+gone, or dropped once its pid belongs to another process. At most 1024
+candidates wait; past that the oldest leaves its entries to exec or the next
+reconciliation.
 
 **Loaded from a path, not embedded.** The kernel-side crate needs a dated
 nightly, `-Z build-std=core` and a matching `bpf-linker`, and is deliberately

@@ -58,6 +58,11 @@ fn ip_prefixes(value: &Value) -> Result<BTreeSet<(IpAddr, u32)>> {
     Ok(result)
 }
 
+/// The unit's own pair must be attached directly and run. Extra effective
+/// programs come from ancestors, such as the daemon's DNS observer on the
+/// cgroup root. They are accepted because these attach points only take
+/// cgroup_skb programs, whose verdicts the kernel ANDs: another program can
+/// drop more traffic, never admit what the native pair refuses.
 fn program_set(direct: &[u32], effective: &[u32]) -> Result<()> {
     let expected: BTreeSet<_> = direct.iter().copied().collect();
     let actual: BTreeSet<_> = effective.iter().copied().collect();
@@ -66,25 +71,14 @@ fn program_set(direct: &[u32], effective: &[u32]) -> Result<()> {
         "missing or duplicate native cgroup filters"
     );
     ensure!(
-        effective.len() == 2 && actual == expected,
+        actual.len() == effective.len() && !actual.contains(&0) && actual.is_superset(&expected),
         "unexpected effective cgroup filters"
     );
     Ok(())
 }
 
-pub(super) fn verify(unit: &str, user: &str, allow: &[IpAddr]) -> Result<(u32, u32)> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        platform::verify(unit, user, allow)
-    }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    {
-        let _ = (unit, user, allow);
-        bail!("application confinement requires x86_64 Linux")
-    }
-}
+pub(super) use platform::verify;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod platform {
     use super::*;
     use serde_json::{json, Map};
@@ -247,7 +241,7 @@ mod platform {
             ("NetworkNamespacePath", ""),
             ("StandardInput", "null"),
             ("StandardOutput", "null"),
-            ("StandardError", "null"),
+            ("StandardError", "journal"),
             ("KillMode", "control-group"),
             ("Restart", "no"),
             ("NotifyAccess", "none"),
@@ -573,6 +567,9 @@ mod platform {
         Ok(file)
     }
 
+    // The whole `bpf_attr.query` layout through `revision`, not only the fields
+    // read here: kernels 6.17 to 7.1 write `revision` at offset 56 whatever
+    // size the caller passed, so a shorter struct is overwritten past its end.
     #[repr(C)]
     #[derive(Default)]
     struct Query {
@@ -583,7 +580,12 @@ mod platform {
         prog_ids: u64,
         prog_cnt: u32,
         padding: u32,
+        prog_attach_flags: u64,
+        link_ids: u64,
+        link_attach_flags: u64,
+        revision: u64,
     }
+    const _: () = assert!(mem::size_of::<Query>() == 64);
     #[repr(C)]
     struct Info {
         fd: u32,
@@ -1031,7 +1033,11 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn verify(unit: &str, user: &str, allow: &[IpAddr]) -> Result<(u32, u32)> {
+    pub(in crate::confinement) fn verify(
+        unit: &str,
+        user: &str,
+        allow: &[IpAddr],
+    ) -> Result<(u32, u32)> {
         ensure!(
             unsafe { libc::getuid() } == 0 && unsafe { libc::geteuid() } == 0,
             "native gate requires real and effective root"
@@ -1124,12 +1130,16 @@ mod tests {
     }
 
     #[test]
-    fn effective_filters_must_exactly_match_direct_pair() {
+    fn effective_filters_must_run_the_direct_pair() {
         assert!(program_set(&[7, 9], &[9, 7]).is_ok());
+        // An ancestor's program, such as CFC's DNS observer on the root.
+        assert!(program_set(&[7, 9], &[7, 9, 10]).is_ok());
         for (direct, effective) in [
             (vec![], vec![]),
             (vec![7, 9], vec![7]),
-            (vec![7, 9], vec![7, 9, 10]),
+            (vec![7, 9], vec![7, 10]),
+            (vec![7, 9], vec![7, 9, 9]),
+            (vec![7, 9], vec![7, 9, 0]),
             (vec![7, 7], vec![7, 7]),
             (vec![0, 9], vec![0, 9]),
         ] {

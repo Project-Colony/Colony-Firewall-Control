@@ -10,7 +10,7 @@ use iced::widget::{
 use iced::{Element, Length};
 use std::collections::VecDeque;
 
-use crate::{format, LiveEntry, Message};
+use crate::{format, Message};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictFilter {
@@ -51,9 +51,9 @@ impl std::fmt::Display for VerdictFilter {
 }
 
 pub struct ListArgs<'a> {
-    pub live: &'a VecDeque<LiveEntry>,
+    pub live: &'a VecDeque<proto::ConnectionEvent>,
     /// Snapshot rendered instead of `live` while the feed is paused.
-    pub frozen: Option<&'a [LiveEntry]>,
+    pub frozen: Option<&'a [proto::ConnectionEvent]>,
     pub filter: &'a str,
     pub verdict: VerdictFilter,
     pub new_while_paused: usize,
@@ -104,14 +104,15 @@ pub fn view(args: ListArgs<'_>) -> Element<'_, Message> {
     } = args;
 
     let paused = frozen.is_some();
-    let source: Box<dyn Iterator<Item = &LiveEntry>> = match frozen {
+    let source: Box<dyn Iterator<Item = &proto::ConnectionEvent>> = match frozen {
         Some(f) => Box::new(f.iter()),
         None => Box::new(live.iter()),
     };
-    let shown: Vec<&LiveEntry> = source
-        .filter(|e| matches(&e.event, filter, verdict))
-        .collect();
-    let total = frozen.map(<[LiveEntry]>::len).unwrap_or(live.len());
+    let shown: Vec<&proto::ConnectionEvent> =
+        source.filter(|e| matches(e, filter, verdict)).collect();
+    let total = frozen
+        .map(<[proto::ConnectionEvent]>::len)
+        .unwrap_or(live.len());
 
     let pause_label = if paused {
         if new_while_paused > 0 {
@@ -189,8 +190,7 @@ pub fn view(args: ListArgs<'_>) -> Element<'_, Message> {
     .into()
 }
 
-fn live_row(e: &LiveEntry) -> Element<'_, Message> {
-    let ev = &e.event;
+fn live_row(ev: &proto::ConnectionEvent) -> Element<'_, Message> {
     let conn = ev.connection.as_ref();
     let proc = ev.process.as_ref();
 
@@ -239,10 +239,11 @@ fn live_row(e: &LiveEntry) -> Element<'_, Message> {
             .padding([1, 6])
             .on_press(Message::MakeRuleFromEvent {
                 exe: proc.map(|p| p.exe.clone()).unwrap_or_default(),
-                dst_host: c.dst_host.clone(),
+                src_ip: c.src_ip.clone(),
                 dst_ip: c.dst_ip.clone(),
                 dst_port: c.dst_port,
                 protocol: c.protocol,
+                direction: c.direction,
             })
             .style(crate::theme::subtle_icon)
             .into(),

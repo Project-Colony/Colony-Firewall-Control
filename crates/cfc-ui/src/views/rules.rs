@@ -263,7 +263,7 @@ fn rule_row<'a>(
             text(if r.name.is_empty() {
                 "(unnamed)".to_string()
             } else {
-                r.name.clone()
+                convert::display_safe(&r.name)
             })
             .size(12),
             text(convert::rule_summary(r)).size(10),
@@ -407,11 +407,11 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     // This rule restricts more than the fields above can show. Saving keeps
     // those predicates, but the user should know they are there rather than
     // read the visible fields as the whole rule.
-    let carried: Element<'_, Message> = if ed.carried_scope.is_set() {
+    let carried: Element<'_, Message> = if crate::hidden_scope_is_set(&ed.carried_scope) {
         container(
             text(format!(
                 "also restricted to {} - kept on save, edit with cfc",
-                ed.carried_scope.summary()
+                crate::hidden_scope_summary(&ed.carried_scope)
             ))
             .size(11),
         )

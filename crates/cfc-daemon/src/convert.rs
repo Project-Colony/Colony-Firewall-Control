@@ -240,7 +240,8 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
 /// `.and_then(|n| IpNet::from_str(&n).ok())`, so a typo'd CIDR became `None` -
 /// turning an Allow scoped `exe + 10.0.0.0/8` into an Allow scoped `exe`, i.e.
 /// "this program may reach anywhere". A client's own validation is not a
-/// substitute: `UpsertRule` accepts whatever any group member sends.
+/// substitute: `UpsertRule` accepts whatever the calling app, tray or root
+/// CLI sends.
 ///
 /// Three fields can fail: `dst_net`, `protocol` and `dst_port`. The last is the
 /// least obvious and was missed on the first pass - the wire type is `uint32`
@@ -252,7 +253,9 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
 /// the `has_*` flags carry presence explicitly.
 pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
     let dst_net = match empty_to_none(&s.dst_net) {
-        Some(n) => Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad dst_net `{n}`: {e}"))?),
+        Some(n) => {
+            Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad dst_net `{n:.64}`: {e}"))?)
+        }
         None => None,
     };
     let protocol = match s.has_protocol {
@@ -271,7 +274,9 @@ pub fn scope_from_pb(s: &pb::RuleScope) -> Result<RuleScope, String> {
         false => None,
     };
     let src_net = match empty_to_none(&s.src_net) {
-        Some(n) => Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad src_net `{n}`: {e}"))?),
+        Some(n) => {
+            Some(ipnet::IpNet::from_str(&n).map_err(|e| format!("bad src_net `{n:.64}`: {e}"))?)
+        }
         None => None,
     };
     let src_port =
@@ -331,12 +336,16 @@ pub fn rule_to_pb(r: &Rule) -> pb::RuleInfo {
 /// matches EVERYTHING"), which is the strongest argument for enforcing it here:
 /// three clients independently decided it was dangerous, and the one boundary
 /// they all pass through did not check.
+///
+/// A `/0` network adds no specificity but still counts as a scope here: it
+/// limits the rule to one address family, and refusing it would quarantine
+/// rules stored before `/0` stopped ranking (storage runs this at load).
 pub fn reject_unscoped(scope: &RuleScope) -> Result<(), String> {
-    if scope.specificity() == 0 {
+    if scope.specificity() == 0 && scope.src_net.is_none() && scope.dst_net.is_none() {
         return Err(
             "rule scope constrains nothing, so it would match every process and \
              every destination; scope it to at least one of exe_path, uid, \
-             dst_host, dst_net, dst_port or protocol"
+             dst_net, dst_port or protocol"
                 .to_string(),
         );
     }
@@ -358,12 +367,14 @@ pub fn rule_from_pb(r: &pb::RuleInfo) -> Result<Rule, String> {
     scope.reject_unmatchable_parent()?;
     scope.reject_inbound_destination_scope()?;
     scope.reject_unattributable_inbound_scope()?;
-    let created_at = if r.created_at_unix_ms == 0 {
-        chrono::Utc::now()
-    } else {
-        chrono::DateTime::from_timestamp_millis(r.created_at_unix_ms)
-            .unwrap_or_else(chrono::Utc::now)
-    };
+    // Never in the future: a timed rule expires at created_at + n, so a
+    // client-supplied date in 2100 made "allow for 90s" permanent while every
+    // list still showed 90s. A past date is kept, which is what an import
+    // of an exported rule needs.
+    let now = chrono::Utc::now();
+    let created_at = chrono::DateTime::from_timestamp_millis(r.created_at_unix_ms)
+        .filter(|_| r.created_at_unix_ms != 0)
+        .map_or(now, |at| at.min(now));
     Ok(Rule {
         id,
         name: r.name.clone(),
@@ -393,10 +404,9 @@ pub fn verdict_to_pb_action(v: &Verdict) -> pb::Action {
 /// Flattens a decided flow into the row shape persisted by
 /// [`crate::storage::RuleStore::insert_events`].
 pub fn event_row_from_observed(
-    conn: &Connection,
-    proc: &Process,
-    verdict: &Verdict,
+    obs: &crate::nfqueue::ObservedConnection,
 ) -> crate::storage::EventRow {
+    let (conn, proc, verdict) = (&obs.connection, &obs.process, &obs.verdict);
     crate::storage::EventRow {
         id: 0,
         ts_unix_ms: conn.timestamp.timestamp_millis(),
@@ -411,10 +421,7 @@ pub fn event_row_from_observed(
         uid: proc.uid,
         action: action_db_str(verdict.action).to_string(),
         source: verdict_source_db_str(&verdict.source).to_string(),
-        rule_id: match verdict.source {
-            cfc_core::VerdictSource::Rule(id) => Some(id.to_string()),
-            _ => None,
-        },
+        rule_id: obs.rule_id().map(|id| id.to_string()),
     }
 }
 
@@ -573,6 +580,27 @@ mod tests {
             ..Default::default()
         });
         assert!(rule_from_pb(&pb).is_ok());
+    }
+
+    #[test]
+    fn a_slash_zero_only_scope_is_still_storable() {
+        // `/0` stopped adding specificity, but it still limits a rule to one
+        // address family, so the gate keeps accepting it: refusing it here
+        // would also quarantine such rules already on disk.
+        for net in ["0.0.0.0/0", "::/0"] {
+            let dst = RuleScope {
+                dst_net: Some(net.parse().unwrap()),
+                ..RuleScope::any()
+            };
+            assert_eq!(dst.specificity(), 0);
+            assert_eq!(reject_unscoped(&dst), Ok(()), "{net}");
+            let src = RuleScope {
+                src_net: Some(net.parse().unwrap()),
+                ..RuleScope::any()
+            };
+            assert_eq!(reject_unscoped(&src), Ok(()), "{net}");
+        }
+        assert!(reject_unscoped(&RuleScope::any()).is_err());
     }
 
     #[test]
@@ -749,7 +777,7 @@ mod tests {
     fn a_malformed_dst_net_is_refused_not_dropped() {
         // The whole point. Dropping it to None turned "this program may reach
         // 10.0.0.0/8" into "this program may reach anywhere" - a silent
-        // widening of policy on the path any group member can reach.
+        // widening of policy on the path every rule write goes through.
         let mut pb = scope_to_pb(&RuleScope::any());
         pb.exe_path = "/usr/bin/curl".into();
         pb.dst_net = "10.0.0.0/33".into();
@@ -759,6 +787,11 @@ mod tests {
             "the message must name the field: {e}"
         );
         assert!(e.contains("10.0.0.0/33"), "and quote the value: {e}");
+        // But only so much of it: the message is a gRPC status and a log line.
+        let mut long = pb.clone();
+        long.dst_net = "9".repeat(1 << 20);
+        let e = scope_from_pb(&long).expect_err("refused");
+        assert!(e.len() < 256, "{} bytes", e.len());
 
         // A rule carrying it is refused whole, rather than persisted narrower
         // than it reads.
@@ -831,6 +864,25 @@ mod tests {
     }
 
     #[test]
+    fn a_future_creation_date_cannot_postpone_expiry() {
+        let mut scope = RuleScope::any();
+        scope.dst_port = Some(443);
+        let mut pb = rule_to_pb(&Rule::new("x", Action::Allow, scope));
+        pb.duration = cfc_proto::v1::Duration::Seconds as i32;
+        pb.duration_seconds = 90;
+        let year_2100 = 4_102_444_800_000;
+        pb.created_at_unix_ms = year_2100;
+        let rule = rule_from_pb(&pb).unwrap();
+        assert!(rule.created_at <= chrono::Utc::now());
+        // A past date, as an export carries, is kept.
+        pb.created_at_unix_ms = 1_000;
+        assert_eq!(
+            rule_from_pb(&pb).unwrap().created_at.timestamp_millis(),
+            1_000
+        );
+    }
+
+    #[test]
     fn connection_to_pb_carries_5tuple() {
         let conn = cfc_core::Connection::new(
             Protocol::Tcp,
@@ -865,7 +917,7 @@ mod tests {
         let rule_id = uuid::Uuid::new_v4();
         let verdict = cfc_core::Verdict::deny_from_rule(rule_id);
 
-        let row = event_row_from_observed(&conn, &proc, &verdict);
+        let row = event_row_from_observed(&observed(conn, proc, verdict, None));
         assert_eq!(row.action, "Deny");
         assert_eq!(row.source, "rule");
         assert_eq!(row.rule_id.as_deref(), Some(rule_id.to_string().as_str()));
@@ -892,11 +944,73 @@ mod tests {
             2,
         );
         let proc = cfc_core::Process::unknown(7);
-        let row = event_row_from_observed(&conn, &proc, &cfc_core::Verdict::default_allow());
+        let row = event_row_from_observed(&observed(
+            conn,
+            proc,
+            cfc_core::Verdict::default_allow(),
+            None,
+        ));
         assert_eq!(row.uid, None);
         assert_eq!(row.source, "default");
         assert_eq!(row.rule_id, None);
         assert_eq!(event_row_to_pb(&row).uid, None);
+    }
+
+    fn observed(
+        connection: cfc_core::Connection,
+        process: cfc_core::Process,
+        verdict: cfc_core::Verdict,
+        undecided: Option<uuid::Uuid>,
+    ) -> crate::nfqueue::ObservedConnection {
+        crate::nfqueue::ObservedConnection {
+            connection,
+            process,
+            verdict,
+            undecided,
+        }
+    }
+
+    #[test]
+    fn an_undecided_outcome_records_the_rule_id() {
+        let conn = cfc_core::Connection::new(
+            Protocol::Udp,
+            Direction::Outbound,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5353,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            53,
+        );
+        let undecided = uuid::Uuid::new_v4();
+        for verdict in [
+            cfc_core::Verdict::from_policy(Action::Deny),
+            cfc_core::Verdict::default_allow(),
+            cfc_core::Verdict {
+                action: Action::Deny,
+                source: cfc_core::VerdictSource::Timeout,
+            },
+            cfc_core::Verdict {
+                action: Action::Allow,
+                source: cfc_core::VerdictSource::UserPrompt,
+            },
+        ] {
+            let row = event_row_from_observed(&observed(
+                conn.clone(),
+                cfc_core::Process::unknown(0),
+                verdict,
+                Some(undecided),
+            ));
+            assert_ne!(row.source, "rule");
+            assert_eq!(row.rule_id.as_deref(), Some(undecided.to_string().as_str()));
+        }
+        // A rule that answered is recorded as itself, not as undecided.
+        let answered = uuid::Uuid::new_v4();
+        let row = event_row_from_observed(&observed(
+            conn,
+            cfc_core::Process::unknown(0),
+            cfc_core::Verdict::deny_from_rule(answered),
+            Some(undecided),
+        ));
+        assert_eq!(row.rule_id.as_deref(), Some(answered.to_string().as_str()));
     }
 
     #[test]

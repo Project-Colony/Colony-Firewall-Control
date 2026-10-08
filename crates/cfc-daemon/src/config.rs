@@ -156,8 +156,10 @@ impl Profile {
     ///
     /// The outbound table cannot lock an operator out of a remote machine: it
     /// hooks `output` on `ct state new` only, so an inbound SSH session's
-    /// replies are `ct state established` and are never queued, and loopback is
-    /// accepted outright. Rules can still be added with `cfc-cli` from that
+    /// replies are `ct state established` and are never queued. While the
+    /// daemon runs, new loopback flows follow explicit policy and unmatched
+    /// local IPC is allowed without prompting; while no daemon listens, the
+    /// snippet's `bypass` on `lo` allows them. Rules can still be added with `cfc-cli` from that
     /// session. What it *does* mean on a fresh headless install is that
     /// outbound traffic — package updates, NTP, backups — is denied until
     /// rules exist for it.
@@ -268,14 +270,18 @@ impl Default for EventsConfig {
 pub struct IpcConfig {
     /// Unix group granted access to the control socket. After bind the
     /// daemon chowns the socket to `root:<group>` and chmods it 0660, so
-    /// group membership *is* the access check.
+    /// group membership is what lets a process connect at all.
     pub group: String,
-    /// Require the socket to be group-gated before a non-root peer may
-    /// call a mutating RPC. When the group cannot be resolved the socket
-    /// stays root-only and non-root mutations are refused. Setting this to
-    /// false lets any peer that manages to connect mutate rules — only do
-    /// that if you gate the socket some other way (e.g. filesystem ACLs).
+    /// Require proved membership of `group` before an official client (the
+    /// installed app or tray) may change anything. Setting this to false
+    /// waives the group check for official clients only; every other
+    /// non-root peer stays read-only either way.
     pub require_group: bool,
+    /// The installed Colony Firewall app and tray: the only non-root
+    /// programs that may answer prompts, edit rules or ask to pause. Each
+    /// must be an absolute path to a root-owned file nobody else can write,
+    /// in root-owned directories nobody else can write. Bound at startup.
+    pub official_clients: Vec<std::path::PathBuf>,
 }
 
 impl Default for IpcConfig {
@@ -283,7 +289,36 @@ impl Default for IpcConfig {
         Self {
             group: "colony-firewall".to_string(),
             require_group: true,
+            official_clients: crate::official::DEFAULT_CLIENTS
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
         }
+    }
+}
+
+impl IpcConfig {
+    /// One line per `official_clients` entry that can never match, for the
+    /// startup log: the app or tray it names will be read-only.
+    pub fn official_client_warnings(&self) -> Vec<String> {
+        self.official_clients
+            .iter()
+            .filter_map(|path| {
+                let why = if !path.is_absolute() {
+                    "is not an absolute path"
+                } else if !path.exists() {
+                    "does not exist"
+                } else if crate::official::sealed_identity(path).is_none() {
+                    "is not a root-owned file in root-owned directories that only root can write"
+                } else {
+                    return None;
+                };
+                Some(format!(
+                    "[ipc] official_clients entry {} {why}; that program will be read-only",
+                    path.display()
+                ))
+            })
+            .collect()
     }
 }
 
@@ -317,22 +352,13 @@ pub struct EbpfConfig {
     /// Where the BPF object built by `cargo xtask build-ebpf` was installed.
     /// `None` means `crate::ebpf::DEFAULT_OBJECT_PATH`.
     pub object_path: Option<PathBuf>,
-    /// Compatibility setting, currently ignored: Fast Allow is disabled for
-    /// every configuration because socket marks cannot attest the sender.
-    /// Ordinary traffic uses NFQUEUE; the startup report explains the refusal.
+    /// Legacy key from the removed Fast Allow path. Ignored; a warning is
+    /// logged. Still parsed rather than rejected: a parse error stops the
+    /// daemon while the fail-closed nftables table stays loaded, so an
+    /// upgrade would take the host offline.
     pub fast_allow: bool,
-    /// The `SO_MARK` value the fast path uses, when the machine needs a
-    /// specific one.
-    ///
-    /// `None` - the default - draws one at random at each start, which is what
-    /// keeps it from being a forgeable token. Set it only to resolve a
-    /// collision: the mark space is shared with the whole machine, and a
-    /// consumer that selects on a *mask* will match a random value with a
-    /// probability its mask decides. See `ebpf::loader::pick_mark` for the
-    /// selectors CFC already avoids, and `docs/TROUBLESHOOTING.md` for how to
-    /// find the one it does not know about.
-    ///
-    /// Zero is refused: it is the mark of every socket nothing has marked.
+    /// Legacy key from the removed Fast Allow path. Ignored; a warning is
+    /// logged.
     pub fast_allow_mark: Option<u32>,
 }
 
@@ -387,9 +413,10 @@ impl<'de> Deserialize<'de> for EbpfMode {
     /// `Auto`, matching how `profile` already treats an unknown value, and for
     /// a reason specific to this daemon: a config parse error propagates out of
     /// `Config::load` and the process exits *before* `READY=1`. The nftables
-    /// ruleset is `ct state new queue num 0` with no `bypass`, so a loaded
-    /// table with no daemon behind it blackholes every new outbound connection
-    /// on the machine. A typo in an enrichment layer's switch must not cost
+    /// ruleset is fail-closed for everything except new loopback flows, which
+    /// are allowed while no daemon listens: the final `ct state new queue num
+    /// 0` has no `bypass`, so a loaded table with no daemon behind it
+    /// blackholes every new non-loopback outbound connection on the machine. A typo in an enrichment layer's switch must not cost
     /// someone their network.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct V;
@@ -652,9 +679,10 @@ enabled = " Auto ""#
     /// A typo must not be able to take the machine's network away.
     ///
     /// A config parse error propagates out of `Config::load` and the daemon
-    /// exits *before* `READY=1`. `systemd/nftables-snippet.conf` is
-    /// `ct state new queue num 0` with **no** `bypass`, so a loaded table with
-    /// no daemon behind it drops every new outbound connection. Refusing to
+    /// exits *before* `READY=1`. `systemd/nftables-snippet.conf` ends with
+    /// `ct state new queue num 0` with **no** `bypass` (only the loopback rule
+    /// above it has one), so a loaded table with no daemon behind it drops
+    /// every new non-loopback outbound connection. Refusing to
     /// start over a misspelled enrichment-layer switch would turn a one-letter
     /// mistake into an outage, so an unknown value warns and falls back -
     /// exactly as `profile` already does.
@@ -670,42 +698,15 @@ enabled = " Auto ""#
         assert_eq!(cfg.ebpf.enabled, EbpfMode::Auto);
     }
 
-    /// `daemon.toml.sample` documents the mark in hex, so hex has to parse.
-    /// A sample that shows a spelling the parser rejects is worse than no
-    /// sample: the operator only finds out when the daemon refuses to start.
+    /// The removed Fast Allow keys must keep parsing: rejecting them would
+    /// stop the daemon on upgrade with the fail-closed table still loaded.
     #[test]
-    fn the_fast_allow_mark_parses_in_the_spelling_the_sample_documents() {
-        let mark = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.fast_allow_mark;
-        assert_eq!(mark(""), None, "absent means draw one");
-        assert_eq!(
-            mark("[ebpf]\nfast_allow_mark = 0x00033331\n"),
-            Some(0x0003_3331)
-        );
-        assert_eq!(mark("[ebpf]\nfast_allow_mark = 209713\n"), Some(209_713));
-        // The whole word must fit: the mark is a u32, and the top bit is as
-        // legitimate a mark bit as any other.
-        assert_eq!(
-            mark("[ebpf]\nfast_allow_mark = 0xffffffff\n"),
-            Some(u32::MAX)
-        );
-    }
-
-    /// The fast path is opt-in: nothing short of `fast_allow = true` turns it
-    /// on, and the layer's own eligibility checks still get the last word.
-    #[test]
-    fn ebpf_fast_allow_is_off_unless_asked_for() {
-        let fast_allow = |toml: &str| Config::from_toml_str(toml).unwrap().ebpf.fast_allow;
-
-        assert!(!fast_allow(""), "absent means off");
-        assert!(
-            !fast_allow("[ebpf]\n"),
-            "an empty section keeps the default"
-        );
-        assert!(!fast_allow("[ebpf]\nfast_allow = false\n"));
-        assert!(fast_allow("[ebpf]\nfast_allow = true\n"));
-        // Parsed independently of `enabled`: the switch says what was asked
-        // for, and the layer decides whether it can honour it.
-        assert!(fast_allow("[ebpf]\nenabled = false\nfast_allow = true\n"));
+    fn the_legacy_fast_allow_keys_still_parse() {
+        let cfg =
+            Config::from_toml_str("[ebpf]\nfast_allow = true\nfast_allow_mark = 0x00033331\n")
+                .expect("legacy keys must not abort startup");
+        assert!(cfg.ebpf.fast_allow);
+        assert_eq!(cfg.ebpf.fast_allow_mark, Some(0x0003_3331));
     }
 
     #[test]
@@ -868,6 +869,12 @@ enabled = " Auto ""#
         assert_eq!(cfg.ipc.group, "wheel");
         assert!(!cfg.ipc.require_group);
 
+        assert_eq!(
+            cfg.ipc.official_clients,
+            IpcConfig::default().official_clients,
+            "official_clients keeps its packaged default"
+        );
+
         // A partial [ipc] section keeps per-field defaults.
         let cfg = Config::from_toml_str("[ipc]\ngroup = \"wheel\"\n").unwrap();
         assert_eq!(cfg.ipc.group, "wheel");
@@ -878,6 +885,27 @@ enabled = " Auto ""#
         assert_eq!(cfg.nfqueue.queue_num, 7);
         assert_eq!(cfg.nfqueue.queue_max_len, 4096);
         assert!(!cfg.nfqueue.fail_open);
+    }
+
+    #[test]
+    fn official_clients_default_to_the_installed_app_and_tray() {
+        assert_eq!(
+            IpcConfig::default().official_clients,
+            [
+                std::path::PathBuf::from("/usr/bin/colony-firewall"),
+                std::path::PathBuf::from("/usr/bin/colony-firewall-tray")
+            ]
+        );
+        let cfg = Config::from_toml_str(
+            "[ipc]\nofficial_clients = [\"bin/gui\", \"/nonexistent/cfc-gui\", \"/tmp\"]\n",
+        )
+        .unwrap();
+        let warnings = cfg.ipc.official_client_warnings();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("bin/gui is not an absolute path"));
+        assert!(warnings[1].contains("does not exist"));
+        assert!(warnings[2].contains("root-owned"));
+        assert!(warnings.iter().all(|w| w.ends_with("will be read-only")));
     }
 
     #[test]
@@ -902,8 +930,8 @@ enabled = " Auto ""#
              config resolves to the automatic default"
         );
         assert!(
-            !cfg.ebpf.fast_allow,
-            "a shipped config must not take allows off the packet path"
+            !cfg.ebpf.fast_allow && cfg.ebpf.fast_allow_mark.is_none(),
+            "a shipped config must not set the legacy Fast Allow keys"
         );
         assert_eq!(
             cfg.storage.path,

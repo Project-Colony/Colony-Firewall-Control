@@ -68,11 +68,6 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(total))
 }
 
-/// clap value parser wrapper.
-pub fn parse_duration_arg(s: &str) -> Result<Duration, String> {
-    parse_duration(s)
-}
-
 /// Renders a number of seconds the way the status line wants it: `2h 5m`,
 /// `45s`, `0s`.
 pub fn format_secs(total: i64) -> String {

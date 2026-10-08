@@ -2,26 +2,44 @@
 
 The failure modes of an outbound firewall are unusually punishing: when it
 breaks, *the network* breaks, and the tool you'd use to debug it may be on
-the other side of the connection it just dropped. Read the first section
-before enabling enforcement on any machine you reach over SSH.
+the other side of the connection it just dropped. Read
+[Testing over SSH](#testing-over-ssh-without-locking-yourself-out) before
+enabling enforcement on any machine you reach over SSH.
 
 ## Daemon restarts and rule upgrades
 
 Once loaded, both nft tables survive daemon stops and restarts. With no queue
 listener, new tracked flows drop; established and related traffic retains its
-authorization. To intentionally remove filtering, stop the corresponding nft
-unit. An active network manager that requires this unit also stops; disabling
-enforcement removes its requirement for subsequent starts. Uninstall removes
-both tables and Colony's pinned BPF directory.
+authorization. To intentionally remove filtering, disable the corresponding
+nft unit with `--now`:
+
+```sh
+sudo systemctl disable --now colony-firewall-nft colony-firewalld
+sudo systemctl disable --now colony-firewall-nft-inbound
+```
+
+`disable` removes the network managers' requirement on the unit and reloads
+systemd before stopping it. A plain `systemctl stop` keeps that requirement
+loaded, so an active NetworkManager or systemd-networkd stops with the unit,
+and starting the manager again loads the table again. Disable the daemon too
+if filtering should stay off: starting it loads the outbound table. Uninstall
+removes both tables and Colony's pinned BPF directory.
+
+Never `restart` an nft unit, including from configuration management: it
+deletes the table before loading it again, which leaves new flows unfiltered
+for a moment, and it restarts the daemon and the network managers that
+require the unit. `reload` replaces the table in one transaction.
 
 Package upgrades reload active nft units atomically. After a manual upgrade,
-run `systemctl daemon-reload`, then `systemctl reenable colony-firewalld
-colony-firewall-nft` (and the inbound unit only if already enabled), and
+run `systemctl daemon-reload`, then `systemctl reenable colony-firewall-nft`
+(and the inbound unit only if already enabled; never the daemon, whose
+`Also=` would enable a disabled nft unit), and
 `systemctl reload colony-firewall-nft` (and the inbound unit if active) before
 relying on the new rules. Reenable installs the native network-manager
-requirements on existing deployments. A startup error saying
-previous Fast Allow state could not be disabled means old acceptance may still
-exist; resolve that error and inspect the loaded table. The nft units load
+requirements on existing deployments. A startup error saying the
+legacy fast_allow nftables set could not be flushed means a mark left by an
+older release may still be accepted; resolve that error and inspect the loaded
+table. The nft units load
 before the daemon. Failed daemon initialization leaves filtering installed;
 a failed nft load blocks the daemon and the enabled NetworkManager or
 systemd-networkd requirements. This covers those managers' startup after
@@ -36,54 +54,64 @@ this check. `CFC_INBOUND_FORCE=1` remains the explicit console override.
 
 ## Testing over SSH without locking yourself out
 
-The shipped nftables snippet is **fail-closed**: `queue num 0` without the
-`bypass` keyword means that if nothing is listening on NFQUEUE 0 (daemon
-stopped, crashed, or not yet started), the kernel drops every *new*
-outbound connection. Your established SSH session survives (`ct state new`
-only matches new flows), but the moment it drops you cannot open a new one.
+The outbound table cannot refuse a new inbound SSH session. It hooks
+`output` and queues only `ct state new`, and everything `sshd` sends your
+client is a reply on a connection the client opened, so it is
+`ct state established` and never queued. That holds while the daemon is
+down too. Two things can still cut you off:
 
-Three layers of protection, use all of them the first time:
+- **The inbound table** (`colony-firewall-nft-inbound`, opt-in). It queues
+  every new inbound connection, SSH included, and only an inbound Allow rule
+  admits one. Its final `queue num 0` has no `bypass`, so while no daemon
+  listens it drops every new inbound connection whatever the rules say. The
+  session you enabled it from survives; the next one does not. Its lockout
+  guard (see above) refuses to load the table when no inbound Allow rule
+  could admit an established session, but it does not check the rule's
+  source network, and no rule admits anything while the daemon is down.
+- **Outbound lookups your login makes.** `sshd` and its PAM and NSS stack
+  can open new outbound flows while you log in: reverse DNS with
+  `UseDNS yes`, an LDAP, Kerberos, SSSD or RADIUS server. They are root
+  processes, so with no root prompt subscriber they get `no_ui_action` at
+  once (a denial under every profile), and while the daemon is down they
+  drop. Accounts that resolve locally are unaffected. Find these flows with
+  `sudo cfc prompts` or `cfc log --action deny` and allow each one scoped to
+  its program and server, for example
+  `cfc rules add --exe <program> --dst-net <server> --dst-port <port> --protocol tcp --name login-ldap`.
 
-**1. Allow SSH above the queue rule.** Edit your copy of the snippet so
-port 22 never reaches NFQUEUE at all:
+Do not exempt port 22 in the outbound chain. It does nothing for reaching
+the box, and `tcp dport 22 accept` lets every process on the host, attributed
+or not, reach any address on that port without a verdict or a log line.
 
-```
-table inet colony_firewall {
-    chain output {
-        type filter hook output priority 0; policy accept;
-        tcp dport 22 accept
-        ct state new queue num 0
-    }
-}
-```
+Use both of these the first time:
 
-(This exempts *outbound* SSH from filtering - for a remote machine you
-manage, also make sure your *inbound* SSH path doesn't depend on any
-process this firewall could deny, e.g. a DNS lookup in `sshd`'s PAM stack.)
-
-**2. Arm a dead-man's switch BEFORE applying the rules.** In a detached
+**1. Arm a dead-man's switch BEFORE applying the rules.** In a detached
 shell that survives your SSH session:
 
 ```sh
-sudo setsid sh -c 'sleep 300 && nft delete table inet colony_firewall' &
+sudo setsid sh -c 'sleep 300; nft delete table inet colony_firewall_inbound; nft delete table inet colony_firewall' &
 ```
 
-Then apply the snippet. If you still have connectivity after testing,
-cancel the timer (`sudo pkill -f 'nft delete table'`, or just re-apply the
-snippet after the timer fires). If you locked yourself out, wait out the
-five minutes and the table deletes itself.
+Then enable enforcement. If you still have connectivity after testing,
+cancel the timer (`sudo pkill -f '[n]ft delete table'`; the brackets keep
+the pattern from matching the `sudo` running it), or, after it fired,
+`sudo systemctl reload colony-firewall-nft` (and
+`colony-firewall-nft-inbound` if it is enabled) to load the tables again.
+If you locked yourself out, wait out the five minutes and both tables
+delete themselves. Deleting the inbound table fails harmlessly when it was
+never loaded.
 
-**3. Know the console recovery.** From a local console, serial console, or
+**2. Know the console recovery.** From a local console, serial console, or
 your VPS provider's emergency shell:
 
 ```sh
-nft delete table inet colony_firewall   # stop enqueueing entirely
+nft delete table inet colony_firewall_inbound   # admit inbound again
+nft delete table inet colony_firewall           # stop enqueueing outbound
 # or
-systemctl start colony-firewalld        # give the queue a consumer again
+systemctl start colony-firewalld                # give the queue a consumer again
 ```
 
-Either one restores traffic; the first disables enforcement, the second
-resumes it.
+Deleting the tables disables enforcement; starting the daemon resumes it,
+and with it any inbound Allow rule you wrote.
 
 ## No network after enabling
 
@@ -97,8 +125,9 @@ cfc status
 ```
 
 If `systemctl` shows the unit dead while the nftables rule is loaded, you
-are in the fail-closed state described above: packets are queued to NFQUEUE
-0 and nobody answers. Start the daemon or delete the table.
+are in the fail-closed state (see the
+[matrix](#fail-open-vs-fail-closed-matrix)): new non-loopback flows are
+queued to NFQUEUE 0 and nobody answers. Start the daemon or delete the table.
 
 **Is the nftables table actually loaded?**
 
@@ -110,8 +139,8 @@ If this errors with "No such file or directory", nothing is being
 enqueued - the daemon runs but enforces *nothing*, silently. This is the
 usual state after a reboot if you only ever applied the snippet manually
 with `nft -f`: nftables rules do not persist across reboots on their own.
-Enable the companion unit (`colony-firewall-nft.service`) or merge the
-snippet into `/etc/nftables.conf` so the rule comes back at boot.
+Enable the companion unit (`colony-firewall-nft.service`) so the rule comes
+back at boot.
 
 **Do the queue numbers match?** The snippet says `queue num 0`; the daemon
 binds the queue from `[nfqueue] queue_num` in `daemon.toml` (default 0).
@@ -119,7 +148,9 @@ If they differ, packets queue to a number nobody consumes - same lockout
 as a dead daemon.
 
 **The fail-open alternative.** If you would rather lose filtering than
-lose the network when the daemon is down, add the `bypass` keyword:
+lose the network when the daemon is down, add the `bypass` keyword to the
+final queue rule of a local copy of the snippet (see
+[Changing the shipped ruleset](#changing-the-shipped-ruleset)):
 
 ```
 ct state new queue num 0 bypass
@@ -142,7 +173,7 @@ improvement working, and the reason is in the journal:
 journalctl -u colony-firewalld -b --no-pager | tail -40
 ```
 
-The daemon prints hint lines next to the failure. Three causes:
+The daemon prints hint lines next to the failure. Four causes:
 
 **Missing capability.** `failed to open NFQUEUE socket: ...` followed by
 a `CAP_NET_ADMIN` hint. Run it via the bundled unit rather than by hand;
@@ -169,6 +200,24 @@ Either stop the other consumer, or move this daemon to a free number in
 nftables rule. The two must agree or you get the same lockout as a dead
 daemon.
 
+**The rule database cannot be opened.** Startup opens
+`/var/lib/colony-firewall/rules.db` (`[storage] path`) before anything
+else, so these fail on every start:
+
+```sh
+journalctl -u colony-firewalld -b -g 'opening rule store|durable storage requires|newer than this daemon supports'
+```
+
+- `durable storage requires WAL` or `synchronous=FULL`: the path is on a
+  filesystem that cannot hold a WAL journal (a network share, for one), or
+  outside the directories the unit can write. Keep `[storage] path` on local disk
+  under `/var/lib/colony-firewall`.
+- `newer than this daemon supports`: the package was downgraded. Reinstall
+  the newer one, or restore a backup of `rules.db` that the older version
+  wrote.
+- Any other error under `opening rule store` or `purging transient rules`:
+  usually a full `/var`. Free space and start the daemon again.
+
 Once it starts cleanly the unit reports ready only after both the queue
 and the control socket are bound, so `systemctl is-active` genuinely
 means "filtering".
@@ -180,7 +229,9 @@ The GUI will not connect, or `cfc` prints:
 ```
 permission denied on /run/colony-firewall/cfc.sock - add your user to the
 colony-firewall group (sudo usermod -aG colony-firewall $USER) then log
-out and back in, or run as root
+out and back in, or run as root. The group gives read access and lets the
+Colony Firewall app and tray connect; firewall changes come from the app,
+the tray or sudo cfc
 ```
 
 The control socket is `root:colony-firewall` mode 0660, so the kernel
@@ -232,44 +283,181 @@ Two neighbouring errors that are *not* this one, and say so:
 Every one of these exits 4 ("daemon unreachable"), so scripts can tell
 them apart from a bad argument (2) or a missing rule (3).
 
+## A change is refused: "read-only access"
+
+Since 0.8.0 only root and the installed Colony Firewall app and tray can
+change the firewall. Everything else of yours, `cfc` without sudo included,
+is read-only, and the daemon says why (exit 1):
+
+```
+read-only access: <reason>. Firewall changes are accepted only from the
+installed Colony Firewall app and tray, or from root (sudo cfc ...).
+```
+
+- **From `cfc`**: run it with `sudo`. A non-root `cfc prompts` still shows
+  prompts but cannot answer them, and does not count as a connected UI.
+- **"this colony-firewall is not the installed /usr/bin/colony-firewall
+  (restart it after an upgrade)"** or **"the caller did not seal itself at
+  startup"**: the app or tray was upgraded under you, or is a 0.7 build.
+  Quit and start it again (the tray from your session's autostart or by
+  hand, `colony-firewall-tray &`). The tray tells you once in a
+  notification when its binary was replaced, and shows the reason when an
+  answer is refused. Until it restarts, the first prompt after the upgrade
+  waits out `prompt_timeout_secs` and later ones take `no_ui_action`, unless
+  the app is open and current.
+- **"the caller loaded /home/…/something.so"**: a library from outside the
+  root-owned system directories is mapped into the app, usually a global
+  `LD_PRELOAD` (MangoHud, gamemode) or a user-installed Vulkan layer or
+  GTK/input-method module. Start the app without it. The daemon refuses to
+  trust a process that runs code it cannot vouch for.
+- **"the caller is being traced"**: a debugger or `strace` is attached.
+- **"the caller runs in a private mnt (or user) namespace"**: the app was
+  started inside a sandbox or container wrapper. Start it directly.
+- **"the connection's client end is unknown (unix_diag: …)"**: the kernel
+  has no `unix_diag` support (module not loaded). `sudo modprobe unix_diag`;
+  until then the app and tray are read-only and `sudo cfc` works.
+- **"firewall changes require root, or the installed Colony Firewall app or
+  tray run by a member of group 'colony-firewall'"**: you started the app
+  from a session that predates joining the group. Log out and back in.
+
+The journal names the caller and the reason for every refusal:
+
+```sh
+journalctl -u colony-firewalld -g 'refusing a firewall change'
+```
+
+## Pause, resume, import or an Allow rule asks for a password, or fails
+
+Pause, resume and rule import change the whole firewall at once, and an
+Allow rule that names no program lets every program through, so the app and
+tray need an administrator password for them (polkit: every time for pause
+and resume, kept a few minutes for the others). Root (`sudo cfc`) is never
+asked. Rules that name a program, and Deny rules, never ask. What the
+refusals mean:
+
+- **"authorization dialog dismissed"**: you cancelled it.
+- **"no polkit authentication agent answered in your session"**: nothing in
+  your session shows polkit dialogs. Start one (`hyprpolkitagent`,
+  `polkit-gnome-authentication-agent-1`, `lxqt-policykit-agent`; most full
+  desktops already run one) or use `sudo cfc pause`.
+- **"polkit is not installed or not running"** or **"the system D-Bus is
+  unreachable"**: install polkit, or use `sudo cfc`.
+- **"not authorized by polkit policy"**: a local polkit rule denies
+  `org.projectcolony.firewall.pause`, `org.projectcolony.firewall.import-rules`
+  or `org.projectcolony.firewall.allow-every-program` for you. `pkaction --verbose --action-id org.projectcolony.firewall.pause`
+  shows the defaults; a missing action means the policy file is not
+  installed in `/usr/share/polkit-1/actions/`.
+- **"authorization timed out after 120 s"**: the dialog was left open; the
+  daemon closed it.
+
+## The daemon warns about `kernel.yama.ptrace_scope`
+
+`kernel.yama.ptrace_scope is 1: a program of the desktop user can start the
+installed app or tray under ptrace ...` is logged once at startup. It is not
+an error: with that setting any program of yours can start the app under a
+debugger, change its code before it seals itself and make changes as it,
+and the daemon cannot tell afterwards. Setting
+`kernel.yama.ptrace_scope = 2` closes that route; the commands are in
+[HARDENING.md](HARDENING.md#the-control-socket-and-who-can-talk-to-it).
+Debugging your own programs then needs root.
+
 ## Loopback and the local resolver
 
 The snippet's `output` hook matches loopback traffic too. On systems using
 systemd-resolved, every DNS query goes to the stub resolver at
-`127.0.0.53:53` - over loopback - so each lookup gets intercepted and can
-prompt, time out, or (under `strict`) be denied. The symptom is DNS that
-is slow, flaky, or dead while direct-by-IP connections work.
-
-Exempt loopback above the queue rule:
+`127.0.0.53:53` - over loopback. The shipped ruleset queues new loopback
+flows with their own rule, just above the final queue rule:
 
 ```
-table inet colony_firewall {
-    chain output {
-        type filter hook output priority 0; policy accept;
-        oifname lo accept
-        ct state new queue num 0
-    }
-}
+oifname "lo" ct state new queue num 0 bypass
+ct state new queue num 0
 ```
 
-Loopback traffic never leaves the machine, so exempting it costs you no
-outbound coverage. The ruleset installed by the companion
-`colony-firewall-nft.service` unit includes this exemption; the caveat
-applies mainly if you carry an older copy of the snippet in your own
-`/etc/nftables.conf`.
+While the daemon runs, it judges them like any other flow: explicit rules
+apply, and unmatched local IPC (the stub resolver, CUPS, a local dev
+server) is allowed without prompting. While nothing listens on the queue,
+`bypass` makes the kernel accept them, so local IPC keeps working when the
+daemon is down. That includes the stub resolver's socket, but only for names
+it can answer from its cache or local records: its queries to the upstream
+servers are new non-loopback flows, so resolving anything else still needs
+the daemon. Every non-loopback new flow still meets the fail-closed rule.
+
+`bypass` only covers a daemon that is not listening. A daemon that listens
+but whose single worker is stuck (an executable on a hung mount being
+hashed, for instance) leaves new loopback flows, local DNS included,
+waiting in the same queue; once it fills they drop until the watchdog
+restarts the daemon, which takes up to about 90 seconds.
+
+If you load a local copy of the snippet, compare it with the shipped one
+after every upgrade: a copy without the loopback rule drops every new
+loopback flow whenever the daemon is down, and one with an explicit
+`oifname lo accept` skips the daemon for loopback entirely, so loopback
+rules never apply.
 
 Note the daemon already exempts its *own* reverse-DNS lookups internally
 (they would otherwise deadlock the queue); the loopback rule is about
 everyone else's DNS.
 
+## Traffic that never reaches the daemon
+
+The `output` chain (and the inbound one) only queues `ct state new`.
+Two kinds of packet are settled in the kernel instead:
+
+- **Link control is accepted.** IPv6 neighbour discovery and MLD, which
+  conntrack itself marks untracked, and IGMP membership traffic. Only the
+  hop limits (and, for MLD, the sources) the RFCs require match, so these
+  stay on the link. Without them IPv6 neighbour resolution and multicast group
+  membership stop working; ND and MLD never reach the queue, so no rule
+  could restore them.
+- **Other INVALID and UNTRACKED packets drop**, including flows an
+  explicit `notrack` rule touched (a busy DNS or NTP server's tuning, for
+  instance). An `accept` in another table does not override this chain's
+  `policy drop`. To keep such flows, load a local copy of the snippet with
+  an accept for them above the queue rules (see
+  [Changing the shipped ruleset](#changing-the-shipped-ruleset)).
+
+## Changing the shipped ruleset
+
+`colony-firewall-nft.service` loads
+`/usr/share/colony-firewall/nftables-snippet.conf`, and that file starts by
+deleting any `table inet colony_firewall` already loaded. A table of that name
+from `/etc/nftables.conf` or a manual `nft -f` is therefore replaced at boot,
+whenever the daemon starts (it requires the unit) and on every package
+upgrade (which reloads the unit). Carry changes as a local copy that the unit
+loads instead:
+
+```sh
+sudo install -Dm644 /usr/share/colony-firewall/nftables-snippet.conf \
+     /etc/colony-firewall/nftables-snippet.conf
+sudoedit /etc/colony-firewall/nftables-snippet.conf
+sudo systemctl edit colony-firewall-nft
+```
+
+and in the drop-in, override both commands (upgrades reload, so
+`ExecReload=` matters as much as `ExecStart=`):
+
+```
+[Service]
+ExecStart=
+ExecStart=/usr/bin/nft -f /etc/colony-firewall/nftables-snippet.conf
+ExecReload=
+ExecReload=/usr/bin/nft -f /etc/colony-firewall/nftables-snippet.conf
+```
+
+Then `sudo systemctl reload colony-firewall-nft`. Keep the `add table` and
+`delete table` lines at the top of the copy: they are what lets a reload
+replace the table in one transaction. Upgrades do not touch the copy, so
+compare it with the shipped file after each one. The inbound unit takes the
+same drop-in with `nftables-inbound.conf`.
+
 ## Fail-open vs fail-closed matrix
 
 What happens to a **new outbound connection** in each state:
 
-| State                              | Without `bypass` (shipped)     | With `bypass`                  |
+| State                              | Without `bypass` on the final rule (shipped) | With `bypass`        |
 |------------------------------------|--------------------------------|--------------------------------|
 | Daemon up, nft rule loaded         | Filtered: rules, then prompts, then profile fallback | Same |
-| Daemon down, nft rule loaded       | **Dropped. Total outbound lockout.** | Allowed, unfiltered (silent) |
+| Daemon down, nft rule loaded       | **Dropped. Outbound lockout** (new loopback flows still allowed) | Allowed, unfiltered (silent) |
 | Daemon up, nft rule *not* loaded   | Allowed, unfiltered (silent - daemon sees nothing) | Same |
 | Daemon paused (`cfc pause`)        | Rules still enforced; only *unmatched* flows pass instead of prompting. Auto-resumes | Same |
 
@@ -338,17 +526,20 @@ cfc status
 # prompt policy    30s timeout -> Deny, no UI -> Deny
 ```
 
-Inbound SSH is unaffected — the ruleset hooks `output` on `ct state new`,
-and an established session's replies are never queued — so you always
-have a way back in to fix it.
+Inbound SSH is unaffected: the outbound ruleset never queues a session's
+replies, and the opt-in inbound table judges by your inbound rules and
+`inbound_action`, not `no_ui_action`. A login that needs the network (LDAP,
+Kerberos, reverse DNS) is the exception; see
+[Testing over SSH](#testing-over-ssh-without-locking-yourself-out).
 
 Then pick one of three fixes:
 
-**1. Answer prompts from the terminal.** This is what `cfc prompts` is
-for - it subscribes just like the GUI does, so the daemon starts asking:
+**1. Answer prompts from the terminal.** This is what `sudo cfc prompts`
+is for - it subscribes just like the GUI does, so the daemon starts asking
+(without sudo it only watches, and the daemon keeps applying `no_ui_action`):
 
 ```sh
-cfc prompts
+sudo cfc prompts
 ```
 
 Keys are `a` allow, `d` deny, `r` reject, `s` skip (let it time out), `q`
@@ -360,14 +551,14 @@ set. For a bounded unattended window - during a package install, say -
 `--auto-allow` or `--auto-deny` answer everything without asking, and
 `--count N` exits after N prompts.
 
-**2. Pre-seed rules and accept the fallback.** `cfc rules
-bundle add system` (also spelled `cfc rules bootstrap-defaults`) covers
+**2. Pre-seed rules and accept the fallback.** `sudo cfc rules
+bundle add system` (also spelled `sudo cfc rules bootstrap-defaults`) covers
 the usual system services. `cfc rules bundle list` shows the others —
-`web` for installed browsers, `dev` for git/cargo/npm, `updates` for
+`web` for installed browsers, `dev` for git/cargo/docker, `updates` for
 apt/dnf/flatpak — each scoped to a specific executable, never to a bare
 port. Entries whose program is not installed here are skipped and
 reported. Add your own with
-`cfc rules add`. Anything you did not anticipate still hits
+`sudo cfc rules add`. Anything you did not anticipate still hits
 `no_ui_action`.
 
 **3. Change the fallback — deliberately.** `no_ui_action = "Allow"` in
@@ -378,7 +569,7 @@ unanticipated connection — including a payload phoning home — goes out
 unasked. Prefer (1) or (2). If you do set it, send `SIGHUP` and it takes
 effect without a restart.
 
-Note that `cfc prompts` and the GUI can both be connected at once, and
+Note that `sudo cfc prompts` and the GUI can both be connected at once, and
 both see the prompts addressed to you. Delivery is scoped by the uid
 that owns the connecting process: you receive prompts for your own
 processes, root receives everything, and traffic the daemon could not
@@ -431,8 +622,8 @@ Watchdog timeout (limit 30s)!
 ```
 
 in the journal means the worker stopped responding, not that the machine
-was idle - a worker parked in a blocking `recv` with nothing to do is
-explicitly treated as healthy, so an idle system is never killed. Look
+was idle - an idle worker still wakes every few milliseconds to check
+for work, and that counts as progress, so an idle system is never killed. Look
 for the daemon's own complaint just before the restart:
 
 ```sh
@@ -449,8 +640,17 @@ for a stalled one, and under the fail-closed nftables rule a stalled
 daemon is a dead network.
 
 Restarts *without* a watchdog message are ordinary failures -
-`Restart=on-failure` retrying a bind that keeps failing. See "The daemon
-exits immediately" above.
+`Restart=on-failure` retrying a start that keeps failing, such as a queue
+bind or the rule database. See "The daemon exits immediately" above. A
+full disk at runtime does not restart the daemon: it costs event-log rows,
+which the journal reports as `event log write failed`.
+
+If manual restarts pile on top of the automatic ones, systemd can give up
+with `start request repeated too quickly`. Fix the cause, then:
+
+```sh
+sudo systemctl reset-failed colony-firewalld && sudo systemctl start colony-firewalld
+```
 
 ## Some rules are not being enforced
 
@@ -470,7 +670,70 @@ journalctl -u colony-firewalld -g 'failed to deserialize'
 ```
 
 If you need the rule back now and cannot upgrade, delete the offending
-row by id and re-create it with `cfc rules add`.
+row with `cfc rules remove <id>`, giving the full id from the journal, and
+re-create it with `cfc rules add`.
+
+The same warning counts **quarantined** rows: rules an older version
+accepted that the daemon now refuses (for example one scoped only on a
+parent executable, which would match every process). They are not
+applied, not listed, and preserved on disk. The journal names each one
+and why:
+
+```sh
+journalctl -u colony-firewalld -g 'fails the API boundary'
+```
+
+Remove it with `cfc rules remove <id>` (the full id) and re-create it in
+a form the daemon accepts. `cfc rules import --replace` also deletes such rows.
+
+## An Allow rule no longer lets a program through
+
+Since 0.8.0 a Deny or Reject rule scoped to a program (`--exe` or
+`--sha256`) wins over every Allow rule that names no program, however many
+predicates that Allow has. A broad `allow --protocol tcp --dst-port 443`
+therefore no longer admits a program that `deny --exe` refuses, and the
+connect hooks may refuse that program outright. To let it through on some
+destinations, add an Allow scoped to the same program and those
+destinations (`--exe X --dst-port 443`): among program rules the more
+specific one still wins. A `/0` network no longer counts when rules are
+ranked either, so a rule that relied on `--dst-net 0.0.0.0/0` to outrank
+another may now lose the tie to a Deny. `cfc rules list` shows the rules
+involved; the hit counters show which one answers.
+
+## A prompt says the program could not be identified
+
+Since 0.8.0 a flow whose program is only partly known (no socket owner
+found, a binary too large to hash, a process that exited first) is asked
+about when a rule naming a program may apply to it, instead of being
+refused in silence. The prompt names that rule and says the program could
+not be fully identified; your answer applies to that connection only. With
+no app, tray or `sudo cfc prompts` connected the flow takes `no_ui_action`,
+and the event log shows it with that rule's id and source `default`.
+
+The usual rule named is a program Deny or Reject (`deny --exe X`, often one
+an earlier "Deny always" answer created): since 0.8.0 it beats every
+generic Allow, so a flow from an unknown program no longer passes a generic
+Allow it matches while that Deny might be about it. Unattributed UDP under
+`allow --uid 1000 --protocol udp --dst-port 53` is the common case. No Allow
+rule can settle this. Either scope the named Deny to destinations
+(`--dst-port`, `--dst-net`) so it cannot apply to these flows, or make
+attribution succeed (below). A `--sha256` Deny without `--exe` does the same
+to every image over 64 MiB (Chromium, Electron, VS Code), since any of them
+could be the denied one: re-create it with `--exe` as well.
+
+These prompts appear even while paused or for loopback flows, because a
+rule may be about them. If they are frequent, find out why attribution
+fails. Run the daemon with `--debug` (`systemctl edit colony-firewalld`,
+then repeat `ExecStart=` with `--debug` appended) and look for:
+
+```sh
+journalctl -u colony-firewalld -g 'udp attribution ambiguous|attribution budget expired|table unreadable|identity is incomplete'
+```
+
+"udp attribution ambiguous" means several sockets could own the datagram
+(typically `SO_REUSEPORT` or a wildcard-bound socket shared across
+programs); scope a rule on the port instead of the program for that
+traffic.
 
 ## Where things live
 

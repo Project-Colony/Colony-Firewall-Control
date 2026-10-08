@@ -2,12 +2,12 @@
 # Asserts that the release tarball actually contains every file the
 # packaging recipes expect to find in it.
 #
-# The Colony app-store channel installs from a flat tarball: the commands
-# in pkg/colony.json's "postInstall" run with the extracted directory as
-# their working directory, so every relative source they name must have
-# been staged by the "Assemble tarball" step in
-# .github/workflows/release.yml. When it is not, the install silently
-# skips that file -- which is how the sysusers fragment went missing and
+# The release tarball installs from a flat directory: its install.sh,
+# generated from pkg/colony.json's "postInstall" by
+# scripts/tarball-installers.sh, runs from the extracted directory, so every
+# relative source it names must have been staged by the "Assemble tarball"
+# step in .github/workflows/release.yml. When it is not, the install fails
+# or skips that file -- which is how the sysusers fragment went missing and
 # left the control socket root-only.
 #
 # Checks, all fatal:

@@ -26,7 +26,7 @@ pub struct LogArgs {
     pub action: Option<ActionArg>,
 
     /// Only records newer than this, e.g. 2h, 30m, 1d.
-    #[arg(long, value_parser = crate::humantime::parse_duration_arg)]
+    #[arg(long, value_parser = crate::humantime::parse_duration)]
     pub since: Option<Duration>,
 }
 

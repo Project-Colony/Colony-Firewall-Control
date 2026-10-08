@@ -20,8 +20,6 @@ cfc-client = { path = "../cfc-client" }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
-prost = { workspace = true }
-tokio-stream = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
 # Completion + man generation live behind hidden subcommands so packaging
@@ -33,7 +31,6 @@ thiserror = { workspace = true }
 # Raw-mode single-keypress reads for `cfc prompts`. libc is already in the
 # dependency graph; a TTY crate would be a new one.
 libc = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
@@ -41,3 +38,7 @@ serde_json = { workspace = true }
 ipnet = { workspace = true }
 uuid = { workspace = true }
 owo-colors = { workspace = true }
+
+[dev-dependencies]
+# tests/cli_e2e.rs serves the daemon side over a Unix socket.
+tokio-stream = { workspace = true }

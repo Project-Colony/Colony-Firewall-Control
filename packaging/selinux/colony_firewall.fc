@@ -14,7 +14,6 @@
 
 /etc/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_conf_t,s0)
 /var/lib/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_var_lib_t,s0)
-/var/log/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_log_t,s0)
 /run/colony-firewall(/.*)?			gen_context(system_u:object_r:colony_firewall_runtime_t,s0)
 
 /usr/lib/systemd/system/colony-firewalld\.service	--	gen_context(system_u:object_r:colony_firewall_unit_file_t,s0)

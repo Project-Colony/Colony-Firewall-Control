@@ -13,14 +13,11 @@ cfc-core = { path = "../cfc-core" }
 cfc-proto = { path = "../cfc-proto" }
 
 tonic = { workspace = true }
-prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tower = { workspace = true }
 hyper-util = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
-ipnet = { workspace = true }
-chrono = { workspace = true }
+# close_range(2) and prctl(2) for `seal_official_process`.
+libc = { workspace = true }

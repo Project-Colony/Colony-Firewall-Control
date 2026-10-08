@@ -1,4 +1,4 @@
-policy_module(colony_firewall, 0.2.0)
+policy_module(colony_firewall, 0.3.0)
 
 ########################################
 #
@@ -21,9 +21,14 @@ policy_module(colony_firewall, 0.2.0)
 #     resolve struct offsets without CO-RE;
 #   * walks other processes' /proc entries to attribute a socket to a program;
 #   * runs rpm(8) once per package-database generation, for provenance;
-#   * runs nft(8) at start and at stop, to put its fast-allow mark into one
-#     nftables set and take it out again;
-#   * serves a unix socket under /run/colony-firewall to the CLI, tray and GUI.
+#   * runs nft(8) once at start, to flush a legacy Fast Allow set, and once a
+#     minute, to ask whether the filtering table is loaded;
+#   * serves a unix socket under /run/colony-firewall to the CLI, tray and GUI,
+#     and checks that a non-root client is the installed app or tray: it stats
+#     the client's image and every executable file it mapped, and asks
+#     sock_diag (UNIX_DIAG) for the client end of the connection;
+#   * asks polkit over the system bus before the app or tray may pause,
+#     resume or import rules.
 #
 # Every one of those is a separate way to be denied, and the failure modes
 # differ: a denied bpf() degrades to sock_diag + /proc and the firewall keeps
@@ -50,10 +55,6 @@ files_type(colony_firewall_var_lib_t)
 # door, and the one that survives a wrong umask.
 type colony_firewall_runtime_t;
 files_pid_file(colony_firewall_runtime_t)
-
-# /var/log/colony-firewall
-type colony_firewall_log_t;
-logging_log_file(colony_firewall_log_t)
 
 type colony_firewall_unit_file_t;
 systemd_unit_file(colony_firewall_unit_file_t)
@@ -101,8 +102,9 @@ allow colony_firewalld_t self:unix_dgram_socket create_socket_perms;
 #
 # This is the group that must not fail. A denial here is not a degraded
 # feature, it is a daemon that exits before READY=1 - and because the nftables
-# ruleset is fail-closed (`ct state new queue num 0`, no `bypass`), a daemon
-# that does not come up takes the machine's outbound network with it.
+# ruleset is fail-closed for everything except new loopback flows, which are
+# allowed while no daemon listens, a daemon that does not come up takes the
+# machine's non-loopback outbound network with it.
 #
 ########################################
 
@@ -190,28 +192,17 @@ optional_policy(`
 # check on the same file rather than the only one.
 libs_read_lib_files(colony_firewalld_t)
 
-# The fast-allow path. The connect hooks mark the sockets of a process the
-# daemon has ruled allowed process-wide, and the shipped snippet accepts that
-# mark ahead of the queue - but only for values in a set the snippet declares
-# empty. The daemon runs nft(8) to put its per-start random value in and to
-# flush the set again, executed in this domain like rpm below rather than
-# transitioning to iptables_t, which may rewrite the whole ruleset. nft then
-# opens a netlink_netfilter socket, already allowed in the filtering group
-# above: it is the socket class NFQUEUE itself lives on.
+# nft(8), for two things. Once at start, `flush set` empties the legacy
+# fast_allow set: Fast Allow was removed, and a 0.4-0.6 daemon that crashed
+# while armed can have left its mark accepted there. Once a minute, `list
+# table` tells `cfc status` whether the filtering table is loaded. Executed in
+# this domain like rpm below rather than transitioning to iptables_t, which may
+# rewrite the whole ruleset. nft then opens a netlink_netfilter socket, already
+# allowed in the filtering group above: it is the socket class NFQUEUE itself
+# lives on.
 #
-# Five subcommands, not the two an earlier version of this comment claimed:
-# `flush set` and `add element` do the work, `list set` and `list table` are
-# the probe that tells a missing set from a missing table, and `get element`
-# is the periodic check that the mark is still accepted after a ruleset
-# reload. Nor is it twice in a daemon's life: the nft unit starts *after* the
-# daemon, so arming is a retry on every heartbeat - ten seconds, or two on a
-# kernel that cannot pin the exec/exit tracepoint links - until the table
-# appears, and once armed the check runs every sixty. On a host where this is
-# denied that is an AVC every heartbeat, for as long as the daemon runs with
-# fast_allow = true - loud on purpose, but worth knowing before reading a log.
-#
-# A denial costs the fast path and nothing else. The daemon reports it as off
-# with the reason in `cfc status`, and every connection keeps taking the queue.
+# A denial costs the flush (an error in the journal at start) and the probe
+# (`enforcing` keeps its previous answer); filtering itself is unaffected.
 #
 # Fedora labels /usr/bin/nft iptables_exec_t (RHEL: /usr/sbin/nft); the same
 # type covers both spellings, and the daemon tries both paths.
@@ -264,6 +255,40 @@ optional_policy(`
 
 ########################################
 #
+# Official clients and polkit
+#
+# Before a non-root client may change anything, the daemon checks it is the
+# installed app or tray: it stats that binary and every directory above it,
+# and every executable file the client mapped (binaries and libraries), to
+# prove each is root-owned and unwritable by anyone else. The /proc reads
+# (maps, fd, ns, status, and /proc/1/ns) are covered by the attribution
+# group above; the UNIX_DIAG query by the netlink_tcpdiag_socket rule (it is
+# the same NETLINK_SOCK_DIAG socket).
+#
+# A denial here makes the app and tray read-only, with the reason in their
+# error message; root (sudo cfc) keeps working.
+#
+########################################
+
+corecmd_getattr_all_executables(colony_firewalld_t)
+corecmd_search_bin(colony_firewalld_t)
+files_list_root(colony_firewalld_t)
+files_search_usr(colony_firewalld_t)
+libs_search_lib(colony_firewalld_t)
+
+# CheckAuthorization on org.freedesktop.PolicyKit1. Denied, pause, resume and
+# rule import from the app or tray fail with "system D-Bus is unreachable" or
+# "polkit check failed"; sudo cfc still works.
+optional_policy(`
+	dbus_system_bus_client(colony_firewalld_t)
+
+	optional_policy(`
+		policykit_dbus_chat(colony_firewalld_t)
+	')
+')
+
+########################################
+#
 # Own files
 #
 ########################################
@@ -280,10 +305,6 @@ manage_files_pattern(colony_firewalld_t, colony_firewall_var_lib_t, colony_firew
 # and never surfaces as an error anywhere.
 allow colony_firewalld_t colony_firewall_var_lib_t:file map;
 files_var_lib_filetrans(colony_firewalld_t, colony_firewall_var_lib_t, { dir file })
-
-manage_dirs_pattern(colony_firewalld_t, colony_firewall_log_t, colony_firewall_log_t)
-manage_files_pattern(colony_firewalld_t, colony_firewall_log_t, colony_firewall_log_t)
-logging_log_filetrans(colony_firewalld_t, colony_firewall_log_t, { dir file })
 
 manage_dirs_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)
 manage_files_pattern(colony_firewalld_t, colony_firewall_runtime_t, colony_firewall_runtime_t)

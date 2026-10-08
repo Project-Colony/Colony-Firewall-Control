@@ -9,28 +9,29 @@ desktop, not what's theoretically pure.
 
 1. Start in `profile = "balanced"`, leave the UI running.
 2. Click through prompts for a week. Save persistent rules as you go.
-3. Run `cfc rules bootstrap-defaults` to install common system rules.
+3. Run `sudo cfc rules bootstrap-defaults` to install common system rules.
 4. Once the prompt rate drops to maybe 1-2 a day, switch to
-   `profile = "strict"` for fail-closed behavior.
+   `profile = "strict"` if you prefer a shorter prompt timeout.
 5. Audit `cfc rules list` monthly. Remove rules for apps you no longer
    use, and check `cfc log --since 30d` for destinations you did not
    expect.
 
-On a headless machine, substitute `cfc prompts` for "leave the UI
-running" throughout - it subscribes the same way the GUI does.
+On a headless machine, substitute `sudo cfc prompts` for "leave the UI
+running" throughout - it subscribes the same way the GUI does. Without sudo
+it only watches (see [the control socket](#the-control-socket-and-who-can-talk-to-it)).
 
 ## Choosing a profile
 
 | Profile  | No UI    | Timeout  | Window | Use when                                      |
 |----------|----------|----------|--------|------------------------------------------------|
-| relaxed  | Allow    | Deny     | 60s    | Headless servers / can't always be at the UI   |
-| balanced | Allow    | Deny     | 30s    | Daily-driver workstations (default)            |
-| strict   | Deny     | Deny     | 15s    | Lockdown posture, UI always present            |
+| relaxed  | Deny     | Deny     | 60s    | Longer time to answer prompts                  |
+| balanced | Deny     | Deny     | 30s    | Daily-driver workstations (default)            |
+| strict   | Deny     | Deny     | 15s    | Shorter time to answer prompts                 |
 
-**No profile ever permits a connection by itself.** Not on timeout, not
+**No profile ever permits a remote connection by itself.** Not on timeout, not
 when nothing is subscribed. The presets differ only in how long a prompt
-waits for an answer. Only a stored rule, or a person answering, allows
-traffic.
+waits for an answer. Under these presets, a stored rule or a prompt answer
+permits remote traffic. Unmatched local IPC is allowed without prompting.
 
 A timeout means the question *was* put to you and went unanswered; if
 that granted access, the cheapest attack would be to connect while
@@ -58,8 +59,8 @@ before the daemon and `network-pre.target`. Enabled enforcement is required
 by NetworkManager and systemd-networkd, so an nft load failure blocks their
 startup. Initial daemon failure leaves the table loaded and drops new flows.
 This does not cover initramfs networking, already configured interfaces, or
-other network managers. Once loaded, strict
-filtering denies unmatched flows, so DHCP, DNS and NTP need standing rules or
+other network managers. Once loaded, strict filtering denies unmatched remote
+flows, so DHCP, DNS and NTP need standing rules or
 the machine cannot even get a lease. Network managers retrying DNS will
 look like total network failure. **Only flip to strict after you have
 rules for every always-on system service**.
@@ -87,10 +88,12 @@ User-side conveniences that hit the network constantly:
 You can install the system service rules with one command:
 
 ```sh
-cfc rules bootstrap-defaults
+sudo cfc rules bootstrap-defaults
 ```
 
-This is idempotent: it skips rules already present by name.
+This is idempotent: it skips the rules it installed earlier and identical
+same-named rules seeded before 0.7.0. A different rule with one of its names
+stops it before anything changes.
 
 ## What to *deny* first
 
@@ -110,6 +113,10 @@ predicates are compatible, their uncertainty refuses the flow before a lower
 Allow, pause or prompt can admit it. Replace these rules explicitly with
 executable or numeric scopes; a legacy hostname Allow no longer grants access.
 The editor requires the old hostname to be removed before saving a replacement.
+Such a rule cannot be disabled either, since a toggle sends the hostname back
+and the daemon refuses it: edit or delete it (`sudo cfc rules remove <id>`). Its
+refusals are logged as the default policy, so the daemon names every enabled
+legacy hostname rule in a warning at startup.
 
 CLI and GUI destination presets use the observed numeric endpoint, as `/32`
 for IPv4 or `/128` for IPv6, and label it as an IP. They do not turn a domain
@@ -123,6 +130,9 @@ It does not validate a resolver transaction, sender or question. These records
 remain untrusted diagnostics in a separate cache. They cannot satisfy a
 policy rule. Observations and forward-confirmed PTR diagnostics use separate caches. Diagnostic entries
 retain the record TTL, clamped to 60s..1h; the policy cache remains separate.
+A name with anything but ASCII letters, digits, `-`, `_` and `.` is dropped,
+so a crafted answer cannot print text that looks like the address or trust
+label shown beside it.
 
 ## Deny or Reject?
 
@@ -165,6 +175,15 @@ Two caveats, both real:
 protocol` is much safer than `exe` alone - if a process is later
 compromised, the attacker still can't pivot to arbitrary destinations.
 
+**A program Deny beats a generic Allow.** A Deny or Reject rule scoped to
+a program (`--exe` or `--sha256`) wins over every Allow rule that names no
+program, however many other predicates that Allow carries: `deny --exe
+/opt/agent` holds even next to `allow --protocol tcp --dst-port 443`. Among
+rules that name a program the more specific one still wins, so an
+`allow --exe X --dst-port 443` carves an exception out of `deny --exe X`.
+A `/0` network (`--dst-net 0.0.0.0/0`) does not count as a predicate when
+rules are ranked.
+
 **Watch the hit counter.** `cfc rules list` shows `hits` per rule. A rule
 with zero hits after weeks of use is probably obsolete or wrong.
 
@@ -172,22 +191,104 @@ with zero hits after weeks of use is probably obsolete or wrong.
 different binary after an interpreter upgrade. When in doubt, target the
 real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
 
+**Executables over 64 MiB have no digest.** The daemon does not hash an
+image larger than 64 MiB, and Chromium, Electron apps and VS Code are
+usually past it. For such a program:
+
+- `cfc rules add --pin-hash` refuses the file. A digest supplied another way
+  (`--sha256`, an import) is stored but can never be compared, so a rule
+  carrying one, Allow or Deny, cannot be decided for the program. Wherever
+  its other fields match and the rules below it would answer differently,
+  the program's flows are prompted, naming that rule, and take
+  `no_ui_action` when no UI is connected. A `--sha256` Deny without
+  `--exe` therefore holds every such image open under every generic Allow
+  (any of them could be the denied one); give it `--exe` too, so other
+  programs are decided by path.
+- On a root-sealed path (root-owned, with root-owned ancestors, as a package
+  installs it) nothing else changes: "Allow always" saves a path-only rule.
+- On any other path (under a home directory, a user-writable `/opt`
+  tree), an Allow cannot be bound to the image, so "Allow always" applies
+  once and saves no rule (the UI says why), and every new flow, each
+  retransmit included, opens its own prompt. A hand-written path-only rule
+  (`cfc rules add --exe <path>`) works, but whoever can write that file
+  inherits it. Installing the program root-owned is the better fix.
+
+**Incomplete identity is asked, not refused.** A flow whose executable,
+uid or digest is unknown (unattributed UDP, an expired attribution budget,
+a process that exited first) cannot be checked against a program rule. When
+such a rule and the rest of the rule set disagree, the flow is prompted
+with the identity shown as unknown; with no UI connected it takes
+`no_ui_action`. That is Deny on every shipped profile. If you set
+`no_ui_action = "Allow"`, a `deny --exe` rule no longer holds on a machine
+nobody is watching: a program can make its own UDP attribution ambiguous
+(binding a port another of its user's sockets shares) or exit before
+`/proc` is read, and its flow then gets the permissive fallback. Keep
+`no_ui_action` at Deny where program denies matter.
+
 ## What this firewall does *not* protect against
+
+Normal mode follows the desktop application firewall model of OpenSnitch and
+Windows Firewall Control. It filters new tracked IP flows using socket
+attribution. [Explicit application confinement](../README.md#explicit-application-confinement)
+is a separate launch mode.
 
 - **Anything from root**: `/usr/bin/colony-firewalld` itself is trusted,
   and so is any other root process. Use this firewall alongside, not
   instead of, traditional access controls.
 - **eBPF / unprivileged user namespaces**: a sufficiently privileged user
   can bypass NFQUEUE entirely with `unshare -rn` and a custom net namespace.
-- **Local relays and DNS**: loopback is exempt. A denied application can use
-  an allowed local resolver or proxy; outbound traffic is attributed to that
-  service. Hostname rules and observed answers do not isolate DNS queries.
+- **Local relays and DNS**: while the daemon runs, explicit rules apply to
+  new direct loopback flows and unmatched local IPC is allowed without
+  prompting. While no daemon listens on the queue, new loopback flows are
+  allowed unfiltered (`bypass` on the `lo` rule only): an explicit loopback
+  Deny or Reject rule is not enforced in that window, nothing records those
+  flows, and a loopback connection opened then keeps its authorization once
+  the daemon is back. An authorized local
+  resolver or proxy can relay remote traffic, which is attributed to that
+  service. CFC cannot establish the originating application's identity from
+  remote flows delegated through AF_UNIX or D-Bus brokers. Existing local
+  connections retain their authorization. Hostname rules and observed answers
+  do not isolate DNS queries.
+- **Inbound-initiated connections**: with inbound filtering off (the
+  default) a connection a remote peer opens is never queued: its replies are
+  established traffic. A program that outbound rules deny still answers on
+  any port it listens on. Enable inbound filtering to decide those flows.
 - **Inherited or passed sockets**: established/related traffic keeps its
   connection-wide authorization. An inherited or passed descriptor is not
-  reauthorized for each sending executable.
-- **Packet-layer privileges**: applications with `CAP_NET_RAW` can use packet
-  sockets outside the shipped IP OUTPUT hooks. These rules do not provide
-  layer-2 containment.
+  reauthorized for each sending executable. Current descriptor ownership
+  and validated eBPF hints reduce false attribution; neither proves which
+  process sent a packet.
+- **Mount namespaces and same-user code**: a process reports its executable
+  path as its own mount namespace sees it. When that path names a different
+  file in the daemon's view (a container's or `unshare -rm` user's
+  `/usr/bin/curl`), the executable is reported as unknown, so path rules for
+  the host's file do not match it. A path the daemon cannot see at all (a
+  Flatpak `/app` path, anything under `/home`, hidden by `ProtectHome`) is
+  taken as reported: a hand-written path-only rule for such a path can be
+  matched from a mount namespace, so pin its hash. Code already running as a
+  user can also borrow an allowed program's identity by running it with
+  chosen arguments or with `LD_PRELOAD`, which a hash pin does not prevent.
+  An image deleted while it runs is matched by the path it had (an upgraded
+  program keeps its rules), which the daemon cannot check against anything.
+  Only a process in the daemon's own user namespace, running an image from a
+  mount of its own mount namespace, gets that path. One in another user
+  namespace (`unshare -U`, a rootless container), or one running an image
+  through another namespace's mount (`/proc/<pid>/root`, a passed
+  descriptor), keeps the `" (deleted)"` suffix, so its rules stop matching
+  until it restarts. A setuid mount helper such as setuid `bwrap` lets a
+  user present a path that way too. Digests and the root-sealed test trust
+  what the filesystem reports: on a FUSE filesystem the daemon can read
+  (`user_allow_other` in `/etc/fuse.conf`), the user who mounted it controls
+  both. An image the daemon cannot open at all, such as
+  an AppImage or anything on a FUSE mount without `allow_other`, has no
+  executable identity, so an Allow scoped to its path never applies to it.
+- **Raw and packet sockets**: applications with `CAP_NET_RAW` can use AF_PACKET
+  outside the shipped `inet OUTPUT` hook. Raw IP packets can coincide with
+  another socket's tuple even when TCP matching is strict. Tuple and inode
+  checks do not prove raw packet provenance or provide layer-2 containment.
+  Docker grants `CAP_NET_RAW` to containers by default, so a
+  `--network=host` container can send frames on the host's interfaces this
+  way; run workloads CFC should govern with `--cap-drop NET_RAW`.
 - **DNS-over-HTTPS embedded in browsers**: the firewall sees the outer HTTPS
   flow. Domain isolation requires an application-aware proxy or separate containment.
 - **Container traffic**: Docker / Podman / LXC route through their own
@@ -217,38 +318,160 @@ connect - the UI will report a permission error. Create the group with
 the shipped `sysusers.d` fragment or by hand
 (`groupadd -r colony-firewall`), then add yourself and restart.
 
-**Layer 2 - peer credentials.** Every connection carries `SO_PEERCRED`,
+**Layer 2 - who the caller is.** Every connection carries `SO_PEERCRED`,
 and the daemon checks the caller per RPC:
 
-| RPC class | RPCs                        | Requires                    |
-|-----------|-----------------------------|-----------------------------|
-| Mutating  | `UpsertRule`, `DeleteRule`, `SetPaused`, `SubmitVerdict` | uid 0, **or** a socket that is genuinely group-gated |
-| Read-only | `ListRules`, `GetStatus`, `ListEvents`, `StreamConnections`, `StreamPrompts` | Only layer 1 |
+| RPC | root (`sudo cfc`) | installed app or tray | any other program |
+|-----|-------------------|-----------------------|-------------------|
+| `ListRules`, `GetStatus`, `ListEvents`, `StreamConnections` | yes | yes | yes |
+| `StreamPrompts` | yes, counts as a UI | yes, counts as a UI | sees its prompts, does **not** count as a UI |
+| `SubmitVerdict`, `UpsertRule`, `DeleteRule` | yes | yes, no password (an Allow that names no program: after polkit authorization) | refused |
+| `SetPaused` (pause **and** resume), `ApplyRules` (import, replace, bundles) | yes, no password | after polkit authorization | refused |
 
-`require_group = false` in `[ipc]` turns the mutating check off. Leave it
-on unless you are gating the socket some other way (filesystem ACLs);
-with it off, any process that manages to connect can rewrite your rules.
+There is no RPC that changes `[default_policy]`: that is root editing
+`daemon.toml` and sending `SIGHUP`.
 
-**Say it plainly: every member of the group is fully trusted.** There is
-no in-band authentication, no per-user identity, and no password. Group
-membership grants the ability to allow or deny any traffic on this host,
-which is root-equivalent control over the firewall. This is not a
-multi-user privilege boundary - add only administrators of the machine.
+**Group membership no longer grants control.** It lets your session connect
+and read, and lets the installed app and tray connect. Everything else of
+yours, a non-root `cfc` included, is read-only: a change is refused with the
+reason, a read-only `cfc prompts` does not stop `no_ui_action` from applying,
+and it never enters a prompt's audience, so it cannot answer even a prompt
+about its own process. Any process running as the daemon's own uid is treated
+like root; in production that *is* root.
 
-**The one exception is prompt ownership.** A prompt is about a process,
-and that process has an owner uid. Delivery is scoped to it: a
-`StreamPrompts` subscription is handed a prompt only when the subscriber's
-peer uid matches the owner, and `SubmitVerdict` refuses a caller the prompt
-was not handed to. So another logged-in user's session is neither shown the
-prompt nor able to answer it - it never even learns the prompt id.
+**How the app and tray are recognised.** Each request from a non-root peer
+that wants to change something is checked against the calling process, all
+of it between two reads of that process's start time (so a reused pid fails):
 
-Exactly what that does and does not promise:
+- it runs in the host's mount and user namespaces;
+- it is not traced, runs under no seccomp filter (a filter installed before
+  `exec` survives it and can make the prologue's descriptor closing report
+  success without closing anything), and its effective uid is the
+  connection's;
+- it ran the app's sealing prologue at startup: every inherited descriptor
+  closed and the process made non-dumpable, which the kernel shows by giving
+  its `/proc` files to root;
+- its running image is, by device and inode, one of `[ipc] official_clients`
+  (default `/usr/bin/colony-firewall` and `/usr/bin/colony-firewall-tray`),
+  and that file is root-owned, unwritable by group and other, in root-owned
+  directories nobody else can write. Re-checked every time, so after an
+  upgrade a process still running the replaced binary is read-only until it
+  is restarted. Its prompt subscription is checked again before each prompt
+  and ends at the first one after the upgrade (which still waits out the
+  timeout), so it stops counting as a UI and later prompts take
+  `no_ui_action`; the tray says it must be restarted;
+- it holds the client end of this very connection itself, on a descriptor
+  above stderr (found through sock_diag's `UNIX_DIAG`);
+- every executable file it mapped comes from such sealed directories, so an
+  `LD_PRELOAD` or `LD_AUDIT` library from your home directory makes it
+  read-only, with the library named.
+
+The prologue and the descriptor check are what stop the obvious trick:
+connect, write a whole request into the socket, then `exec` the installed app
+with the socket inherited. Non-dumpable stops same-user `ptrace`,
+`/proc/<pid>/mem` and `pidfd_getfd` on the app from the moment the prologue
+runs. It does nothing about a tracer that was there before (see below).
+
+`require_group = true` (the default) also requires the app or tray to be run
+by a proved group member. `require_group = false` waives that for the app
+and tray only; it never makes anything else writable.
+
+**polkit for whole-firewall changes.** Pause, resume and rule import change
+everything at once, and an Allow rule that names no program (no `exe_path`
+or `exe_sha256`: `allow --protocol tcp`, `allow --dst-port 443`) lets every
+program through wherever it matches, which is a pause for that traffic. So
+even the app and tray need an administrator password for them. The daemon
+asks polkit and your session's polkit agent shows the dialog:
+
+| action | for | default |
+|--------|-----|---------|
+| `org.projectcolony.firewall.pause` | `SetPaused`, pause and resume | `auth_admin`, a password every time |
+| `org.projectcolony.firewall.import-rules` | `ApplyRules` (import, replace, bundles) | `auth_admin_keep`, one password covers a few minutes |
+| `org.projectcolony.firewall.allow-every-program` | `UpsertRule` storing an enabled Allow that names no program, or a prompt answer customized into one | `auth_admin_keep` |
+
+Pause is never kept because the tray's menu is a D-Bus object any program of
+yours can click (`com.canonical.dbusmenu` `Event`): polkit, not the tray,
+stands between such a click and a pause, and a kept authorization would let
+it through for five minutes after your last pause or resume. Such a click
+still raises a genuine password dialog you did not ask for; cancel it.
+
+Without an agent (start one, e.g. `hyprpolkitagent` or `polkit-gnome`) or
+without polkit, the request is refused with that reason and `sudo cfc` still
+works. The daemon waits 120 s for an answer, then cancels the dialog.
+Answering a prompt and editing a rule that names a program, or a Deny,
+never ask. A customized prompt answer that polkit refuses still applies
+once; only its standing rule is not saved.
+
+**What this still trusts.** The check is about the *process*, so code that
+runs inside the installed app is the app:
+
+- a preloaded payload that copies itself into anonymous executable memory and
+  unmaps its file is not seen (anonymous executable mappings cannot be
+  refused: GPU drivers JIT into them);
+- code written into the app before it sealed itself. Under Yama's
+  `kernel.yama.ptrace_scope = 1` (the default on most distributions) a
+  program may trace its own child, so it can start the installed app or tray
+  with `PTRACE_TRACEME` or under a debugger, patch its code at the `exec`
+  stop and detach. The patched process then runs the real prologue and every
+  check passes: nothing the daemon reads later shows a past trace. Setting
+  `kernel.yama.ptrace_scope = 2` (only root may trace, `PTRACE_TRACEME`
+  included) closes this, at the cost of debugging your own programs without
+  root; the daemon warns at startup while it is lower:
+
+  ```sh
+  echo 'kernel.yama.ptrace_scope = 2' | sudo tee /etc/sysctl.d/60-ptrace-scope.conf
+  sudo sysctl --system
+  ```
+- the session's notification server, which the tray's prompt buttons go
+  through. The tray takes an answer only from the connection that owns
+  `org.freedesktop.Notifications` (a button signal any other program emits
+  is ignored), but a same-user program that stops the notification daemon
+  and takes that name answers for you, "Always allow app" included;
+- synthetic input into the GUI can click its buttons: under X11 or
+  XWayland, and on Wayland compositors that offer the virtual-keyboard
+  protocol to every client (Hyprland and sway do; `wtype` uses it). That
+  reaches every rule a program-scoped edit can make, not the polkit-guarded
+  ones above;
+- a socket handed back into the app: a same-user program that started the
+  app itself (connect first, then exec the installed binary, keeping a copy
+  of the connection in a child) can pass that copy into the sealed app as a
+  D-Bus message attachment while the child writes a request on it. The
+  daemon then sees the app holding the connection and accepts the request.
+  This is a race, but a repeatable one;
+- a user-installed Vulkan layer, GTK or input-method module, or a global
+  `LD_PRELOAD` (MangoHud, gamemode) loaded from your home directory makes the
+  app read-only rather than trusted. The refusal names the library.
+
+The kernel-enforced next step would be making the two binaries setgid to a
+dedicated empty group and trusting the connect-time `SO_PEERCRED` gid: glibc
+then ignores `LD_PRELOAD`/`LD_AUDIT` (secure execution), the process is
+non-dumpable from `exec`, and a connection made before that `exec` carries
+the wrong gid, which also closes the handed-back socket above. An
+unprivileged tracer, or a seccomp filter (which needs `no_new_privs`), makes
+`exec` drop the setgid, so it would close the pre-seal tracing route too,
+whatever `ptrace_scope` says. That costs packaging work in every channel and
+is not done yet.
+
+Side effects of the sealing prologue: the app and tray write no core dumps,
+attaching a debugger to them needs root, and a developer build run from
+`target/` is never official (its directory is not root-sealed). Run the
+daemon as your own user to test writes from a development build.
+
+**Prompt ownership.** A prompt is about a process, and that process has an
+owner uid. Delivery is scoped to it: a `StreamPrompts` subscription is handed
+a prompt only when the subscriber's peer uid matches the owner, and
+`SubmitVerdict` refuses a caller the prompt was not handed to. So another
+logged-in user's session is neither shown the prompt nor able to answer it -
+it never even learns the prompt id.
+
+Exactly what that does and does not promise (for callers that may answer at
+all, see above):
 
 | Prompt is about a process owned by | Delivered to           | Answerable by          |
 |------------------------------------|------------------------|------------------------|
-| uid 1000                           | uid 1000, root         | uid 1000, root         |
+| uid 1000                           | uid 1000, root         | uid 1000's app or tray, root |
 | uid 0 (a system daemon)            | root only              | root only              |
-| nobody - attribution failed        | every subscriber       | every subscriber that received it |
+| nobody - attribution failed        | every subscriber       | every app, tray or root subscriber that received it |
 
 Two deliberate consequences:
 
@@ -258,7 +481,7 @@ Two deliberate consequences:
   *root-owned* process is not shown to an ordinary user's UI. With no root
   subscriber connected there is no audience for it, so the daemon answers
   it immediately with `no_ui_action` rather than stalling the packet until
-  `prompt_timeout_secs` expires. Run the CLI as root if you want to be
+  `prompt_timeout_secs` expires. Run `sudo cfc prompts` if you want to be
   asked about system daemons.
 - **Unattributed flows are offered to everyone.** When the process exited
   before `/proc` could be read the daemon has no owner uid to match. It
@@ -267,7 +490,7 @@ Two deliberate consequences:
   policy in exactly the case where a human should look.
 
 This is prompt-level isolation between sessions, not a privilege boundary:
-every group member can still write rules that affect the whole host.
+any group member's app can still write rules that affect the whole host.
 
 ## What hot-reloads and what needs a restart
 
@@ -298,7 +521,7 @@ Three places record what the firewall did:
 logged with the calling uid and pid, the target, and the outcome:
 
 ```sh
-journalctl -u colony-firewalld -g 'rule upserted|rule delete|verdict submitted|paused'
+journalctl -u colony-firewalld -g 'rule upserted|rules applied|rule delete|verdict submitted|paused'
 ```
 
 so "who deleted the rule blocking that telemetry endpoint" is answerable
@@ -311,11 +534,11 @@ log the action, its source, the executable, pid, uid and destination:
 journalctl -u colony-firewalld -g 'connection blocked'
 ```
 
-This line is emitted after the refusal row commits and verdict delivery succeeds.
-A failed commit drops the packet and ends the worker before live publication.
+This line is emitted once the verdict is delivered, before the row is queued
+for the database.
 
-**3. The events table.** Parsed NFQUEUE refusals commit synchronously;
-Allow observations use best-effort asynchronous persistence. Query with `cfc log`:
+**3. The events table.** Every verdict is written by an asynchronous writer
+that commits in batches; no packet waits for it. Query with `cfc log`:
 
 ```sh
 cfc log --since 24h --action deny
@@ -323,11 +546,27 @@ cfc log --exe firefox --limit 200
 cfc log --json --since 1h | jq -r '.[] | .dst_host // .dst_ip' | sort | uniq -c
 ```
 
-Refusal commits can delay a verdict. WAL and synchronous=FULL are required at
-startup. Mutex and SQLite busy waits each have a 250 ms limit, which does not
-bound filesystem I/O or fsync. Allow rows can be dropped when their queue fills;
-that loss is logged. Malformed packets, nftables drops and in-kernel refusals
-are not covered by this durable NFQUEUE gate. Retention is a row cap, not a time window:
+WAL and synchronous=FULL are required at startup. Rows are lost, never
+waited for, when the writer's queue is full or a batch commit fails (a full
+disk, an I/O error); the loss is counted and logged:
+
+```sh
+journalctl -u colony-firewalld -g 'events were not persisted|event log write failed'
+```
+
+Up to about a second of rows still waiting for their batch is lost on a crash,
+a power cut or a stop. Malformed packets, nftables drops and in-kernel refusals
+are not recorded at all.
+
+Both journal sources share journald's per-unit rate limit (by default 10000
+messages per 30 seconds). A sustained flood of refused packets can exceed it,
+and journald then drops this unit's lines for the rest of that interval,
+including the mutating-RPC lines above; it logs how many it suppressed. Raise
+`LogRateLimitIntervalSec=`/`LogRateLimitBurst=` in a drop-in for the unit if
+that trail matters more than journal volume. The same flood fills the events
+table, whose oldest rows the row cap below evicts.
+
+Retention is a row cap, not a time window:
 `[events] max_rows` (default 100000), pruned every 60 seconds. Raise it
 if you want a longer history, and remember the table lives in
 `/var/lib/colony-firewall/rules.db` - back it up or ship it off the host
@@ -345,24 +584,26 @@ to shrink what a code-execution bug could reach:
 
 | Directive                          | Why                             |
 |------------------------------------|---------------------------------|
-| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE and for flushing legacy Fast Allow state, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer, `CAP_CHOWN` for the control socket's group, and `CAP_DAC_READ_SEARCH` for the `/proc/*/fd` walk attribution falls back to. The count and the list have to agree: this said seven and named five, and the two it left out are exactly the pair the SELinux policy was once missing - with the fail-closed ruleset, a daemon that cannot read `/proc` attributes nothing and the machine loses outbound traffic |
+| `CapabilityBoundingSet`, `AmbientCapabilities` | Seven capabilities, not full root: `CAP_NET_ADMIN` for NFQUEUE, the nftables table probe and the one-shot flush of the legacy Fast Allow set, `CAP_NET_RAW` for Reject injection, `CAP_SYS_PTRACE` for reading other processes' `/proc`, `CAP_BPF` + `CAP_PERFMON` for the eBPF layer, `CAP_CHOWN` for the control socket's group, and `CAP_DAC_READ_SEARCH` for the `/proc/*/fd` walk attribution falls back to. The count and the list have to agree: this said seven and named five, and the two it left out are exactly the pair the SELinux policy was once missing - with the fail-closed ruleset, a daemon that cannot read `/proc` attributes nothing and the machine loses outbound traffic |
 | `NoNewPrivileges`                  | No regaining privileges via setuid binaries |
 | `SystemCallFilter=@system-service` | seccomp; the biggest blast-radius reduction available |
 | `SystemCallFilter=bpf perf_event_open` | The two syscalls the eBPF layer needs, named individually |
 | `SystemCallArchitectures=native`   | Closes the 32-bit-syscall bypass of that filter |
 | `MemoryDenyWriteExecute`           | Nothing here JITs; no W+X memory |
-| `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths` | Read-only filesystem apart from the state, runtime and log directories |
-| `RestrictAddressFamilies`          | AF_UNIX, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET only |
+| `ProtectSystem=strict`, `ProtectHome`, `ReadWritePaths` | Read-only filesystem apart from the state and runtime directories and the bpffs pin directory |
+| `PrivateDevices`                   | Private `/dev` with only pseudo devices: uid 0 cannot open the block devices and write underneath `ProtectSystem` |
+| `RestrictAddressFamilies`          | AF_UNIX, AF_INET, AF_INET6, AF_NETLINK only; no packet sockets |
 | `RestrictNamespaces`, `LockPersonality`, `RestrictRealtime`, `RestrictSUIDSGID` | Namespace and personality lockdown |
-| `ProtectKernelTunables`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname` | No writing kernel state |
+| `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname` | No writing kernel state |
+| `ReadOnlyPaths` (in place of `ProtectKernelTunables`) | The `/proc` and `/sys` entries `ProtectKernelTunables` makes read-only, listed by hand so `/sys/fs/bpf` stays writable for the pinned links. An entry missing from the list stays writable: a `/sys/fs` filesystem or `/proc` entry it does not name, or a new top-level `/sys` directory. `/proc/kallsyms` and `/proc/kcore` stay visible, which `ProtectKernelTunables` would hide; without `CAP_SYS_RAWIO` the daemon cannot open `/proc/kcore`, and without `CAP_SYSLOG` it sees kernel addresses in `/proc/kallsyms` only when every process does |
 | `UMask=0077`                       | Closes the window between `bind` and the explicit chmod of the control socket |
 | `PrivateTmp`                       | No shared `/tmp`                |
 
 **`ProtectProc=invisible` is deliberately absent.** It would hide other
 processes' `/proc` entries from the daemon, and that is precisely how
 process attribution works: `/proc/net/{tcp,udp}` gives a socket inode,
-and the owning pid is found by walking `/proc/*/fd` for a matching
-`socket:[inode]` link. Turning it on makes every connection resolve to an
+and a current descriptor holder is found by walking `/proc/*/fd` for a
+matching `socket:[inode]` link. Turning it on makes every connection resolve to an
 unknown process, which defeats the entire tool. Same reason
 `CAP_SYS_PTRACE` is in the bounding set. If you are hand-editing the
 unit, do not "harden" either of these.
@@ -408,23 +649,30 @@ to `cgroupfs`.
 
 The other half of the security posture is the nftables side, not the
 daemon: whether the kernel drops or accepts new connections when nobody
-is answering the queue. The shipped snippet is fail-closed, which is the
-safer default and also the one that can lock you out of a remote box.
+is answering the queue. The shipped snippet is fail-closed for everything
+except new loopback flows, which are allowed while no daemon listens. That
+is the safer default, and also the one that cuts a box off from everything
+it reaches out to, including any network lookup an SSH login needs (the
+opt-in inbound table drops new SSH sessions outright while the daemon is down).
 The full matrix - daemon up or down, table loaded or not, with and
 without `bypass` - is in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#fail-open-vs-fail-closed-matrix).
 Read it before enabling enforcement on a machine you only reach over SSH.
 
 `[nfqueue] fail_open` must be `false`; `true` is rejected. Queue overflow
-must drop traffic instead of bypassing policy and durable refusal auditing.
-The nftables `bypass` keyword governs missing listeners and is not shipped.
+must drop traffic instead of bypassing policy and refusal auditing.
+The nftables `bypass` keyword governs missing listeners; the shipped snippet
+uses it only on the loopback rule (`oifname "lo"`).
 
 ## When something stops working
 
 Order of operations:
 
-1. Switch profile back to `balanced` so the daemon stops actively denying
-   things while you debug.
+1. `sudo cfc pause --for 15m` (or Pause in the app, which asks for an
+   administrator password): unmatched outbound flows pass instead of being
+   denied while you debug, explicit rules still apply, and it resumes on its
+   own. Every profile denies unmatched flows, so switching profile changes
+   nothing.
 2. `cfc live` and reproduce the failure - the deny verdict will show in
    real time.
 3. `cfc rules list | grep <app>` - is the rule too narrow?
@@ -442,7 +690,7 @@ cfc rules export --out ~/cfc-rules-$(date +%F).json
 Restore with:
 
 ```sh
-cfc rules import --replace ~/cfc-rules-2026-05-25.json
+sudo cfc rules import --replace ~/cfc-rules-2026-05-25.json
 ```
 
 `--replace` makes the daemon's rule set match the file: every rule in the file

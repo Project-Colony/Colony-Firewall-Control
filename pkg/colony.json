@@ -28,10 +28,11 @@
         "install -D -m 0644 colony-firewall-autostart.desktop /etc/xdg/autostart/colony-firewall.desktop",
         "install -D -m 0644 colony-firewall-tray-autostart.desktop /etc/xdg/autostart/colony-firewall-tray.desktop",
         "install -D -m 0644 colony-firewall.svg /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
+        "install -D -m 0644 org.projectcolony.firewall.policy /usr/share/polkit-1/actions/org.projectcolony.firewall.policy",
         "install -D -m 0644 cfc-ebpf.o /usr/lib/colony-firewall/cfc-ebpf.o",
         "systemd-sysusers",
         "systemctl daemon-reload",
-        "for unit in colony-firewalld.service colony-firewall-nft.service colony-firewall-nft-inbound.service; do if systemctl is-enabled --quiet \"$unit\"; then systemctl reenable \"$unit\" || exit 1; fi; done",
+        "for unit in colony-firewall-nft.service colony-firewall-nft-inbound.service; do if systemctl is-enabled --quiet \"$unit\"; then systemctl reenable \"$unit\" || exit 1; fi; done",
         "systemctl try-reload-or-restart colony-firewall-nft.service colony-firewall-nft-inbound.service || { echo \"Firewall rules could not be refreshed; reload colony-firewall-nft and inspect the journal before relying on filtering.\" >&2; exit 1; }"
       ],
       "preRemove": [
@@ -46,6 +47,7 @@
         "rm -f /usr/lib/colony-firewall/inbound-lockout-guard.sh",
         "rm -f /usr/share/applications/colony-firewall.desktop /etc/xdg/autostart/colony-firewall.desktop /etc/xdg/autostart/colony-firewall-tray.desktop",
         "rm -f /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg",
+        "rm -f /usr/share/polkit-1/actions/org.projectcolony.firewall.policy",
         "rm -f /usr/lib/colony-firewall/cfc-ebpf.o",
         "rmdir --ignore-fail-on-non-empty /usr/lib/colony-firewall || true",
         "systemctl daemon-reload"
@@ -60,6 +62,7 @@
   ],
   "optionalDepends": {
     "libnotify": "desktop notifications",
-    "libx11": "run the GUI in X11/XWayland sessions"
+    "libx11": "run the GUI in X11/XWayland sessions",
+    "polkit": "administrator prompt when the app or tray pauses filtering, imports rules or allows every program"
   }
 }

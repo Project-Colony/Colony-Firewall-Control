@@ -1,10 +1,14 @@
 # Security Policy
 
-Colony Firewall Control is **alpha software**. It runs a daemon as root with
+Colony Firewall Control is **beta software**. It runs a daemon as root with
 `CAP_NET_ADMIN` and makes allow/deny decisions about your network traffic, so
 security reports are taken seriously -- but expectations should match the
-project's maturity: there has been no external audit, and interfaces may
-change without notice.
+project's maturity: **there has been no external security audit yet**, and
+interfaces may change without notice.
+
+The explicit application confinement mode (`cfc applications run`, new in
+0.7.0) is **experimental**, and its interface and platform requirements may
+change.
 
 ## Supported Versions
 
@@ -22,7 +26,20 @@ form for this repository:
 
 Please do **not** open a public issue for anything you believe is exploitable
 (privilege escalation via the daemon, rule-bypass of the NFQUEUE filter,
-crafted-packet parsing crashes, socket permission problems, etc.).
+crafted-packet parsing crashes, socket permission problems, a non-root program
+other than the installed app and tray getting a firewall change accepted,
+etc.).
+
+Out of scope: the limits documented in
+[What this firewall does not protect against](docs/HARDENING.md#what-this-firewall-does-not-protect-against),
+such as root processes, established or inherited flows, replies on
+inbound-initiated connections while inbound filtering is off, local relays,
+AF_PACKET and raw sockets, and code running as an allowed program's user,
+and the residual risks listed under
+[The control socket and who can talk to it](docs/HARDENING.md#the-control-socket-and-who-can-talk-to-it)
+(code already running inside the official app or tray).
+A way around the firewall that this list does not describe, or a
+description that turns out to be wrong, is in scope.
 
 What to expect:
 
@@ -35,3 +52,20 @@ What to expect:
 Dependency vulnerabilities are scanned continuously in CI with `cargo deny`
 (RustSec advisory database); a report is still welcome if you spot an
 exploitable path through a dependency before CI does.
+
+## Verifying Releases
+
+Release assets are not signed with a project key. From 0.8.0 the release
+tarball carries a Sigstore-signed build provenance attestation, which ties its
+digest to this repository's release workflow and the commit it built:
+
+```sh
+gh attestation verify colony-firewall-control-<V>-linux-x86_64.tar.zst \
+    --repo Project-Colony/Colony-Firewall-Control
+```
+
+`SHA256SUMS` comes from the same job and is uploaded beside the tarball, so it
+detects a damaged download, not a replaced one. The attached `PKGBUILD` pins
+the hash of the source archive GitHub served when the tag was built; nothing
+compares that archive with the tagged tree, so it binds the recipe to those
+bytes and no further.

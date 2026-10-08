@@ -81,14 +81,19 @@ pub struct PackageFile {
     pub sha256: Option<String>,
 }
 
+/// The packet thread declined to build, or to wait for, the package index.
+/// Not an answer: it is never cached and reads as [`Provenance::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotReady;
+
 /// A distribution package database, viewed as a path -> record lookup.
 pub trait PackageDb: Send + Sync {
     /// Human-readable backend name, for logs.
     fn name(&self) -> &'static str;
 
-    /// The package record for an absolute path, or `None` when no installed
+    /// The package record for an absolute path, `Ok(None)` when no installed
     /// package owns it.
-    fn lookup(&self, exe: &Path) -> Option<PackageFile>;
+    fn lookup(&self, exe: &Path) -> Result<Option<PackageFile>, NotReady>;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +190,9 @@ pub fn describe(exe: &Path, running_sha256: Option<&str>) -> (Option<String>, Pr
     let Ok(meta) = std::fs::metadata(exe) else {
         return (None, Provenance::Unknown);
     };
-    let record = cached_lookup(db.as_ref(), exe, &meta);
+    let Ok(record) = cached_lookup(db.as_ref(), exe, &meta) else {
+        return (None, Provenance::Unknown);
+    };
     let provenance = decide(record.as_ref(), running_sha256);
     (record.map(|r| r.package), provenance)
 }
@@ -222,15 +229,23 @@ fn decide(record: Option<&PackageFile>, running_sha256: Option<&str>) -> Provena
 /// The key is already content-addressed for our purposes: replacing the
 /// file changes the inode or the mtime, so a swapped binary can never be
 /// answered from a stale entry.
-fn cached_lookup(db: &dyn PackageDb, exe: &Path, meta: &std::fs::Metadata) -> Option<PackageFile> {
+///
+/// [`NotReady`] is not memoized. Cached as "no package", it showed every
+/// binary first seen at boot or after an upgrade as unpackaged for the
+/// cache's full hour.
+fn cached_lookup(
+    db: &dyn PackageDb,
+    exe: &Path,
+    meta: &std::fs::Metadata,
+) -> Result<Option<PackageFile>, NotReady> {
     let key = (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec());
     let now = Instant::now();
     if let Some(hit) = LOOKUP_CACHE.lock().get(&key, now) {
-        return hit;
+        return Ok(hit);
     }
-    let record = db.lookup(exe);
+    let record = db.lookup(exe)?;
     LOOKUP_CACHE.lock().insert(key, record.clone(), now);
-    record
+    Ok(record)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,8 +393,8 @@ thread_local! {
 /// Declares the calling thread to be the packet worker.
 ///
 /// Call once, from the worker itself. After this, a provenance lookup on this
-/// thread that finds the package index stale answers "no package" instead of
-/// building it, and leaves a note for [`warm`].
+/// thread that finds the package index stale or locked for a rebuild answers
+/// [`NotReady`] instead of building or waiting, and leaves a note for [`warm`].
 pub fn mark_datapath_thread() {
     ON_DATAPATH.with(|c| c.set(true));
 }
@@ -476,8 +491,8 @@ impl IndexCache {
         &self,
         exe: &Path,
         build: impl FnOnce(Option<SystemTime>) -> Index,
-    ) -> Option<String> {
-        self.record_of(exe, build, may_build()).map(|(pkg, _)| pkg)
+    ) -> Result<Option<String>, NotReady> {
+        Ok(self.record_of(exe, build, may_build())?.map(|(pkg, _)| pkg))
     }
 
     /// The package owning `exe` *and* the digest the index carries for it, for
@@ -488,15 +503,23 @@ impl IndexCache {
         exe: &Path,
         build: impl FnOnce(Option<SystemTime>) -> Index,
         may_build: bool,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Result<Option<(String, Option<String>)>, NotReady> {
         let stamp = self.stamp();
         let key = path_hash(exe);
 
-        if let Some(idx) = self.index.read().as_ref() {
+        // Nor does the datapath wait for a build: a builder holds the write
+        // lock through all of it, up to RPM_QUERY_TIMEOUT for rpm.
+        let current = if may_build {
+            Some(self.index.read())
+        } else {
+            self.index.try_read()
+        };
+        if let Some(idx) = current.as_ref().and_then(|guard| guard.as_ref()) {
             if idx.stamp == stamp {
-                return idx.get(key).map(|p| (p, idx.digest(key)));
+                return Ok(idx.get(key).map(|p| (p, idx.digest(key))));
             }
         }
+        drop(current);
 
         // The datapath does not build. Building means reading every installed
         // package's file list - 123 ms and 66 MB through the allocator on the
@@ -505,14 +528,13 @@ impl IndexCache {
         // a tenth of a second. Measured cold: the second connection after a
         // restart took 21 ms while the rest took 0.6 ms.
         //
-        // So a caller that cannot afford to build says so, gets `None`, and
-        // leaves a note. `None` here means "no package known", which is
-        // already the honest answer for anything unpackaged, and provenance is
-        // not a rule predicate - it decorates prompts and events. Nothing is
-        // enforced differently while the index is a few seconds late.
+        // So a caller that cannot afford to build says so, gets `NotReady`,
+        // and leaves a note. Provenance is not a rule predicate - it decorates
+        // prompts and events - so nothing is enforced differently while the
+        // index is a few seconds late; the record shows `Unknown` meanwhile.
         if !may_build {
             self.wanted.store(true, Ordering::Relaxed);
-            return None;
+            return Err(NotReady);
         }
 
         let mut guard = self.index.write();
@@ -541,8 +563,9 @@ impl IndexCache {
             release_index_scratch();
             self.wanted.store(false, Ordering::Relaxed);
         }
-        let idx = guard.as_ref()?;
-        idx.get(key).map(|p| (p, idx.digest(key)))
+        Ok(guard
+            .as_ref()
+            .and_then(|idx| idx.get(key).map(|p| (p, idx.digest(key)))))
     }
 }
 
@@ -594,8 +617,10 @@ impl PackageDb for Pacman {
         "pacman"
     }
 
-    fn lookup(&self, exe: &Path) -> Option<PackageFile> {
-        let dir = self.cache.owner_of(exe, |s| self.build_index(s))?;
+    fn lookup(&self, exe: &Path) -> Result<Option<PackageFile>, NotReady> {
+        let Some(dir) = self.cache.owner_of(exe, |s| self.build_index(s))? else {
+            return Ok(None);
+        };
         let (name, version) = split_pkg_dir(&dir);
         let mtree = self.cache.root.join(&dir).join("mtree");
         let sha256 = match mtree_digest_for(&mtree, exe) {
@@ -605,10 +630,10 @@ impl PackageDb for Pacman {
                 None
             }
         };
-        Some(PackageFile {
+        Ok(Some(PackageFile {
             package: format!("{name} {version}"),
             sha256,
-        })
+        }))
     }
 }
 
@@ -788,7 +813,8 @@ fn errno_of(err: &anyhow::Error) -> Option<i32> {
 /// Not a performance knob - a safety one. `dnf` holds the rpmdb open for the
 /// length of a transaction, and a query that arrives mid-upgrade waits for it.
 /// Without a bound, a `dnf update` on a slow disk would block whichever thread
-/// is building the index, and that thread is on the packet path. Ten seconds
+/// is building the index, and every other non-packet lookup waiting on its
+/// lock. Ten seconds
 /// is far past any healthy query on the biggest installs and far short of a
 /// package transaction.
 const RPM_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -851,20 +877,18 @@ impl Rpm {
     /// One `rpm -qa` pass, streamed.
     ///
     /// A failure of any kind - rpm missing, the database locked, the query
-    /// timing out - yields an *empty* index rather than propagating. That is
-    /// the same answer this host gave before this backend existed
-    /// (`Unpackaged` everywhere), and it is the only answer that keeps a
-    /// package transaction from being able to stall the firewall.
+    /// timing out - yields an empty index rather than propagating, which keeps
+    /// a package transaction from being able to stall the firewall. That index
+    /// carries no stamp, so it is never current: the packet thread answers
+    /// `NotReady` (shown as unknown) and the next [`warm`] retries. Stamped,
+    /// it reported every binary as unpackaged until the next transaction.
     fn build_index(&self, stamp: Option<SystemTime>) -> Index {
         let mut idx = Index::empty(stamp);
         let out = match self.run_query() {
             Ok(out) => out,
             Err(e) => {
-                warn!(
-                    "rpm provenance query failed: {e}; \
-                     binaries on this host will report as unpackaged"
-                );
-                return idx;
+                warn!("rpm provenance query failed: {e}; retrying on the next index refresh");
+                return Index::empty(None);
             }
         };
         let mut current: Option<(String, u32)> = None;
@@ -1031,11 +1055,11 @@ impl PackageDb for Rpm {
         "rpm"
     }
 
-    fn lookup(&self, exe: &Path) -> Option<PackageFile> {
-        let (package, sha256) = self
+    fn lookup(&self, exe: &Path) -> Result<Option<PackageFile>, NotReady> {
+        Ok(self
             .cache
-            .record_of(exe, |s| self.build_index(s), may_build())?;
-        Some(PackageFile { package, sha256 })
+            .record_of(exe, |s| self.build_index(s), may_build())?
+            .map(|(package, sha256)| PackageFile { package, sha256 }))
     }
 }
 
@@ -1109,13 +1133,15 @@ impl PackageDb for Dpkg {
         "dpkg"
     }
 
-    fn lookup(&self, exe: &Path) -> Option<PackageFile> {
-        let pkg = self.cache.owner_of(exe, |s| self.build_index(s))?;
-        Some(PackageFile {
-            package: pkg,
-            // Deliberately unverified; see the type docs.
-            sha256: None,
-        })
+    fn lookup(&self, exe: &Path) -> Result<Option<PackageFile>, NotReady> {
+        Ok(self
+            .cache
+            .owner_of(exe, |s| self.build_index(s))?
+            .map(|pkg| PackageFile {
+                package: pkg,
+                // Deliberately unverified; see the type docs.
+                sha256: None,
+            }))
     }
 }
 
@@ -1374,7 +1400,7 @@ mod tests {
         fake_pacman(tmp.path(), "abc123");
         let db = Pacman::new(tmp.path().to_path_buf());
 
-        let hit = db.lookup(Path::new("/usr/bin/curl")).unwrap();
+        let hit = db.lookup(Path::new("/usr/bin/curl")).unwrap().unwrap();
         assert_eq!(hit.package, "curl 8.21.0-1");
         assert_eq!(hit.sha256.as_deref(), Some("abc123"));
         assert_eq!(decide(Some(&hit), Some("abc123")), Provenance::Verified);
@@ -1382,13 +1408,16 @@ mod tests {
 
         // Owned but absent from mtree (a file listed in `files` only):
         // package known, nothing to verify.
-        let hit = db.lookup(Path::new("/usr/bin/curl-config")).unwrap();
+        let hit = db
+            .lookup(Path::new("/usr/bin/curl-config"))
+            .unwrap()
+            .unwrap();
         assert_eq!(hit.package, "curl 8.21.0-1");
         assert_eq!(hit.sha256, None);
         assert_eq!(decide(Some(&hit), Some("abc123")), Provenance::Unknown);
 
         // Nobody owns it.
-        assert_eq!(db.lookup(Path::new("/tmp/curl")), None);
+        assert_eq!(db.lookup(Path::new("/tmp/curl")), Ok(None));
         assert_eq!(decide(None, Some("abc123")), Provenance::Unpackaged);
     }
 
@@ -1404,10 +1433,11 @@ mod tests {
             let db = Pacman::new(root.clone());
             mark_datapath_thread();
 
-            // The index is cold. A datapath lookup must answer "no package"
+            // The index is cold. A datapath lookup must answer "not ready"
             // rather than spending 123 ms reading every package's file list.
-            assert!(
-                db.lookup(Path::new("/usr/bin/curl")).is_none(),
+            assert_eq!(
+                db.lookup(Path::new("/usr/bin/curl")),
+                Err(NotReady),
                 "the packet worker built the package index"
             );
             assert!(
@@ -1420,12 +1450,65 @@ mod tests {
             let other =
                 std::thread::spawn(move || Pacman::new(root).lookup(Path::new("/usr/bin/curl")));
             assert!(
-                other.join().unwrap().is_some(),
+                other.join().unwrap().unwrap().is_some(),
                 "a non-datapath thread must still build"
             );
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn the_datapath_thread_does_not_wait_for_a_build_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_pacman(tmp.path(), "abc123");
+        let db = std::sync::Arc::new(Pacman::new(tmp.path().to_path_buf()));
+        assert!(db.lookup(Path::new("/usr/bin/curl")).unwrap().is_some());
+
+        // A builder (warm) holds the write lock through a whole rebuild.
+        let building = db.cache.index.write();
+        let worker = std::sync::Arc::clone(&db);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            mark_datapath_thread();
+            let _ = tx.send(worker.lookup(Path::new("/usr/bin/curl")));
+        });
+        let answer = rx.recv_timeout(Duration::from_secs(5));
+        drop(building);
+        assert_eq!(
+            answer.expect("the packet worker waited for the build"),
+            Err(NotReady)
+        );
+    }
+
+    #[test]
+    fn a_not_ready_answer_is_not_cached() {
+        struct LateIndex(AtomicBool);
+        impl PackageDb for LateIndex {
+            fn name(&self) -> &'static str {
+                "late"
+            }
+            fn lookup(&self, _: &Path) -> Result<Option<PackageFile>, NotReady> {
+                if !self.0.swap(true, Ordering::Relaxed) {
+                    return Err(NotReady);
+                }
+                Ok(Some(PackageFile {
+                    package: "curl 8.21.0-1".into(),
+                    sha256: None,
+                }))
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("curl");
+        std::fs::write(&exe, b"image").unwrap();
+        let meta = std::fs::metadata(&exe).unwrap();
+        let db = LateIndex(AtomicBool::new(false));
+        assert_eq!(cached_lookup(&db, &exe, &meta), Err(NotReady));
+        assert_eq!(
+            cached_lookup(&db, &exe, &meta).unwrap().unwrap().package,
+            "curl 8.21.0-1",
+            "the index is ready now and must be asked again"
+        );
     }
 
     /// `warm` is the only thing that rebuilds a stale index once the datapath
@@ -1444,7 +1527,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fake_pacman(tmp.path(), "abc123");
         let db = Pacman::new(tmp.path().to_path_buf());
-        assert!(db.lookup(Path::new("/usr/bin/wget")).is_none());
+        assert!(db.lookup(Path::new("/usr/bin/wget")).unwrap().is_none());
 
         // Install another package; the root's mtime moves.
         let pkg = tmp.path().join("wget-1.25.0-2");
@@ -1457,7 +1540,7 @@ mod tests {
         // Force a visibly different mtime even on a coarse-grained clock.
         filetime_bump(tmp.path());
 
-        let hit = db.lookup(Path::new("/usr/bin/wget")).unwrap();
+        let hit = db.lookup(Path::new("/usr/bin/wget")).unwrap().unwrap();
         assert_eq!(hit.package, "wget 1.25.0-2");
         assert_eq!(hit.sha256.as_deref(), Some("feed"));
     }
@@ -1489,11 +1572,11 @@ mod tests {
         std::fs::write(tmp.path().join("curl.md5sums"), "abc  usr/bin/curl\n").unwrap();
 
         let db = Dpkg::new(tmp.path().to_path_buf());
-        let hit = db.lookup(Path::new("/usr/bin/curl")).unwrap();
+        let hit = db.lookup(Path::new("/usr/bin/curl")).unwrap().unwrap();
         assert_eq!(hit.package, "curl");
         assert_eq!(hit.sha256, None, "dpkg records MD5 only; we do not verify");
         assert_eq!(decide(Some(&hit), Some("whatever")), Provenance::Unknown);
-        assert_eq!(db.lookup(Path::new("/tmp/curl")), None);
+        assert_eq!(db.lookup(Path::new("/tmp/curl")), Ok(None));
     }
 
     #[test]
@@ -1502,7 +1585,10 @@ mod tests {
         std::fs::write(tmp.path().join("libc6:amd64.list"), "/usr/bin/ldd\n").unwrap();
         let db = Dpkg::new(tmp.path().to_path_buf());
         assert_eq!(
-            db.lookup(Path::new("/usr/bin/ldd")).unwrap().package,
+            db.lookup(Path::new("/usr/bin/ldd"))
+                .unwrap()
+                .unwrap()
+                .package,
             "libc6:amd64"
         );
     }
@@ -1543,14 +1629,20 @@ mod tests {
                  curl 8.0.1-1.el9\tdrwxr-xr-x\t/usr/share/doc/curl\t\n"
             ),
         );
-        let rec = db.lookup(Path::new("/usr/bin/curl")).expect("owned");
+        let rec = db
+            .lookup(Path::new("/usr/bin/curl"))
+            .unwrap()
+            .expect("owned");
         assert_eq!(rec.package, "curl 8.0.1-1.el9");
         assert_eq!(rec.sha256.as_deref(), Some(SHA_CURL));
 
         // The directory in that output must not have been indexed: if it had,
         // /usr/share/doc/curl would answer for its whole subtree.
-        assert!(db.lookup(Path::new("/usr/share/doc/curl")).is_none());
-        assert!(db.lookup(Path::new("/usr/bin/wget")).is_none());
+        assert!(db
+            .lookup(Path::new("/usr/share/doc/curl"))
+            .unwrap()
+            .is_none());
+        assert!(db.lookup(Path::new("/usr/bin/wget")).unwrap().is_none());
     }
 
     #[test]
@@ -1563,7 +1655,10 @@ mod tests {
             tmp.path(),
             &format!("ancient 1.0-1\t-rwxr-xr-x\t/usr/bin/ancient\t{MD5_OLD}\n"),
         );
-        let rec = db.lookup(Path::new("/usr/bin/ancient")).expect("owned");
+        let rec = db
+            .lookup(Path::new("/usr/bin/ancient"))
+            .unwrap()
+            .expect("owned");
         assert_eq!(rec.package, "ancient 1.0-1");
         assert_eq!(
             rec.sha256, None,
@@ -1647,7 +1742,24 @@ mod tests {
         let db = tmp.path().join("rpmdb");
         std::fs::create_dir_all(&db).unwrap();
         let rpm = Rpm::with_program(db, tmp.path().join("no-such-rpm"));
-        assert!(rpm.lookup(Path::new("/usr/bin/curl")).is_none());
+        assert!(rpm.lookup(Path::new("/usr/bin/curl")).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_rpm_query_is_not_kept_as_the_current_index() {
+        // A query that timed out at boot was stamped like a good one, so every
+        // binary read as unpackaged until the next package transaction.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("rpmdb");
+        std::fs::create_dir_all(&db).unwrap();
+        let rpm = Rpm::with_program(db, tmp.path().join("no-such-rpm"));
+        assert!(rpm.lookup(Path::new("/usr/bin/curl")).unwrap().is_none());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                mark_datapath_thread();
+                assert_eq!(rpm.lookup(Path::new("/usr/bin/curl")), Err(NotReady));
+            });
+        });
     }
 
     #[test]
@@ -1751,7 +1863,10 @@ mod tests {
 
         let db = Pacman::new(tmp.path().to_path_buf());
         assert_eq!(
-            db.lookup(Path::new("/usr/bin/curl")).unwrap().package,
+            db.lookup(Path::new("/usr/bin/curl"))
+                .unwrap()
+                .unwrap()
+                .package,
             "curl 8.21.0-1"
         );
     }
@@ -1795,7 +1910,8 @@ mod tests {
         let curl = Path::new("/usr/bin/curl");
         // Hash the real file the way process_resolve does, from the bytes
         // on disk.
-        let running = sha256_of(curl);
+        let running =
+            crate::process_resolve::sha256_file(curl, cfc_core::rule::SHA256_MAX_LEN).unwrap();
         println!("/usr/bin/curl running sha256 = {running}");
 
         // Cold: this call also builds the whole path index.
@@ -1806,7 +1922,11 @@ mod tests {
              (cold, incl. index build: {:?})",
             started.elapsed()
         );
-        assert_eq!(package.as_deref(), Some("curl 8.21.0-1"));
+        // The owning package, not a version: curl updates under this test.
+        assert!(
+            package.as_deref().is_some_and(|p| p.starts_with("curl ")),
+            "/usr/bin/curl must belong to the curl package, got {package:?}"
+        );
         assert_eq!(
             provenance,
             Provenance::Verified,
@@ -1826,10 +1946,7 @@ mod tests {
         // the file the kernel mapped is not the file the package shipped.
         let tampered = describe(curl, Some(&"0".repeat(64)));
         println!("/usr/bin/curl with a foreign digest -> {tampered:?}");
-        assert_eq!(
-            tampered,
-            (Some("curl 8.21.0-1".to_string()), Provenance::Modified)
-        );
+        assert_eq!(tampered, (package.clone(), Provenance::Modified));
 
         // A byte-identical copy in /tmp is owned by nobody: the dropper case.
         let tmp = tempfile::tempdir().unwrap();
@@ -1842,30 +1959,5 @@ mod tests {
             (None, Provenance::Unpackaged),
             "identical bytes, but no package owns that path"
         );
-    }
-
-    #[cfg(test)]
-    fn sha256_of(path: &Path) -> String {
-        use sha2::{Digest, Sha256};
-        use std::io::Read as _;
-        let mut f = std::fs::File::open(path).unwrap();
-        let mut h = Sha256::new();
-        // Same shape as sha256_file in process_resolve: io::copy and `{:x}`
-        // both stop compiling under RustCrypto 0.11. This one only fails under
-        // --all-targets, which is why it outlived the other two.
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = f.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            h.update(&buf[..n]);
-        }
-        let mut out = String::with_capacity(64);
-        for byte in h.finalize() {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
     }
 }

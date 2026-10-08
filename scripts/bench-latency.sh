@@ -10,9 +10,8 @@
 #
 # Two directions, because they do not take the same path:
 #   out   host -> namespace. Every SYN leaves through the host's output chain,
-#         where `inet colony_firewall` queues `ct state new` to the daemon -
-#         unless the client is fast-allowed, in which case its mark takes it
-#         past the queue. This is the direction the fast path exists for.
+#         where `inet colony_firewall` queues `ct state new` to the daemon.
+#         This is the direction that meets the queue.
 #   in    namespace -> host. The SYN arrives on the host's input path, which
 #         `inet colony_firewall_inbound` filters only where that opt-in unit
 #         is loaded. With it absent, this direction never meets a queue - but
@@ -27,10 +26,9 @@
 #         from 10.199.0.0/24 there, or read `in` as unavailable on that host.
 #
 # The script never touches nftables, the daemon or its rules. It measures the
-# machine as it finds it, prints what `cfc status` says the fast path is, and
-# leaves the comparison to whoever runs it more than once: with the client
-# covered by a lasting Allow rule (fast path), by a flow-scoped one (queue),
-# and with the table absent (nothing). The client CFC attributes is python3,
+# machine as it finds it, and leaves the comparison to whoever runs it more
+# than once: with the client covered by an Allow rule (queue) and with the
+# table absent (nothing). The client CFC attributes is python3,
 # so the rule to write is for python3's resolved path (`readlink -f
 # "$(command -v python3)"`); the first connect of a run is the one that prompts.
 #
@@ -44,11 +42,11 @@
 #     SQLite bench, and the next one that writes should remember it.
 #
 # Needs root - it creates a namespace and a veth pair - plus iproute2 and
-# python3. A VM is the right place: the point of measuring is to arm the fast
-# path, and arming a firewall on a development host has consequences.
+# python3. A VM is the right place: the point of measuring is to arm the
+# firewall, and arming one on a development host has consequences.
 #
 #   sudo scripts/bench-latency.sh                          both directions, 200 connects
-#   sudo scripts/bench-latency.sh -n 1000 -d out -l "fast path live"
+#   sudo scripts/bench-latency.sh -n 1000 -d out -l "queue armed"
 #   sudo scripts/bench-latency.sh --json >> runs.jsonl     one JSON object per direction
 
 set -euo pipefail
@@ -245,19 +243,6 @@ wait_listening "" "$PORT"
 # each probe is allowed to fail: the bench is also how one measures a machine
 # with no CFC on it at all.
 KERNEL="$(uname -r)"
-FAST_ALLOW="cfc not installed"
-if command -v cfc >/dev/null 2>&1; then
-    # cfc exits non-zero when the daemon is down; under pipefail that failed
-    # the whole pipeline after python had already printed, and the `|| echo`
-    # that used to follow printed the same words a second time.
-    FAST_ALLOW="$( (cfc status --json 2>/dev/null || true) | python3 -c '
-import json, sys
-try:
-    print(json.load(sys.stdin).get("fast_allow", "not reported"))
-except Exception:
-    print("daemon not reachable")
-')"
-fi
 TABLES="nft not installed"
 if command -v nft >/dev/null 2>&1; then
     # `|| true` on the whole pipeline: a machine with no colony table makes
@@ -269,7 +254,6 @@ if command -v nft >/dev/null 2>&1; then
 fi
 {
     echo "kernel:      $KERNEL"
-    echo "fast-allow:  $FAST_ALLOW"
     echo "nft tables:  $TABLES"
     echo "link:        $HOST_IF ($HOST_IP) <-> $NS:$NS_IF ($NS_IP), port $PORT"
     echo "per run:     $COUNT connects after $WARMUP warm-up, ${TIMEOUT}s timeout each"
@@ -281,13 +265,13 @@ run_direction() { # run_direction <out|in>
     local dir="$1" ns="" target="$NS_IP" raw
     if [[ "$dir" == in ]]; then ns="$NS"; target="$HOST_IP"; fi
     raw="$(in_ns "$ns" python3 -c "$CLIENT" "$target" "$PORT" "$COUNT" "$TIMEOUT" "$WARMUP")"
-    python3 - "$raw" "$dir" "$LABEL" "$KERNEL" "$FAST_ALLOW" "$COUNT" "$JSON" "$PORT" <<'PY'
+    python3 - "$raw" "$dir" "$LABEL" "$KERNEL" "$COUNT" "$JSON" "$PORT" <<'PY'
 import json, sys
 r = json.loads(sys.argv[1])
-port_num = int(sys.argv[8])
+port_num = int(sys.argv[7])
 r.update(direction=sys.argv[2], label=sys.argv[3], kernel=sys.argv[4],
-         fast_allow=sys.argv[5], connects=int(sys.argv[6]))
-if sys.argv[7] == "1":
+         connects=int(sys.argv[5]))
+if sys.argv[6] == "1":
     print(json.dumps(r))
     sys.exit(0)
 f = r["failed"]
