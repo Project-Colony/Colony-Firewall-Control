@@ -1303,12 +1303,22 @@ fn spawn_exit_recheck(
                 })
                 .collect();
             if !waiting.is_empty() {
-                let mut queue = pending.lock();
-                queue.splice(0..0, waiting);
-                queue.truncate(MAX_PENDING_EXITS);
+                requeue(&mut pending.lock(), waiting);
             }
         }
     })
+}
+
+/// Puts the candidates still waiting back ahead of those that arrived during
+/// the tick, then drops the oldest past the cap.
+///
+/// Truncating the tail instead dropped the new arrivals, so a set of leaders
+/// whose workers never exit filled the queue for good and every later exit
+/// was forgotten.
+fn requeue(queue: &mut Vec<(u32, Option<u64>)>, waiting: Vec<(u32, Option<u64>)>) {
+    queue.splice(0..0, waiting);
+    let excess = queue.len().saturating_sub(MAX_PENDING_EXITS);
+    queue.drain(..excess);
 }
 
 /// Takes a ring-buffer map out of the object and starts a task that drains it.
@@ -1377,6 +1387,18 @@ fn decode<T: Copy>(bytes: &[u8]) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_exit_queue_keeps_the_newest_candidates() {
+        let waiting: Vec<_> = (1..=MAX_PENDING_EXITS as u32)
+            .map(|pid| (pid, None))
+            .collect();
+        let mut queue = vec![(99_999, Some(7))];
+        requeue(&mut queue, waiting);
+        assert_eq!(queue.len(), MAX_PENDING_EXITS);
+        assert_eq!(queue.first(), Some(&(2, None)));
+        assert_eq!(queue.last(), Some(&(99_999, Some(7))));
+    }
 
     #[test]
     fn a_live_thread_group_is_not_evicted() {
