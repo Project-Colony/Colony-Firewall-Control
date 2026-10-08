@@ -704,7 +704,6 @@ dependencies = [
  "ipnet",
  "libc",
  "owo-colors",
- "prost",
  "serde",
  "serde_json",
  "sha2",
@@ -712,7 +711,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tracing",
  "tracing-subscriber",
  "uuid",
 ]
@@ -724,17 +722,12 @@ dependencies = [
  "anyhow",
  "cfc-core",
  "cfc-proto",
- "chrono",
  "hyper-util",
- "ipnet",
- "prost",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tonic",
  "tower",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -743,12 +736,9 @@ version = "0.7.0"
 dependencies = [
  "chrono",
  "ipnet",
- "once_cell",
- "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.20",
  "uuid",
 ]
 
@@ -771,11 +761,9 @@ dependencies = [
  "libc",
  "nfq",
  "nix",
- "once_cell",
  "parking_lot",
  "procfs",
  "proptest",
- "prost",
  "rusqlite",
  "serde",
  "serde_json",
@@ -800,7 +788,6 @@ name = "cfc-proto"
 version = "0.7.0"
 dependencies = [
  "prost",
- "serde",
  "tonic",
  "tonic-build",
  "tonic-prost",
@@ -828,24 +815,16 @@ dependencies = [
 name = "cfc-ui"
 version = "0.7.0"
 dependencies = [
- "anyhow",
  "cfc-client",
  "cfc-core",
- "cfc-proto",
  "chrono",
  "colony-ui",
  "futures",
  "iced",
  "ipnet",
- "prost",
- "serde",
- "thiserror 2.0.20",
  "tokio",
- "tokio-stream",
- "tonic",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

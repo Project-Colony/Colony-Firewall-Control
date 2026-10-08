@@ -15,21 +15,13 @@ path = "src/main.rs"
 [dependencies]
 colony-ui = "0.1.5"
 cfc-core = { path = "../cfc-core" }
-cfc-proto = { path = "../cfc-proto" }
 cfc-client = { path = "../cfc-client" }
 
 iced = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
 futures = { workspace = true }
 
-serde = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
 ipnet = { workspace = true }
