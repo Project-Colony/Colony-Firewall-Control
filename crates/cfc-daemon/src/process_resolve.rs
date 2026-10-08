@@ -96,6 +96,11 @@ const SHA256_MAX_LEN: u64 = cfc_core::rule::SHA256_MAX_LEN;
 
 const CACHE_CAP: usize = 1024;
 
+/// How much of `/proc/<pid>/cmdline` is kept. Arguments are only shown, never
+/// matched by a rule, and the kernel allows several MiB of them, a copy of
+/// which rides every parked prompt, observation and client message.
+const CMDLINE_MAX_BYTES: usize = 4096;
+
 static INODE_PID_CACHE: LazyLock<Mutex<TtlCache<u64, (u32, i32)>>> =
     LazyLock::new(|| Mutex::new(TtlCache::new(INODE_CACHE_TTL, CACHE_CAP)));
 
@@ -192,10 +197,7 @@ fn resolve_inner(
     // cannot pair an old path with a new digest.
     let proc_exe_path = PathBuf::from(format!("/proc/{pid}/exe"));
     let image = MappedImage::open(&proc_exe_path);
-    let mut cmdline = p
-        .as_ref()
-        .and_then(|p| p.cmdline().ok())
-        .unwrap_or_default();
+    let mut cmdline = p.as_ref().map(read_cmdline).unwrap_or_default();
     let mut cwd = p.as_ref().and_then(|p| p.cwd().ok());
 
     let (ppid, uid, gid) = match &kern {
@@ -322,6 +324,37 @@ fn resolve_inner(
 /// flow to the process *listening* on the port is a real and separate thing,
 /// and it would be one netlink round trip rather than two /proc scans; it is
 /// not done here because it would change which rules match, not just how fast.
+/// The process's arguments, at most [`CMDLINE_MAX_BYTES`] of them. A cut
+/// argument ends in `...`.
+fn read_cmdline(p: &ProcFsProcess) -> Vec<String> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let read = p.open_relative("cmdline").and_then(|f| {
+        f.take(CMDLINE_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut buf)
+            .map_err(Into::into)
+    });
+    if read.is_err() {
+        return Vec::new();
+    }
+    split_cmdline(&buf)
+}
+
+fn split_cmdline(buf: &[u8]) -> Vec<String> {
+    let cut = buf.len() > CMDLINE_MAX_BYTES;
+    let mut args: Vec<String> = buf[..buf.len().min(CMDLINE_MAX_BYTES)]
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    if cut {
+        if let Some(last) = args.last_mut() {
+            last.push_str("...");
+        }
+    }
+    args
+}
+
 pub fn socket_owner(
     protocol: Protocol,
     direction: Direction,
@@ -1005,6 +1038,23 @@ mod tests {
     use std::io::Write;
 
     // -- hex address formatting / parsing ---------------------------------
+
+    #[test]
+    fn cmdline_is_bounded_and_marks_a_cut() {
+        assert_eq!(split_cmdline(b"curl\0-s\0\0x\0"), ["curl", "-s", "x"]);
+        let mut long = b"prog\0".to_vec();
+        long.resize(CMDLINE_MAX_BYTES * 4, b'a');
+        let args = split_cmdline(&long);
+        assert_eq!(args[0], "prog");
+        assert!(args[1].ends_with("..."));
+        assert_eq!(
+            args.iter().map(String::len).sum::<usize>(),
+            CMDLINE_MAX_BYTES - 1 + 3
+        );
+        // Our own process reads through the same path.
+        let me = ProcFsProcess::myself().unwrap();
+        assert!(!read_cmdline(&me).is_empty());
+    }
 
     #[test]
     fn formats_ipv4() {
