@@ -1801,8 +1801,10 @@ fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String> {
 
     // Validate in the user's namespace as well as the daemon's: ProtectHome
     // and PrivateTmp hide exactly the paths a person commonly enters.
-    let typed = ed.exe.trim();
-    let exe = if typed.is_empty() {
+    // Not trimmed: a file name may end in a space, and saving a rule for
+    // "/opt/app " must not quietly retarget it to "/opt/app".
+    let typed = ed.exe.as_str();
+    let exe = if typed.trim().is_empty() {
         String::new()
     } else {
         cfc_core::exe_path::resolve_policy(std::path::Path::new(typed))?
@@ -1960,6 +1962,14 @@ mod tests {
         ed.dst_host.clear();
         ed.dst_net = "2001:db8::1/128".into();
         assert!(build_rule_from_editor(&ed).is_ok());
+    }
+
+    #[test]
+    fn editor_keeps_an_executable_path_verbatim() {
+        let mut ed = editor_with_scope();
+        ed.exe = "/usr/bin/cfc-test-app ".into();
+        let rule = build_rule_from_editor(&ed).unwrap();
+        assert_eq!(rule.scope.unwrap().exe_path, "/usr/bin/cfc-test-app ");
     }
 
     #[test]
