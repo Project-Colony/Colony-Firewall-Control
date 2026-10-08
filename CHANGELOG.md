@@ -6,6 +6,27 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- New loopback flows now go through the queue instead of being accepted
+  outright (`oifname "lo" accept` is gone from the outbound table). While the
+  daemon runs, explicit rules apply to them, so a loopback Deny that 0.7.0
+  never enforced now takes effect, and unmatched local IPC is still allowed
+  without a prompt. Each new loopback connection pays the queue round trip.
+- Socket attribution is stricter. TCP needs an exact connected tuple and never
+  selects a listening socket, so an outbound flow no longer inherits a
+  listener's rules. UDP accepts zero-remote and wildcard-local sockets only
+  when every compatible socket agrees on its owner. The process and
+  descriptor found must still hold the socket after the executable is read;
+  otherwise the identity is unknown.
+
+### Security
+
+- While no daemon listens on the queue, new loopback flows are allowed
+  (`oifname "lo" ct state new queue num 0 bypass`), so local services keep
+  working when the daemon is down. Loopback Deny rules are not enforced then.
+  Every other new flow stays fail-closed.
+
 ### Removed
 
 - The Fast Allow userspace path, disabled since 0.7.0 because a socket mark
