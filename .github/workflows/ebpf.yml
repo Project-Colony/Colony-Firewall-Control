@@ -140,8 +140,8 @@ jobs:
           # - and its rustc side read stable (see the install step).
           #
           # (1) The system LLVM the install step provided must actually be the
-          #     major it asked llvm.sh for - the script can fall back when a
-          #     major is not packaged for the runner's distro yet. Comparing
+          #     major it requested from apt.llvm.org, which may not carry that
+          #     major for the runner's release yet. Comparing
           #     the nightly's LLVM against itself would assert nothing; this
           #     compares it against what landed on disk.
           WANT="${{ steps.linker.outputs.llvm_major }}"

@@ -21,7 +21,9 @@ is still manual.
 - [x] systemd unit + nft snippet
 - [x] CI: cargo fmt + clippy + test + build
 - [x] AUR PKGBUILD draft
-- [x] Colony app store manifest (`pkg/colony.json`)
+- [x] Release tarball recipe (`pkg/colony.json`; no Colony store client reads
+      it, `scripts/tarball-installers.sh` turns it into the tarball's
+      `install.sh`)
 
 ## Phase 1 - Daemon MVP [done]
 
@@ -175,7 +177,8 @@ kernel 7.1.8.
 - [ ] VirusTotal lookup integration (optional, opt-in)
 - [x] Profile presets: relaxed / balanced / strict
 - [x] Import rules from opensnitch JSON
-- [x] Colony app store manifest (`colony.json`)
+- [ ] Colony app store listing (needs a root `colony.json` in Colony's real
+      schema; the store installs one per-user binary, never units or tables)
 - [x] AUR PKGBUILD draft (now AUR-ready in `pkg/`; not yet published,
       signed release pending)
 - [x] Shell completions + man pages

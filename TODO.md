@@ -221,7 +221,7 @@ stable. An AUR install therefore gets `Degrade::ObjectMissing` and runs on
 
 Three ways out, none free:
 
-1. leave it (what happens today - the Colony tarball has the object, AUR does not);
+1. leave it (what happens today - the release tarball has the object, AUR does not);
 2. ship the object as a second `source=()` from the release assets - but that
    deadlocks against draft releases, and it would be the one shipped component
    no AUR user builds from source, which for kernel code deserves a hard think;

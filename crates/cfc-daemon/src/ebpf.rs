@@ -137,9 +137,9 @@ pub enum NoteLevel {
 
 /// Where the BPF object is expected to live.
 ///
-/// The Colony package installs it here (`pkg/colony.json` postInstall, 0644
-/// root:root, which is also what `loader::vet_object` requires before loading
-/// it unasked). `.github/workflows/release.yml` builds it with
+/// The release tarball's `install.sh` installs it here (generated from
+/// `pkg/colony.json` postInstall, 0644 root:root, which is also what
+/// `loader::vet_object` requires before loading it unasked). `.github/workflows/release.yml` builds it with
 /// `cargo xtask build-ebpf` and stages it into the tarball;
 /// `scripts/check-release-assets.sh` fails the build if the manifest and the
 /// tarball ever disagree about it.

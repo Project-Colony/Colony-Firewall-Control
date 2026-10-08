@@ -33,7 +33,7 @@ jobs:
 
   # Guards the release tarball against pkg/colony.json: every file the
   # manifest's postInstall installs has to be staged by release.yml, or the
-  # Colony channel silently ships without it (this is how the sysusers
+  # tarball's install.sh silently ships without it (this is how the sysusers
   # fragment went missing and left the control socket root-only).
   release-assets:
     runs-on: ubuntu-latest
