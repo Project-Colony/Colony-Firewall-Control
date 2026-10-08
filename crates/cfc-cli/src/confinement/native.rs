@@ -573,6 +573,9 @@ mod platform {
         Ok(file)
     }
 
+    // The whole `bpf_attr.query` layout through `revision`, not only the fields
+    // read here: kernels 6.17 to 7.1 write `revision` at offset 56 whatever
+    // size the caller passed, so a shorter struct is overwritten past its end.
     #[repr(C)]
     #[derive(Default)]
     struct Query {
@@ -583,7 +586,12 @@ mod platform {
         prog_ids: u64,
         prog_cnt: u32,
         padding: u32,
+        prog_attach_flags: u64,
+        link_ids: u64,
+        link_attach_flags: u64,
+        revision: u64,
     }
+    const _: () = assert!(mem::size_of::<Query>() == 64);
     #[repr(C)]
     struct Info {
         fd: u32,
