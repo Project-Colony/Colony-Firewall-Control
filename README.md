@@ -209,7 +209,7 @@ systemd-timesyncd and chronyd NTP (:123/udp), the DHCP clients (dhcpcd,
 NetworkManager and systemd-networkd, :67 and :547/udp), pacman and paru
 HTTPS mirrors (:443/tcp), and the SSH client (:22/tcp) - and is
 idempotent (rules it installed are skipped, as are identical same-named
-rules seeded before 0.7.0; a different rule with one of its names stops it
+rules seeded before 0.7.0, which `bundle remove` also removes; a different rule with one of its names stops it
 before anything changes; `--dry-run` previews). **Do not skip this step.** No profile allows unmatched remote flows
 on its own. With no rules and no UI connected, unmatched queued remote
 connections are denied. Filtering starts before the network is configured

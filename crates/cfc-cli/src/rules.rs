@@ -2001,6 +2001,31 @@ fn same_policy(rule: &proto::RuleInfo, wanted: &proto::RuleInfo) -> bool {
         && rule.scope == wanted.scope
 }
 
+/// Ids of the rules that are this bundle's own entries as seeded before 0.7.0
+/// gave bundle rules deterministic ids: same name, and granting exactly what
+/// the entry would install here. `bundle add` counts them as present and
+/// `bundle remove` removes them; an edited copy is neither.
+fn legacy_copies(
+    bundle: &Bundle,
+    present: &[(&'static str, PathBuf)],
+    existing: &[proto::RuleInfo],
+) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for (rule_name, exe) in present {
+        let Some(spec) = bundle.rules.iter().find(|r| r.name == *rule_name) else {
+            continue;
+        };
+        let wanted = proto_for(spec, &exe.to_string_lossy());
+        ids.extend(
+            existing
+                .iter()
+                .filter(|rule| rule.name == *rule_name && same_policy(rule, &wanted))
+                .map(|rule| rule.id.clone()),
+        );
+    }
+    ids
+}
+
 fn bundle_rule_id(bundle: &str, name: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("colony-firewall-bundle\0{bundle}\0{name}"));
@@ -2179,27 +2204,21 @@ pub async fn bundle_add(
     let mut added = Vec::new();
     let mut skipped_present = 0u32;
     // A rule with an entry's name but another id was not installed by this
-    // bundle. One identical to the entry is that entry as seeded before 0.7.0
-    // gave bundle rules their own ids, and counts as present; any other one
+    // bundle. A copy seeded before 0.7.0 counts as present; any other one
     // stops the command before it changes anything.
-    let mut legacy = std::collections::HashSet::new();
-    for (rule_name, exe) in &planned.present {
+    let legacy = legacy_copies(&bundle, &planned.present, &existing);
+    for (rule_name, _) in &planned.present {
         let id = bundle_rule_id(bundle.name, rule_name);
-        let wanted = proto_for(by_name[*rule_name], &exe.to_string_lossy());
-        for rule in existing
+        if let Some(rule) = existing
             .iter()
-            .filter(|rule| rule.name == *rule_name && rule.id != id)
+            .find(|rule| rule.name == *rule_name && rule.id != id && !legacy.contains(&rule.id))
         {
-            if same_policy(rule, &wanted) {
-                legacy.insert(*rule_name);
-            } else {
-                return Err(CliError::runtime(format!(
-                    "bundle rule `{rule_name}` collides with rule {} of the same name, which this \
-                     bundle did not install and which differs from it; rename or remove that rule \
-                     and retry. Nothing was changed",
-                    short_id(&rule.id)
-                )));
-            }
+            return Err(CliError::runtime(format!(
+                "bundle rule `{rule_name}` collides with rule {} of the same name, which this \
+                 bundle did not install and which differs from it; rename or remove that rule \
+                 and retry. Nothing was changed",
+                short_id(&rule.id)
+            )));
         }
     }
 
@@ -2218,7 +2237,10 @@ pub async fn bundle_add(
             skipped_present += 1;
             continue;
         }
-        if legacy.contains(rule_name) {
+        if existing
+            .iter()
+            .any(|rule| rule.name == *rule_name && legacy.contains(&rule.id))
+        {
             skipped_present += 1;
             continue;
         }
@@ -2287,8 +2309,9 @@ const RETIRED_BUNDLE_RULES: &[(&str, &str)] = &[
 
 /// `cfc rules bundle remove <name>`
 ///
-/// Removes only deterministic IDs created by this bundle. Existing rules
-/// imported by older versions lack this ownership evidence and are preserved.
+/// Removes the deterministic IDs this bundle gives its rules, and the copies
+/// of its entries seeded before 0.7.0 that still grant exactly what the entry
+/// would (see [`legacy_copies`]). Any other rule, same name or not, is kept.
 pub async fn bundle_remove(
     client: &mut Client,
     name: &str,
@@ -2309,9 +2332,13 @@ pub async fn bundle_remove(
         .collect();
 
     let existing = client.list_rules().await?;
+    let legacy = legacy_copies(&bundle, &plan(&bundle).present, &existing);
     let mut removed = Vec::new();
     let mut kept = Vec::new();
-    for r in existing.iter().filter(|r| owned.contains(&r.id)) {
+    for r in existing
+        .iter()
+        .filter(|r| owned.contains(&r.id) || legacy.contains(&r.id))
+    {
         // Bundles install only Allows. An editor keeps the id, so one that is
         // now a Deny or Reject is the user's decision, and deleting it would
         // let the traffic it stops through to the prompt or the default.
@@ -2761,21 +2788,31 @@ mod bundle_tests {
     use super::*;
 
     // Hosts seeded before 0.7.0 hold the bundle's rules under random ids.
-    // An identical copy counts as present; an edited one still blocks.
+    // An identical copy is the bundle's own, for add and for remove; an
+    // edited one is not.
     #[test]
     fn a_pre_0_7_copy_of_a_bundle_rule_counts_only_while_unchanged() {
         let bundle = find_bundle("inbound").unwrap();
-        let wanted = proto_for(&bundle.rules[0], "");
+        let entry = &bundle.rules[0];
+        let present = [(entry.name, PathBuf::from("/usr/bin/sshd"))];
+        let wanted = proto_for(entry, "/usr/bin/sshd");
         let mut legacy = wanted.clone();
         legacy.id = "11111111-1111-4111-8111-111111111111".into();
         legacy.enabled = false;
-        assert!(same_policy(&legacy, &wanted));
         let mut deny = legacy.clone();
+        deny.id = "22222222-2222-4222-8222-222222222222".into();
         deny.action = proto::Action::Deny as i32;
-        assert!(!same_policy(&deny, &wanted));
         let mut wider = legacy.clone();
+        wider.id = "33333333-3333-4333-8333-333333333333".into();
         wider.scope.as_mut().unwrap().src_net.clear();
-        assert!(!same_policy(&wider, &wanted));
+        let mut elsewhere = legacy.clone();
+        elsewhere.id = "44444444-4444-4444-8444-444444444444".into();
+        elsewhere.scope.as_mut().unwrap().exe_path = "/usr/local/bin/sshd".into();
+        let found = legacy_copies(&bundle, &present, &[legacy, deny, wider, elsewhere]);
+        assert_eq!(
+            found,
+            std::collections::HashSet::from(["11111111-1111-4111-8111-111111111111".to_owned()])
+        );
     }
 
     // `/usr/bin/firefox` on Arch is `exec /usr/lib/firefox/firefox`, and
