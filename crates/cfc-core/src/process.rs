@@ -101,13 +101,6 @@ impl Process {
             provenance: Provenance::Unknown,
         }
     }
-
-    pub fn display_name(&self) -> String {
-        self.exe
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("pid:{}", self.pid))
-    }
 }
 
 #[cfg(test)]

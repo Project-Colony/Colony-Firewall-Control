@@ -1910,7 +1910,8 @@ mod tests {
         let curl = Path::new("/usr/bin/curl");
         // Hash the real file the way process_resolve does, from the bytes
         // on disk.
-        let running = sha256_of(curl);
+        let running =
+            crate::process_resolve::sha256_file(curl, cfc_core::rule::SHA256_MAX_LEN).unwrap();
         println!("/usr/bin/curl running sha256 = {running}");
 
         // Cold: this call also builds the whole path index.
@@ -1958,30 +1959,5 @@ mod tests {
             (None, Provenance::Unpackaged),
             "identical bytes, but no package owns that path"
         );
-    }
-
-    #[cfg(test)]
-    fn sha256_of(path: &Path) -> String {
-        use sha2::{Digest, Sha256};
-        use std::io::Read as _;
-        let mut f = std::fs::File::open(path).unwrap();
-        let mut h = Sha256::new();
-        // Same shape as sha256_file in process_resolve: io::copy and `{:x}`
-        // both stop compiling under RustCrypto 0.11. This one only fails under
-        // --all-targets, which is why it outlived the other two.
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = f.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            h.update(&buf[..n]);
-        }
-        let mut out = String::with_capacity(64);
-        for byte in h.finalize() {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
     }
 }

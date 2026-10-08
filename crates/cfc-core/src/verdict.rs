@@ -34,10 +34,6 @@ impl Verdict {
         }
     }
 
-    pub fn allow_from_rule(rule_id: uuid::Uuid) -> Self {
-        Self::from_rule(crate::Action::Allow, rule_id)
-    }
-
     pub fn deny_from_rule(rule_id: uuid::Uuid) -> Self {
         Self::from_rule(crate::Action::Deny, rule_id)
     }

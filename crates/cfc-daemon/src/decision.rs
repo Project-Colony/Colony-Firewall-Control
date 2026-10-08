@@ -314,29 +314,6 @@ impl Engine {
         self.inner.rules.read().rules.len()
     }
 
-    /// The distinct executables enabled rules name, under one read lock.
-    ///
-    /// `snapshot()` would answer this too, and answer it expensively: it deep
-    /// clones every rule - names, `PathBuf`s, every `Option<String>` in every
-    /// scope - and merges hit counts on the way, none of which the caller
-    /// wants. This clones the paths it is actually asked for and nothing else.
-    ///
-    /// Deliberately does not evaluate anything while holding the lock: the
-    /// caller re-enters through `process_wide_action`, which takes its own read
-    /// lock, and nesting reads on a `std::sync::RwLock` can deadlock against a
-    /// waiting writer.
-    pub fn enabled_exe_paths(&self) -> std::collections::BTreeSet<std::path::PathBuf> {
-        let now_unix_ms = chrono::Utc::now().timestamp_millis();
-        self.inner
-            .rules
-            .read()
-            .rules
-            .iter()
-            .filter(|r| r.enabled && !r.is_expired(now_unix_ms))
-            .filter_map(|r| r.scope.exe_path.clone())
-            .collect()
-    }
-
     /// Executables safe to compile into the kernel's table, and the ones that
     /// are not.
     ///
@@ -348,6 +325,11 @@ impl Engine {
     /// A synthetic process with no uid cannot decide a uid-scoped rule.
     /// Excluding every executable such a rule could touch preserves the
     /// per-user decision in the packet path, where the uid is available.
+    ///
+    /// Returns owned paths and evaluates nothing under the lock: the caller
+    /// re-enters through `process_wide_action`, which takes its own read lock,
+    /// and nesting reads on a `std::sync::RwLock` can deadlock against a
+    /// waiting writer.
     pub fn compilable_exe_paths(&self) -> Option<std::collections::BTreeSet<std::path::PathBuf>> {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rules = self.inner.rules.read();
