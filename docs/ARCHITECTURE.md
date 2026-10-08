@@ -13,8 +13,9 @@ Two long-running processes:
    [iced](https://iced.rs/).
 
 The CLI tool `cfc` shares the same gRPC client path as the UI, and covers
-the same surface: it can answer prompts (`cfc prompts`), which is how a
-headless machine gets a say.
+the same surface: it can answer prompts (`sudo cfc prompts`), which is how a
+headless machine gets a say. Run without sudo it is read-only (see
+[IPC and the trust model](#ipc-and-the-trust-model)).
 
 ```
 +----------------------------+     +----------------+
@@ -24,7 +25,7 @@ headless machine gets a say.
 +------------+---------------+     +-------+--------+
              |                             |
              |  tonic gRPC over UDS, 0660 root:colony-firewall
-             |  (SO_PEERCRED checked per RPC)
+             |  (peer process checked per change RPC)
              v                             v
 +--------------------------------------------------+
 |  colony-firewalld  (systemd, root)                |
@@ -326,24 +327,38 @@ the entire attack surface. Two layers:
    is never briefly group-readable by the wrong group. If the group does not
    exist the daemon does not refuse to start: it warns with the exact fix and
    leaves the socket 0600, root-only.
-2. **Peer credentials.** Every connection carries `SO_PEERCRED`. Mutating
-   RPCs (`UpsertRule`, `ApplyRules`, `DeleteRule`, `SetPaused`, `SubmitVerdict`) require
-   uid 0 or a socket that is genuinely group-gated. Read-only RPCs
-   (`ListRules`, `GetStatus`, `ListEvents`, `StreamConnections`,
-   `StreamPrompts`) are open to any peer that got past layer 1.
+2. **Who the peer process is.** Read-only RPCs (`ListRules`, `GetStatus`,
+   `ListEvents`, `StreamConnections`, `StreamPrompts`) are open to any peer
+   that got past layer 1. Change RPCs (`SubmitVerdict`, `UpsertRule`,
+   `DeleteRule`, `ApplyRules`, `SetPaused`) are accepted from root (or the
+   daemon's own uid) and from the installed app and tray only. From
+   `SO_PEERCRED`'s pid, `official.rs` checks, between two start-time reads,
+   that the process runs in the host namespaces, is not traced, has sealed
+   itself (`cfc_client::seal_official_process`: inherited descriptors closed,
+   non-dumpable), runs one of the root-sealed `[ipc] official_clients`
+   binaries by device and inode, holds this connection's client end itself
+   (`UNIX_DIAG` names it) and mapped no executable file from outside sealed
+   directories. The check runs on the blocking pool.
+3. **polkit.** `SetPaused` (pause and resume) and `ApplyRules` from the app
+   or tray also need `CheckAuthorization` for
+   `org.projectcolony.firewall.pause` or `org.projectcolony.firewall.import-rules`
+   (`polkit.rs`, one system-bus connection per call, 120 s timeout, the
+   dialog cancelled on expiry). Root is never asked.
 
-Group membership *is* the credential - there is no in-band authentication.
-Everyone in the group is fully trusted. The one exception is prompt
-ownership: the daemon records which subscriber uids actually received each
-prompt and refuses a verdict from anyone else, so one desktop session cannot
-answer another's. Root is exempt.
+Every other peer is read-only. Its prompt subscription is not counted in the
+router's census, so `no_ui_action` still applies when only such peers
+listen, and it never enters a prompt's audience. Prompt ownership comes on
+top: the daemon records which answering subscriber uids actually received
+each prompt and refuses a verdict from anyone else, so one desktop session
+cannot answer another's. Root is exempt.
 
 Values arriving over the wire are decoded strictly. An unspecified or
 out-of-range action or duration is an `InvalidArgument` error, not a silent
 fall-through to the zero value - which happened to be Allow.
 
-Every mutating RPC and every Deny/Reject verdict is logged to the journal
-with the calling uid and pid. See [HARDENING.md](HARDENING.md).
+Every change RPC (allowed or refused, with the official image and the polkit
+action) and every Deny/Reject verdict is logged to the journal with the
+calling uid and pid. See [HARDENING.md](HARDENING.md).
 
 ## Threading model
 

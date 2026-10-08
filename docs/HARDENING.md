@@ -9,15 +9,16 @@ desktop, not what's theoretically pure.
 
 1. Start in `profile = "balanced"`, leave the UI running.
 2. Click through prompts for a week. Save persistent rules as you go.
-3. Run `cfc rules bootstrap-defaults` to install common system rules.
+3. Run `sudo cfc rules bootstrap-defaults` to install common system rules.
 4. Once the prompt rate drops to maybe 1-2 a day, switch to
    `profile = "strict"` if you prefer a shorter prompt timeout.
 5. Audit `cfc rules list` monthly. Remove rules for apps you no longer
    use, and check `cfc log --since 30d` for destinations you did not
    expect.
 
-On a headless machine, substitute `cfc prompts` for "leave the UI
-running" throughout - it subscribes the same way the GUI does.
+On a headless machine, substitute `sudo cfc prompts` for "leave the UI
+running" throughout - it subscribes the same way the GUI does. Without sudo
+it only watches (see [the control socket](#the-control-socket-and-who-can-talk-to-it)).
 
 ## Choosing a profile
 
@@ -87,7 +88,7 @@ User-side conveniences that hit the network constantly:
 You can install the system service rules with one command:
 
 ```sh
-cfc rules bootstrap-defaults
+sudo cfc rules bootstrap-defaults
 ```
 
 This is idempotent: it skips the rules it installed earlier and identical
@@ -113,7 +114,7 @@ Allow, pause or prompt can admit it. Replace these rules explicitly with
 executable or numeric scopes; a legacy hostname Allow no longer grants access.
 The editor requires the old hostname to be removed before saving a replacement.
 Such a rule cannot be disabled either, since a toggle sends the hostname back
-and the daemon refuses it: edit or delete it (`cfc rules remove <id>`). Its
+and the daemon refuses it: edit or delete it (`sudo cfc rules remove <id>`). Its
 refusals are logged as the default policy, so the daemon names every enabled
 legacy hostname rule in a warning at startup.
 
@@ -291,38 +292,104 @@ connect - the UI will report a permission error. Create the group with
 the shipped `sysusers.d` fragment or by hand
 (`groupadd -r colony-firewall`), then add yourself and restart.
 
-**Layer 2 - peer credentials.** Every connection carries `SO_PEERCRED`,
+**Layer 2 - who the caller is.** Every connection carries `SO_PEERCRED`,
 and the daemon checks the caller per RPC:
 
-| RPC class | RPCs                        | Requires                    |
-|-----------|-----------------------------|-----------------------------|
-| Mutating  | `UpsertRule`, `ApplyRules`, `DeleteRule`, `SetPaused`, `SubmitVerdict` | uid 0, **or** a socket that is genuinely group-gated |
-| Read-only | `ListRules`, `GetStatus`, `ListEvents`, `StreamConnections`, `StreamPrompts` | Only layer 1 |
+| RPC | root (`sudo cfc`) | installed app or tray | any other program |
+|-----|-------------------|-----------------------|-------------------|
+| `ListRules`, `GetStatus`, `ListEvents`, `StreamConnections` | yes | yes | yes |
+| `StreamPrompts` | yes, counts as a UI | yes, counts as a UI | sees its prompts, does **not** count as a UI |
+| `SubmitVerdict`, `UpsertRule`, `DeleteRule` | yes | yes, no password | refused |
+| `SetPaused` (pause **and** resume), `ApplyRules` (import, replace, bundles) | yes, no password | after polkit authorization | refused |
 
-`require_group = false` in `[ipc]` turns the mutating check off. Leave it
-on unless you are gating the socket some other way (filesystem ACLs);
-with it off, any process that manages to connect can rewrite your rules.
+There is no RPC that changes `[default_policy]`: that is root editing
+`daemon.toml` and sending `SIGHUP`.
 
-**Say it plainly: every member of the group is fully trusted.** There is
-no in-band authentication, no per-user identity, and no password. Group
-membership grants the ability to allow or deny any traffic on this host,
-which is root-equivalent control over the firewall. This is not a
-multi-user privilege boundary - add only administrators of the machine.
+**Group membership no longer grants control.** It lets your session connect
+and read, and lets the installed app and tray connect. Everything else of
+yours, a non-root `cfc` included, is read-only: a change is refused with the
+reason, a read-only `cfc prompts` does not stop `no_ui_action` from applying,
+and it never enters a prompt's audience, so it cannot answer even a prompt
+about its own process. Any process running as the daemon's own uid is treated
+like root; in production that *is* root.
 
-**The one exception is prompt ownership.** A prompt is about a process,
-and that process has an owner uid. Delivery is scoped to it: a
-`StreamPrompts` subscription is handed a prompt only when the subscriber's
-peer uid matches the owner, and `SubmitVerdict` refuses a caller the prompt
-was not handed to. So another logged-in user's session is neither shown the
-prompt nor able to answer it - it never even learns the prompt id.
+**How the app and tray are recognised.** Each request from a non-root peer
+that wants to change something is checked against the calling process, all
+of it between two reads of that process's start time (so a reused pid fails):
 
-Exactly what that does and does not promise:
+- it runs in the host's mount and user namespaces;
+- it is not traced, and its effective uid is the connection's;
+- it ran the app's sealing prologue at startup: every inherited descriptor
+  closed and the process made non-dumpable, which the kernel shows by giving
+  its `/proc` files to root;
+- its running image is, by device and inode, one of `[ipc] official_clients`
+  (default `/usr/bin/colony-firewall` and `/usr/bin/colony-firewall-tray`),
+  and that file is root-owned, unwritable by group and other, in root-owned
+  directories nobody else can write. Re-checked every time, so after an
+  upgrade a process still running the replaced binary is read-only until it
+  is restarted;
+- it holds the client end of this very connection itself, on a descriptor
+  above stderr (found through sock_diag's `UNIX_DIAG`);
+- every executable file it mapped comes from such sealed directories, so an
+  `LD_PRELOAD` or `LD_AUDIT` library from your home directory makes it
+  read-only, with the library named.
+
+The prologue and the descriptor check are what stop the obvious trick:
+connect, write a whole request into the socket, then `exec` the installed app
+with the socket inherited. Non-dumpable also stops later same-user `ptrace`,
+`/proc/<pid>/mem` and `pidfd_getfd` on the app.
+
+`require_group = true` (the default) also requires the app or tray to be run
+by a proved group member. `require_group = false` waives that for the app
+and tray only; it never makes anything else writable.
+
+**polkit for whole-firewall changes.** Pause, resume and rule import change
+everything at once, so even the app and tray need an administrator password
+for them: the daemon asks polkit (`org.projectcolony.firewall.pause`,
+`org.projectcolony.firewall.import-rules`, both `auth_admin_keep`, so one
+password covers a few minutes) and your session's polkit agent shows the
+dialog. Without an agent (start one, e.g. `hyprpolkitagent` or
+`polkit-gnome`) or without polkit, the request is refused with that reason
+and `sudo cfc pause` still works. The daemon waits 120 s for an answer, then
+cancels the dialog. Answering a prompt and editing one rule never ask.
+
+**What this still trusts.** The check is about the *process*, so code that
+runs inside the installed app is the app:
+
+- a preloaded payload that copies itself into anonymous executable memory and
+  unmaps its file is not seen (anonymous executable mappings cannot be
+  refused: GPU drivers JIT into them);
+- synthetic input into the GUI under X11 or XWayland can click its buttons;
+- a user-installed Vulkan layer, GTK or input-method module, or a global
+  `LD_PRELOAD` (MangoHud, gamemode) loaded from your home directory makes the
+  app read-only rather than trusted. The refusal names the library.
+
+The kernel-enforced next step would be making the two binaries setgid to a
+dedicated empty group and trusting the connect-time `SO_PEERCRED` gid: glibc
+then ignores `LD_PRELOAD`/`LD_AUDIT` (secure execution) and the process is
+non-dumpable from `exec`. That costs packaging work in every channel and is
+not done yet.
+
+Side effects of the sealing prologue: the app and tray write no core dumps,
+attaching a debugger to them needs root, and a developer build run from
+`target/` is never official (its directory is not root-sealed). Run the
+daemon as your own user to test writes from a development build.
+
+**Prompt ownership.** A prompt is about a process, and that process has an
+owner uid. Delivery is scoped to it: a `StreamPrompts` subscription is handed
+a prompt only when the subscriber's peer uid matches the owner, and
+`SubmitVerdict` refuses a caller the prompt was not handed to. So another
+logged-in user's session is neither shown the prompt nor able to answer it -
+it never even learns the prompt id.
+
+Exactly what that does and does not promise (for callers that may answer at
+all, see above):
 
 | Prompt is about a process owned by | Delivered to           | Answerable by          |
 |------------------------------------|------------------------|------------------------|
-| uid 1000                           | uid 1000, root         | uid 1000, root         |
+| uid 1000                           | uid 1000, root         | uid 1000's app or tray, root |
 | uid 0 (a system daemon)            | root only              | root only              |
-| nobody - attribution failed        | every subscriber       | every subscriber that received it |
+| nobody - attribution failed        | every subscriber       | every app, tray or root subscriber that received it |
 
 Two deliberate consequences:
 
@@ -332,7 +399,7 @@ Two deliberate consequences:
   *root-owned* process is not shown to an ordinary user's UI. With no root
   subscriber connected there is no audience for it, so the daemon answers
   it immediately with `no_ui_action` rather than stalling the packet until
-  `prompt_timeout_secs` expires. Run the CLI as root if you want to be
+  `prompt_timeout_secs` expires. Run `sudo cfc prompts` if you want to be
   asked about system daemons.
 - **Unattributed flows are offered to everyone.** When the process exited
   before `/proc` could be read the daemon has no owner uid to match. It
@@ -341,7 +408,7 @@ Two deliberate consequences:
   policy in exactly the case where a human should look.
 
 This is prompt-level isolation between sessions, not a privilege boundary:
-every group member can still write rules that affect the whole host.
+any group member's app can still write rules that affect the whole host.
 
 ## What hot-reloads and what needs a restart
 
@@ -519,7 +586,8 @@ uses it only on the loopback rule (`oifname "lo"`).
 
 Order of operations:
 
-1. `cfc pause --for 15m`: unmatched outbound flows pass instead of being
+1. `sudo cfc pause --for 15m` (or Pause in the app, which asks for an
+   administrator password): unmatched outbound flows pass instead of being
    denied while you debug, explicit rules still apply, and it resumes on its
    own. Every profile denies unmatched flows, so switching profile changes
    nothing.
@@ -540,7 +608,7 @@ cfc rules export --out ~/cfc-rules-$(date +%F).json
 Restore with:
 
 ```sh
-cfc rules import --replace ~/cfc-rules-2026-05-25.json
+sudo cfc rules import --replace ~/cfc-rules-2026-05-25.json
 ```
 
 `--replace` makes the daemon's rule set match the file: every rule in the file

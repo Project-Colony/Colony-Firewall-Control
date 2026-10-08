@@ -89,8 +89,8 @@ use tracing::{info, warn};
 
 /// Validates a rule's explicit executable target without blocking IPC.
 ///
-/// `canonicalize` is a synchronous syscall on a path any `colony-firewall`
-/// group member supplies, and this runs inside a `#[tonic::async_trait]`
+/// `canonicalize` is a synchronous syscall on a path a client supplies, and
+/// this runs inside a `#[tonic::async_trait]`
 /// handler on the shared runtime. A path under a hung NFS mount or an
 /// unreachable autofs trigger would otherwise park a worker thread with no
 /// timeout; enough concurrent calls and the prompt-delivery tasks stall, which

@@ -270,7 +270,7 @@ impl Default for EventsConfig {
 pub struct IpcConfig {
     /// Unix group granted access to the control socket. After bind the
     /// daemon chowns the socket to `root:<group>` and chmods it 0660, so
-    /// group membership *is* the access check.
+    /// group membership is what lets a process connect at all.
     pub group: String,
     /// Require proved membership of `group` before an official client (the
     /// installed app or tray) may change anything. Setting this to false

@@ -26,13 +26,18 @@ form for this repository:
 
 Please do **not** open a public issue for anything you believe is exploitable
 (privilege escalation via the daemon, rule-bypass of the NFQUEUE filter,
-crafted-packet parsing crashes, socket permission problems, etc.).
+crafted-packet parsing crashes, socket permission problems, a non-root program
+other than the installed app and tray getting a firewall change accepted,
+etc.).
 
 Out of scope: the limits documented in
 [What this firewall does not protect against](docs/HARDENING.md#what-this-firewall-does-not-protect-against),
 such as root processes, established or inherited flows, replies on
 inbound-initiated connections while inbound filtering is off, local relays,
-AF_PACKET and raw sockets, and code running as an allowed program's user.
+AF_PACKET and raw sockets, and code running as an allowed program's user,
+and the residual risks listed under
+[The control socket and who can talk to it](docs/HARDENING.md#the-control-socket-and-who-can-talk-to-it)
+(code already running inside the official app or tray).
 A way around the firewall that this list does not describe, or a
 description that turns out to be wrong, is in scope.
 

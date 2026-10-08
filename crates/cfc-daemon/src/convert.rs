@@ -240,7 +240,8 @@ pub fn scope_to_pb(s: &RuleScope) -> pb::RuleScope {
 /// `.and_then(|n| IpNet::from_str(&n).ok())`, so a typo'd CIDR became `None` -
 /// turning an Allow scoped `exe + 10.0.0.0/8` into an Allow scoped `exe`, i.e.
 /// "this program may reach anywhere". A client's own validation is not a
-/// substitute: `UpsertRule` accepts whatever any group member sends.
+/// substitute: `UpsertRule` accepts whatever the calling app, tray or root
+/// CLI sends.
 ///
 /// Three fields can fail: `dst_net`, `protocol` and `dst_port`. The last is the
 /// least obvious and was missed on the first pass - the wire type is `uint32`
@@ -755,7 +756,7 @@ mod tests {
     fn a_malformed_dst_net_is_refused_not_dropped() {
         // The whole point. Dropping it to None turned "this program may reach
         // 10.0.0.0/8" into "this program may reach anywhere" - a silent
-        // widening of policy on the path any group member can reach.
+        // widening of policy on the path every rule write goes through.
         let mut pb = scope_to_pb(&RuleScope::any());
         pb.exe_path = "/usr/bin/curl".into();
         pb.dst_net = "10.0.0.0/33".into();

@@ -66,6 +66,43 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Breaking: only root and the installed app and tray may change the
+  firewall.** Group membership no longer grants control. A non-root peer may
+  answer prompts, add, edit or delete rules, pause, resume or import only when
+  its process runs the installed, root-sealed `/usr/bin/colony-firewall` or
+  `/usr/bin/colony-firewall-tray` (by device and inode), sealed itself at
+  startup (inherited descriptors closed, non-dumpable), holds the connection
+  itself, is not traced, runs in the host namespaces and mapped no executable
+  file from outside root-owned directories. Every other program of the
+  desktop user, a non-root `cfc` included, is read-only: its changes are
+  refused with the reason (exit 1 in `cfc`), its prompt subscription does not
+  count as a connected UI and it cannot answer prompts. A peer with the
+  daemon's own uid keeps full control (root in production). New
+  `[ipc] official_clients` key; `require_group` now waives the group check
+  for the app and tray only. See docs/HARDENING.md for what this still
+  trusts.
+- **Breaking: pause, resume and rule import from the app or tray ask for an
+  administrator password** through polkit
+  (`org.projectcolony.firewall.pause`, `org.projectcolony.firewall.import-rules`,
+  `auth_admin_keep`). The policy file is installed by every package; polkit
+  is an optional dependency. Root is never asked, and answering a prompt or
+  editing a rule never asks. The tray no longer blocks its prompt
+  notifications while the dialog is open.
+
+  Upgrading from 0.7.0:
+  1. Scripts that ran `cfc` as a regular user to change rules, pause or
+     answer prompts must use `sudo cfc`. Reading (`status`, `rules list`,
+     `log`, `live`) is unchanged.
+  2. Restart Colony Firewall and its tray after the upgrade. The 0.7
+     processes, and any process still running a replaced binary, are
+     read-only until relaunched.
+  3. Pausing from the app or tray needs a polkit agent in the session
+     (most desktops run one; on Hyprland, `hyprpolkitagent`). Without one
+     the request is refused with that reason and `sudo cfc pause` works.
+  4. A non-root `cfc prompts` no longer counts as a UI: on a headless machine
+     run `sudo cfc prompts`, or `no_ui_action` applies.
+  5. A user-wide `LD_PRELOAD` or a Vulkan layer loaded from your home
+     directory makes the app read-only; the refusal names the library.
 - `cfc prompts`: keys typed while no prompt was shown, such as an answer
   typed just as a prompt expired, answered the next prompt as soon as it was
   printed, and an arrow key skipped one prompt and left `A` or `D` to answer

@@ -21,7 +21,7 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 - iced GUI with parchment / burgundy theme, four tabs (Prompts / Rules /
   Live / Stats), a countdown on every prompt, and desktop notifications
   when the window is hidden
-- **Answer prompts from a terminal** (`cfc prompts`) - headless servers
+- **Answer prompts from a terminal** (`sudo cfc prompts`) - headless servers
   and SSH sessions are not second-class citizens
 - **Persistent verdict log** (`cfc log`): what did this app contact, and
   what did we do about it
@@ -167,7 +167,9 @@ sudo install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
 sudo systemctl daemon-reload
 
 # The control socket is root:colony-firewall 0660. Join the group, then
-# log out and back in, or the GUI and cfc get "permission denied".
+# log out and back in, or the GUI, the tray and cfc get "permission denied".
+# Membership gives read access and lets the installed app and tray connect;
+# changes come from those two or from sudo cfc (see Who can change what).
 sudo usermod -aG colony-firewall "$USER"
 ```
 
@@ -200,9 +202,9 @@ without prompting:
 sudo cfc rules bootstrap-defaults   # same as: cfc rules bundle add system
 ```
 
-(`sudo` because group membership from `usermod -aG colony-firewall` only
-takes effect in a new login session. After logging out and back in, plain
-`cfc` works.)
+(`sudo` because `cfc` run as a regular user is read-only: it can show status,
+rules and the logs, but only root, or the installed Colony Firewall app and
+tray, can change the firewall.)
 
 This installs twelve allow rules - systemd-resolved DNS (:53),
 systemd-timesyncd and chronyd NTP (:123/udp), the DHCP clients (dhcpcd,
@@ -244,7 +246,7 @@ colony-firewall
 On a headless machine, answer them from the terminal instead:
 
 ```sh
-cfc prompts
+sudo cfc prompts
 ```
 
 With no subscriber at all the daemon applies `no_ui_action` to unmatched
@@ -252,7 +254,9 @@ remote flows without asking anyone. **That is a denial under every
 profile.** "Nobody is connected" is a permanent condition on a headless
 box, not a passing one, and answering it with an allow would mean those
 hosts had no outbound firewall whatsoever. Stored rules are what such a
-machine runs on; `cfc prompts` is how you add more without a GUI.
+machine runs on; `sudo cfc prompts` is how you add more without a GUI. A
+`cfc prompts` without sudo only watches: the daemon neither counts it as a UI
+nor accepts its answers.
 
 This does not refuse inbound SSH: the ruleset hooks `output` on
 `ct state new` only, so an inbound SSH session's replies are
@@ -414,14 +418,14 @@ cfc status
 
 # Answer prompts from this terminal - no GUI needed.
 # a=allow d=deny r=reject s=skip q=quit, then duration and scope.
-cfc prompts
+sudo cfc prompts
 
-# Add a rule from the command line
-cfc rules add --action allow --exe /usr/bin/curl --dst-port 443
+# Add a rule from the command line (changes need sudo; reading does not)
+sudo cfc rules add --action allow --exe /usr/bin/curl --dst-port 443
 
 # Rules take an id, a unique id prefix, or the rule's name
 cfc rules show curl-https
-cfc rules disable 3f2a
+sudo cfc rules disable 3f2a
 
 # Watch traffic decisions in real time (colorized), with filters
 cfc live --denied
@@ -431,17 +435,32 @@ cfc live --exe firefox --follow
 cfc log --since 24h
 cfc log --exe firefox --action deny
 
-# Pause enforcement for a bounded window (the daemon auto-resumes)
-cfc pause --for 30m
-cfc resume
+# Pause enforcement for a bounded window (the daemon auto-resumes).
+# From the app or tray, Pause asks for an administrator password instead.
+sudo cfc pause --for 30m
+sudo cfc resume
 
 # Back up rules
 cfc rules export --out rules.json
 
 # Migrate from an existing opensnitch install. A rule with no equivalent
 # here (hostname, regexp) stops it; --skip-unconvertible imports the rest.
-cfc rules import-opensnitch /etc/opensnitchd/rules
+sudo cfc rules import-opensnitch /etc/opensnitchd/rules
 ```
+
+### Who can change what
+
+| who | read status, rules, logs, live view, prompts | answer prompts, add/edit/delete rules | pause, resume, import rules |
+|---|---|---|---|
+| root (`sudo cfc`) | yes | yes | yes |
+| the installed Colony Firewall app and tray, run by a `colony-firewall` group member | yes | yes | after an administrator password (polkit, kept a few minutes) |
+| any other program of a group member, including `cfc` without sudo | yes | no | no |
+
+The daemon recognises the app and tray by the running image: it must be the
+installed, root-owned `/usr/bin/colony-firewall` or `colony-firewall-tray`,
+started normally (not traced, no library preloaded from your files). After
+an upgrade, restart both; until then they are read-only. Details and limits
+are in [docs/HARDENING.md](docs/HARDENING.md).
 
 Executable rules require the canonical mapped target explicitly. An alias
 such as `/bin/tool` on a system where `/bin` links to `/usr/bin` is refused;
@@ -499,7 +518,7 @@ Every profile denies on timeout: a prompt you were shown and did not
 answer must not become an allow. The profiles differ in how long they
 wait, and in what happens when there is nobody subscribed to ask.
 
-Use `strict` only when you always have the UI running (or `cfc prompts`),
+Use `strict` only when you always have the UI running (or `sudo cfc prompts`),
 otherwise you lose network when the daemon starts before a subscriber
 does (fail-closed posture).
 

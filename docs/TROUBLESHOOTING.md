@@ -229,7 +229,9 @@ The GUI will not connect, or `cfc` prints:
 ```
 permission denied on /run/colony-firewall/cfc.sock - add your user to the
 colony-firewall group (sudo usermod -aG colony-firewall $USER) then log
-out and back in, or run as root
+out and back in, or run as root. The group gives read access and lets the
+Colony Firewall app and tray connect; firewall changes come from the app,
+the tray or sudo cfc
 ```
 
 The control socket is `root:colony-firewall` mode 0660, so the kernel
@@ -280,6 +282,66 @@ Two neighbouring errors that are *not* this one, and say so:
 
 Every one of these exits 4 ("daemon unreachable"), so scripts can tell
 them apart from a bad argument (2) or a missing rule (3).
+
+## A change is refused: "read-only access"
+
+Since 0.8.0 only root and the installed Colony Firewall app and tray can
+change the firewall. Everything else of yours, `cfc` without sudo included,
+is read-only, and the daemon says why (exit 1):
+
+```
+read-only access: <reason>. Firewall changes are accepted only from the
+installed Colony Firewall app and tray, or from root (sudo cfc ...).
+```
+
+- **From `cfc`**: run it with `sudo`. A non-root `cfc prompts` still shows
+  prompts but cannot answer them, and does not count as a connected UI.
+- **"this colony-firewall is not the installed /usr/bin/colony-firewall
+  (restart it after an upgrade)"** or **"the caller did not seal itself at
+  startup"**: the app or tray was upgraded under you, or is a 0.7 build.
+  Quit and start it again (the tray from your session's autostart or by
+  hand, `colony-firewall-tray &`).
+- **"the caller loaded /home/…/something.so"**: a library from outside the
+  root-owned system directories is mapped into the app, usually a global
+  `LD_PRELOAD` (MangoHud, gamemode) or a user-installed Vulkan layer or
+  GTK/input-method module. Start the app without it. The daemon refuses to
+  trust a process that runs code it cannot vouch for.
+- **"the caller is being traced"**: a debugger or `strace` is attached.
+- **"the caller runs in a private mnt (or user) namespace"**: the app was
+  started inside a sandbox or container wrapper. Start it directly.
+- **"the connection's client end is unknown (unix_diag: …)"**: the kernel
+  has no `unix_diag` support (module not loaded). `sudo modprobe unix_diag`;
+  until then the app and tray are read-only and `sudo cfc` works.
+- **"mutating RPCs require uid 0 or membership of group 'colony-firewall'"**:
+  you started the app from a session that predates joining the group. Log
+  out and back in.
+
+The journal names the caller and the reason for every refusal:
+
+```sh
+journalctl -u colony-firewalld -g 'refusing a firewall change'
+```
+
+## Pause, resume or import asks for a password, or fails
+
+Pause, resume and rule import change the whole firewall at once, so the app
+and tray need an administrator password for them (polkit, kept for a few
+minutes). Root (`sudo cfc pause`) is never asked. What the refusals mean:
+
+- **"authorization dialog dismissed"**: you cancelled it.
+- **"no polkit authentication agent answered in your session"**: nothing in
+  your session shows polkit dialogs. Start one (`hyprpolkitagent`,
+  `polkit-gnome-authentication-agent-1`, `lxqt-policykit-agent`; most full
+  desktops already run one) or use `sudo cfc pause`.
+- **"polkit is not installed or not running"** or **"the system D-Bus is
+  unreachable"**: install polkit, or use `sudo cfc`.
+- **"not authorized by polkit policy"**: a local polkit rule denies
+  `org.projectcolony.firewall.pause` or `org.projectcolony.firewall.import-rules`
+  for you. `pkaction --verbose --action-id org.projectcolony.firewall.pause`
+  shows the defaults; a missing action means the policy file is not
+  installed in `/usr/share/polkit-1/actions/`.
+- **"authorization timed out after 120 s"**: the dialog was left open; the
+  daemon closed it.
 
 ## Loopback and the local resolver
 
@@ -454,11 +516,12 @@ Kerberos, reverse DNS) is the exception; see
 
 Then pick one of three fixes:
 
-**1. Answer prompts from the terminal.** This is what `cfc prompts` is
-for - it subscribes just like the GUI does, so the daemon starts asking:
+**1. Answer prompts from the terminal.** This is what `sudo cfc prompts`
+is for - it subscribes just like the GUI does, so the daemon starts asking
+(without sudo it only watches, and the daemon keeps applying `no_ui_action`):
 
 ```sh
-cfc prompts
+sudo cfc prompts
 ```
 
 Keys are `a` allow, `d` deny, `r` reject, `s` skip (let it time out), `q`
@@ -470,14 +533,14 @@ set. For a bounded unattended window - during a package install, say -
 `--auto-allow` or `--auto-deny` answer everything without asking, and
 `--count N` exits after N prompts.
 
-**2. Pre-seed rules and accept the fallback.** `cfc rules
-bundle add system` (also spelled `cfc rules bootstrap-defaults`) covers
+**2. Pre-seed rules and accept the fallback.** `sudo cfc rules
+bundle add system` (also spelled `sudo cfc rules bootstrap-defaults`) covers
 the usual system services. `cfc rules bundle list` shows the others —
 `web` for installed browsers, `dev` for git/cargo/docker, `updates` for
 apt/dnf/flatpak — each scoped to a specific executable, never to a bare
 port. Entries whose program is not installed here are skipped and
 reported. Add your own with
-`cfc rules add`. Anything you did not anticipate still hits
+`sudo cfc rules add`. Anything you did not anticipate still hits
 `no_ui_action`.
 
 **3. Change the fallback — deliberately.** `no_ui_action = "Allow"` in
@@ -488,7 +551,7 @@ unanticipated connection — including a payload phoning home — goes out
 unasked. Prefer (1) or (2). If you do set it, send `SIGHUP` and it takes
 effect without a restart.
 
-Note that `cfc prompts` and the GUI can both be connected at once, and
+Note that `sudo cfc prompts` and the GUI can both be connected at once, and
 both see the prompts addressed to you. Delivery is scoped by the uid
 that owns the connecting process: you receive prompts for your own
 processes, root receives everything, and traffic the daemon could not
