@@ -350,7 +350,9 @@ an external filesystem broker or concealed lower storage.
 To approve a peer, repeat the launch with `--allow IP` before `--`; repeat the
 flag for additional peers. The launcher prints the tree identity. Use
 `sudo cfc applications stop ID` to terminate it from another terminal, or
-Ctrl-C in the launching terminal.
+Ctrl-C in the launching terminal; closing that terminal or losing its SSH
+session also stops the tree. A launcher killed outright (SIGKILL) cannot
+clean up: the tree keeps running until `cfc applications stop ID`.
 
 Each active tree receives a reserved host UID and private PID, mount, user,
 IPC, UTS and cgroup namespaces. Its writable state is private and its runtime

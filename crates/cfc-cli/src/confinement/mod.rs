@@ -353,8 +353,14 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
             fs::create_dir_all(CONTROL)?;
             sealed_directory(Path::new(CONTROL))?;
             sealed_directory(Path::new(UNITS))?;
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            // Installed before anything is provisioned, so a signal that arrives
+            // while systemctl runs, or a closed terminal or SSH session, ends in
+            // stop() instead of the default action leaving the tree running.
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut interrupt = signal(SignalKind::interrupt())?;
+            let mut terminate = signal(SignalKind::terminate())?;
+            let mut hangup = signal(SignalKind::hangup())?;
+            let mut quit = signal(SignalKind::quit())?;
             let manifest = Manifest {
                 id: uuid::Uuid::new_v4().simple().to_string(),
                 runtime,
@@ -380,6 +386,11 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
                     "application preparation failed; cleanup: {cleanup:?}"
                 )));
             }
+            // Before the start job, so the identity is known even if this
+            // process is killed outright while the tree runs.
+            if matches!(format, OutputFormat::Human) {
+                eprintln!("Confined application: {}", manifest.id);
+            }
             let application = unit(&manifest.id);
             let started =
                 manager(&["daemon-reload"]).and_then(|_| manager(&["start", &application]));
@@ -388,9 +399,6 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
                 return Err(
                     error.context(format!("application setup failed; cleanup: {cleanup:?}"))
                 );
-            }
-            if matches!(format, OutputFormat::Human) {
-                eprintln!("Confined application: {}", manifest.id);
             }
             let outcome = async {
                 let completed = loop {
@@ -412,8 +420,10 @@ pub(super) async fn run(command: ApplicationsCmd, format: OutputFormat) -> Resul
                         "unexpected application state: {state}"
                     );
                     tokio::select! {
-                        result = tokio::signal::ctrl_c() => { result?; break false; },
+                        _ = interrupt.recv() => break false,
                         _ = terminate.recv() => break false,
+                        _ = hangup.recv() => break false,
+                        _ = quit.recv() => break false,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
                     }
                 };
