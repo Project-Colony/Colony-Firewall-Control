@@ -734,7 +734,7 @@ impl<Q: PacketQueue> Worker<Q> {
             // Per packet, not per prompt: a Reject response is derived from
             // the individual segment (its sequence numbers, its source
             // port), and parallel connections share one prompt.
-            let verdict = match self.engine.evaluate(&packet.connection, &packet.process) {
+            let verdict = match self.engine.peek(&packet.connection, &packet.process) {
                 // A refusal decided since the prompt opened always wins.
                 Decision::Resolved(current) if current.action != Action::Allow => current,
                 // So does a rule's Allow over a fallback nobody chose: a rule
@@ -752,6 +752,10 @@ impl<Q: PacketQueue> Worker<Q> {
                 }
                 _ => pv.verdict,
             };
+            // Only a rule whose answer was applied gets the hit.
+            if let VerdictSource::Rule(id) = verdict.source {
+                self.engine.count_hit(id);
+            }
             self.deliver(
                 packet.message,
                 ObservedConnection {
@@ -2658,7 +2662,9 @@ mod tests {
                 .handle_message(FakeMsg::new(1, tcp_packet(443)))
                 .unwrap();
             let prompt = h.prompt_rx.try_recv().unwrap();
-            h.worker().engine.upsert_rule(allow_port_rule(443));
+            let rule = allow_port_rule(443);
+            let id = rule.id;
+            h.worker().engine.upsert_rule(rule);
             h.worker()
                 .resolve_prompt(PromptVerdict {
                     prompt_id: prompt.prompt_id,
@@ -2666,6 +2672,14 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(h.verdicts(), vec![(1, expected)], "{answer:?}");
+            // The rule is credited only when its answer was the one applied.
+            let hits = h.worker().engine.snapshot().rules[0].hit_count;
+            assert_eq!(
+                hits,
+                u64::from(expected == NfqVerdict::Accept),
+                "{answer:?}"
+            );
+            assert_eq!(h.worker().engine.snapshot().rules[0].id, id);
         }
     }
 

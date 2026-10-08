@@ -136,8 +136,28 @@ impl Engine {
     }
 
     /// Evaluate without blocking. Returns `Resolved` if a rule matches,
-    /// otherwise `NeedsPrompt`.
+    /// otherwise `NeedsPrompt`, and counts a hit for the matched rule.
     pub fn evaluate(&self, conn: &Connection, proc: &Process) -> Decision {
+        let decision = self.peek(conn, proc);
+        if let Decision::Resolved(Verdict {
+            source: cfc_core::VerdictSource::Rule(id),
+            ..
+        }) = decision
+        {
+            self.count_hit(id);
+        }
+        decision
+    }
+
+    /// Credits one match to a rule.
+    pub fn count_hit(&self, rule_id: uuid::Uuid) {
+        *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
+    }
+
+    /// [`Self::evaluate`] without counting a hit, for a caller that may not
+    /// apply the answer: a parked packet released with the user's verdict
+    /// must not credit the rule it did not follow.
+    pub fn peek(&self, conn: &Connection, proc: &Process) -> Decision {
         let now_unix_ms = chrono::Utc::now().timestamp_millis();
         let rule_match = {
             let rules = self.inner.rules.read();
@@ -157,7 +177,6 @@ impl Engine {
             }
         };
         if let Some((rule_id, action)) = rule_match {
-            *self.inner.hits.lock().entry(rule_id).or_insert(0) += 1;
             // Verbatim: a Reject rule must reach the datapath as Reject so
             // the refusal is actually injected, not silently downgraded.
             return Decision::Resolved(Verdict::from_rule(action, rule_id));
