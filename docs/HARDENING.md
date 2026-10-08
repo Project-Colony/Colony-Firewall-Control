@@ -360,15 +360,22 @@ runs inside the installed app is the app:
   unmaps its file is not seen (anonymous executable mappings cannot be
   refused: GPU drivers JIT into them);
 - synthetic input into the GUI under X11 or XWayland can click its buttons;
+- a socket handed back into the app: a same-user program that started the
+  app itself (connect first, then exec the installed binary, keeping a copy
+  of the connection in a child) can pass that copy into the sealed app as a
+  D-Bus message attachment while the child writes a request on it. The
+  daemon then sees the app holding the connection and accepts the request.
+  This is a race, but a repeatable one;
 - a user-installed Vulkan layer, GTK or input-method module, or a global
   `LD_PRELOAD` (MangoHud, gamemode) loaded from your home directory makes the
   app read-only rather than trusted. The refusal names the library.
 
 The kernel-enforced next step would be making the two binaries setgid to a
 dedicated empty group and trusting the connect-time `SO_PEERCRED` gid: glibc
-then ignores `LD_PRELOAD`/`LD_AUDIT` (secure execution) and the process is
-non-dumpable from `exec`. That costs packaging work in every channel and is
-not done yet.
+then ignores `LD_PRELOAD`/`LD_AUDIT` (secure execution), the process is
+non-dumpable from `exec`, and a connection made before that `exec` carries
+the wrong gid, which also closes the handed-back socket above. That costs
+packaging work in every channel and is not done yet.
 
 Side effects of the sealing prologue: the app and tray write no core dumps,
 attaching a debugger to them needs root, and a developer build run from

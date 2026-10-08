@@ -22,10 +22,17 @@
 //! 8. its start time still matches (the "after" read), so none of the above
 //!    was read from a process that replaced it under the same pid.
 //!
-//! Steps 4 and 6 close the exec-after-connect route: connect, write a whole
-//! request, then exec the official binary with the socket inherited. That
-//! process has not run the prologue yet, or has closed the inherited
+//! Steps 4 and 6 close the plain exec-after-connect route: connect, write a
+//! whole request, then exec the official binary with the socket inherited.
+//! That process has not run the prologue yet, or has closed the inherited
 //! connection by the time it is sealed.
+//!
+//! They do not close a variant: a helper that kept a copy of that socket can
+//! hand it back to the sealed process (the app and tray accept D-Bus messages
+//! from any same-user process, and D-Bus carries descriptors) while it
+//! writes a request on it. Step 6 then sees the process holding the
+//! connection. Binding each request to its sender (SO_PASSCRED) or trusting
+//! a connect-time credential (setgid binaries) would; see docs/HARDENING.md.
 //!
 //! What it cannot see: code already running inside the official image that
 //! moved itself into anonymous memory (anonymous executable mappings are

@@ -312,9 +312,9 @@ installed Colony Firewall app and tray, or from root (sudo cfc ...).
 - **"the connection's client end is unknown (unix_diag: …)"**: the kernel
   has no `unix_diag` support (module not loaded). `sudo modprobe unix_diag`;
   until then the app and tray are read-only and `sudo cfc` works.
-- **"mutating RPCs require uid 0 or membership of group 'colony-firewall'"**:
-  you started the app from a session that predates joining the group. Log
-  out and back in.
+- **"firewall changes require root, or the installed Colony Firewall app or
+  tray run by a member of group 'colony-firewall'"**: you started the app
+  from a session that predates joining the group. Log out and back in.
 
 The journal names the caller and the reason for every refusal:
 

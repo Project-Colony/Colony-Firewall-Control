@@ -573,7 +573,8 @@ impl FirewallService {
         match gate(peer.uid, self.own_uid, group_ok) {
             Gate::Privileged => Ok(None),
             Gate::DenyGroup => Err(Status::permission_denied(format!(
-                "mutating RPCs require uid 0 or membership of group '{}'",
+                "firewall changes require root, or the installed Colony Firewall app or \
+                 tray run by a member of group '{}'",
                 self.auth.group
             ))),
             Gate::NeedOfficial => {
@@ -2016,6 +2017,19 @@ mod tests {
             status.message()
         );
         assert!(!svc.stats.is_paused());
+
+        let status = svc
+            .set_paused(request(
+                SetPausedRequest::default(),
+                peer(1001, 1001, OFFICIAL_PID),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            status.message().contains("member of group 'cfc-test'"),
+            "{}",
+            status.message()
+        );
     }
 
     /// A pending prompt about uid 1000's process, with an answering UI so it
