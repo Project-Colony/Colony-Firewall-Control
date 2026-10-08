@@ -938,21 +938,27 @@ fn warm_notification_spec_version() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // First, before D-Bus or the runtime exist: the daemon accepts answers
+    // and pause requests only from a sealed, installed copy of this tray.
+    let sealed = cfc_client::seal_official_process();
     warm_notification_spec_version();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building the tokio runtime")?
-        .block_on(run())
+        .block_on(run(sealed))
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    if let Err(error) = sealed {
+        warn!("could not seal the process ({error}); the daemon will treat this tray as read-only");
+    }
 
     let socket = socket_path_from_env();
     info!(socket = %socket.display(), "starting colony-firewall-tray");

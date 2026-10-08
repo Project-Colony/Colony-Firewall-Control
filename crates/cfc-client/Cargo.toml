@@ -19,3 +19,5 @@ tower = { workspace = true }
 hyper-util = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# close_range(2) and prctl(2) for `seal_official_process`.
+libc = { workspace = true }

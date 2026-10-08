@@ -723,6 +723,7 @@ dependencies = [
  "cfc-core",
  "cfc-proto",
  "hyper-util",
+ "libc",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",

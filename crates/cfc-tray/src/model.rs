@@ -97,6 +97,7 @@ pub fn unreachable_hint(err: &ClientError) -> String {
         ClientError::Connect { .. } | ClientError::Transport(_) => {
             "connection failed — is colony-firewalld healthy?".into()
         }
+        ClientError::Denied(_) => "read-only - restart the tray, or use sudo cfc".into(),
         ClientError::Rpc(_) | ClientError::StreamClosed => "daemon answered with an error".into(),
     }
 }
@@ -636,7 +637,11 @@ mod tests {
     #[test]
     fn hints_are_short_and_actionable() {
         let p = PathBuf::from("/run/colony-firewall/cfc.sock");
-        let cases: [(ClientError, &str); 4] = [
+        let cases: [(ClientError, &str); 5] = [
+            (
+                ClientError::Denied("read-only access: ...".into()),
+                "sudo cfc",
+            ),
             (
                 ClientError::SocketMissing { path: p.clone() },
                 "systemctl status colony-firewalld",

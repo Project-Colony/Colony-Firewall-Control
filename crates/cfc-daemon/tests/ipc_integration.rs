@@ -362,6 +362,7 @@ async fn next_message<T>(stream: &mut tonic::Streaming<T>) -> T {
 fn status_of(err: ClientError) -> tonic::Status {
     match err {
         ClientError::Rpc(status) => status,
+        ClientError::Denied(message) => tonic::Status::permission_denied(message),
         other => panic!("expected an RPC status, got: {other}"),
     }
 }

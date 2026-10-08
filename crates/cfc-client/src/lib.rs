@@ -38,9 +38,17 @@ pub enum ClientError {
     /// problem far more often than anything else.
     #[error(
         "permission denied on {path} - add your user to the colony-firewall group \
-         (sudo usermod -aG colony-firewall $USER) then log out and back in, or run as root"
+         (sudo usermod -aG colony-firewall $USER) then log out and back in, or run as root. \
+         The group gives read access and lets the Colony Firewall app and tray connect; \
+         firewall changes come from the app, the tray or sudo cfc"
     )]
     PermissionDenied { path: PathBuf },
+
+    /// The daemon refused the request (PERMISSION_DENIED). The text is the
+    /// daemon's own reason, made display-safe, and is shown as it is: it
+    /// already says what to do (use the app or tray, or sudo).
+    #[error("{0}")]
+    Denied(String),
 
     /// The socket inode is there but nothing is listening: a crashed or
     /// SIGKILLed daemon leaves exactly this behind.
@@ -58,7 +66,7 @@ pub enum ClientError {
     },
 
     #[error("rpc: {0}")]
-    Rpc(#[from] tonic::Status),
+    Rpc(tonic::Status),
 
     #[error("transport: {0}")]
     Transport(#[from] tonic::transport::Error),
@@ -67,6 +75,16 @@ pub enum ClientError {
     /// during a restart, fatal for a one-shot (non-following) consumer.
     #[error("stream closed by the daemon")]
     StreamClosed,
+}
+
+impl From<tonic::Status> for ClientError {
+    fn from(status: tonic::Status) -> Self {
+        if status.code() == tonic::Code::PermissionDenied {
+            ClientError::Denied(convert::display_safe(status.message()))
+        } else {
+            ClientError::Rpc(status)
+        }
+    }
 }
 
 impl ClientError {
@@ -81,7 +99,7 @@ impl ClientError {
             | ClientError::Connect { .. }
             | ClientError::Transport(_) => true,
             ClientError::Rpc(status) => status.code() == tonic::Code::Unavailable,
-            ClientError::StreamClosed => false,
+            ClientError::StreamClosed | ClientError::Denied(_) => false,
         }
     }
 }
@@ -158,8 +176,29 @@ pub struct VerdictOutcome {
     pub persist_note: Option<String>,
 }
 
+/// Per-request deadline of [`Client::connect`].
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-request deadline of [`Client::connect_interactive`]: longer than the
+/// daemon's 120 s wait for a polkit password dialog, so the daemon's own
+/// answer (authorized, dismissed, timed out) always arrives first.
+pub const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(150);
+
 impl Client {
+    /// Connects with the 5 s per-request deadline every ordinary call uses.
     pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Self::connect_with_timeout(socket_path, REQUEST_TIMEOUT).await
+    }
+
+    /// Connects for a request that may wait on an administrator password
+    /// (pause, resume): the daemon asks polkit and polkit asks the user.
+    pub async fn connect_interactive(socket_path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        Self::connect_with_timeout(socket_path, INTERACTIVE_TIMEOUT).await
+    }
+
+    async fn connect_with_timeout(
+        socket_path: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> Result<Self, ClientError> {
         let path = socket_path.as_ref().to_path_buf();
         let connect_path = path.clone();
 
@@ -177,7 +216,7 @@ impl Client {
                 path: path.clone(),
                 source: e.into(),
             })?
-            .timeout(Duration::from_secs(5));
+            .timeout(timeout);
 
         let channel = endpoint
             .connect_with_connector(service_fn(move |_: Uri| {
@@ -325,6 +364,61 @@ impl Client {
 }
 
 // ---------------------------------------------------------------------------
+// Official client prologue
+// ---------------------------------------------------------------------------
+
+/// Makes this process recognisable to the daemon as the installed Colony
+/// Firewall app or tray. The first statement of their `main`, before any
+/// thread, runtime, D-Bus or display connection exists; never called by the
+/// CLI.
+///
+/// 1. Closes every inherited descriptor above stderr, so no control-socket
+///    connection opened by whoever exec'd this binary survives into it. The
+///    daemon accepts a connection only when the official process itself holds
+///    it, which closes the "connect, write a request, then exec the app"
+///    route.
+/// 2. Marks the process non-dumpable. The kernel then gives `/proc/<pid>` to
+///    root, which is the marker the daemon checks, and same-user `ptrace`,
+///    `/proc/<pid>/mem` and `pidfd_getfd` are refused for the rest of the
+///    process's life.
+///
+/// A failure is returned for the caller to log once logging is up. The app
+/// keeps working, read-only: the daemon refuses its changes with a reason.
+pub fn seal_official_process() -> std::io::Result<()> {
+    close_inherited_fds()?;
+    // SAFETY: prctl(PR_SET_DUMPABLE) takes plain integers and touches no
+    // memory of ours.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn close_inherited_fds() -> std::io::Result<()> {
+    // SAFETY: close_range(2) only closes descriptors; nothing in this
+    // single-threaded prologue owns one above stderr yet.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(error);
+    }
+    // Kernels before 5.9: list first, then close, so the directory handle is
+    // not closed under the iteration.
+    let open: Vec<i32> = std::fs::read_dir("/proc/self/fd")?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd >= 3)
+        .collect();
+    for fd in open {
+        // SAFETY: as above; EBADF for the listing's own, now closed, handle
+        // is harmless.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Resilient (self-reconnecting) subscriptions
 // ---------------------------------------------------------------------------
 
@@ -436,7 +530,7 @@ async fn pump_once<T: ResilientSubscription>(
             }
             Err(status) => {
                 return PumpOutcome::Lost {
-                    err: ClientError::Rpc(status),
+                    err: status.into(),
                     connected: true,
                 }
             }
@@ -572,6 +666,162 @@ mod tests {
         assert!(!ClientError::Rpc(tonic::Status::not_found("nope")).is_unreachable());
         assert!(ClientError::Rpc(tonic::Status::unavailable("bye")).is_unreachable());
         assert!(!ClientError::StreamClosed.is_unreachable());
+    }
+
+    #[test]
+    fn permission_denied_status_becomes_denied_with_the_daemon_message() {
+        let err: ClientError =
+            tonic::Status::permission_denied("read-only access: use sudo\u{1b}[2J").into();
+        match &err {
+            ClientError::Denied(message) => {
+                assert!(message.starts_with("read-only access: use sudo"));
+                assert!(!message.contains('\u{1b}'), "display-safe: {message}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert_eq!(err.to_string(), "read-only access: use sudo\\u{1b}[2J");
+        assert!(!err.is_unreachable());
+        let err: ClientError = tonic::Status::internal("boom").into();
+        assert!(matches!(err, ClientError::Rpc(_)));
+    }
+
+    #[test]
+    fn seal_official_process_closes_inherited_fds_and_sets_non_dumpable() {
+        // In a forked child: the prologue closes every descriptor of the
+        // process it runs in, which would break the test harness.
+        // SAFETY: the child only makes raw syscalls (close_range succeeds on
+        // every kernel CI runs, so the allocating fallback is not reached)
+        // and leaves with _exit.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let code = unsafe {
+                if libc::dup2(1, 57) != 57 {
+                    libc::_exit(10);
+                }
+                if seal_official_process().is_err() {
+                    libc::_exit(11);
+                }
+                if libc::fcntl(57, libc::F_GETFD) != -1 {
+                    libc::_exit(12);
+                }
+                if libc::fcntl(2, libc::F_GETFD) == -1 {
+                    libc::_exit(13);
+                }
+                if libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                    libc::_exit(14);
+                }
+                0
+            };
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: waiting on our own child with a valid out-pointer.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "child died: {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "child check failed");
+    }
+
+    #[tokio::test]
+    async fn connect_interactive_outlives_five_seconds() {
+        use cfc_proto::v1::firewall_server::{Firewall, FirewallServer};
+        use tonic::{Request, Response, Status};
+
+        // A daemon that takes 6 s to answer SetPaused, as one waiting on a
+        // polkit dialog does. Only SetPaused is reached.
+        struct Slow;
+        #[tonic::async_trait]
+        impl Firewall for Slow {
+            type StreamPromptsStream = tokio_stream::Empty<Result<proto::PromptEvent, Status>>;
+            type StreamConnectionsStream =
+                tokio_stream::Empty<Result<proto::ConnectionEvent, Status>>;
+            async fn set_paused(
+                &self,
+                req: Request<proto::SetPausedRequest>,
+            ) -> Result<Response<proto::SetPausedResponse>, Status> {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                Ok(Response::new(proto::SetPausedResponse {
+                    paused: req.into_inner().paused,
+                    resume_at_unix_ms: 0,
+                }))
+            }
+            async fn stream_prompts(
+                &self,
+                _: Request<proto::SubscribeRequest>,
+            ) -> Result<Response<Self::StreamPromptsStream>, Status> {
+                unreachable!()
+            }
+            async fn submit_verdict(
+                &self,
+                _: Request<proto::VerdictRequest>,
+            ) -> Result<Response<proto::VerdictResponse>, Status> {
+                unreachable!()
+            }
+            async fn list_rules(
+                &self,
+                _: Request<proto::ListRulesRequest>,
+            ) -> Result<Response<proto::ListRulesResponse>, Status> {
+                unreachable!()
+            }
+            async fn upsert_rule(
+                &self,
+                _: Request<proto::UpsertRuleRequest>,
+            ) -> Result<Response<proto::UpsertRuleResponse>, Status> {
+                unreachable!()
+            }
+            async fn apply_rules(
+                &self,
+                _: Request<proto::ApplyRulesRequest>,
+            ) -> Result<Response<proto::ApplyRulesResponse>, Status> {
+                unreachable!()
+            }
+            async fn delete_rule(
+                &self,
+                _: Request<proto::DeleteRuleRequest>,
+            ) -> Result<Response<proto::DeleteRuleResponse>, Status> {
+                unreachable!()
+            }
+            async fn stream_connections(
+                &self,
+                _: Request<proto::SubscribeRequest>,
+            ) -> Result<Response<Self::StreamConnectionsStream>, Status> {
+                unreachable!()
+            }
+            async fn get_status(
+                &self,
+                _: Request<proto::StatusRequest>,
+            ) -> Result<Response<proto::StatusResponse>, Status> {
+                unreachable!()
+            }
+            async fn list_events(
+                &self,
+                _: Request<proto::ListEventsRequest>,
+            ) -> Result<Response<proto::ListEventsResponse>, Status> {
+                unreachable!()
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("cfc-client-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("slow.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FirewallServer::new(Slow))
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener)),
+        );
+
+        let mut quick = Client::connect(&socket).await.unwrap();
+        let err = quick.set_paused(true, 0).await.unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Rpc(status) if status.code() == tonic::Code::Cancelled
+                || status.code() == tonic::Code::DeadlineExceeded),
+            "the 5 s client gives up first: {err:?}"
+        );
+        let mut patient = Client::connect_interactive(&socket).await.unwrap();
+        assert!(patient.set_paused(true, 0).await.unwrap().paused);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

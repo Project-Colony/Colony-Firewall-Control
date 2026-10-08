@@ -48,12 +48,20 @@ const DEADLINE_TICK_MS: u64 = 400;
 const PROMPT_ARM_MS: i64 = 1_000;
 
 fn main() -> iced::Result {
+    // First, before any thread, display or daemon connection exists: the
+    // daemon accepts changes only from a sealed, installed copy of this app.
+    let sealed = cfc_client::seal_official_process();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,cfc_ui=info")),
         )
         .init();
+    if let Err(error) = sealed {
+        tracing::warn!(
+            "could not seal the process ({error}); the daemon will treat this app as read-only"
+        );
+    }
 
     iced::application(App::new, App::update, App::view)
         .title(App::title)
