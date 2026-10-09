@@ -478,6 +478,11 @@ cfc rules export --out rules.json
 sudo cfc rules import-opensnitch /etc/opensnitchd/rules
 ```
 
+Every binary (`colony-firewalld`, `colony-firewall`, `colony-firewall-tray`
+and `cfc`) prints its name and version with `--version` (or `-V`) and
+exits. The app and tray answer it before they open a window, a tray icon
+or a daemon connection, so it also works over SSH or in a script.
+
 ### Who can change what
 
 | who | read status, rules, logs, live view, prompts | answer prompts, add/edit/delete rules | pause, resume, import rules, Allow rules that name no program |

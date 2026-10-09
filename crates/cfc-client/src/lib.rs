@@ -421,6 +421,22 @@ fn close_inherited_fds() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The line the app and tray print for `--version` or `-V`, in the
+/// `<binary> <version>` form clap gives the daemon and the CLI. `None` when
+/// the first argument after the program name is anything else.
+///
+/// Checked first in their `main`, before sealing, logging or a display or
+/// D-Bus connection, so it answers on a headless machine. Arguments are
+/// taken as `OsString` because `std::env::args` panics on non-UTF-8.
+pub fn version_line(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+    binary: &str,
+    version: &str,
+) -> Option<String> {
+    let flag = args.nth(1)?;
+    (flag == "--version" || flag == "-V").then(|| format!("{binary} {version}"))
+}
+
 // ---------------------------------------------------------------------------
 // Resilient (self-reconnecting) subscriptions
 // ---------------------------------------------------------------------------
@@ -595,6 +611,18 @@ pub fn stream_prompts_resilient(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_line_answers_only_the_version_flags() {
+        let line = |args: &[&str]| version_line(args.iter().map(Into::into), "app", "1.2.3");
+        assert_eq!(line(&["app", "--version"]).as_deref(), Some("app 1.2.3"));
+        assert_eq!(line(&["app", "-V"]).as_deref(), Some("app 1.2.3"));
+        assert_eq!(line(&["app"]), None);
+        assert_eq!(line(&[]), None);
+        assert_eq!(line(&["app", "--versions"]), None);
+        assert_eq!(line(&["app", "-v"]), None);
+        assert_eq!(line(&["app", "--help", "--version"]), None);
+    }
 
     #[test]
     fn enoent_names_the_daemon() {
