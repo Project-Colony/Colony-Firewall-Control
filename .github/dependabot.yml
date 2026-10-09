@@ -2,7 +2,7 @@
 #
 # Copy to .github/dependabot.yml.
 #
-# Dependabot opening a PR is not the rule being followed: merging it is. See
+# Dependabot opening a PR is not the rule being followed; merging it is. See
 # design/dependencies.md: everything is on its latest release, always.
 version: 2
 updates:
@@ -11,6 +11,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # The shared signing workflow stays at the organisation pin, which moves
+    # for every program at once: design/releases.md in
+    # Project-Colony-Resources, "The pin". A Dependabot PR would move one
+    # repository alone.
+    ignore:
+      - dependency-name: Project-Colony/Project-Colony-Resources
     groups:
       actions:
         patterns: ["*"]
