@@ -490,9 +490,11 @@ The named profiles are presets for these three values (and for
 | strict   | Deny           | Deny             | 15                    |
 
 No profile permits anything on its own: the presets differ only in how
-long a prompt waits. Only a stored rule, or a person answering, allows a
-connection. You can still override either field explicitly under
-`[default_policy]`; the point is that nothing does it for you.
+long a prompt waits and, for the opt-in inbound table, whether an
+unmatched flow is rejected or dropped. Only a stored rule, or a person
+answering, allows a connection. You can still override either field
+explicitly under `[default_policy]`; the point is that nothing does it
+for you.
 
 `timeout_action` is `Deny` in every profile on purpose: a prompt you
 were shown and did not answer must not become an allow, or connecting

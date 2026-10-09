@@ -211,7 +211,14 @@ install -m644 \
     pkg/colony-firewall-autostart.desktop \
     pkg/colony-firewall-tray-autostart.desktop \
     pkg/colony-firewall.svg \
+    pkg/org.projectcolony.firewall.policy \
+    "${STAGE}/"
+
+install -m644 \
     crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o \
+    "${STAGE}/"
+
+install -m644 \
     README.md CHANGELOG.md LICENSE \
     docs/ARCHITECTURE.md docs/HARDENING.md docs/TROUBLESHOOTING.md \
     "${STAGE}/"
