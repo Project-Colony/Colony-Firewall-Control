@@ -1,22 +1,50 @@
+# Keep the supply chain current: GitHub Actions and Cargo dependencies.
+#
+# Copy to .github/dependabot.yml.
+#
+# Dependabot opening a PR is not the rule being followed; merging it is. See
+# design/dependencies.md: everything is on its latest release, always.
 version: 2
 updates:
-  - package-ecosystem: cargo
-    directory: "/"
-    schedule:
-      interval: weekly
-    # Transitive crates too: a root daemon parsing untrusted packets is only
-    # as current as its whole dependency tree.
-    allow:
-      - dependency-type: all
-    groups:
-      # Minor and patch bumps arrive as one PR; majors stay separate.
-      cargo-minor:
-        update-types: ["minor", "patch"]
-
+  # A stale action is the same problem as a stale crate, with more privileges.
   - package-ecosystem: github-actions
-    directory: "/"
+    directory: /
     schedule:
       interval: weekly
+    # The shared signing workflow stays at the organisation pin, which moves
+    # for every program at once: design/releases.md in
+    # Project-Colony-Resources, "The pin". A Dependabot PR would move one
+    # repository alone.
+    ignore:
+      - dependency-name: Project-Colony/Project-Colony-Resources
     groups:
       actions:
         patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Transitive crates too, so the lockfile stays current without a manual
+    # `cargo update`.
+    allow:
+      - dependency-type: all
+    groups:
+      # Minor and patch bumps arrive as one PR, so a routine week is one review
+      # rather than fifteen. Majors stay separate: they deserve their own read.
+      cargo-minor:
+        update-types: ["minor", "patch"]
+
+  # The kernel-side eBPF crate is its own workspace with its own Cargo.lock
+  # (built only by the pinned nightly), so the root entry never sees it.
+  - package-ecosystem: cargo
+    directory: /crates/cfc-ebpf
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    allow:
+      - dependency-type: all
+    groups:
+      cargo-minor:
+        update-types: ["minor", "patch"]
