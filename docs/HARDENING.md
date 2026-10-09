@@ -30,7 +30,9 @@ it only watches (see [the control socket](#the-control-socket-and-who-can-talk-t
 
 **No profile ever permits a remote connection by itself.** Not on timeout, not
 when nothing is subscribed. The presets differ only in how long a prompt
-waits for an answer. Under these presets, a stored rule or a prompt answer
+waits for an answer and, for the opt-in inbound table, whether an
+unmatched inbound flow is rejected (relaxed) or dropped (balanced,
+strict). Under these presets, a stored rule or a prompt answer
 permits remote traffic. Unmatched local IPC is allowed without prompting.
 
 A timeout means the question *was* put to you and went unanswered; if
