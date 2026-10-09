@@ -43,7 +43,7 @@ subscribed, reasoning that a desktop booting before its session starts
 should keep working. That reasoning does not survive contact with a
 machine where a session never starts at all: on a headless server, a VM,
 anything administered over SSH, `colony-firewall` and the tray never run,
-so "nobody is subscribed" is not a window during boot — it is the
+so "nobody is subscribed" is not a window during boot: it is the
 permanent condition. Those hosts had no outbound firewall whatsoever.
 
 `no_ui_action` and `timeout_action` remain genuinely different questions.
@@ -52,18 +52,19 @@ asked and did not answer" is a decision you made by not making one. Both
 now answer *deny*, for different reasons.
 
 You can still set either to `"Allow"` explicitly under `[default_policy]`
-— see below. The change is that nothing does it on your behalf.
+(see below). The change is that nothing does it on your behalf.
 
-The danger with `strict` is bootstrap: the units are ordered
+The danger in every profile is bootstrap: the units are ordered
 before the daemon and `network-pre.target`. Enabled enforcement is required
 by NetworkManager and systemd-networkd, so an nft load failure blocks their
 startup. Initial daemon failure leaves the table loaded and drops new flows.
 This does not cover initramfs networking, already configured interfaces, or
-other network managers. Once loaded, strict filtering denies unmatched remote
-flows, so DHCP, DNS and NTP need standing rules or
-the machine cannot even get a lease. Network managers retrying DNS will
-look like total network failure. **Only flip to strict after you have
-rules for every always-on system service**.
+other network managers. Once loaded, every profile denies an unmatched remote
+flow that no subscriber is there to answer, and at boot none is, so DHCP, DNS
+and NTP need standing rules or the machine cannot even get a lease.
+Network managers retrying DNS will look like total network failure.
+**Have rules for every always-on system service before you enable
+enforcement**, whatever the profile.
 
 `bootstrap-defaults` is intended to bridge exactly that gap: it seeds
 the DHCP clients (dhcpcd / NetworkManager / systemd-networkd), the
@@ -75,13 +76,15 @@ System services that *must* always work:
 
 - `/usr/lib/systemd/systemd-resolved` to port 53 (DNS stub)
 - `/usr/lib/systemd/systemd-timesyncd` or `/usr/bin/chronyd` to port 123 (NTP)
-- `/usr/lib/systemd/systemd-networkd` (DHCP if you use it - UDP 67/68)
+- `/usr/lib/systemd/systemd-networkd`, NetworkManager or dhcpcd (DHCP to UDP
+  67, DHCPv6 to UDP 547)
 - Your VPN client if any (WireGuard usually doesn't traverse NFQUEUE,
   but split-DNS resolvers might)
 
 User-side conveniences that hit the network constantly:
 
-- Package manager: `/usr/bin/pacman`, `/usr/bin/paru`, `/usr/bin/makepkg` -> :443
+- Package manager: `/usr/bin/pacman`, `/usr/bin/paru` -> :443 (`makepkg` is a
+  script: the connections come from the `curl` or `git` it runs)
 - Web browser: `/usr/lib/firefox/firefox`, `/opt/google/chrome/chrome` -> :443, :80
 - IDE / editor: depends, but many phone home for telemetry - decide per app
 
@@ -123,7 +126,7 @@ for IPv4 or `/128` for IPv6, and label it as an IP. They do not turn a domain
 into a permanent IP rule. DNS enrichment starts only after an Allow; explicit
 Deny/Reject decisions start no lookup. Eight permits bound resolver jobs.
 
-#### Observed answers, with `[ebpf] enabled`
+#### Observed answers, with the eBPF layer up
 
 The ingress hook copies DNS-shaped UDP responses received from source port 53.
 It does not validate a resolver transaction, sender or question. These records
@@ -210,7 +213,7 @@ usually past it. For such a program:
   tree), an Allow cannot be bound to the image, so "Allow always" applies
   once and saves no rule (the UI says why), and every new flow, each
   retransmit included, opens its own prompt. A hand-written path-only rule
-  (`cfc rules add --exe <path>`) works, but whoever can write that file
+  (`sudo cfc rules add --exe <path>`) works, but whoever can write that file
   inherits it. Installing the program root-owned is the better fix.
 
 **Incomplete identity is asked, not refused.** A flow whose executable,
@@ -502,13 +505,15 @@ left in place.
 | Setting                                            | On SIGHUP |
 |----------------------------------------------------|-----------|
 | `profile`                                          | Live      |
-| `[default_policy] no_ui_action` / `timeout_action` | Live      |
+| `[default_policy] no_ui_action` / `timeout_action` / `inbound_action` | Live |
 | `[default_policy] prompt_timeout_secs`             | Live (next prompt) |
+| `[provenance] enabled`                             | Live      |
 | `[nfqueue] queue_num` / `queue_max_len` / `fail_open` | Restart |
 | `[storage] path`                                   | Restart   |
 | `[events] max_rows`                                | Restart   |
 | `[pause] default_secs`                             | Restart   |
-| `[ipc] group` / `require_group`                    | Restart   |
+| `[ipc] group` / `require_group` / `official_clients` | Restart |
+| `[ebpf] enabled` / `object_path`                   | Restart   |
 
 Rules are not read from the config file at all - they live in the
 database and every change takes effect immediately.
@@ -610,12 +615,11 @@ unit, do not "harden" either of these.
 
 ### `CAP_BPF`, `CAP_PERFMON` and the seccomp filter
 
-These are granted unconditionally, even though the eBPF layer is off at
-runtime by default (`[ebpf] enabled`). The loader is compiled into the
-shipped daemon, so the config switch is the only thing between a stock
-install and a ring-0 attach — keeping that switch in one place beats
-making operators edit a unit file, and a capability nothing exercises is
-not an attack surface.
+These are granted unconditionally, because the eBPF layer comes up by
+default wherever it can (`[ebpf] enabled` defaults to `"auto"`). Setting
+it to `false` is the one switch between a stock install and a ring-0
+attach: keeping that switch in one place beats making operators edit a unit
+file, and a capability nothing exercises is not an attack surface.
 
 `SystemCallFilter=bpf perf_event_open` is **required** and is not
 implied by `@system-service`. Checked with
@@ -676,7 +680,8 @@ Order of operations:
 2. `cfc live` and reproduce the failure - the deny verdict will show in
    real time.
 3. `cfc rules list | grep <app>` - is the rule too narrow?
-4. Re-add a temporary "allow once" rule via the UI prompt.
+4. Answer its next prompt with "Allow once" (`a`, then `1` in
+   `sudo cfc prompts`): the connection goes through and no rule is saved.
 5. After it works, narrow the rule back down.
 
 ## Backups
@@ -696,7 +701,7 @@ sudo cfc rules import --replace ~/cfc-rules-2026-05-25.json
 `--replace` makes the daemon's rule set match the file: every rule in the file
 is written first, and only then are the rules *absent* from it removed. Nothing
 is applied at all unless every rule in the file reads cleanly, so a typo cannot
-leave you with a partial rule set — and against a fail-closed ruleset, a partial
+leave you with a partial rule set, and against a fail-closed ruleset, a partial
 rule set is a machine with no outbound network. Without `--replace`, import is
 additive and removes nothing.
 

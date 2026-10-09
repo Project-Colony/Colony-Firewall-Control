@@ -6,8 +6,7 @@ Phases 0-3 are done and have since been through a hardening pass
 (Phase 3.5). The eBPF backend and the system tray have since landed
 too; the whitelist fast path landed and was later removed (see
 `TODO.md` 1a). What is left is
-VirusTotal lookups, publishing to the AUR, and one end-to-end test that
-is still manual.
+VirusTotal lookups, the Colony store listing and publishing to the AUR.
 
 ## Phase 0 - Foundation [done]
 
@@ -38,12 +37,14 @@ is still manual.
 - [x] PromptRouter: sync NFQUEUE worker <-> async UI subscribers
 - [x] StreamPrompts + SubmitVerdict with timeout fallback
 - [x] Persist-on-answer (scope from UI becomes a new Rule)
-- [ ] Smoke test: nftables enqueue + curl => observable DROP/ACCEPT (manual)
-      - `scripts/smoke-test.sh` runs in CI but drives a `--dry-run`
-        daemon: it never binds NFQUEUE, so it proves the gRPC/CLI
-        surface, not that a packet is actually dropped. Verifying a real
-        DROP/ACCEPT still means loading the nftables snippet on a real
-        machine by hand.
+- [x] Smoke test: nftables enqueue + curl => observable DROP/ACCEPT
+      - `scripts/armed-e2e.sh`, run by the `e2e` workflow on pushes to
+        `main` and on pull requests, loads the shipped nftables snippet in a network
+        namespace and runs the daemon on a real NFQUEUE: an allowed flow
+        gets HTTP 200, a denied or unmatched one is dropped (curl exit
+        28), and new flows stay dropped after the daemon stops on SIGTERM
+        or SIGKILL. `scripts/smoke-test.sh` still covers the gRPC/CLI
+        surface against a `--dry-run` daemon.
 
 ## Phase 2 - UI MVP [done]
 
@@ -54,7 +55,7 @@ is still manual.
 - [x] Stats counter cards (read from GetStatus, 2s polling)
 - [x] Desktop notifications via notify-rust on new prompts
 - [x] Inline rule editor in Rules tab (name, action, duration, exe, host, net, port, protocol)
-- [x] System tray icon (ksni): `colony-firewall-tray` — status, pending-prompt badge, pause/resume, opens the GUI
+- [x] System tray icon (ksni): `colony-firewall-tray`: status, pending-prompt badge, pause/resume, opens the GUI
 
 ## Phase 3 - CLI [done]
 
@@ -152,9 +153,10 @@ were wrong or missing once the happy path worked.
 
 ## Phase 4 - eBPF backend [done]
 
-Compiled in by default (the `ebpf` cargo feature); still off at runtime
-until `[ebpf] enabled` is set in `daemon.toml`. Verified end to end on
-kernel 7.1.8.
+Compiled in by default (the `ebpf` cargo feature), and brought up at
+runtime wherever the kernel supports it and the object is installed:
+`[ebpf] enabled` defaults to `"auto"`, and `false` turns it off. Verified
+end to end on kernel 7.1.8.
 
 - [x] aya project setup, BPF target in workspace (own workspace, own
       pinned nightly, excluded from the stable build; `cargo xtask
