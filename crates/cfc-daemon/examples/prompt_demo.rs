@@ -1,7 +1,7 @@
 //! Prompt-flow demo daemon.
 //!
 //! Assembles the daemon's real internals (store, engine, router, IPC) on a
-//! plain socket — no root, no NFQUEUE — and emits a synthetic prompt every
+//! plain socket - no root, no NFQUEUE - and emits a synthetic prompt every
 //! 25 seconds, exactly like the integration harness does. Point any client
 //! at it to exercise the full prompt round-trip interactively:
 //!
@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     let store = RuleStore::open(&dir.path().join("rules.db"))?;
     // 45s per prompt: enough time to read a notification and pick a
-    // button. Timeout denies, like every shipped profile — an unanswered
+    // button. Timeout denies, like every shipped profile - an unanswered
     // question is not consent.
     let policy: SharedPolicy = Arc::new(std::sync::RwLock::new(DefaultPolicy {
         no_ui_action: Action::Allow,

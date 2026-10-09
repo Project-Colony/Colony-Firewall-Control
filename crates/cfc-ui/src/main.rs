@@ -554,7 +554,7 @@ pub fn backoff_secs(attempt: u32) -> i64 {
 }
 
 /// Control socket to connect to: `$CFC_SOCKET` when set, else the
-/// packaged default. The CLI has `--socket` for the same reason — pointing
+/// packaged default. The CLI has `--socket` for the same reason - pointing
 /// a client at a daemon running somewhere else (a `--dry-run` instance, a
 /// test socket in a temp dir) shouldn't require a rebuild.
 fn socket_path_from_env() -> PathBuf {
@@ -2183,7 +2183,7 @@ mod tests {
         }
     }
 
-    /// A rule narrowed by predicates the editor has no widget for — the
+    /// A rule narrowed by predicates the editor has no widget for - the
     /// shape `cfc rules add --uid` and opensnitch imports produce.
     fn rule_with_hidden_scope() -> proto::RuleInfo {
         proto::RuleInfo {

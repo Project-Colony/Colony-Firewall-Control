@@ -44,7 +44,7 @@ log line, which is the same contract the daemon keeps everywhere else.
 ## What is deliberately not here
 
 **`CAP_SYS_ADMIN`.** The seven capabilities in `colony_firewall.te` are exactly
-the seven the systemd unit grants — the five BPF/network ones plus `chown`
+the seven the systemd unit grants - the five BPF/network ones plus `chown`
 (the control socket is chgrped to `colony-firewall` after bind) and
 `dac_read_search` (the `/proc/*/fd` walk behind attribution; its absence once
 took a real machine's network down, see the capability comment in the `.te`).

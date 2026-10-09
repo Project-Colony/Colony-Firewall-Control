@@ -36,8 +36,8 @@ done
 problems=()
 
 # The directories a packaging recipe may install from. THREE places below need
-# this list — the staged-path grep, repo_path_for(), and check 3's PKGBUILD grep
-# — and they have to agree. They did not: `scripts` was added to the first two
+# this list - the staged-path grep, repo_path_for(), and check 3's PKGBUILD grep
+# - and they have to agree. They did not: `scripts` was added to the first two
 # and missed in the third, which meant check 3 silently stopped looking at
 # pkg/PKGBUILD's install of scripts/inbound-lockout-guard.sh. A check that
 # passes by not looking is worse than no check, so the list lives here once.

@@ -387,7 +387,7 @@ impl Engine {
     /// rules enable|disable`, `cfc rules import`), and what it read back
     /// was the persisted count *plus* the not-yet-flushed delta. Echoing
     /// that in the upsert stored the delta, while the delta itself stayed
-    /// pending and got added again at the next flush — so every toggle
+    /// pending and got added again at the next flush - so every toggle
     /// inflated the count. Taking the daemon's own values makes the
     /// round-trip lossless no matter what the client sends.
     ///

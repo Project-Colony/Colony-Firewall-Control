@@ -5,7 +5,7 @@ The types and parsers shared between the kernel-side
 
 It is dependency-free and compiles both as `#![no_std]` (for
 `bpfel-unknown-none`) and with `std` (default, for the host). Same source, same
-struct layouts, same parsing code on both sides — which is the point.
+struct layouts, same parsing code on both sides - which is the point.
 
 ## What lives here
 
@@ -25,9 +25,9 @@ frozen by tests:
 `cgroup_skb/ingress` program: DNS header/question/answer walking with
 compression-pointer support, and IPv4/IPv6 → UDP payload offset math.
 
-They are written to the eBPF verifier's rules — no panics (`slice::get`, never
+They are written to the eBPF verifier's rules - no panics (`slice::get`, never
 `&buf[a..b]`), no unbounded loops, no dynamic slicing, no allocation, tiny stack
-frames — but they are *ordinary Rust functions*, so the host test suite drives
+frames - but they are *ordinary Rust functions*, so the host test suite drives
 them directly with hand-built packets. That is the whole reason the module is
 here rather than in `cfc-ebpf`: a BPF object cannot be unit-tested, but this
 can, and it is where all the interesting off-by-one risk lives.
@@ -43,7 +43,7 @@ clamping on the `net` side.
 
 ## Features
 
-* `std` *(default)* — adds `comm_str()`, `filename_str()`, `name_str()`
+* `std` *(default)* - adds `comm_str()`, `filename_str()`, `name_str()`
   (lossy, never panic on invalid UTF-8 or an unterminated buffer), `ip_addr()`,
   `set_ip()` and readable `Debug` impls.
 
@@ -51,7 +51,7 @@ The kernel-side crate depends on this one with `default-features = false`.
 
 ## `aya::Pod`
 
-Deliberately not implemented here — see the note at the top of `lib.rs`. Adding
+Deliberately not implemented here - see the note at the top of `lib.rs`. Adding
 an `aya` feature would put aya into the root `Cargo.lock` and into `cargo deny`'s
 view for the sake of a marker trait. The loader writes the three `unsafe impl`
 lines itself; the layout guarantees above are what make that sound.

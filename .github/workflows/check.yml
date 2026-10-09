@@ -134,7 +134,7 @@ jobs:
   # RUSTUP_TOOLCHAIN is what actually pins this job. dtolnay/rust-toolchain
   # only runs `rustup default <toolchain>`, and the repo's root
   # rust-toolchain.toml (channel = "stable") outranks the rustup default in
-  # rustup's override precedence — so `toolchain: "1.88"` alone silently
+  # rustup's override precedence - so `toolchain: "1.88"` alone silently
   # tested stable. The env var outranks rust-toolchain.toml, and the
   # assertion step below makes a future regression loud instead of silent.
   msrv:
@@ -227,8 +227,8 @@ jobs:
 
   # Actually build the package from THIS checkout, using the -git recipe
   # pointed at the local repository. This is the only job that exercises
-  # build() + package() — the completions/man generation, the install
-  # paths, the .install scriptlet — without needing a published tag, which
+  # build() + package() - the completions/man generation, the install
+  # paths, the .install scriptlet - without needing a published tag, which
   # is why the tag-only, continue-on-error job in release.yml never caught
   # anything. Hard gate.
   pkgbuild-build:
@@ -261,7 +261,7 @@ jobs:
           #
           # This list MIRRORS pkg/PKGBUILD-git. Adding an entry to depends= there
           # and not here fails the job with "Could not resolve all dependencies"
-          # — which is how hicolor-icon-theme announced itself.
+          # - which is how hicolor-icon-theme announced itself.
           pacman -Syu --noconfirm --needed \
             rust protobuf pkgconf git \
             nftables libxkbcommon wayland hicolor-icon-theme
@@ -284,8 +284,8 @@ jobs:
           # and the setting it just made is invisible to the makepkg run below.
           runuser -l builder -c "git config --global --add safe.directory '${GITHUB_WORKSPACE}'"
 
-          # What the clone actually sees. This job has never passed — it dies at
-          # "does not appear to be a git repository" — and the candidates
+          # What the clone actually sees. This job has never passed - it dies at
+          # "does not appear to be a git repository" - and the candidates
           # (missing .git, unreadable path, ownership, a config written where it
           # cannot be read) are indistinguishable from the failure message alone.
           echo "::group::what builder sees at ${GITHUB_WORKSPACE}"

@@ -2,7 +2,7 @@
 //!
 //! Currently one job: build `crates/cfc-ebpf` for the BPF target. That crate
 //! lives in its own cargo workspace with its own `rust-toolchain.toml`, so the
-//! only thing this task really does is run cargo with the right cwd — which is
+//! only thing this task really does is run cargo with the right cwd - which is
 //! precisely what a plain `[alias]` cannot do.
 //!
 //! ```text

@@ -2291,7 +2291,7 @@ fn sha256_of(path: &std::path::Path) -> std::io::Result<String> {
     // Read in a loop rather than io::copy, and hex-encode by hand rather than
     // with `{:x}`. RustCrypto 0.11 drops `io::Write` on the hashers and returns
     // an `Array` that no longer implements `LowerHex`, so both idioms stop
-    // compiling — which is what Dependabot #8 surfaced. This form compiles
+    // compiling - which is what Dependabot #8 surfaced. This form compiles
     // against 0.10 and 0.11 alike, so the bump becomes a version bump again.
     //
     // Worth the care: this digest is what `--pin-hash` binds a rule to. A rule

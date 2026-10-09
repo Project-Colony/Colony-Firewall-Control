@@ -91,11 +91,11 @@ pub fn unreachable_hint(err: &ClientError) -> String {
             "daemon not running? (systemctl status colony-firewalld)".into()
         }
         ClientError::PermissionDenied { .. } => {
-            "no socket access — join the colony-firewall group".into()
+            "no socket access - join the colony-firewall group".into()
         }
-        ClientError::StaleSocket { .. } => "stale socket — restart colony-firewalld".into(),
+        ClientError::StaleSocket { .. } => "stale socket - restart colony-firewalld".into(),
         ClientError::Connect { .. } | ClientError::Transport(_) => {
-            "connection failed — is colony-firewalld healthy?".into()
+            "connection failed - is colony-firewalld healthy?".into()
         }
         ClientError::Denied(_) => "read-only - restart the tray, or use sudo cfc".into(),
         ClientError::Rpc(_) | ClientError::StreamClosed => "daemon answered with an error".into(),
@@ -159,7 +159,7 @@ pub fn status_line(view: &DaemonView, now_unix_ms: i64) -> String {
         DaemonView::Unreachable { hint } => format!("Daemon unreachable: {hint}"),
         DaemonView::Reachable {
             enforcing: false, ..
-        } => "NOT enforcing — nft rule loaded?".into(),
+        } => "NOT enforcing - nft rule loaded?".into(),
         DaemonView::Reachable {
             paused: true,
             resume_at_unix_ms,
@@ -172,7 +172,7 @@ pub fn status_line(view: &DaemonView, now_unix_ms: i64) -> String {
                 // Round up so a fresh 5-minute pause reads "5m 00s", not
                 // "4m 59s".
                 let secs = (remaining_ms + 999) / 1000;
-                format!("Paused — resumes in {}", format_countdown(secs))
+                format!("Paused - resumes in {}", format_countdown(secs))
             }
         }
         DaemonView::Reachable { .. } => "Enforcing".into(),
@@ -198,7 +198,7 @@ pub fn prompts_line(view: &DaemonView) -> Option<String> {
 pub fn tooltip_description(view: &DaemonView, now_unix_ms: i64) -> String {
     let base = status_line(view, now_unix_ms);
     match prompts_line(view) {
-        Some(line) => format!("{base} — {line}"),
+        Some(line) => format!("{base} - {line}"),
         None => base,
     }
 }
@@ -460,7 +460,7 @@ pub fn one_shot_fallback(choice: PromptChoice, exe: &str) -> String {
         PromptChoice::BlockAlways | PromptChoice::DenyOnce => "Denied this time",
     };
     format!(
-        "{applied} — no rule can be pinned to {}, so you may be asked again",
+        "{applied} - no rule can be pinned to {}, so you may be asked again",
         exe_display_name(exe)
     )
 }
@@ -610,7 +610,7 @@ mod tests {
     fn not_enforcing_names_the_nft_rule() {
         assert_eq!(
             status_line(&reachable(false, false, 0, 0), 1_000),
-            "NOT enforcing — nft rule loaded?"
+            "NOT enforcing - nft rule loaded?"
         );
     }
 
@@ -627,11 +627,11 @@ mod tests {
         // Exactly 5 minutes left.
         let now = 10_000_000;
         let view = reachable(true, true, now + 300_000, 0);
-        assert_eq!(status_line(&view, now), "Paused — resumes in 5m 00s");
+        assert_eq!(status_line(&view, now), "Paused - resumes in 5m 00s");
         // 1ms into the pause the display still reads 5m (rounds up).
-        assert_eq!(status_line(&view, now + 1), "Paused — resumes in 5m 00s");
+        assert_eq!(status_line(&view, now + 1), "Paused - resumes in 5m 00s");
         // Deep into it.
-        assert_eq!(status_line(&view, now + 299_000), "Paused — resumes in 1s");
+        assert_eq!(status_line(&view, now + 299_000), "Paused - resumes in 1s");
     }
 
     #[test]
@@ -817,7 +817,7 @@ mod tests {
         );
         assert_eq!(
             tooltip_description(&reachable(true, false, 0, 2), 0),
-            "Enforcing — 2 prompts waiting"
+            "Enforcing - 2 prompts waiting"
         );
     }
 
