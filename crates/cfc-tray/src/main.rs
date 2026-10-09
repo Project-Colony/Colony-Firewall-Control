@@ -980,6 +980,14 @@ fn warm_notification_spec_version() {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(line) = cfc_client::version_line(
+        std::env::args_os(),
+        env!("CARGO_BIN_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        println!("{line}");
+        return Ok(());
+    }
     // First, before D-Bus or the runtime exist: the daemon accepts answers
     // and pause requests only from a sealed, installed copy of this tray.
     let sealed = cfc_client::seal_official_process();

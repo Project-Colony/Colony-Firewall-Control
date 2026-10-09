@@ -269,18 +269,14 @@ jobs:
             /home/builder/rpmbuild/RPMS/noarch/colony-firewall-control-selinux-*.rpm
 
       - name: Binaries exist and say the packaged version
-        # --version only where clap provides it (the daemon and the CLI).
-        # The GUI and tray are checked for presence and mode alone: neither
-        # takes --version, and starting either headless tests a display
-        # server, not a package.
+        # The GUI and tray answer --version before they touch a display,
+        # D-Bus or the daemon, so all four run headless here.
         run: |
           set -eux
-          test -x /usr/bin/colony-firewalld
-          test -x /usr/bin/colony-firewall
-          test -x /usr/bin/colony-firewall-tray
-          test -x /usr/bin/cfc
-          /usr/bin/colony-firewalld --version | grep -F "${VERSION}"
-          /usr/bin/cfc --version | grep -F "${VERSION}"
+          for bin in colony-firewalld colony-firewall colony-firewall-tray cfc; do
+            test -x "/usr/bin/${bin}"
+            test "$("/usr/bin/${bin}" --version)" = "${bin} ${VERSION}"
+          done
 
       - name: Files landed where the units and macros put them
         # Nothing is enabled or started, deliberately: there is no systemd

@@ -48,6 +48,14 @@ const DEADLINE_TICK_MS: u64 = 400;
 const PROMPT_ARM_MS: i64 = 1_000;
 
 fn main() -> iced::Result {
+    if let Some(line) = cfc_client::version_line(
+        std::env::args_os(),
+        env!("CARGO_BIN_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        println!("{line}");
+        return Ok(());
+    }
     // First, before any thread, display or daemon connection exists: the
     // daemon accepts changes only from a sealed, installed copy of this app.
     let sealed = cfc_client::seal_official_process();

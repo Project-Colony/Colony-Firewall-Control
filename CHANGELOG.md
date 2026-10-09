@@ -6,6 +6,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `colony-firewall` and `colony-firewall-tray` print their name and
+  version for `--version` or `-V` and exit, in the same form as
+  `colony-firewalld` and `cfc`. They answer before opening a window, a
+  tray icon or a daemon connection, so the check works headless; the RPM
+  job and `scripts/smoke-test.sh` now run it on all four binaries.
+
 ## [0.8.0] - 2026-10-08
 
 ### Changed

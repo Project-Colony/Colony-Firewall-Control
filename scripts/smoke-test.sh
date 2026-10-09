@@ -53,6 +53,19 @@ CFC="${ROOT}/target/fast/cfc"
 
 # Offline surface: these must work with no daemon at all (packaging runs
 # them against a freshly built binary).
+say "--version on every binary (no daemon or display required)"
+VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "${ROOT}/Cargo.toml")"
+test -n "${VERSION}" || { echo "no version in Cargo.toml [workspace.package]"; exit 1; }
+for bin in colony-firewalld colony-firewall colony-firewall-tray cfc; do
+    for flag in --version -V; do
+        got="$("${ROOT}/target/fast/${bin}" "${flag}")"
+        if [[ "${got}" != "${bin} ${VERSION}" ]]; then
+            echo "${bin} ${flag} printed '${got}', expected '${bin} ${VERSION}'"
+            exit 1
+        fi
+    done
+done
+
 say "cfc completions + man (no daemon required)"
 for shell in bash zsh fish; do
     "${CFC}" completions "${shell}" >"${TMPDIR}/comp.${shell}"
