@@ -16,11 +16,13 @@
 # Named preset. Pick one of: "relaxed", "balanced", "strict".
 # Omit to use "balanced" defaults.
 #
-#   relaxed  - Allow when nobody is subscribed, 60s prompt window.
-#              Best for laptops where you don't always have the UI open.
-#   balanced - Allow when nobody is subscribed, 30s window. (default)
-#   strict   - Deny when nobody is subscribed, 15s window.
-#              Fail-closed posture; only use if you keep the UI running.
+#   relaxed  - 60s prompt window, inbound_action "Reject".
+#   balanced - 30s window, inbound_action "Deny". (default)
+#   strict   - 15s window, inbound_action "Deny".
+#
+# Every profile DENIES when nobody is subscribed to prompts (see
+# no_ui_action below), so seed the starter rules before enabling
+# enforcement: `sudo cfc rules bootstrap-defaults`.
 #
 # Every profile DENIES a prompt that expired unanswered. A timeout means
 # the question was put to you and you did not answer it; if that granted
@@ -66,7 +68,7 @@ profile = "balanced"
 # # of service on your attention. Authorising inbound traffic is what rules
 # # are for:
 # #
-# #     cfc rules add --direction in --action allow --protocol tcp \
+# #     sudo cfc rules add --direction in --action allow --protocol tcp \
 # #         --dst-port 22 --src-net 192.168.1.0/24 --name ssh-from-lan
 # #
 # # Inbound, --dst-port is the port on THIS host and --src-net is the peer.

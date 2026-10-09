@@ -76,7 +76,7 @@ down too. Two things can still cut you off:
   drop. Accounts that resolve locally are unaffected. Find these flows with
   `sudo cfc prompts` or `cfc log --action deny` and allow each one scoped to
   its program and server, for example
-  `cfc rules add --exe <program> --dst-net <server> --dst-port <port> --protocol tcp --name login-ldap`.
+  `sudo cfc rules add --exe <program> --dst-net <server> --dst-port <port> --protocol tcp --name login-ldap`.
 
 Do not exempt port 22 in the outbound chain. It does nothing for reaching
 the box, and `tcp dport 22 accept` lets every process on the host, attributed
@@ -480,7 +480,8 @@ settings in `daemon.toml` govern what happens when nobody answers:
 - `timeout_action` - the verdict when a prompt was shown but **expired
   unanswered** after `prompt_timeout_secs`.
 
-The named profiles are just presets for these three values:
+The named profiles are presets for these three values (and for
+`inbound_action`, which only the opt-in inbound table uses):
 
 | Profile  | `no_ui_action` | `timeout_action` | `prompt_timeout_secs` |
 |----------|----------------|------------------|-----------------------|
@@ -488,7 +489,7 @@ The named profiles are just presets for these three values:
 | balanced | Deny           | Deny             | 30 (default)          |
 | strict   | Deny           | Deny             | 15                    |
 
-No profile permits anything on its own — the presets differ only in how
+No profile permits anything on its own: the presets differ only in how
 long a prompt waits. Only a stored rule, or a person answering, allows a
 connection. You can still override either field explicitly under
 `[default_policy]`; the point is that nothing does it for you.
@@ -507,13 +508,13 @@ appear on a headless server" below.
 Uncommenting a `[default_policy]` field overrides *that one field* and
 leaves the rest of the profile alone - so `profile = "strict"` plus
 `prompt_timeout_secs = 30` is strict with a longer window, not balanced.
-All three fields hot-reload on `SIGHUP`; nothing else in `daemon.toml`
-does.
+The profile and every `[default_policy]` field hot-reload on `SIGHUP`, as
+does `[provenance]`; every other section needs a restart.
 
 ## Prompts never appear on a headless server
 
 There is no GUI to pop them, so the daemon applies `no_ui_action` to
-every unmatched flow without asking anyone — a denial under every
+every unmatched flow without asking anyone: a denial under every
 profile, which looks exactly like a dead network. This is the intended
 behaviour: on a headless box "nobody is connected" is the permanent
 state, and allowing would mean the machine has no outbound firewall at
@@ -523,7 +524,7 @@ Confirm what you are in:
 
 ```sh
 cfc status
-# prompt policy    30s timeout -> Deny, no UI -> Deny
+# prompt policy    30s timeout -> deny, no UI -> deny
 ```
 
 Inbound SSH is unaffected: the outbound ruleset never queues a session's
@@ -553,19 +554,19 @@ set. For a bounded unattended window - during a package install, say -
 
 **2. Pre-seed rules and accept the fallback.** `sudo cfc rules
 bundle add system` (also spelled `sudo cfc rules bootstrap-defaults`) covers
-the usual system services. `cfc rules bundle list` shows the others —
+the usual system services. `cfc rules bundle list` shows the others:
 `web` for installed browsers, `dev` for git/cargo/docker, `updates` for
-apt/dnf/flatpak — each scoped to a specific executable, never to a bare
+apt/dnf/flatpak, each scoped to a specific executable, never to a bare
 port. Entries whose program is not installed here are skipped and
 reported. Add your own with
 `sudo cfc rules add`. Anything you did not anticipate still hits
 `no_ui_action`.
 
-**3. Change the fallback — deliberately.** `no_ui_action = "Allow"` in
+**3. Change the fallback, deliberately.** `no_ui_action = "Allow"` in
 `[default_policy]` makes an unattended box fail open. No profile does
 this for you any more, and you should think before writing it: it means
 the firewall enforces only what you explicitly wrote down, and every
-unanticipated connection — including a payload phoning home — goes out
+unanticipated connection, including a payload phoning home, goes out
 unasked. Prefer (1) or (2). If you do set it, send `SIGHUP` and it takes
 effect without a restart.
 
@@ -670,8 +671,8 @@ journalctl -u colony-firewalld -g 'failed to deserialize'
 ```
 
 If you need the rule back now and cannot upgrade, delete the offending
-row with `cfc rules remove <id>`, giving the full id from the journal, and
-re-create it with `cfc rules add`.
+row with `sudo cfc rules remove <id>`, giving the full id from the journal,
+and re-create it with `sudo cfc rules add`.
 
 The same warning counts **quarantined** rows: rules an older version
 accepted that the daemon now refuses (for example one scoped only on a
@@ -683,8 +684,9 @@ and why:
 journalctl -u colony-firewalld -g 'fails the API boundary'
 ```
 
-Remove it with `cfc rules remove <id>` (the full id) and re-create it in
-a form the daemon accepts. `cfc rules import --replace` also deletes such rows.
+Remove it with `sudo cfc rules remove <id>` (the full id) and re-create it
+in a form the daemon accepts. `sudo cfc rules import --replace` also deletes
+such rows.
 
 ## An Allow rule no longer lets a program through
 
@@ -742,8 +744,12 @@ traffic.
 | Control socket (gRPC)   | `/run/colony-firewall/cfc.sock`             |
 | Daemon config           | `/etc/colony-firewall/daemon.toml`          |
 | Rules database (SQLite) | `/var/lib/colony-firewall/rules.db`         |
-| systemd unit            | `/usr/lib/systemd/system/colony-firewalld.service` |
-| nftables table          | `table inet colony_firewall` (chain `output`) |
+| systemd units           | `/usr/lib/systemd/system/colony-firewalld.service`, `colony-firewall-nft.service`, `colony-firewall-nft-inbound.service` |
+| nftables rulesets       | `/usr/share/colony-firewall/nftables-snippet.conf`, `nftables-inbound.conf` |
+| nftables tables         | `table inet colony_firewall` (chain `output`), `table inet colony_firewall_inbound` (opt-in) |
+| polkit actions          | `/usr/share/polkit-1/actions/org.projectcolony.firewall.policy` |
+| eBPF object (optional)  | `/usr/lib/colony-firewall/cfc-ebpf.o` (`[ebpf] object_path`) |
 
-The UI and `cfc` both accept `--socket <path>` to point at a non-default
-socket (useful with `--dry-run` daemons during development).
+`cfc` takes `--socket <path>`, and the GUI and tray read the `CFC_SOCKET`
+environment variable, to point at a non-default socket (useful with
+`--dry-run` daemons during development).

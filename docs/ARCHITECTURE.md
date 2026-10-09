@@ -2,7 +2,7 @@
 
 ## Process model
 
-Two long-running processes:
+Two long-running processes, plus an optional third:
 
 1. **`colony-firewalld`** (root, systemd) - owns the NFQUEUE socket, runs the
    decision engine, persists rules and a verdict log in SQLite, serves a gRPC
@@ -11,6 +11,10 @@ Two long-running processes:
 2. **`colony-firewall`** (UI, per user session) - connects to the UDS, streams
    pending prompts, posts verdicts. Main window built with
    [iced](https://iced.rs/).
+
+3. **`colony-firewall-tray`** (per user session, optional) - a
+   StatusNotifierItem with the status, a pending-prompt badge, prompt
+   notifications and pause/resume. It opens the GUI on demand.
 
 The CLI tool `cfc` shares the same gRPC client path as the UI, and covers
 the same surface: it can answer prompts (`sudo cfc prompts`), which is how a
@@ -441,24 +445,24 @@ exit 0, which under the shipped fail-closed nftables rule meant a healthy
 looking unit and a blackholed machine.
 
 `WatchdogSec=30` is backed by a real liveness signal rather than a timer
-that always fires. The worker stamps a timestamp each iteration, signed to
-distinguish "busy" from "parked in a blocking recv" - a parked worker is
-healthy indefinitely, an idle machine is not a stall. The main task
-heartbeats `WATCHDOG=1` every 10s and withholds it when the worker has been
-busy without progress for 60s, which bounds detection of a wedged daemon at
-about 90 seconds.
+that always fires. The worker stamps the time on every turn of its loop, and
+no turn blocks for more than a few milliseconds (the idle wait is
+`RECV_POLL_INTERVAL`), so an idle machine keeps the stamp fresh and is never
+mistaken for a stall. The main task heartbeats `WATCHDOG=1` every 10s and
+withholds it once the stamp is 60s old, which bounds detection of a wedged
+daemon at about 90 seconds.
 
 Signals:
 
 - **SIGTERM / SIGINT** - graceful shutdown: `STOPPING=1`, final hit-count
   flush, control socket removed.
-- **SIGHUP** - reloads `profile` and `[default_policy]` in place, without
-  dropping a packet. The policy lives behind a shared `RwLock` that the
-  engine and the prompt router read per decision, so the next prompt uses
-  the new timeout. A config file that fails to parse is rejected and the
+- **SIGHUP** - reloads `profile`, `[default_policy]` and `[provenance]`
+  in place, without dropping a packet. The policy lives behind a shared
+  `RwLock` that the engine and the prompt router read per decision, so the
+  next prompt uses the new timeout. A config file that fails to parse is rejected and the
   running policy is kept. Everything else - the queue number and tuning, the
-  database path, the socket path, the event cap, the IPC group - is bound at
-  startup and needs a restart.
+  database path, the socket path, the event cap, the pause default, the IPC
+  settings, the eBPF layer - is bound at startup and needs a restart.
 
 ## The eBPF layer
 

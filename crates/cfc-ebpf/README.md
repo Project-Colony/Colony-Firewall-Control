@@ -524,7 +524,8 @@ would want it.
 ### What the loader actually does
 
 Implemented in `crates/cfc-daemon/src/ebpf/`, behind the daemon's `ebpf` cargo
-feature (**on** by default) and `[ebpf] enabled` in `daemon.toml` (still off).
+feature (**on** by default) and `[ebpf] enabled` in `daemon.toml` (default
+`"auto"`: loads wherever the kernel supports it, `false` turns it off).
 
 1. reads the object from `[ebpf] object_path`, default
    `/usr/lib/colony-firewall/cfc-ebpf.o`. It is **not** embedded with
