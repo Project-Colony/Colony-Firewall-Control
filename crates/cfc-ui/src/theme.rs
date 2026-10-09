@@ -9,10 +9,10 @@ use iced::{theme::Palette, Background, Border, Color, Shadow, Theme, Vector};
 /// The Parchment palette, from the shared design tokens.
 ///
 /// These eleven names were eleven hand-written `Color::from_rgb` literals. They
-/// are the same eleven colours — the family in Project-Colony-Resources was
-/// derived from them — but they are now one definition instead of two, and the
+/// are the same eleven colours - the family in Project-Colony-Resources was
+/// derived from them - but they are now one definition instead of two, and the
 /// twenty-seven fields they imply come with them for anything that needs more
-/// than a burgundy and a parchment — FADED went with this change, unused, and
+/// than a burgundy and a parchment - FADED went with this change, unused, and
 /// is `PARCHMENT.text_dimmer` if it is ever wanted back.
 ///
 /// Still `const`, so nothing that used them had to change.

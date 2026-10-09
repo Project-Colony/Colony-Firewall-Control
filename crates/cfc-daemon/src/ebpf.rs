@@ -837,7 +837,7 @@ mod tests {
     }
 
     /// The severity policy, over constructed reports rather than by running
-    /// `start()` — the point is the (mode, degrade) matrix, not the load.
+    /// `start()` - the point is the (mode, degrade) matrix, not the load.
     #[test]
     fn severity_follows_what_was_asked_for() {
         let with = |mode: EbpfMode, degrade: Option<Degrade>| Report {

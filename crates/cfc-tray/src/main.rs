@@ -420,7 +420,7 @@ fn open_gui() {
             // as everything else here: by clicking it and watching nothing
             // happen.
             notify_brief(format!(
-                "Cannot open Colony Firewall — {GUI_BIN} is not installed or not on PATH"
+                "Cannot open Colony Firewall - {GUI_BIN} is not installed or not on PATH"
             ));
         }
     }
@@ -478,7 +478,7 @@ fn notify_pending(count: u64) {
         let _ = brand(&mut n)
             .summary("Colony Firewall: verdict needed")
             .body(&format!(
-                "{count} {noun} waiting for a verdict — open Colony Firewall"
+                "{count} {noun} waiting for a verdict - open Colony Firewall"
             ))
             .timeout(notify_rust::Timeout::Milliseconds(8000))
             .show();
@@ -880,7 +880,7 @@ async fn submit_prompt_verdict(
         }
         Ok(_) => {
             info!(prompt_id, "verdict too late - prompt already resolved");
-            notify_brief("Too late — the daemon already applied its default".into());
+            notify_brief("Too late - the daemon already applied its default".into());
         }
         Err(e) => {
             warn!("submitting verdict: {e}");
@@ -896,14 +896,14 @@ async fn submit_prompt_verdict(
 ///
 /// Deliberately *not* `notify_rust::get_capabilities`: that helper is
 /// blocking, and its zbus backend deadlocks when driven from inside this
-/// process's tokio runtime — the tray hung at startup before ever
+/// process's tokio runtime - the tray hung at startup before ever
 /// reaching its first poll. Talking to the bus directly keeps the call
 /// async, and the timeout means a wedged or absent notification server
 /// costs two seconds instead of the whole run.
 ///
 /// On any failure the answer is "no actions": that keeps the tray on the
 /// generic count notification and, crucially, stops it from subscribing
-/// to the prompt feed — subscribing while unable to answer would make the
+/// to the prompt feed - subscribing while unable to answer would make the
 /// daemon hold every prompt for the full timeout instead of applying its
 /// no-subscriber fast path.
 async fn probe_actions_supported() -> bool {

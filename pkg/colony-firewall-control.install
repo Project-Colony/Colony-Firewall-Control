@@ -75,7 +75,7 @@ pre_remove() {
     # The inbound pair belongs here too, and used not to be. Removing the
     # package on a host where the inbound chain had been enabled left
     # 'table inet colony_firewall_inbound' loaded with nothing left to manage
-    # it — on a machine reached over the network, exactly the lockout that
+    # it - on a machine reached over the network, exactly the lockout that
     # keeping inbound in its own opt-in unit was meant to avoid. pkg/colony.json
     # has always taken both down; this is the pacman side catching up.
     systemctl disable --now \
@@ -87,7 +87,7 @@ pre_remove() {
 
     # Stopping the daemon no longer stops CFC. The pinned programs are
     # evaluated by the kernel on their own and keep returning EPERM to
-    # processes started after the daemon died — the property the pinning
+    # processes started after the daemon died - the property the pinning
     # exists for, and the reason removal has to be explicit about it.
     #
     # This package ships no eBPF object, so ordinarily there is nothing here.

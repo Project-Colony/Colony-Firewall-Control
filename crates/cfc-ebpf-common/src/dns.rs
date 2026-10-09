@@ -7,17 +7,17 @@
 //! verifier's 1,000,000-instruction complexity budget allows (see
 //! `crates/cfc-ebpf/README.md`).
 //!
-//! The style it was written in survives that move intact, and deliberately so —
+//! The style it was written in survives that move intact, and deliberately so -
 //! this is a parser for attacker-influenced bytes:
 //!
-//! * **no panics** — every read goes through [`Option`]-returning accessors, so
+//! * **no panics** - every read goes through [`Option`]-returning accessors, so
 //!   there is no bounds-check panic path to reach. A malformed packet returns
 //!   `None`; it never aborts the ring-buffer consumer.
-//! * **no unbounded loops** — every loop has a *compile-time constant* trip
+//! * **no unbounded loops** - every loop has a *compile-time constant* trip
 //!   count and exits early via `break`, so a compression bomb or a lying
 //!   `ancount` costs a fixed amount of work.
-//! * **no dynamic slicing** — `&buf[a..b]` panics; only `slice::get` is used.
-//! * **no allocation and no large stack frames** — [`DnsAnswer`] is 276 bytes
+//! * **no dynamic slicing** - `&buf[a..b]` panics; only `slice::get` is used.
+//! * **no allocation and no large stack frames** - [`DnsAnswer`] is 276 bytes
 //!   and is caller-owned scratch, reused across records.
 //!
 //! It also still compiles under `no_std`, which keeps the option of moving
@@ -33,14 +33,14 @@
 //!
 //! # What is deliberately skipped
 //!
-//! * more than [`MAX_ANSWERS`] answer records per response — the rest of the
+//! * more than [`MAX_ANSWERS`] answer records per response - the rest of the
 //!   packet is ignored;
-//! * more than [`MAX_QUESTIONS`] questions — the packet is dropped entirely,
+//! * more than [`MAX_QUESTIONS`] questions - the packet is dropped entirely,
 //!   because the answer section offset cannot be computed without walking them;
-//! * `CNAME`/`SOA`/`NS`/anything else — skipped by `rdlength`, not reported;
+//! * `CNAME`/`SOA`/`NS`/anything else - skipped by `rdlength`, not reported;
 //! * records whose owner name exceeds [`MAX_NAME_LEN`] (253) bytes;
 //! * responses longer than the caller's scratch buffer (the parser stops at the
-//!   first record it cannot read in full — see [`crate::DNS_BUF_LEN`]);
+//!   first record it cannot read in full - see [`crate::DNS_BUF_LEN`]);
 //! * TCP DNS, DoT, DoH, mDNS, EDNS(0) option parsing.
 
 use crate::DnsAnswer;
@@ -199,7 +199,7 @@ pub fn parse_header(c: &DnsCursor<'_>) -> Option<DnsHeader> {
 /// Advances past a name without materialising it.
 ///
 /// A compression pointer terminates the name in the *stream*, so this returns
-/// `off + 2` without following it — which is exactly what the question and
+/// `off + 2` without following it - which is exactly what the question and
 /// record-skipping paths need.
 #[inline(always)]
 pub fn skip_name(c: &DnsCursor<'_>, start: usize) -> Option<usize> {
@@ -578,7 +578,7 @@ mod tests {
     }
 
     /// Same packet, but placed inside a fixed 512-byte scratch buffer at a
-    /// non-zero base — exactly how the BPF program sees it.
+    /// non-zero base - exactly how the BPF program sees it.
     fn collect_in_scratch(buf: &[u8], base: usize) -> Vec<DnsAnswer> {
         let mut scratch_buf = [0u8; DNS_BUF_LEN];
         let n = buf.len().min(DNS_BUF_LEN - base);

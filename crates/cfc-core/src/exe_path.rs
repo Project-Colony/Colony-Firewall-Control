@@ -30,7 +30,7 @@ pub enum Resolved {
     Unchanged(PathBuf),
     /// Resolved to a different path; a diagnostic caller may select this target.
     ///
-    /// Carries the original so a caller can tell the user what changed —
+    /// Carries the original so a caller can tell the user what changed -
     /// silently rewriting what someone typed is its own kind of surprise.
     Rewritten { from: PathBuf, to: PathBuf },
     /// Nothing is there to resolve. The path is kept verbatim; a rule using it
@@ -93,7 +93,7 @@ pub fn resolve(path: &Path) -> Resolved {
         return Resolved::Relative(path.to_path_buf());
     }
     // A trailing separator makes `canonicalize` answer ENOTDIR even for a real
-    // file, which would report a perfectly good rule as "does not exist" —
+    // file, which would report a perfectly good rule as "does not exist" -
     // `Path` comparison is component-wise, so `/usr/bin/curl/` matches
     // `/usr/bin/curl` at packet time regardless. Strip it before asking the
     // filesystem anything, so the diagnostics describe the file rather than
@@ -122,7 +122,7 @@ pub fn resolve(path: &Path) -> Resolved {
         // The file is not there. Giving up on the whole path here was a real
         // gap: `/bin/notyet` on a usr-merged host would be stored verbatim and
         // stay inert *after* the program was installed, because nothing
-        // re-resolves a stored rule — while the note cheerfully promised it
+        // re-resolves a stored rule - while the note cheerfully promised it
         // would start matching. Resolve the deepest ancestor that does exist
         // and re-attach the missing tail, so the directory half of the
         // usr-merge is handled even when the leaf is absent.
@@ -204,7 +204,7 @@ pub fn resolve_policy(path: &Path) -> Result<Resolved, String> {
 ///
 /// Returns `None` when no ancestor resolves, or when the components that would
 /// have to be re-attached contain anything that cannot be reasoned about
-/// without touching the filesystem — `..` past an unresolved component would
+/// without touching the filesystem - `..` past an unresolved component would
 /// mean guessing.
 fn resolve_via_ancestor(path: &Path) -> Option<PathBuf> {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();

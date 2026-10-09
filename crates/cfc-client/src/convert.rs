@@ -91,7 +91,7 @@ pub fn provenance_token(p: i32) -> &'static str {
 /// Five shapes, because `package` and `provenance` are read together:
 ///
 /// - `"curl 8.21.0-1 (verified)"`  - owned, and the running bytes match.
-/// - `"curl 8.21.0-1 — MODIFIED since install"` - owned, bytes differ.
+/// - `"curl 8.21.0-1 - MODIFIED since install"` - owned, bytes differ.
 /// - `"curl 8.21.0-1 (unverified)"` - owned, but the package database
 ///   records no digest we can check (dpkg). Says who shipped it and
 ///   pointedly does not vouch for it.
@@ -101,7 +101,7 @@ pub fn provenance_label(p: &pb::ProcessInfo) -> String {
     let pkg = p.package.trim();
     match pb::Provenance::try_from(p.provenance).unwrap_or(pb::Provenance::Unspecified) {
         pb::Provenance::Modified if pkg.is_empty() => "MODIFIED since install".to_string(),
-        pb::Provenance::Modified => format!("{pkg} — MODIFIED since install"),
+        pb::Provenance::Modified => format!("{pkg} - MODIFIED since install"),
         pb::Provenance::Verified if pkg.is_empty() => "verified".to_string(),
         pb::Provenance::Verified => format!("{pkg} (verified)"),
         pb::Provenance::Unpackaged => "not from a package".to_string(),
@@ -300,7 +300,7 @@ mod tests {
         );
         assert_eq!(
             provenance_label(&proc("curl 8.21.0-1", pb::Provenance::Modified)),
-            "curl 8.21.0-1 — MODIFIED since install"
+            "curl 8.21.0-1 - MODIFIED since install"
         );
         assert_eq!(
             provenance_label(&proc("", pb::Provenance::Unpackaged)),

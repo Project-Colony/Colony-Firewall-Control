@@ -389,7 +389,7 @@ mod tests {
 
     /// `filename_len == 0` is the kernel side saying "I did not read a path".
     ///
-    /// It happens when the probe read faults, and — deliberately — when the
+    /// It happens when the probe read faults, and - deliberately - when the
     /// loader switched the read off because this kernel's tracepoint record is
     /// a shape it cannot parse. The scratch buffer is not memset between
     /// events (a 292-byte memset does not lower on the BPF backend), so its

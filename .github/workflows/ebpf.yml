@@ -82,7 +82,7 @@ jobs:
           key: bpf-${{ steps.pins.outputs.nightly }}-${{ steps.pins.outputs.linker }}
 
       # `llvm-dev` is whatever LLVM the runner image defaults to, and on
-      # ubuntu-24.04 that is 18 — a version bpf-linker 0.11 dropped. The build
+      # ubuntu-24.04 that is 18 - a version bpf-linker 0.11 dropped. The build
       # then found no libLLVM to link against and died with
       # `rust-lld: error: unable to find library -lLLVM`, which reads like a
       # path problem and is a version problem. The scheduled run failed this
@@ -90,7 +90,7 @@ jobs:
       #
       # The major is derived from the pinned nightly rather than written down.
       # It has to equal rustc's, because bpfel-unknown-none is obj-is-bitcode
-      # and the assert below enforces exactly that — so a second hardcoded
+      # and the assert below enforces exactly that - so a second hardcoded
       # number could only ever drift away from the first.
       - name: Install bpf-linker
         id: linker

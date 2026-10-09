@@ -146,7 +146,7 @@ max_rows = 100000
 # the process in the GUI, the tray and `cfc prompts`:
 #
 #   package  curl 8.21.0-1 (verified)          matches the package record
-#   package  curl 8.21.0-1 — MODIFIED since install
+#   package  curl 8.21.0-1 - MODIFIED since install
 #   package  not from a package                nothing owns this path
 #
 # This is the Linux answer to Windows Firewall Control's "Signed: Yes

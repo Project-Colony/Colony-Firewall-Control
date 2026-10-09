@@ -72,7 +72,7 @@ fn u16_at(buf: &[u8], valid: usize, off: usize) -> Option<u16> {
 /// datagram. Specifically **skipped**:
 ///
 /// * IPv4 fragments other than the first (a later fragment has no UDP header);
-/// * IPv6 packets with extension headers (next-header != UDP) — parsing the
+/// * IPv6 packets with extension headers (next-header != UDP) - parsing the
 ///   chain would need another unbounded-ish loop for very little gain;
 /// * anything whose headers do not fit inside `valid`.
 #[inline(always)]

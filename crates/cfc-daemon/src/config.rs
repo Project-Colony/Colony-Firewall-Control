@@ -11,7 +11,7 @@
 //! - Absent fields fall back to the base.
 //!
 //! This replaces the old heuristic that ignored the profile whenever the
-//! `[default_policy]` block deviated from the literal struct defaults — a
+//! `[default_policy]` block deviated from the literal struct defaults - a
 //! user who wrote balanced-looking values plus `profile = "strict"` used to
 //! silently get strict; now their explicit values win, field by field.
 
@@ -137,7 +137,7 @@ impl Profile {
     /// prompt, can permit a connection.
     ///
     /// A timeout means the question *was* put to the user and went
-    /// unanswered — walking away from a prompt must not be a way to grant
+    /// unanswered - walking away from a prompt must not be a way to grant
     /// access, or an attacker's best move is simply to connect while nobody
     /// is at the keyboard.
     ///
@@ -146,7 +146,7 @@ impl Profile {
     /// connected, on the theory that a desktop booting before its session
     /// starts should keep working. That theory quietly gave away the whole
     /// product on any machine where a session never starts at all. A headless
-    /// server, a VM, anything administered over SSH — `cfc-ui` and the tray
+    /// server, a VM, anything administered over SSH - `cfc-ui` and the tray
     /// never run there, so "there is nobody to ask" is not a window during
     /// boot, it is the permanent condition, and Allow meant those hosts had no
     /// outbound firewall whatsoever. Denying is the only answer consistent
@@ -161,13 +161,13 @@ impl Profile {
     /// local IPC is allowed without prompting; while no daemon listens, the
     /// snippet's `bypass` on `lo` allows them. Rules can still be added with `cfc-cli` from that
     /// session. What it *does* mean on a fresh headless install is that
-    /// outbound traffic — package updates, NTP, backups — is denied until
+    /// outbound traffic - package updates, NTP, backups - is denied until
     /// rules exist for it.
     ///
     /// The *inbound* table can, which is why it is a separate opt-in unit with
     /// an `ExecStartPre` lockout guard rather than something an upgrade turns
     /// on. Once it is loaded, `inbound_action` below applies to every new
-    /// inbound flow that no rule admits — including the next SSH connection.
+    /// inbound flow that no rule admits - including the next SSH connection.
     /// See `systemd/nftables-inbound.conf`.
     pub fn policy(self) -> DefaultPolicy {
         match self {
@@ -502,7 +502,7 @@ impl Config {
     /// Loads the config file, or the built-in defaults when it is absent.
     ///
     /// Also publishes the process-wide switches that are not carried by a
-    /// value anyone threads through the call graph — currently just
+    /// value anyone threads through the call graph - currently just
     /// `[provenance] enabled`, consumed deep inside process resolution.
     /// Doing it here rather than in `main` is what makes those switches
     /// hot-reload: SIGHUP re-enters this function (see `reload_policy` in
