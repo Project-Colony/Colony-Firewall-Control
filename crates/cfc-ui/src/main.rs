@@ -3,6 +3,7 @@
 mod app;
 mod editor;
 mod format;
+mod i18n;
 mod session_stats;
 mod status_log;
 mod streams;
@@ -35,6 +36,8 @@ fn main() -> iced::Result {
         );
     }
 
+    // The interface follows the system language until Preferences can set it.
+    i18n::init_from_env();
     // Parchment is this app's identity, and stays the theme until the user
     // picks another.
     colony_ui::set_active_theme("parchment", "light");

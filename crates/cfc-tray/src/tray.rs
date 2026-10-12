@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::app::now_unix_ms;
+use crate::i18n::t;
 use crate::model::{self, DaemonView, PauseControl};
 use crate::theme;
 
@@ -147,12 +148,12 @@ impl ksni::Tray for TrayApp {
         match m.pause {
             Some(PauseControl::Offer) => items.push(
                 SubMenu {
-                    label: "Pause".into(),
+                    label: t("menu_pause").into(),
                     submenu: model::PAUSE_CHOICES
                         .iter()
-                        .map(|&(label, secs)| {
+                        .map(|&(key, secs)| {
                             StandardItem {
-                                label: label.into(),
+                                label: t(key).into(),
                                 activate: Box::new(move |t: &mut Self| t.send(Cmd::Pause(secs))),
                                 ..Default::default()
                             }
@@ -165,7 +166,7 @@ impl ksni::Tray for TrayApp {
             ),
             Some(PauseControl::ResumeNow) => items.push(
                 StandardItem {
-                    label: "Resume now".into(),
+                    label: t("menu_resume_now").into(),
                     activate: Box::new(|t: &mut Self| t.send(Cmd::Resume)),
                     ..Default::default()
                 }
@@ -177,7 +178,7 @@ impl ksni::Tray for TrayApp {
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
-                label: "Open Colony Firewall".into(),
+                label: t("menu_open").into(),
                 activate: Box::new(|t: &mut Self| t.send(Cmd::OpenGui)),
                 ..Default::default()
             }
@@ -186,7 +187,7 @@ impl ksni::Tray for TrayApp {
         items.push(MenuItem::Separator);
         items.push(
             StandardItem {
-                label: "Quit tray".into(),
+                label: t("menu_quit").into(),
                 activate: Box::new(|t: &mut Self| t.send(Cmd::Quit)),
                 ..Default::default()
             }
@@ -207,5 +208,76 @@ impl ksni::Tray for TrayApp {
              (GNOME needs the AppIndicator extension for SNI trays)"
         );
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{set_locale, Locale};
+    use ksni::Tray as _;
+
+    fn app(view: DaemonView) -> TrayApp {
+        TrayApp {
+            view,
+            tx: mpsc::unbounded_channel().0,
+            icons: Vec::new(),
+            icon_theme_path: None,
+        }
+    }
+
+    /// Every label of a menu, submenus included.
+    fn labels(items: &[MenuItem<TrayApp>]) -> Vec<String> {
+        items
+            .iter()
+            .flat_map(|item| match item {
+                MenuItem::Standard(s) => vec![s.label.clone()],
+                MenuItem::SubMenu(s) => std::iter::once(s.label.clone())
+                    .chain(labels(&s.submenu))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_menu_builds_in_both_locales() {
+        let views = [
+            DaemonView::Connecting,
+            DaemonView::Unreachable { hint: "x".into() },
+            DaemonView::Reachable {
+                enforcing: true,
+                paused: false,
+                resume_at_unix_ms: 0,
+                prompts_pending: 2,
+            },
+            DaemonView::Reachable {
+                enforcing: true,
+                paused: true,
+                resume_at_unix_ms: 0,
+                prompts_pending: 1,
+            },
+        ];
+        for view in views {
+            set_locale(Locale::En);
+            let english = labels(&app(view.clone()).menu());
+            set_locale(Locale::Fr);
+            let french = labels(&app(view.clone()).menu());
+            set_locale(Locale::En);
+
+            assert_eq!(english.len(), french.len(), "{view:?}");
+            for label in english.iter().chain(&french) {
+                assert!(!label.is_empty(), "{view:?}");
+                // A key left untranslated would show as itself, and ksni
+                // would also eat its underscores.
+                assert!(!label.contains('_'), "{label:?} in {view:?}");
+            }
+            assert!(english.contains(&"Quit tray".to_string()), "{english:?}");
+            assert!(
+                french.contains(&"Quitter l'icône".to_string()),
+                "{french:?}"
+            );
+            assert_ne!(english[0], french[0], "the status line follows the locale");
+        }
     }
 }

@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use crate::app::{Message, DELETE_CONFIRM_MS};
 use crate::editor::{hidden_scope_is_set, hidden_scope_summary, RuleEditor};
 use crate::format;
+use crate::i18n::{t, t_fmt};
 use crate::theme::{self, sz, ui_text};
 
 /// Which column the list is ordered by, and in which direction.
@@ -143,11 +144,11 @@ fn list_view(args: ListArgs<'_>) -> Element<'_, Message> {
     filtered.sort_by(|a, b| compare_rules(a, b, sort));
 
     let toolbar = row![
-        button(ui_text("+ Add rule").size(sz(12)))
+        button(ui_text(t("rules_add")).size(sz(12)))
             .padding([4, 12])
             .on_press(Message::OpenEditor)
             .style(iced::widget::button::primary),
-        text_input("Search by name / exe / host", filter)
+        text_input(t("rules_search"), filter)
             .font(colony_ui::ui_font())
             .on_input(Message::RulesFilterChanged)
             .padding(4)
@@ -155,9 +156,15 @@ fn list_view(args: ListArgs<'_>) -> Element<'_, Message> {
             .width(theme::scaled(260.0)),
         Space::new().width(Length::Fill),
         ui_text(if filter.trim().is_empty() {
-            format!("{} rules", rules.len())
+            t_fmt("rules_count", &[("count", &rules.len().to_string())])
         } else {
-            format!("{}/{} rules", filtered.len(), rules.len())
+            t_fmt(
+                "rules_count_filtered",
+                &[
+                    ("shown", &filtered.len().to_string()),
+                    ("count", &rules.len().to_string()),
+                ],
+            )
         })
         .size(sz(11)),
     ]
@@ -170,9 +177,8 @@ fn list_view(args: ListArgs<'_>) -> Element<'_, Message> {
             toolbar,
             container(
                 column![
-                    ui_text("No rules yet").size(sz(18)),
-                    ui_text("Click \"+ Add rule\" or answer a prompt with a persist option.")
-                        .size(sz(12)),
+                    ui_text(t("rules_empty_title")).size(sz(18)),
+                    ui_text(t("rules_empty_body")).size(sz(12)),
                 ]
                 .spacing(8),
             )
@@ -185,19 +191,36 @@ fn list_view(args: ListArgs<'_>) -> Element<'_, Message> {
     if filtered.is_empty() {
         return column![
             toolbar,
-            container(ui_text(format!("No rules match \"{filter}\"")).size(sz(13))).padding(16),
+            container(ui_text(t_fmt("rules_no_match", &[("filter", filter)])).size(sz(13)))
+                .padding(16),
         ]
         .spacing(6)
         .into();
     }
 
     let header = row![
-        ui_text("on").size(sz(11)).width(theme::scaled(40.0)),
-        ui_text("action").size(sz(11)).width(theme::scaled(56.0)),
-        ui_text("duration").size(sz(11)).width(theme::scaled(84.0)),
-        sort_header("name / scope", SortKey::Name, sort, Length::Fill),
-        sort_header("created", SortKey::Created, sort, theme::scaled(110.0)),
-        sort_header("hits", SortKey::Hits, sort, theme::scaled(54.0)),
+        ui_text(t("rules_col_on"))
+            .size(sz(11))
+            .width(theme::scaled(40.0)),
+        ui_text(t("rules_col_action"))
+            .size(sz(11))
+            .width(theme::scaled(56.0)),
+        ui_text(t("rules_col_duration"))
+            .size(sz(11))
+            .width(theme::scaled(84.0)),
+        sort_header(t("rules_col_name"), SortKey::Name, sort, Length::Fill),
+        sort_header(
+            t("rules_col_created"),
+            SortKey::Created,
+            sort,
+            theme::scaled(110.0)
+        ),
+        sort_header(
+            t("rules_col_hits"),
+            SortKey::Hits,
+            sort,
+            theme::scaled(54.0)
+        ),
         ui_text("").width(theme::scaled(140.0)),
     ]
     .spacing(6)
@@ -237,7 +260,7 @@ fn rule_row<'a>(
     pending_delete: Option<&(String, i64)>,
     now_ms: i64,
 ) -> Element<'a, Message> {
-    let toggle_label = if r.enabled { "on" } else { "off" };
+    let toggle_label = t(if r.enabled { "rules_on" } else { "rules_off" });
     let toggle_style = if r.enabled {
         iced::widget::button::primary
     } else {
@@ -248,7 +271,11 @@ fn rule_row<'a>(
     // within DELETE_CONFIRM_MS actually removes the rule.
     let armed = pending_delete
         .is_some_and(|(id, at)| *id == r.id && now_ms.saturating_sub(*at) <= DELETE_CONFIRM_MS);
-    let delete_label = if armed { "Confirm?" } else { "Delete" };
+    let delete_label = t(if armed {
+        "rules_confirm_delete"
+    } else {
+        "rules_delete"
+    });
 
     row![
         button(ui_text(toggle_label).size(sz(11)))
@@ -256,15 +283,15 @@ fn rule_row<'a>(
             .on_press(Message::ToggleRuleEnabled(r.id.clone()))
             .style(toggle_style)
             .width(theme::scaled(40.0)),
-        ui_text(convert::action_label(r.action))
+        ui_text(format::action_label(r.action))
             .size(sz(12))
             .width(theme::scaled(56.0)),
-        ui_text(convert::rule_duration_label(r))
+        ui_text(format::duration_label(r))
             .size(sz(12))
             .width(theme::scaled(84.0)),
         column![
             ui_text(if r.name.is_empty() {
-                "(unnamed)".to_string()
+                t("rules_unnamed").to_string()
             } else {
                 convert::display_safe(&r.name)
             })
@@ -279,7 +306,7 @@ fn rule_row<'a>(
         ui_text(r.hit_count.to_string())
             .size(sz(12))
             .width(theme::scaled(54.0)),
-        button(ui_text("Edit").size(sz(11)))
+        button(ui_text(t("rules_edit")).size(sz(11)))
             .padding([2, 8])
             .on_press(Message::EditExistingRule(r.id.clone()))
             .style(iced::widget::button::secondary),
@@ -300,19 +327,19 @@ fn rule_row<'a>(
 
 fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     let title = row![
-        ui_text(if ed.editing_id.is_some() {
-            "Edit rule"
+        ui_text(t(if ed.editing_id.is_some() {
+            "editor_edit_title"
         } else {
-            "New rule"
-        })
+            "editor_new_title"
+        }))
         .size(sz(18)),
         Space::new().width(Length::Fill),
-        ui_text("Esc cancel · Enter save").size(sz(10)),
-        button(ui_text("Cancel").size(sz(12)))
+        ui_text(t("editor_keys")).size(sz(10)),
+        button(ui_text(t("editor_cancel")).size(sz(12)))
             .padding([4, 10])
             .on_press(Message::CloseEditor)
             .style(iced::widget::button::secondary),
-        button(ui_text("Save").size(sz(12)))
+        button(ui_text(t("editor_save")).size(sz(12)))
             .padding([4, 12])
             .on_press(Message::SaveRule)
             .style(iced::widget::button::primary),
@@ -321,7 +348,7 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     .padding(6)
     .align_y(iced::Alignment::Center);
 
-    let name_field = labeled_input("Name", &ed.name, Message::EditorName, "ui-added");
+    let name_field = labeled_input(t("editor_name"), &ed.name, Message::EditorName, "ui-added");
 
     let action_pick = pick_list(
         [
@@ -361,44 +388,40 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     .text_size(sz(13));
 
     let policy_row = row![
-        labeled(action_pick.into(), "Action", 200.0),
-        labeled(duration_pick.into(), "Duration", 200.0),
-        labeled(protocol_pick.into(), "Protocol", 200.0),
+        labeled(action_pick.into(), t("editor_action"), 200.0),
+        labeled(duration_pick.into(), t("editor_duration"), 200.0),
+        labeled(protocol_pick.into(), t("editor_protocol"), 200.0),
     ]
     .spacing(12);
 
-    let scope_intro = ui_text("At least one match below is required:").size(sz(11));
+    let scope_intro = ui_text(t("editor_scope_intro")).size(sz(11));
     let exe_field = labeled_input(
-        "Executable path",
+        t("editor_exe"),
         &ed.exe,
         Message::EditorExe,
         "/usr/bin/curl",
     );
     let host_field: Element<'_, Message> = if ed.dst_host.is_empty() {
-        ui_text("Destination rules use numeric IPs. DNS names are diagnostic only.")
+        ui_text(t("editor_numeric_destinations"))
             .size(sz(11))
             .into()
     } else {
         column![
-            ui_text(format!(
-                "Legacy hostname: {} (policy is uncertain; saving requires explicit removal)",
-                ed.dst_host
-            ))
-            .size(sz(11)),
-            button(ui_text("Remove legacy hostname from this rule").size(sz(12)))
+            ui_text(t_fmt("editor_legacy_hostname", &[("host", &ed.dst_host)])).size(sz(11)),
+            button(ui_text(t("editor_remove_hostname")).size(sz(12)))
                 .on_press(Message::EditorDstHost(String::new())),
         ]
         .spacing(6)
         .into()
     };
     let net_field = labeled_input(
-        "Destination IP / CIDR (/32 for IPv4, /128 for IPv6 endpoint)",
+        t("editor_dst_net"),
         &ed.dst_net,
         Message::EditorDstNet,
         "10.0.0.0/8",
     );
     let port_field = labeled_input(
-        "Destination port",
+        t("editor_dst_port"),
         &ed.dst_port,
         Message::EditorDstPort,
         "443",
@@ -418,9 +441,9 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     // read the visible fields as the whole rule.
     let carried: Element<'_, Message> = if hidden_scope_is_set(&ed.carried_scope) {
         container(
-            ui_text(format!(
-                "also restricted to {} - kept on save, edit with cfc",
-                hidden_scope_summary(&ed.carried_scope)
+            ui_text(t_fmt(
+                "editor_carried",
+                &[("scope", &hidden_scope_summary(&ed.carried_scope))],
             ))
             .size(sz(11)),
         )
@@ -514,7 +537,7 @@ impl From<ProtoOption> for Option<proto::Protocol> {
 impl std::fmt::Display for ProtoOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            ProtoOption::Any => "Any",
+            ProtoOption::Any => t("protocol_any"),
             ProtoOption::Tcp => "TCP",
             ProtoOption::Udp => "UDP",
             ProtoOption::Icmp => "ICMP",
@@ -552,9 +575,9 @@ impl From<ActionOption> for proto::Action {
 impl std::fmt::Display for ActionOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            ActionOption::Allow => "Allow",
-            ActionOption::Deny => "Deny",
-            ActionOption::Reject => "Reject",
+            ActionOption::Allow => t("option_allow"),
+            ActionOption::Deny => t("option_deny"),
+            ActionOption::Reject => t("option_reject"),
         })
     }
 }
@@ -593,10 +616,10 @@ impl From<DurationOption> for proto::Duration {
 impl std::fmt::Display for DurationOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            DurationOption::Seconds => "Timed (preserve lifetime)",
-            DurationOption::Once => "Once",
-            DurationOption::UntilRestart => "Until restart",
-            DurationOption::Always => "Always",
+            DurationOption::Seconds => t("option_timed"),
+            DurationOption::Once => t("option_once"),
+            DurationOption::UntilRestart => t("option_until_restart"),
+            DurationOption::Always => t("option_always"),
         })
     }
 }

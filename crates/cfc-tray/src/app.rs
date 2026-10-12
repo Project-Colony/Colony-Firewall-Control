@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt as _};
 use tracing::{debug, info, warn};
 
+use crate::i18n::{t, t_fmt};
 use crate::model::{self, DaemonView, NotifyGate, PromptChoice};
 use crate::notify::{
     notify_brief, notify_pending, probe_actions_supported, with_note, PromptNotifier,
@@ -144,7 +145,7 @@ fn spawn_set_paused(
             }
             Err(e) => {
                 warn!("{verb} failed: {e}");
-                Err(model::pause_failed_body(verb, &e))
+                Err(model::pause_failed_body(paused, &e))
             }
         }));
     });
@@ -175,9 +176,7 @@ fn open_gui() {
             // a broken tray rather than a missing binary. Found the same way
             // as everything else here: by clicking it and watching nothing
             // happen.
-            notify_brief(format!(
-                "Cannot open Colony Firewall - {GUI_BIN} is not installed or not on PATH"
-            ));
+            notify_brief(t_fmt("cannot_open_gui", &[("program", GUI_BIN)]));
         }
     }
 }
@@ -284,7 +283,7 @@ async fn submit_prompt_verdict(
         }
         Ok(_) => {
             info!(prompt_id, "verdict too late - prompt already resolved");
-            notify_brief("Too late - the daemon already applied its default".into());
+            notify_brief(t("verdict_too_late").into());
         }
         Err(e) => {
             warn!("submitting verdict: {e}");
@@ -382,7 +381,7 @@ pub async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
                     && std::fs::read_link("/proc/self/exe").is_ok_and(|exe| model::replaced_on_disk(&exe))
                 {
                     told_replaced = true;
-                    notify_brief(model::REPLACED_BODY.into());
+                    notify_brief(model::replaced_body());
                 }
                 if !refresh(&handle, &mut client, &socket, &mut gate, &mut was_reachable, generic).await {
                     break;

@@ -1,12 +1,13 @@
 //! Daemon counters, the health signals that come with them, and two
 //! breakdowns computed from the live feed this session.
 
-use cfc_client::{convert, proto};
+use cfc_client::proto;
 use iced::widget::{column, container, row, scrollable, Space};
 use iced::{Element, Length};
 
 use crate::app::Message;
 use crate::format;
+use crate::i18n::{t, t_fmt};
 use crate::session_stats::{Counts, SessionStats};
 use crate::theme::{self, sz, ui_text};
 
@@ -18,7 +19,7 @@ pub fn view<'a>(
     now_ms: i64,
 ) -> Element<'a, Message> {
     let Some(s) = status else {
-        return container(ui_text("Waiting for daemon status...").size(sz(13)))
+        return container(ui_text(t("stats_waiting")).size(sz(13)))
             .padding(16)
             .into();
     };
@@ -30,37 +31,40 @@ pub fn view<'a>(
     if !s.enforcing {
         blocks.push(banner(
             theme::banner_err,
-            "⚠ not enforcing",
-            "No packets seen - is the nftables/iptables NFQUEUE rule loaded? (Also expected under --dry-run.)",
+            t("badge_not_enforcing"),
+            t("stats_not_enforcing_body"),
         ));
     }
     if s.skipped_rules > 0 {
         blocks.push(banner(
             theme::banner_warn,
-            "⚠ rules skipped",
-            &format!(
-                "{} rule row(s) on disk could not be loaded and are NOT being enforced.",
-                s.skipped_rules
+            t("stats_rules_skipped"),
+            &t_fmt(
+                "stats_rules_skipped_body",
+                &[("count", &s.skipped_rules.to_string())],
             ),
         ));
     }
     if s.paused {
         blocks.push(banner(
             theme::banner_warn,
-            "⚠ paused",
-            &format!(
-                "Everything is being accepted without consulting rules - {}.",
-                format::format_resume_in(s.resume_at_unix_ms, now_ms)
+            t("badge_paused"),
+            &t_fmt(
+                "stats_paused_body",
+                &[(
+                    "resume",
+                    &format::format_resume_in(s.resume_at_unix_ms, now_ms),
+                )],
             ),
         ));
     }
 
     blocks.push(
         row![
-            stat_card("daemon version", s.version.clone()),
-            stat_card("uptime", humanize_seconds(s.uptime_seconds)),
-            stat_card("rules", s.rules_count.to_string()),
-            stat_card("pending prompts", s.prompts_pending.to_string()),
+            stat_card(t("stats_daemon_version"), s.version.clone()),
+            stat_card(t("stats_uptime"), humanize_seconds(s.uptime_seconds)),
+            stat_card(t("stats_rules"), s.rules_count.to_string()),
+            stat_card(t("stats_pending"), s.prompts_pending.to_string()),
             Space::new().width(Length::Fill),
         ]
         .spacing(10)
@@ -68,9 +72,9 @@ pub fn view<'a>(
     );
     blocks.push(
         row![
-            stat_card("connections seen", s.connections_seen.to_string()),
-            stat_card("allowed", s.connections_allowed.to_string()),
-            stat_card("denied", s.connections_denied.to_string()),
+            stat_card(t("stats_seen"), s.connections_seen.to_string()),
+            stat_card(t("stats_allowed"), s.connections_allowed.to_string()),
+            stat_card(t("stats_denied"), s.connections_denied.to_string()),
             Space::new().width(Length::Fill),
         ]
         .spacing(10)
@@ -80,14 +84,17 @@ pub fn view<'a>(
     // The live policy, i.e. what happens when nobody answers.
     blocks.push(
         row![
-            stat_small("prompt timeout", format!("{}s", s.prompt_timeout_secs)),
             stat_small(
-                "on timeout",
-                convert::action_label(s.timeout_action).to_string()
+                t("stats_prompt_timeout"),
+                format!("{}s", s.prompt_timeout_secs)
             ),
             stat_small(
-                "with no UI",
-                convert::action_label(s.no_ui_action).to_string()
+                t("stats_on_timeout"),
+                format::action_label(s.timeout_action).to_string()
+            ),
+            stat_small(
+                t("stats_no_ui"),
+                format::action_label(s.no_ui_action).to_string()
             ),
             Space::new().width(Length::Fill),
         ]
@@ -96,21 +103,17 @@ pub fn view<'a>(
     );
 
     blocks.push(
-        ui_text(format!(
-            "Breakdowns below cover this UI session only ({} events observed since the window opened).",
-            session.events()
+        ui_text(t_fmt(
+            "stats_session_note",
+            &[("count", &session.events().to_string())],
         ))
         .size(sz(10))
         .into(),
     );
     blocks.push(
         row![
-            top_table("Top apps (session)", session.top_apps(TOP_N), true),
-            top_table(
-                "Top destinations (session)",
-                session.top_dests(TOP_N),
-                false
-            ),
+            top_table(t("stats_top_apps"), session.top_apps(TOP_N), true),
+            top_table(t("stats_top_dests"), session.top_dests(TOP_N), false),
         ]
         .spacing(10)
         .into(),
@@ -130,7 +133,7 @@ fn banner<'a>(
 ) -> Element<'a, Message> {
     container(
         column![
-            ui_text(title).size(sz(14)),
+            ui_text(format!("⚠ {title}")).size(sz(14)),
             ui_text(body.to_string()).size(sz(11))
         ]
         .spacing(3),
@@ -167,13 +170,13 @@ fn top_table<'a>(
     let mut body: Vec<Element<'a, Message>> = vec![row![
         ui_text(title).size(sz(13)),
         Space::new().width(Length::Fill),
-        ui_text("conn / allow / deny").size(sz(9)),
+        ui_text(t("stats_columns")).size(sz(9)),
     ]
     .align_y(iced::Alignment::Center)
     .into()];
 
     if rows.is_empty() {
-        body.push(ui_text("(nothing observed yet)").size(sz(11)).into());
+        body.push(ui_text(t("stats_nothing")).size(sz(11)).into());
     }
 
     for (key, counts) in rows {
@@ -213,7 +216,10 @@ fn humanize_seconds(s: u64) -> String {
     let m = (s % 3600) / 60;
     let sec = s % 60;
     if d > 0 {
-        format!("{d}d {h}h")
+        t_fmt(
+            "uptime_days",
+            &[("days", &d.to_string()), ("hours", &h.to_string())],
+        )
     } else if h > 0 {
         format!("{h}h {m}m")
     } else if m > 0 {

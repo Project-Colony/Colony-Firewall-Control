@@ -16,6 +16,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::editor::{saved_rule_line, RuleEditor};
+use crate::i18n::{t, t_fmt};
 use crate::session_stats::SessionStats;
 use crate::status_log::StatusLog;
 use crate::theme::{sz, ui_text};
@@ -412,9 +413,12 @@ impl App {
         self.detach_orphaned_editor();
         for label in expired {
             self.log.warn(
-                format!(
-                    "{label}: prompt expired -> {} by default",
-                    format::fallback_past(timeout_action)
+                t_fmt(
+                    "log_prompt_expired",
+                    &[
+                        ("prompt", &label),
+                        ("verdict", format::fallback_past(timeout_action)),
+                    ],
                 ),
                 now,
             );
@@ -458,10 +462,7 @@ impl App {
             .is_some_and(|id| !self.prompts.iter().any(|card| &card.event.prompt_id == id))
         {
             editor.prompt_id = None;
-            self.log.warn(
-                "the prompt being customized is gone; Save now stores a new rule",
-                self.now_ms,
-            );
+            self.log.warn(t("log_customized_prompt_gone"), self.now_ms);
         }
     }
 
@@ -603,7 +604,7 @@ impl App {
             lines.push(
                 row![
                     Space::new().width(Length::Fill),
-                    button(ui_text("dismiss all").size(sz(10)))
+                    button(ui_text(t("log_dismiss_all")).size(sz(10)))
                         .padding([0, 6])
                         .on_press(Message::DismissAllLog)
                         .style(theme::subtle_icon),
@@ -620,22 +621,22 @@ impl App {
     }
 
     fn header_bar(&self, paused: bool) -> Element<'_, Message> {
-        let (badge_label, badge_style): (&str, fn(&iced::Theme) -> iced::widget::container::Style) =
+        let (badge_key, badge_style): (&str, fn(&iced::Theme) -> iced::widget::container::Style) =
             match &self.daemon {
-                DaemonState::Connecting => ("● connecting", theme::badge_warn),
+                DaemonState::Connecting => ("badge_connecting", theme::badge_warn),
                 DaemonState::Connected => {
                     if paused {
-                        ("● paused", theme::badge_warn)
+                        ("badge_paused", theme::badge_warn)
                     } else if self.stream_trouble {
-                        ("● reconnecting", theme::badge_warn)
+                        ("badge_reconnecting", theme::badge_warn)
                     } else {
-                        ("● connected", theme::badge_ok)
+                        ("badge_connected", theme::badge_ok)
                     }
                 }
-                DaemonState::Failed(_) => ("● disconnected", theme::badge_err),
+                DaemonState::Failed(_) => ("badge_disconnected", theme::badge_err),
             };
 
-        let badge = container(ui_text(badge_label).size(sz(11)))
+        let badge = container(ui_text(format!("● {}", t(badge_key))).size(sz(11)))
             .padding([3, 10])
             .style(badge_style);
 
@@ -643,7 +644,7 @@ impl App {
         // that deserves its own badge, not a green "connected".
         let enforcing_badge: Element<'_, Message> = match &self.status {
             Some(s) if self.connected() && !s.enforcing => {
-                container(ui_text("⚠ not enforcing").size(sz(11)))
+                container(ui_text(format!("⚠ {}", t("badge_not_enforcing"))).size(sz(11)))
                     .padding([3, 10])
                     .style(theme::badge_err)
                     .into()
@@ -653,13 +654,13 @@ impl App {
 
         let pause_btn: Element<'_, Message> = if self.connected() {
             if paused {
-                button(ui_text("Resume").size(sz(12)))
+                button(ui_text(t("button_resume")).size(sz(12)))
                     .padding([4, 14])
                     .on_press_maybe((!self.pause_pending).then_some(Message::TogglePaused))
                     .style(iced::widget::button::primary)
                     .into()
             } else {
-                button(ui_text("Pause").size(sz(12)))
+                button(ui_text(t("button_pause")).size(sz(12)))
                     .padding([4, 14])
                     .on_press_maybe(
                         (self.pause_armed() && !self.pause_pending)
@@ -678,8 +679,8 @@ impl App {
                     .retry_at_ms
                     .and_then(|at| format::remaining_secs(at, self.now_ms).filter(|s| *s > 0))
                 {
-                    Some(s) => format!("Reconnect ({s}s)"),
-                    None => "Reconnect".to_string(),
+                    Some(s) => t_fmt("button_reconnect_in", &[("secs", &s.to_string())]),
+                    None => t("button_reconnect").to_string(),
                 };
                 button(ui_text(label).size(sz(12)))
                     .padding([4, 14])
@@ -690,12 +691,12 @@ impl App {
             _ => Space::new().into(),
         };
 
-        let title_text = match self.tab {
-            Tab::Prompts => "Pending prompts",
-            Tab::Rules => "Rules",
-            Tab::Live => "Live connections",
-            Tab::Stats => "Stats",
-        };
+        let title_text = t(match self.tab {
+            Tab::Prompts => "title_prompts",
+            Tab::Rules => "tab_rules",
+            Tab::Live => "title_live",
+            Tab::Stats => "tab_stats",
+        });
 
         let inner = row![
             ui_text(title_text).size(sz(18)),
@@ -753,7 +754,7 @@ fn prompt_label(ev: &proto::PromptEvent) -> String {
         .process
         .as_ref()
         .map(cfc_client::convert::process_display)
-        .unwrap_or_else(|| "unknown".into());
+        .unwrap_or_else(|| t("unknown").into());
     let dest = ev
         .connection
         .as_ref()
@@ -857,11 +858,11 @@ async fn submit_verdict(
             true,
             outcome
                 .persist_error
-                .unwrap_or_else(|| "the answer applied, but no lasting rule was saved".to_string()),
+                .unwrap_or_else(|| t("error_no_lasting_rule").to_string()),
         ));
     }
     if outcome.accepted && require_confirmed_rule && outcome.rule_persisted != Some(true) {
-        return Err(fail(true, "the verdict applied, but this daemon did not confirm a standing rule; restart the updated daemon".into()));
+        return Err(fail(true, t("error_rule_unconfirmed").into()));
     }
     Ok((prompt_id, outcome.accepted, outcome.persist_note))
 }

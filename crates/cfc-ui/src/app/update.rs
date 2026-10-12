@@ -11,6 +11,7 @@ use super::{
 };
 use crate::editor::{build_rule_from_editor, toggled_rule, RuleEditor};
 use crate::format;
+use crate::i18n::{t, t_fmt};
 use crate::views::{self, prompts::PromptAction};
 
 impl App {
@@ -47,8 +48,10 @@ impl App {
                 Task::none()
             }
             Message::RulesLoaded(Err(e)) => {
-                self.log
-                    .warn(format!("listing rules failed: {e}"), self.now_ms);
+                self.log.warn(
+                    t_fmt("log_list_rules_failed", &[("error", &e)]),
+                    self.now_ms,
+                );
                 Task::none()
             }
             Message::DeleteRule(id) => {
@@ -67,16 +70,16 @@ impl App {
             }
             Message::RuleDeleted(Ok((id, true))) => {
                 self.rules.retain(|r| r.id != id);
-                self.log.info("rule deleted", self.now_ms);
+                self.log.info(t("log_rule_deleted"), self.now_ms);
                 Task::none()
             }
             Message::RuleDeleted(Ok((_, false))) => {
-                self.log
-                    .warn("rule was already gone on the daemon", self.now_ms);
+                self.log.warn(t("log_rule_already_gone"), self.now_ms);
                 Task::none()
             }
             Message::RuleDeleted(Err(e)) => {
-                self.log.error(format!("delete failed: {e}"), self.now_ms);
+                self.log
+                    .error(t_fmt("log_delete_failed", &[("error", &e)]), self.now_ms);
                 Task::none()
             }
             Message::StatusLoaded(Ok(s)) => {
@@ -234,23 +237,18 @@ impl App {
                 // The daemon had already answered this prompt itself. The
                 // old code swallowed this, so the user believed they had
                 // allowed something the timeout had actually decided.
-                self.log.error(
-                    "prompt already expired - the daemon answered it",
-                    self.now_ms,
-                );
+                self.log.error(t("log_prompt_already_expired"), self.now_ms);
                 Task::none()
             }
             Message::VerdictSubmitted(Err(failure)) => {
                 self.settle_card(&failure.prompt_id, failure.applied);
-                let still = if failure.applied {
-                    ""
+                let key = if failure.applied {
+                    "log_verdict_failed"
                 } else {
-                    " - the prompt is still waiting for an answer"
+                    "log_verdict_failed_pending"
                 };
-                self.log.error(
-                    format!("verdict failed: {}{still}", failure.message),
-                    self.now_ms,
-                );
+                self.log
+                    .error(t_fmt(key, &[("error", &failure.message)]), self.now_ms);
                 Task::none()
             }
             Message::OpenEditor => {
@@ -337,8 +335,7 @@ impl App {
                     return Task::none();
                 }
                 self.pause_pending = true;
-                self.log
-                    .info("Waiting for administrator authorization...", self.now_ms);
+                self.log.info(t("log_waiting_for_admin"), self.now_ms);
                 let socket = self.socket_path.clone();
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
@@ -354,20 +351,24 @@ impl App {
                 }
                 if paused {
                     self.log.warn(
-                        format!(
-                            "enforcement paused - {}",
-                            format::format_resume_in(resume_at_unix_ms, self.now_ms)
+                        t_fmt(
+                            "log_enforcement_paused",
+                            &[(
+                                "resume",
+                                &format::format_resume_in(resume_at_unix_ms, self.now_ms),
+                            )],
                         ),
                         self.now_ms,
                     );
                 } else {
-                    self.log.info("enforcement resumed", self.now_ms);
+                    self.log.info(t("log_enforcement_resumed"), self.now_ms);
                 }
                 Task::none()
             }
             Message::PausedSet(Err(e)) => {
                 self.pause_pending = false;
-                self.log.error(format!("pause failed: {e}"), self.now_ms);
+                self.log
+                    .error(t_fmt("log_pause_failed", &[("error", &e)]), self.now_ms);
                 Task::none()
             }
             Message::EditorName(s) => {
@@ -460,7 +461,7 @@ impl App {
                         // of the form and can be below the fold, which made
                         // Save look like it did nothing.
                         self.log
-                            .error(format!("saving rule failed: {e}"), self.now_ms);
+                            .error(t_fmt("log_save_rule_failed", &[("error", &e)]), self.now_ms);
                         editor.validation = Some(e);
                         Task::none()
                     }
@@ -495,7 +496,7 @@ impl App {
                     ed.validation = Some(e.clone());
                 }
                 self.log
-                    .error(format!("saving rule failed: {e}"), self.now_ms);
+                    .error(t_fmt("log_save_rule_failed", &[("error", &e)]), self.now_ms);
                 // The optimistic enable/disable toggle may now disagree
                 // with the daemon; re-read the truth.
                 let socket = self.socket_path.clone();

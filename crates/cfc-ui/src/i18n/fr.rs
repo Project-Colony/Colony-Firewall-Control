@@ -1,0 +1,371 @@
+//! French strings. Same keys as `en.rs`, translated rather than glossed, and
+//! addressed to the user as « vous ».
+
+pub(super) const STRINGS: &[(&str, &str)] = &[
+    // Sidebar
+    ("tab_prompts", "Demandes"),
+    ("tab_rules", "Règles"),
+    ("tab_live", "En direct"),
+    ("tab_stats", "Statistiques"),
+    ("nav_views", "Vues"),
+    ("hint_switch_tab", "1-4  changer d'onglet"),
+    ("hint_keys_title", "Touches pour la demande du haut :"),
+    ("hint_allow_once", "A  autoriser une fois"),
+    ("hint_block_once", "D  bloquer pour l'instant"),
+    ("hint_allow_program", "Maj+A  toujours autoriser"),
+    ("hint_block_program", "Maj+D  toujours bloquer"),
+    // Header and status log
+    ("title_prompts", "Demandes en attente"),
+    ("title_live", "Connexions en direct"),
+    ("badge_connecting", "connexion en cours"),
+    ("badge_paused", "en pause"),
+    ("badge_reconnecting", "reconnexion"),
+    ("badge_connected", "connecté"),
+    ("badge_disconnected", "déconnecté"),
+    ("badge_not_enforcing", "filtrage inactif"),
+    ("button_pause", "Pause"),
+    ("button_resume", "Reprendre"),
+    ("button_reconnect", "Reconnecter"),
+    ("button_reconnect_in", "Reconnecter ({secs} s)"),
+    ("log_dismiss_all", "tout effacer"),
+    ("unknown", "inconnu"),
+    (
+        "log_prompt_expired",
+        "{prompt} : demande expirée -> {verdict} par défaut",
+    ),
+    (
+        "log_customized_prompt_gone",
+        "la demande en cours de personnalisation a disparu ; Enregistrer crée désormais une \
+         nouvelle règle",
+    ),
+    (
+        "log_list_rules_failed",
+        "échec de la lecture des règles : {error}",
+    ),
+    ("log_rule_deleted", "règle supprimée"),
+    (
+        "log_rule_already_gone",
+        "la règle n'existait déjà plus sur le démon",
+    ),
+    ("log_delete_failed", "échec de la suppression : {error}"),
+    (
+        "log_prompt_already_expired",
+        "demande déjà expirée : le démon y a répondu",
+    ),
+    ("log_verdict_failed", "échec du verdict : {error}"),
+    (
+        "log_verdict_failed_pending",
+        "échec du verdict : {error} ; la demande attend toujours une réponse",
+    ),
+    (
+        "log_waiting_for_admin",
+        "En attente de l'autorisation de l'administrateur...",
+    ),
+    ("log_enforcement_paused", "filtrage en pause : {resume}"),
+    ("log_enforcement_resumed", "filtrage repris"),
+    ("log_pause_failed", "échec de la pause : {error}"),
+    (
+        "log_save_rule_failed",
+        "échec de l'enregistrement de la règle : {error}",
+    ),
+    (
+        "log_rule_saved",
+        "règle enregistrée : {summary}, {duration}",
+    ),
+    (
+        "log_rule_saved_disabled",
+        "règle enregistrée : {summary}, {duration}, désactivée",
+    ),
+    (
+        "log_daemon_unreachable",
+        "démon injoignable, nouvelle tentative...",
+    ),
+    (
+        "log_daemon_unreachable_hint",
+        "démon injoignable, nouvelle tentative... - {hint}",
+    ),
+    (
+        "error_no_lasting_rule",
+        "la réponse a été appliquée, mais aucune règle durable n'a été enregistrée",
+    ),
+    (
+        "error_rule_unconfirmed",
+        "le verdict a été appliqué, mais ce démon n'a pas confirmé de règle permanente ; \
+         redémarrez le démon mis à jour",
+    ),
+    // Verdicts, durations and provenance
+    ("verb_allows", "autorise"),
+    ("verb_denies", "refuse"),
+    ("verb_rejects", "rejette"),
+    ("verb_answers", "répond"),
+    ("past_allowed", "autorisée"),
+    ("past_denied", "refusée"),
+    ("past_rejected", "rejetée"),
+    ("past_answered", "traitée"),
+    ("action_allow", "autoriser"),
+    ("action_deny", "refuser"),
+    ("action_reject", "rejeter"),
+    ("duration_once", "une fois"),
+    ("duration_until_restart", "jusqu'au redémarrage"),
+    ("duration_always", "toujours"),
+    ("duration_seconds", "secondes"),
+    ("resume_manually", "jusqu'à une reprise manuelle"),
+    ("resume_now", "reprise en cours..."),
+    ("resume_in", "reprise dans {time}"),
+    ("uptime_days", "{days} j {hours} h"),
+    ("provenance_verified", "vérifié"),
+    ("provenance_pkg_verified", "{package} (vérifié)"),
+    ("provenance_modified", "MODIFIÉ depuis l'installation"),
+    (
+        "provenance_pkg_modified",
+        "{package} - MODIFIÉ depuis l'installation",
+    ),
+    ("provenance_unpackaged", "ne provient pas d'un paquet"),
+    ("provenance_pkg_unverified", "{package} (non vérifié)"),
+    // Prompts
+    ("prompts_empty_title", "Aucune demande en attente"),
+    (
+        "prompts_empty_body",
+        "Les connexions sortantes qu'aucune règle ne tranche apparaîtront ici, pour que vous \
+         les autorisiez ou les bloquiez.",
+    ),
+    (
+        "prompts_empty_keys",
+        "Clavier, sur la demande du haut : A autoriser une fois / D bloquer pour l'instant ; \
+         Maj+A toujours autoriser ce programme, Maj+D toujours le bloquer.",
+    ),
+    ("prompt_row_program", "Programme"),
+    ("prompt_row_path", "Chemin"),
+    ("prompt_row_cmdline", "Commande"),
+    ("prompt_row_process", "Processus"),
+    ("prompt_row_user", "Utilisateur"),
+    ("prompt_row_cwd", "Dossier"),
+    ("prompt_row_binding", "Liaison"),
+    ("prompt_row_checksum", "Empreinte"),
+    ("prompt_row_package", "Paquet"),
+    ("prompt_row_source", "Source"),
+    ("prompt_row_remote", "Distant"),
+    ("prompt_row_protocol", "Protocole"),
+    ("prompt_row_started", "Début"),
+    (
+        "prompt_binding_no_hash",
+        "Empreinte du binaire indisponible ; aucune autorisation permanente ne peut être \
+         enregistrée",
+    ),
+    (
+        "prompt_binding_pinned",
+        "Toujours autoriser sera lié à ce binaire",
+    ),
+    (
+        "prompt_note_user_writable",
+        "(chemin modifiable par un utilisateur)",
+    ),
+    ("prompt_note_not_hashed", "(sans empreinte)"),
+    ("prompt_note_verified_name", "(nom vérifié)"),
+    ("prompt_note_unverified_name", "(nom non vérifié)"),
+    (
+        "prompt_undecided",
+        "La règle « {rule} » peut s'appliquer, mais le programme n'a pas pu être entièrement \
+         identifié ; votre réponse s'applique à cette connexion.",
+    ),
+    ("prompt_pid", "pid {pid}"),
+    ("prompt_pid_parent", "pid {pid} (pid parent {ppid})"),
+    ("prompt_incoming", "Connexion entrante"),
+    ("prompt_outgoing", "Connexion sortante"),
+    ("prompt_this_program", "ce programme"),
+    ("prompt_action_allow_program", "Autoriser ce programme"),
+    ("prompt_action_block_program", "Bloquer ce programme"),
+    ("prompt_action_block_once", "Bloquer pour l'instant"),
+    ("prompt_action_allow_once", "Autoriser une fois"),
+    (
+        "prompt_consequence_allow_program",
+        "Toujours autoriser {program} à se connecter",
+    ),
+    (
+        "prompt_consequence_block_program",
+        "Toujours empêcher {program} de se connecter",
+    ),
+    (
+        "prompt_consequence_block_once",
+        "Refuser cette connexion uniquement et redemander la prochaine fois",
+    ),
+    (
+        "prompt_consequence_allow_once",
+        "Autoriser cette connexion uniquement et redemander la prochaine fois",
+    ),
+    ("prompt_key_target", "A / D répondent à cette demande"),
+    (
+        "prompt_customize",
+        "Personnaliser cette règle avant de la créer",
+    ),
+    (
+        "prompt_unscopable",
+        "Aucun chemin d'exécutable pour cette connexion : une règle « ce programme » aurait \
+         un programme vide et s'appliquerait à tout, seules les réponses ponctuelles sont \
+         donc proposées.",
+    ),
+    (
+        "prompt_no_deadline",
+        "aucun délai : en attente de votre réponse",
+    ),
+    (
+        "prompt_countdown",
+        "le démon {verb} automatiquement dans {time}",
+    ),
+    ("copy", "copier"),
+    // Rules
+    ("rules_add", "+ Ajouter une règle"),
+    ("rules_search", "Rechercher par nom / exécutable / hôte"),
+    ("rules_count", "{count} règles"),
+    ("rules_count_filtered", "{shown}/{count} règles"),
+    ("rules_empty_title", "Aucune règle pour l'instant"),
+    (
+        "rules_empty_body",
+        "Cliquez sur « + Ajouter une règle » ou répondez à une demande avec une option \
+         permanente.",
+    ),
+    (
+        "rules_no_match",
+        "Aucune règle ne correspond à « {filter} »",
+    ),
+    ("rules_col_on", "actif"),
+    ("rules_col_action", "action"),
+    ("rules_col_duration", "durée"),
+    ("rules_col_name", "nom / portée"),
+    ("rules_col_created", "créée"),
+    ("rules_col_hits", "accès"),
+    ("rules_on", "oui"),
+    ("rules_off", "non"),
+    ("rules_confirm_delete", "Confirmer ?"),
+    ("rules_delete", "Supprimer"),
+    ("rules_edit", "Modifier"),
+    ("rules_unnamed", "(sans nom)"),
+    // Rule editor
+    ("editor_edit_title", "Modifier la règle"),
+    ("editor_new_title", "Nouvelle règle"),
+    ("editor_keys", "Échap annuler · Entrée enregistrer"),
+    ("editor_cancel", "Annuler"),
+    ("editor_save", "Enregistrer"),
+    ("editor_name", "Nom"),
+    ("editor_action", "Action"),
+    ("editor_duration", "Durée"),
+    ("editor_protocol", "Protocole"),
+    (
+        "editor_scope_intro",
+        "Au moins un critère ci-dessous est requis :",
+    ),
+    ("editor_exe", "Chemin de l'exécutable"),
+    (
+        "editor_numeric_destinations",
+        "Les règles de destination utilisent des adresses IP numériques. Les noms DNS servent \
+         uniquement au diagnostic.",
+    ),
+    (
+        "editor_legacy_hostname",
+        "Nom d'hôte hérité : {host} (règle incertaine ; il faut le retirer pour enregistrer)",
+    ),
+    (
+        "editor_remove_hostname",
+        "Retirer le nom d'hôte hérité de cette règle",
+    ),
+    (
+        "editor_dst_net",
+        "IP / CIDR de destination (/32 pour une adresse IPv4, /128 pour une adresse IPv6)",
+    ),
+    ("editor_dst_port", "Port de destination"),
+    (
+        "editor_carried",
+        "également limitée à {scope} : conservé à l'enregistrement, modifiable avec cfc",
+    ),
+    ("protocol_any", "Tous"),
+    ("option_allow", "Autoriser"),
+    ("option_deny", "Refuser"),
+    ("option_reject", "Rejeter"),
+    ("option_timed", "Temporisée (durée conservée)"),
+    ("option_once", "Une fois"),
+    ("option_until_restart", "Jusqu'au redémarrage"),
+    ("option_always", "Toujours"),
+    ("scope_inbound", "entrant"),
+    ("scope_outbound", "sortant"),
+    ("scope_direction_unknown", "direction ?"),
+    ("scope_from", "depuis {net}"),
+    ("scope_src_port", "port source {port}"),
+    ("scope_uid", "uid {uid}"),
+    ("scope_parent", "parent {exe}"),
+    ("scope_sha256", "sha256 {digest}..."),
+    ("error_port", "« {port} » n'est pas un port valide"),
+    (
+        "error_dst_net",
+        "IP / CIDR de destination invalide : {error}",
+    ),
+    (
+        "error_saved_duration",
+        "une règle enregistrée doit durer « Jusqu'au redémarrage » ou « Toujours »",
+    ),
+    (
+        "error_timed",
+        "seule une règle temporisée existante, de durée positive, peut rester temporisée",
+    ),
+    (
+        "error_hash_required",
+        "le binaire de la demande n'a pas pu être haché ; seule une autorisation ponctuelle \
+         est possible",
+    ),
+    (
+        "error_scope_empty",
+        "la règle doit restreindre au moins un critère : exécutable, hôte, réseau, port de \
+         destination ou protocole",
+    ),
+    // Live
+    ("live_all", "Tous les verdicts"),
+    ("live_allowed", "Autorisées"),
+    ("live_denied", "Refusées"),
+    ("live_resume_new", "Reprendre ({count} nouvelles)"),
+    ("live_filter", "Filtrer par processus / hôte / IP / port"),
+    ("live_rows", "{shown}/{total} lignes"),
+    ("live_col_time", "heure"),
+    ("live_col_proto", "proto"),
+    ("live_col_process", "processus"),
+    ("live_col_dest", "dest."),
+    ("live_col_verdict", "verdict"),
+    ("live_no_traffic", "(aucun trafic observé pour l'instant)"),
+    ("live_no_match", "(aucune ligne ne correspond au filtre)"),
+    ("live_make_rule", "créer une règle"),
+    // Stats
+    ("stats_waiting", "En attente de l'état du démon..."),
+    (
+        "stats_not_enforcing_body",
+        "Aucun paquet vu : la règle NFQUEUE nftables/iptables est-elle chargée ? (Attendu \
+         aussi avec --dry-run.)",
+    ),
+    ("stats_rules_skipped", "règles ignorées"),
+    (
+        "stats_rules_skipped_body",
+        "{count} règle(s) enregistrée(s) sur le disque n'ont pas pu être chargées et ne sont \
+         PAS appliquées.",
+    ),
+    (
+        "stats_paused_body",
+        "Tout est accepté sans consulter les règles : {resume}.",
+    ),
+    ("stats_daemon_version", "version du démon"),
+    ("stats_uptime", "en service depuis"),
+    ("stats_rules", "règles"),
+    ("stats_pending", "demandes en attente"),
+    ("stats_seen", "connexions vues"),
+    ("stats_allowed", "autorisées"),
+    ("stats_denied", "refusées"),
+    ("stats_prompt_timeout", "délai des demandes"),
+    ("stats_on_timeout", "à l'expiration"),
+    ("stats_no_ui", "sans interface"),
+    (
+        "stats_session_note",
+        "Les répartitions ci-dessous couvrent uniquement cette session ({count} événements \
+         observés depuis l'ouverture de la fenêtre).",
+    ),
+    ("stats_top_apps", "Applications principales (session)"),
+    ("stats_top_dests", "Destinations principales (session)"),
+    ("stats_columns", "conn. / autor. / refus"),
+    ("stats_nothing", "(rien d'observé pour l'instant)"),
+    ("stats_other", "(autres)"),
+];

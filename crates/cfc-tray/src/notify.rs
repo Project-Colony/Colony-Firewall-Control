@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::app::now_unix_ms;
+use crate::i18n::{t, t_fmt};
 use crate::model::{self, PromptPresentation};
 use crate::tray::Cmd;
 use crate::{answers, icon, theme};
@@ -93,17 +94,15 @@ fn on_notification_thread<F: FnOnce() + Send + 'static>(f: F) {
 pub fn notify_pending(count: u64) {
     // notify-rust's show() blocks on D-Bus; keep it off the poll loop.
     on_notification_thread(move || {
-        let noun = if count == 1 {
-            "connection"
+        let key = if count == 1 {
+            "notify_pending_one"
         } else {
-            "connections"
+            "notify_pending_many"
         };
         let mut n = notify_rust::Notification::new();
         let _ = brand(&mut n)
-            .summary("Colony Firewall: verdict needed")
-            .body(&format!(
-                "{count} {noun} waiting for a verdict - open Colony Firewall"
-            ))
+            .summary(t("notify_verdict_needed"))
+            .body(&t_fmt(key, &[("count", &count.to_string())]))
             .timeout(notify_rust::Timeout::Milliseconds(8000))
             .show();
     });
@@ -206,15 +205,15 @@ impl PromptNotifier {
             // for, and long labels wrap the button row onto a second
             // line. "Details" is the freedesktop `default` action, so
             // clicking the bubble body opens the GUI too.
-            .action(model::KEY_ALLOW_ONCE, "Allow once");
+            .action(model::KEY_ALLOW_ONCE, t("action_allow_once"));
         if n.offer_block {
-            notification.action(model::KEY_ALLOW, "Always allow app");
+            notification.action(model::KEY_ALLOW, t("action_allow_always"));
         }
-        notification.action(model::KEY_DENY, "Deny");
+        notification.action(model::KEY_DENY, t("action_deny"));
         if n.offer_block {
-            notification.action(model::KEY_BLOCK, "Block app");
+            notification.action(model::KEY_BLOCK, t("action_block"));
         }
-        notification.action(model::KEY_DEFAULT, "Details");
+        notification.action(model::KEY_DEFAULT, t("action_details"));
         // Waited for past the prompt's deadline: by then the slot is
         // reclaimed and the bubble closed, so this only ends a wait whose
         // server vanished without saying so.
@@ -395,10 +394,10 @@ fn close_notifications(ids: Vec<u32>) {
 fn overflow_notification(body: &str) -> notify_rust::Notification {
     let mut n = notify_rust::Notification::new();
     brand(&mut n)
-        .summary("Several connections are waiting")
+        .summary(t("overflow_title"))
         .body(body)
         .timeout(notify_rust::Timeout::Milliseconds(8000))
-        .action(model::KEY_DEFAULT, "Open Colony Firewall");
+        .action(model::KEY_DEFAULT, t("menu_open"));
     n
 }
 

@@ -4,6 +4,7 @@
 use cfc_client::proto;
 
 use crate::format;
+use crate::i18n::{t, t_fmt};
 
 #[derive(Debug, Clone)]
 pub struct RuleEditor {
@@ -62,29 +63,32 @@ pub fn hidden_scope_summary(scope: &proto::RuleScope) -> String {
     let mut parts = Vec::new();
     if scope.has_direction {
         parts.push(
-            match proto::Direction::try_from(scope.direction) {
-                Ok(proto::Direction::Inbound) => "inbound",
-                Ok(proto::Direction::Outbound) => "outbound",
-                _ => "direction ?",
-            }
+            t(match proto::Direction::try_from(scope.direction) {
+                Ok(proto::Direction::Inbound) => "scope_inbound",
+                Ok(proto::Direction::Outbound) => "scope_outbound",
+                _ => "scope_direction_unknown",
+            })
             .to_string(),
         );
     }
     if !scope.src_net.is_empty() {
-        parts.push(format!("from {}", scope.src_net));
+        parts.push(t_fmt("scope_from", &[("net", &scope.src_net)]));
     }
     if scope.has_src_port {
-        parts.push(format!("src port {}", scope.src_port));
+        parts.push(t_fmt(
+            "scope_src_port",
+            &[("port", &scope.src_port.to_string())],
+        ));
     }
     if scope.has_uid {
-        parts.push(format!("uid {}", scope.uid));
+        parts.push(t_fmt("scope_uid", &[("uid", &scope.uid.to_string())]));
     }
     if !scope.parent_exe.is_empty() {
-        parts.push(format!("parent {}", scope.parent_exe));
+        parts.push(t_fmt("scope_parent", &[("exe", &scope.parent_exe)]));
     }
     if !scope.exe_sha256.is_empty() {
         let short: String = scope.exe_sha256.chars().take(12).collect();
-        parts.push(format!("sha256 {short}..."));
+        parts.push(t_fmt("scope_sha256", &[("digest", &short)]));
     }
     parts.join(", ")
 }
@@ -256,10 +260,17 @@ pub fn saved_rule_line(rule: &proto::RuleInfo) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let disabled = if rule.enabled { "" } else { ", disabled" };
-    format!(
-        "rule saved: {summary}, {}{disabled}",
-        convert::rule_duration_label(rule)
+    let key = if rule.enabled {
+        "log_rule_saved"
+    } else {
+        "log_rule_saved_disabled"
+    };
+    t_fmt(
+        key,
+        &[
+            ("summary", &summary),
+            ("duration", &format::duration_label(rule)),
+        ],
     )
 }
 
@@ -283,7 +294,7 @@ pub fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String
             ed.dst_port
                 .trim()
                 .parse::<u16>()
-                .map_err(|_| format!("\"{}\" is not a valid port", ed.dst_port))?,
+                .map_err(|_| t_fmt("error_port", &[("port", &ed.dst_port)]))?,
         )
     };
 
@@ -291,7 +302,7 @@ pub fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String
     if !dst_net.is_empty() {
         dst_net
             .parse::<ipnet::IpNet>()
-            .map_err(|e| format!("dst-net invalid: {e}"))?;
+            .map_err(|e| t_fmt("error_dst_net", &[("error", &e.to_string())]))?;
     }
 
     // The daemon rejects a persisted Once rule outright; catch it here so
@@ -300,24 +311,20 @@ pub fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String
         ed.duration,
         proto::Duration::Once | proto::Duration::Unspecified
     ) {
-        return Err("a saved rule needs \"Until restart\" or \"Always\"".into());
+        return Err(t("error_saved_duration").into());
     }
 
     if ed.duration == proto::Duration::Seconds
         && (ed.duration_seconds == 0 || ed.editing_id.is_none() || ed.prompt_id.is_some())
     {
-        return Err(
-            "only an existing timed rule with a positive lifetime can retain Seconds".into(),
-        );
+        return Err(t("error_timed").into());
     }
 
     if ed.prompt_hash_required
         && ed.action == proto::Action::Allow
         && ed.carried_scope.exe_sha256.is_empty()
     {
-        return Err(
-            "the prompted image could not be hashed; only a one-time Allow is available".into(),
-        );
+        return Err(t("error_hash_required").into());
     }
 
     // Need at least one scope predicate, else the rule would match
@@ -330,9 +337,7 @@ pub fn build_rule_from_editor(ed: &RuleEditor) -> Result<proto::RuleInfo, String
         && ed.protocol.is_none()
         && !hidden_scope_is_set(&ed.carried_scope);
     if scope_empty {
-        return Err(
-            "rule must restrict at least one of: exe, dst-host, dst-net, dst-port, protocol".into(),
-        );
+        return Err(t("error_scope_empty").into());
     }
 
     // Validate in the user's namespace as well as the daemon's: ProtectHome

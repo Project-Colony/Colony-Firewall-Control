@@ -9,6 +9,7 @@ use cfc_client::proto;
 use std::collections::HashMap;
 
 use crate::format;
+use crate::i18n::t;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Counts {
@@ -45,7 +46,7 @@ impl SessionStats {
 
         let app = match ev.process.as_ref() {
             Some(p) if !p.exe.is_empty() => p.exe.clone(),
-            _ => "unknown".to_string(),
+            _ => t("unknown").to_string(),
         };
         record_bounded(&mut self.apps, app, ev.verdict);
 
@@ -77,12 +78,12 @@ impl SessionStats {
 /// past row ten.
 const KEY_CAP: usize = 4096;
 
-/// The key everything past [`KEY_CAP`] is counted under.
+/// The key everything past [`KEY_CAP`] is counted under, "(other)".
 ///
 /// Visible on purpose: a top-ten table that silently dropped the tail would
 /// be lying about the totals. This way the folded remainder shows up as a row
 /// like any other.
-const OVERFLOW_KEY: &str = "(autres)";
+const OVERFLOW_KEY: &str = "stats_other";
 
 /// Counts `key`, folding into [`OVERFLOW_KEY`] once the table is full.
 ///
@@ -94,7 +95,7 @@ fn record_bounded(map: &mut HashMap<String, Counts>, key: String, verdict: i32) 
         return;
     }
     if map.len() >= KEY_CAP {
-        map.entry(OVERFLOW_KEY.to_string())
+        map.entry(t(OVERFLOW_KEY).to_string())
             .or_default()
             .record(verdict);
         return;
@@ -279,7 +280,7 @@ mod tests {
                 "the cap plus exactly one bucket for the remainder"
             );
             assert_eq!(
-                m.get(OVERFLOW_KEY).map(|c| c.total),
+                m.get(t(OVERFLOW_KEY)).map(|c| c.total),
                 Some(500),
                 "the folded tail must still be counted, not dropped"
             );

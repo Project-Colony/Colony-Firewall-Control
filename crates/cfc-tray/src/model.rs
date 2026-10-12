@@ -5,6 +5,8 @@
 use cfc_client::{proto, ClientError};
 use std::collections::HashMap;
 
+use crate::i18n::{t, t_fmt};
+
 /// At most one desktop notification per this many milliseconds, however
 /// fast prompts arrive. Only used by the generic (non-actionable)
 /// fallback path; actionable notifications are one-per-prompt by design.
@@ -33,14 +35,14 @@ pub const KEY_BLOCK: &str = "block";
 /// notify-rust reports dismissal/expiry as this pseudo-action key.
 pub const KEY_CLOSED: &str = "__closed";
 
-/// The pause durations offered by the submenu. `0` means "the daemon's
-/// configured default" ([pause] default_secs), matching the SetPaused
-/// contract.
+/// The pause durations offered by the submenu, as (label key, seconds). `0`
+/// means "the daemon's configured default" ([pause] default_secs), matching
+/// the SetPaused contract.
 pub const PAUSE_CHOICES: [(&str, u32); 4] = [
-    ("For 5 min", 300),
-    ("For 30 min", 1800),
-    ("For 1 h", 3600),
-    ("Daemon default", 0),
+    ("pause_5_min", 300),
+    ("pause_30_min", 1800),
+    ("pause_1_h", 3600),
+    ("pause_default", 0),
 ];
 
 /// What the last GetStatus poll saw.
@@ -86,30 +88,27 @@ pub struct MenuModel {
 /// The full [`ClientError`] messages are the authority; these are their
 /// one-menu-line abbreviations.
 pub fn unreachable_hint(err: &ClientError) -> String {
-    match err {
-        ClientError::SocketMissing { .. } => {
-            "daemon not running? (systemctl status colony-firewalld)".into()
-        }
-        ClientError::PermissionDenied { .. } => {
-            "no socket access - join the colony-firewall group".into()
-        }
-        ClientError::StaleSocket { .. } => "stale socket - restart colony-firewalld".into(),
-        ClientError::Connect { .. } | ClientError::Transport(_) => {
-            "connection failed - is colony-firewalld healthy?".into()
-        }
-        ClientError::Denied(_) => "read-only - restart the tray, or use sudo cfc".into(),
-        ClientError::Rpc(_) | ClientError::StreamClosed => "daemon answered with an error".into(),
-    }
+    t(match err {
+        ClientError::SocketMissing { .. } => "hint_socket_missing",
+        ClientError::PermissionDenied { .. } => "hint_permission_denied",
+        ClientError::StaleSocket { .. } => "hint_stale_socket",
+        ClientError::Connect { .. } | ClientError::Transport(_) => "hint_connect_failed",
+        ClientError::Denied(_) => "hint_read_only",
+        ClientError::Rpc(_) | ClientError::StreamClosed => "hint_rpc_error",
+    })
+    .into()
 }
 
 /// Notification body for a pause or resume the daemon did not carry out.
 /// A denial is the daemon's own reason (a dismissed password dialog, no
 /// polkit agent, a tray that must be restarted), which already says what to
 /// do; anything else is a plain failure.
-pub fn pause_failed_body(verb: &str, err: &ClientError) -> String {
-    match err {
-        ClientError::Denied(reason) => format!("Could not {verb} the firewall: {reason}"),
-        other => format!("Could not {verb} the firewall ({other})"),
+pub fn pause_failed_body(paused: bool, err: &ClientError) -> String {
+    match (paused, err) {
+        (true, ClientError::Denied(reason)) => t_fmt("pause_denied", &[("reason", reason)]),
+        (false, ClientError::Denied(reason)) => t_fmt("resume_denied", &[("reason", reason)]),
+        (true, other) => t_fmt("pause_failed", &[("error", &other.to_string())]),
+        (false, other) => t_fmt("resume_failed", &[("error", &other.to_string())]),
     }
 }
 
@@ -118,15 +117,15 @@ pub fn pause_failed_body(verb: &str, err: &ClientError) -> String {
 /// already says what to do, e.g. restart the tray after an upgrade.
 pub fn verdict_refused_body(err: &ClientError) -> Option<String> {
     match err {
-        ClientError::Denied(reason) => Some(format!("Your answer was not accepted: {reason}")),
+        ClientError::Denied(reason) => Some(t_fmt("verdict_refused", &[("reason", reason)])),
         _ => None,
     }
 }
 
 /// Shown once when this tray's binary was replaced on disk while it ran.
-pub const REPLACED_BODY: &str = "Colony Firewall was updated. Quit the tray from its menu and \
-     start it again, and restart the app: until then the firewall refuses their answers and \
-     changes.";
+pub fn replaced_body() -> String {
+    t("replaced_on_disk").into()
+}
 
 /// Whether `/proc/self/exe` (as read) names a file that was replaced or
 /// removed since this process started, which an upgrade does.
@@ -155,11 +154,11 @@ pub fn format_countdown(secs: i64) -> String {
 /// through the "Resume now" item either way.
 pub fn status_line(view: &DaemonView, now_unix_ms: i64) -> String {
     match view {
-        DaemonView::Connecting => "Connecting to colony-firewalld…".into(),
-        DaemonView::Unreachable { hint } => format!("Daemon unreachable: {hint}"),
+        DaemonView::Connecting => t("status_connecting").into(),
+        DaemonView::Unreachable { hint } => t_fmt("status_unreachable", &[("hint", hint)]),
         DaemonView::Reachable {
             enforcing: false, ..
-        } => "NOT enforcing - nft rule loaded?".into(),
+        } => t("status_not_enforcing").into(),
         DaemonView::Reachable {
             paused: true,
             resume_at_unix_ms,
@@ -167,15 +166,15 @@ pub fn status_line(view: &DaemonView, now_unix_ms: i64) -> String {
         } => {
             let remaining_ms = resume_at_unix_ms.saturating_sub(now_unix_ms);
             if *resume_at_unix_ms <= 0 || remaining_ms <= 0 {
-                "Paused".into()
+                t("status_paused").into()
             } else {
                 // Round up so a fresh 5-minute pause reads "5m 00s", not
                 // "4m 59s".
                 let secs = (remaining_ms + 999) / 1000;
-                format!("Paused - resumes in {}", format_countdown(secs))
+                t_fmt("status_paused_for", &[("time", &format_countdown(secs))])
             }
         }
-        DaemonView::Reachable { .. } => "Enforcing".into(),
+        DaemonView::Reachable { .. } => t("status_enforcing").into(),
     }
 }
 
@@ -186,8 +185,12 @@ pub fn prompts_line(view: &DaemonView) -> Option<String> {
             prompts_pending: n @ 1..,
             ..
         } => {
-            let noun = if *n == 1 { "prompt" } else { "prompts" };
-            Some(format!("{n} {noun} waiting"))
+            let key = if *n == 1 {
+                "status_prompt_waiting"
+            } else {
+                "status_prompts_waiting"
+            };
+            Some(t_fmt(key, &[("count", &n.to_string())]))
         }
         _ => None,
     }
@@ -282,13 +285,13 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
     let exe = ev.process.as_ref().map_or("", |p| p.exe.as_str());
     let name = match ev.process.as_ref() {
         Some(p) => cfc_client::convert::process_display(p),
-        None => "An unknown process".to_string(),
+        None => t("notify_unknown_process").to_string(),
     };
-    let summary = format!("{name} wants to connect");
+    let summary = t_fmt("notify_wants_to_connect", &[("name", &name)]);
     let target = match ev.connection.as_ref() {
         Some(c) => {
             let ip = if c.dst_ip.is_empty() {
-                "unknown"
+                t("notify_unknown_address")
             } else {
                 &c.dst_ip
             };
@@ -296,13 +299,13 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
                 ip.to_string()
             } else {
                 format!(
-                    "{} ({ip}; {} hostname)",
+                    "{} ({ip}; {})",
                     cfc_client::convert::display_safe(&c.dst_host),
-                    if c.dst_host_verified {
-                        "verified"
+                    t(if c.dst_host_verified {
+                        "notify_verified_hostname"
                     } else {
-                        "unverified"
-                    }
+                        "notify_unverified_hostname"
+                    })
                 )
             };
             format!(
@@ -311,7 +314,7 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
                 cfc_client::convert::protocol_label(c.protocol)
             )
         }
-        None => "an unknown destination".to_string(),
+        None => t("notify_unknown_destination").to_string(),
     };
     let mut body = target;
     if !exe.is_empty() {
@@ -319,7 +322,8 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
         body.push_str(&cfc_client::convert::display_safe(exe));
     }
     if cfc_client::convert::exe_is_rule_scopable(exe) {
-        body.push_str("\nAlways allow app covers all destinations until the rule is removed.");
+        body.push('\n');
+        body.push_str(t("notify_allow_covers_all"));
     }
     // Said before the buttons, because it changes what Allow means: the
     // daemon judged this path rewritable by a non-root user, so an Allow
@@ -327,20 +331,18 @@ pub fn prompt_notification(ev: &proto::PromptEvent, now_unix_ms: i64) -> PromptN
     // again instead of inheriting the access.
     if ev.binds_to_hash {
         body.push('\n');
-        body.push_str(
+        body.push_str(t(
             if ev.process.as_ref().is_some_and(|p| !p.sha256.is_empty()) {
-                "Allow will pin to this binary (user-writable path)"
+                "notify_pin_to_binary"
             } else {
-                "Image hash unavailable; persistent allow cannot be saved"
+                "notify_no_hash"
             },
-        );
+        ));
     }
     // Why a flow a rule may cover is asked about at all.
     if !ev.undecided_rule_id.is_empty() {
-        body.push_str(
-            "\nA rule may apply, but the program could not be fully identified; \
-             your answer applies to this connection.",
-        );
+        body.push('\n');
+        body.push_str(t("notify_undecided"));
     }
     let remaining = ev.deadline_unix_ms.saturating_sub(now_unix_ms);
     let timeout_ms = remaining.clamp(i64::from(MIN_PROMPT_TIMEOUT_MS), i64::from(u32::MAX)) as u32;
@@ -419,7 +421,7 @@ pub fn verdict_for(
 
 /// Body of the brief confirmation after "Block app always" succeeded.
 pub fn block_confirmation(exe: &str) -> String {
-    format!("Rule created: deny {} always", exe_display_name(exe))
+    t_fmt("confirm_deny_always", &[("name", &exe_display_name(exe))])
 }
 
 /// Said when the verdict applied but the standing rule did not get saved.
@@ -431,8 +433,8 @@ pub fn block_confirmation(exe: &str) -> String {
 pub fn rule_not_saved(exe: &str, why: Option<&str>) -> String {
     let name = exe_display_name(exe);
     match why {
-        Some(w) => format!("{name}: the answer applied, but no lasting rule was saved ({w})"),
-        None => format!("{name}: the answer applied, but no lasting rule was saved"),
+        Some(w) => t_fmt("rule_not_saved_why", &[("name", &name), ("reason", w)]),
+        None => t_fmt("rule_not_saved", &[("name", &name)]),
     }
 }
 
@@ -443,7 +445,7 @@ pub fn rule_not_saved(exe: &str, why: Option<&str>) -> String {
 /// so they know they will not be asked again, and so an accidental click is
 /// something they can see and undo rather than discover months later.
 pub fn allow_confirmation(exe: &str) -> String {
-    format!("Rule created: allow {} always", exe_display_name(exe))
+    t_fmt("confirm_allow_always", &[("name", &exe_display_name(exe))])
 }
 
 /// Said when a persisted choice fell back to a one-shot verdict because the
@@ -455,14 +457,11 @@ pub fn allow_confirmation(exe: &str) -> String {
 /// told the user a standing rule existed for a program the daemon could not
 /// even identify. The next prompt from it then looks like the firewall forgot.
 pub fn one_shot_fallback(choice: PromptChoice, exe: &str) -> String {
-    let applied = match choice {
-        PromptChoice::AllowAlways | PromptChoice::AllowOnce => "Allowed this time",
-        PromptChoice::BlockAlways | PromptChoice::DenyOnce => "Denied this time",
+    let key = match choice {
+        PromptChoice::AllowAlways | PromptChoice::AllowOnce => "fallback_allowed",
+        PromptChoice::BlockAlways | PromptChoice::DenyOnce => "fallback_denied",
     };
-    format!(
-        "{applied} - no rule can be pinned to {}, so you may be asked again",
-        exe_display_name(exe)
-    )
+    t_fmt(key, &[("name", &exe_display_name(exe))])
 }
 
 /// The basename, for a message meant to be read at a glance.
@@ -547,15 +546,15 @@ pub fn present_prompt(active_actionable: usize, overflowed: u64) -> PromptPresen
 
 /// Body of the collapsed overflow notification.
 pub fn overflow_body(count: u64) -> String {
-    let noun = if count == 1 {
-        "connection"
+    let key = if count == 1 {
+        "overflow_one"
     } else {
-        "connections"
+        "overflow_many"
     };
     // Not "open Colony Firewall to answer": a window opened now does not
     // receive prompts that are already pending, only one already running
     // has them.
-    format!("{count} more {noun} waiting. An open Colony Firewall window can answer them; otherwise the default applies when they time out.")
+    t_fmt(key, &[("count", &count.to_string())])
 }
 
 #[cfg(test)]
@@ -580,6 +579,7 @@ mod tests {
         assert!(bare.contains("no lasting rule"), "{bare}");
     }
     use super::*;
+    use crate::i18n::{set_locale, Locale};
     use std::path::PathBuf;
 
     fn reachable(
@@ -704,15 +704,21 @@ mod tests {
         for (err, needle) in cases {
             let hint = unreachable_hint(&err);
             assert!(hint.contains(needle), "{hint:?} should contain {needle:?}");
-            assert!(!hint.contains('\n'), "hint must be one line: {hint:?}");
-            assert!(hint.len() < 80, "hint must stay short: {hint:?}");
+            // The French menu line has to fit as well.
+            for locale in [Locale::En, Locale::Fr] {
+                set_locale(locale);
+                let hint = unreachable_hint(&err);
+                assert!(!hint.contains('\n'), "hint must be one line: {hint:?}");
+                assert!(hint.chars().count() < 80, "hint must stay short: {hint:?}");
+            }
+            set_locale(Locale::En);
         }
     }
 
     #[test]
     fn a_denied_pause_says_why() {
         let body = pause_failed_body(
-            "pause",
+            true,
             &ClientError::Denied(
                 "authorization dialog dismissed (polkit action org.projectcolony.firewall.pause)"
                     .into(),
@@ -723,7 +729,7 @@ mod tests {
             "Could not pause the firewall: authorization dialog dismissed \
              (polkit action org.projectcolony.firewall.pause)"
         );
-        let body = pause_failed_body("resume", &ClientError::StreamClosed);
+        let body = pause_failed_body(false, &ClientError::StreamClosed);
         assert!(
             body.starts_with("Could not resume the firewall ("),
             "{body}"
@@ -802,9 +808,9 @@ mod tests {
         // exactly one choice must use it.
         assert_eq!(PAUSE_CHOICES.iter().filter(|(_, s)| *s == 0).count(), 1);
         assert_eq!(PAUSE_CHOICES.len(), 4);
-        assert!(PAUSE_CHOICES.contains(&("For 5 min", 300)));
-        assert!(PAUSE_CHOICES.contains(&("For 30 min", 1800)));
-        assert!(PAUSE_CHOICES.contains(&("For 1 h", 3600)));
+        assert!(PAUSE_CHOICES.contains(&("pause_5_min", 300)));
+        assert!(PAUSE_CHOICES.contains(&("pause_30_min", 1800)));
+        assert!(PAUSE_CHOICES.contains(&("pause_1_h", 3600)));
     }
 
     // --- tooltip ------------------------------------------------------------

@@ -36,6 +36,9 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 - Headless CLI (`cfc`) for status, rule CRUD, live feed, prompts and log
 - System-tray companion (`colony-firewall-tray`): status at a glance,
   pending-prompt badge and notifications, quick pause/resume
+- The app and the tray speak English and French, following the system
+  language (`LC_ALL`, `LC_MESSAGES`, then `LANG`); `cfc` output stays in
+  English for scripts and logs
 - JSON export / import for backup and machine-to-machine sync
 - opensnitch JSON import for one-shot migration
 - Named profiles: relaxed / balanced / strict (in `daemon.toml`)
