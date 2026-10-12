@@ -5,7 +5,7 @@ mod filter;
 #[cfg(target_arch = "x86_64")]
 mod native;
 
-use crate::{output::OutputFormat, ApplicationsCmd};
+use crate::{commands::ApplicationsCmd, output::OutputFormat};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};

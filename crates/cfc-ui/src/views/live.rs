@@ -10,7 +10,8 @@ use iced::widget::{
 use iced::{Element, Length};
 use std::collections::VecDeque;
 
-use crate::{format, Message};
+use crate::app::Message;
+use crate::format;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictFilter {

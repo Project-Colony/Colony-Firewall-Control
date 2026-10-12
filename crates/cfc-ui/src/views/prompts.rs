@@ -13,7 +13,8 @@ use cfc_client::{convert, proto};
 use iced::widget::{button, column, container, progress_bar, row, scrollable, text, Space};
 use iced::{Element, Font, Length};
 
-use crate::{format, Message, PromptCard};
+use crate::app::{Message, PromptCard};
+use crate::format;
 
 /// Below this many seconds the countdown turns amber.
 const URGENT_SECS: i64 = 5;

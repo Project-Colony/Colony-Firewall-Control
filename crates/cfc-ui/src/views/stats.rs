@@ -5,8 +5,9 @@ use cfc_client::{convert, proto};
 use iced::widget::{column, container, row, scrollable, text, Space};
 use iced::{Element, Length};
 
+use crate::app::Message;
+use crate::format;
 use crate::session_stats::{Counts, SessionStats};
-use crate::{format, Message};
 
 const TOP_N: usize = 10;
 

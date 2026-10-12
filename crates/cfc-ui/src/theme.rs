@@ -71,7 +71,10 @@ pub fn card(_theme: &Theme) -> container::Style {
         },
         text_color: Some(PARCHMENT_TEXT),
         shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.05),
+            color: Color {
+                a: 0.05,
+                ..PARCHMENT_TEXT
+            },
             offset: Vector::new(0.0, 2.0),
             blur_radius: 4.0,
         },
@@ -170,12 +173,7 @@ pub fn panel(_theme: &Theme) -> container::Style {
 /// Full-width warning strip - "the daemon is running but not enforcing".
 pub fn banner_warn(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgba(
-            0xb8 as f32 / 255.0,
-            0x73 as f32 / 255.0,
-            0x33 as f32 / 255.0,
-            0.18,
-        ))),
+        background: Some(Background::Color(Color { a: 0.18, ..AMBER })),
         border: Border {
             color: AMBER,
             width: 1.0,
@@ -190,12 +188,10 @@ pub fn banner_warn(_theme: &Theme) -> container::Style {
 /// Full-width danger strip - enforcement is silently not happening.
 pub fn banner_err(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgba(
-            0x80 as f32 / 255.0,
-            0x1f as f32 / 255.0,
-            0x2c as f32 / 255.0,
-            0.14,
-        ))),
+        background: Some(Background::Color(Color {
+            a: 0.14,
+            ..BURGUNDY
+        })),
         border: Border {
             color: BURGUNDY,
             width: 1.0,
@@ -210,12 +206,10 @@ pub fn banner_err(_theme: &Theme) -> container::Style {
 /// Live-feed row tint for a blocked flow, so denies read at a glance.
 pub fn row_denied(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color::from_rgba(
-            0x80 as f32 / 255.0,
-            0x1f as f32 / 255.0,
-            0x2c as f32 / 255.0,
-            0.07,
-        ))),
+        background: Some(Background::Color(Color {
+            a: 0.07,
+            ..BURGUNDY
+        })),
         border: Border::default(),
         text_color: Some(PARCHMENT_TEXT),
         shadow: Shadow::default(),

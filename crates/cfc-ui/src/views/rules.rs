@@ -5,7 +5,9 @@ use iced::widget::{
 use iced::{Element, Length};
 use std::cmp::Ordering;
 
-use crate::{format, Message, RuleEditor, DELETE_CONFIRM_MS};
+use crate::app::{Message, DELETE_CONFIRM_MS};
+use crate::editor::{hidden_scope_is_set, hidden_scope_summary, RuleEditor};
+use crate::format;
 
 /// Which column the list is ordered by, and in which direction.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -407,11 +409,11 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     // This rule restricts more than the fields above can show. Saving keeps
     // those predicates, but the user should know they are there rather than
     // read the visible fields as the whole rule.
-    let carried: Element<'_, Message> = if crate::hidden_scope_is_set(&ed.carried_scope) {
+    let carried: Element<'_, Message> = if hidden_scope_is_set(&ed.carried_scope) {
         container(
             text(format!(
                 "also restricted to {} - kept on save, edit with cfc",
-                crate::hidden_scope_summary(&ed.carried_scope)
+                hidden_scope_summary(&ed.carried_scope)
             ))
             .size(11),
         )
