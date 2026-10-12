@@ -1,4 +1,4 @@
-# Kernel-side crate. Deliberately its OWN cargo workspace (note the empty
+# Kernel-side crate. Deliberately its OWN cargo workspace (note the
 # `[workspace]` table at the bottom) so that:
 #
 #   * `cargo build --workspace` / `cargo clippy --workspace` / the MSRV check at
@@ -28,11 +28,8 @@ description = "Colony Firewall Control - eBPF programs (exec/exit tracking and D
 publish = false
 
 [dependencies]
-aya-ebpf = "0.2.1"
-# `default-features = false` drops the `std` feature, turning the shared crate
-# into `#![no_std]`. Same source file, same layout constants, same parsers as
-# the userspace side -- that is the whole point.
-cfc-ebpf-proto = { path = "../cfc-ebpf-proto", default-features = false }
+aya-ebpf = { workspace = true }
+cfc-ebpf-proto = { workspace = true }
 
 [[bin]]
 name = "cfc-ebpf"
@@ -60,3 +57,10 @@ overflow-checks = false
 # NOTE: never set `strip` here; it would remove .BTF.
 
 [workspace]
+
+[workspace.dependencies]
+aya-ebpf = "0.2.1"
+# `default-features = false` drops the `std` feature, turning the shared crate
+# into `#![no_std]`. Same source file, same layout constants, same parsers as
+# the userspace side -- that is the whole point.
+cfc-ebpf-proto = { path = "../cfc-ebpf-proto", default-features = false }

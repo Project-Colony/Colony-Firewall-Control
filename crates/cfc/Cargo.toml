@@ -14,18 +14,16 @@ path = "src/main.rs"
 
 [dependencies]
 sha2 = { workspace = true }
-cfc-core = { path = "../cfc-core" }
-cfc-proto = { path = "../cfc-proto" }
-cfc-client = { path = "../cfc-client" }
+cfc-core = { workspace = true }
+cfc-proto = { workspace = true }
+cfc-client = { workspace = true }
 
 tokio = { workspace = true }
 tonic = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
-# Completion + man generation live behind hidden subcommands so packaging
-# can produce them from the freshly built binary (see packaging/arch/PKGBUILD).
-clap_complete = "4.6"
-clap_mangen = "0.3"
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 # Raw-mode single-keypress reads for `cfc prompts`. libc is already in the
