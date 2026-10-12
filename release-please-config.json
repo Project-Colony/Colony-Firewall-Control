@@ -1,0 +1,71 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false,
+      "draft": false,
+      "prerelease": false,
+      "bump-minor-pre-major": false,
+      "changelog-sections": [
+        {
+          "type": "feat",
+          "section": "Features"
+        },
+        {
+          "type": "fix",
+          "section": "Fixes"
+        },
+        {
+          "type": "perf",
+          "section": "Performance"
+        },
+        {
+          "type": "refactor",
+          "section": "Internals"
+        },
+        {
+          "type": "docs",
+          "section": "Documentation"
+        },
+        {
+          "type": "chore",
+          "section": "Chores",
+          "hidden": true
+        },
+        {
+          "type": "test",
+          "section": "Tests",
+          "hidden": true
+        },
+        {
+          "type": "ci",
+          "section": "CI",
+          "hidden": true
+        }
+      ],
+      "extra-files": [
+        "Cargo.toml",
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='cfc' || @.name.value=='cfc-client' || @.name.value=='cfc-core' || @.name.value=='cfc-daemon' || @.name.value=='cfc-ebpf-proto' || @.name.value=='cfc-proto' || @.name.value=='cfc-tray' || @.name.value=='cfc-ui' || @.name.value=='cfc-xtask')].version"
+        },
+        {
+          "type": "toml",
+          "path": "crates/cfc-ebpf/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='cfc-ebpf-proto')].version"
+        },
+        "packaging/arch/PKGBUILD",
+        "packaging/rpm/colony-firewall-control.spec",
+        {
+          "type": "json",
+          "path": "packaging/tarball-manifest.json",
+          "jsonpath": "$.version"
+        }
+      ]
+    }
+  },
+  "pull-request-header": "The next release, assembled from the commits since the last one. Merging this tags it, and the tag is what builds and publishes."
+}

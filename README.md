@@ -1,20 +1,71 @@
+<div align="center">
+
 # Colony Firewall Control
 
-Application-aware outbound firewall for Linux, written in Rust.
+**An outbound firewall for Linux desktops and servers that asks before a program reaches the network, and remembers the answer.**
 
-A Colony-flavored port of [opensnitch](https://github.com/evilsocket/opensnitch)
-from Go/Python to Rust, with an [iced](https://iced.rs/) UI matching the
-Colony app aesthetic (parchment + burgundy).
+</div>
 
-## Why
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![Colony app](https://img.shields.io/badge/Colony-security-purple)](https://github.com/Project-Colony/Colony)
+[![Platforms](https://img.shields.io/badge/platforms-linux-lightgrey)](#installation)
 
-The Linux desktop has no built-in outbound firewall with per-application
-prompts. The closest equivalent of [Windows Firewall Control](https://www.malwarebytes.com/windows-firewall-control)
-is opensnitch, which works but ships a Go daemon plus a 200 MB PyQt5 GUI.
-Colony Firewall Control gives you the same model in a single Rust workspace:
-NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
+Linux ships no outbound firewall that works per program: ufw, firewalld and
+plain nftables decide by address and port, so a browser and a payload phoning
+home on port 443 look the same to them, and opensnitch, the closest
+equivalent of Windows Firewall Control, needs a Go daemon plus a 200 MB PyQt5
+GUI. Colony Firewall Control is a Rust port of the opensnitch model: the
+kernel queues every new connection, a root daemon decides it from rules that
+name the program, and an [iced](https://iced.rs/) app, a tray icon or the
+terminal asks you about the rest.
 
-## Features
+> **Status:** the daemon, the app, the tray and the `cfc` CLI cover outbound
+> filtering end to end, and opt-in inbound filtering. CI tests real packet
+> verdicts on a live NFQUEUE in a network namespace, loads the eBPF layer on
+> several kernels and installs the RPM end to end on Fedora; the app and the
+> tray are covered by unit tests only. Nothing is published on the AUR yet: use the
+> release tarball or build the PKGBUILD each release carries. The copy Colony
+> installs is a read-only monitor (see [Via Colony](#via-colony-recommended)).
+> Explicit application confinement is experimental. Releases after 0.8.0 are
+> signed with the organisation key.
+
+## Why Colony Firewall Control
+
+- **Rules name programs, not just ports.** A rule names the executable that
+  connects, checked against the image actually running, so allowing a
+  browser on 443 does not allow everything else on 443. An Allow rule that
+  names no program takes an administrator password.
+- **One Rust workspace instead of Go plus PyQt.** The daemon, the app, the
+  tray and `cfc` share one gRPC schema over a Unix socket, and the root
+  daemon that parses untrusted packets is memory-safe.
+- **Headless machines are first class.** `sudo cfc prompts` answers prompts
+  over SSH, and every command takes `--json`.
+- **It fails closed, and says so.** With the daemon down, new non-loopback
+  connections drop instead of passing, and `cfc status` and the app say when
+  nothing is being enforced.
+
+```
++----------------------------+     +----------------+
+|  cfc-ui   (iced, user)     |     |  cfc (tty)     |
+|   pop-ups, rules editor    |     |   status, rules|
+|   live feed, stats         |     |   prompts, log |
++------------+---------------+     +-------+--------+
+             |                             |
+             | tonic gRPC over UDS, 0660 root:colony-firewall
+             |   (peer credentials checked per RPC)
+             v                             v
++--------------------------------------------------+
+|  cfc-daemon  (systemd, root)                      |
+|   - NFQUEUE intercept, out-of-order verdicts      |
+|   - process resolution (sock_diag + /proc, cached)|
+|   - decision engine (deterministic precedence)    |
+|   - reject injection (TCP RST / ICMP unreachable) |
+|   - sqlite: rules + event log                     |
+|   - prompt router (sync NFQ <-> async clients)    |
++--------------------------------------------------+
+```
+
+## What it does
 
 - Per-application outbound filtering with NFQUEUE intercept
 - Live pop-ups for unknown connections, persistent rules for known ones
@@ -48,593 +99,155 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
   observations never supply policy identity
 - Memory-safe Rust top to bottom for a root daemon parsing untrusted packets
 
-## Architecture
+## Installation
 
-```
-+----------------------------+     +----------------+
-|  cfc-ui   (iced, user)     |     |  cfc-cli (tty) |
-|   pop-ups, rules editor    |     |   status, rules|
-|   live feed, stats         |     |   prompts, log |
-+------------+---------------+     +-------+--------+
-             |                             |
-             | tonic gRPC over UDS, 0660 root:colony-firewall
-             |   (peer credentials checked per RPC)
-             v                             v
-+--------------------------------------------------+
-|  cfc-daemon  (systemd, root)                      |
-|   - NFQUEUE intercept, out-of-order verdicts      |
-|   - process resolution (sock_diag + /proc, cached)|
-|   - decision engine (deterministic precedence)    |
-|   - reject injection (TCP RST / ICMP unreachable) |
-|   - sqlite: rules + event log                     |
-|   - prompt router (sync NFQ <-> async clients)    |
-+--------------------------------------------------+
-```
+### Via Colony (recommended)
 
-Ten crates: nine workspace members, plus the kernel-side `cfc-ebpf`, which
-is its own workspace (pinned nightly + bpf-linker, built by `cargo xtask
-build-ebpf`) so stable builds never see it:
+Search for **Colony Firewall Control** in
+[Colony](https://github.com/Project-Colony/Colony) (category Security) and
+install it. Colony installs the app for your user and keeps it updated.
 
-| Crate             | Role                                                                       |
-|-------------------|----------------------------------------------------------------------------|
-| `cfc-core`        | Shared types and rule matching: `Rule`, `Verdict`, `Connection`, `Process` |
-| `cfc-proto`       | gRPC schema (tonic + tonic-prost)                                          |
-| `cfc-client`      | Shared UDS gRPC client wrapper                                             |
-| `cfc-daemon`      | Privileged daemon                                                          |
-| `cfc-ui`          | iced GUI                                                                   |
-| `cfc-cli`         | Terminal control tool                                                      |
-| `cfc-tray`        | System-tray companion (StatusNotifierItem)                                 |
-| `cfc-ebpf-common` | POD types and pure parsers shared by eBPF and userspace                    |
-| `cfc-ebpf`        | Kernel-side programs of the optional eBPF backend                          |
-| `xtask`           | Build automation (eBPF object build)                                       |
+A firewall also needs parts that Colony, which runs nothing as root, cannot
+install: the daemon, its systemd units, the nftables ruleset, the
+`colony-firewall` group and the polkit policy. Install those from the
+[release tarball](#direct-binary-download), the
+[Arch recipe](#arch-linux-aur) or a [source build](#build-from-source), then
+follow [First run](docs/guide/first-run.md#first-run). The copy Colony
+installs is a read-only monitor: it shows the status, prompts, rules and
+live traffic, but the daemon accepts changes only from the root-owned
+`/usr/bin/colony-firewall` and `/usr/bin/colony-firewall-tray` that the
+packages install, and the app shows the daemon's reason when it refuses one.
 
-More docs:
+### Arch Linux (AUR)
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) - process model, packet
-  flow, threading
-- [docs/HARDENING.md](docs/HARDENING.md) - moving to a locked-down
-  profile, the socket trust model, the audit trail
-- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) - lockout recovery,
-  no-network debugging, socket permissions, fail-open vs fail-closed
-- [docs/ROADMAP.md](docs/ROADMAP.md) - full phase checklist
-
-## Install
-
-### Arch Linux
-
-Not on the AUR yet. Two recipes ship in `pkg/`; the `-git` one works
-today, without a published release:
+Not published on the AUR yet. Each release carries the recipe CI built
+against its tag, with the real source checksum (`PKGBUILD` and `SRCINFO`);
+[packaging/README.md](packaging/README.md#arch-linux-aur) shows how to build
+it. From a checkout, the `-git` recipe builds the current source:
 
 ```sh
 build=$(mktemp -d)
-cp pkg/PKGBUILD-git "$build"/PKGBUILD
-cp pkg/colony-firewall-control.install "$build"/
+cp packaging/arch/PKGBUILD-git "$build"/PKGBUILD
+cp packaging/arch/colony-firewall-control.install "$build"/
 cd "$build" && makepkg -si
 ```
-
-`pkg/PKGBUILD` is the AUR release recipe instead: it builds from the
-`v$pkgver` GitHub tag tarball, so it only resolves once that tag is
-pushed, and its checksums have to be filled in with `updpkgsums` first.
-See [pkg/README.md](pkg/README.md) for the submission procedure.
 
 Either package installs everything except the eBPF object - the three
 units, the sysusers fragment, both nftables rulesets and the inbound
 lockout guard, the polkit policy, the desktop entries and icon,
 completions and man pages - and prints the first-run steps on install.
 Without the object the daemon runs on `sock_diag` + `/proc`; the release
-tarball ships it, see [pkg/README.md](pkg/README.md#release-tarball).
+tarball ships it, see [packaging/README.md](packaging/README.md#release-tarball).
 
-### Manual
+### Direct binary download
 
-```sh
-cargo build --workspace --release
+Grab the assets from the [latest release](../../releases/latest):
 
-# Binaries
-sudo install -Dm755 target/release/colony-firewalld /usr/bin/colony-firewalld
-sudo install -Dm755 target/release/colony-firewall  /usr/bin/colony-firewall
-sudo install -Dm755 target/release/cfc              /usr/bin/cfc
-sudo install -Dm755 target/release/colony-firewall-tray /usr/bin/colony-firewall-tray
+| Asset | What it is |
+|---|---|
+| `colony-firewall-control-<V>-linux-x86_64.tar.zst` | everything: the daemon, the app, the tray, `cfc`, the units, the eBPF object and an `install.sh` |
+| `colony-firewall-control-linux` | the app alone, x86_64; the file Colony installs |
+| `PKGBUILD`, `SRCINFO` | the Arch recipe for this release |
+| `SHA256SUMS` | sha256 of the tarball and of the app |
 
-# All units. colony-firewall-nft.service is what First run step 1
-# enables; without it that step fails with "Unit ... not found".
-sudo install -Dm644 systemd/colony-firewalld.service \
-     /usr/lib/systemd/system/colony-firewalld.service
-sudo install -Dm644 systemd/colony-firewall-nft.service \
-     /usr/lib/systemd/system/colony-firewall-nft.service
-sudo install -Dm644 systemd/colony-firewall-nft-inbound.service \
-     /usr/lib/systemd/system/colony-firewall-nft-inbound.service
-
-# The ruleset colony-firewall-nft.service loads. The unit hardcodes this
-# path, so it is not optional either.
-sudo install -Dm644 systemd/nftables-snippet.conf \
-     /usr/share/colony-firewall/nftables-snippet.conf
-sudo install -Dm644 systemd/nftables-inbound.conf \
-     /usr/share/colony-firewall/nftables-inbound.conf
-sudo install -Dm755 scripts/inbound-lockout-guard.sh \
-     /usr/lib/colony-firewall/inbound-lockout-guard.sh
-
-# Config, and the group that gates the control socket
-sudo install -Dm644 systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
-sudo install -Dm644 systemd/colony-firewall.sysusers \
-     /usr/lib/sysusers.d/colony-firewall.conf
-sudo systemd-sysusers
-
-# Desktop integration: launcher, autostart entry (so prompts reach you in
-# every session) and icon. Skip on a headless box.
-sudo install -Dm644 pkg/colony-firewall.desktop \
-     /usr/share/applications/colony-firewall.desktop
-sudo install -Dm644 pkg/colony-firewall-autostart.desktop \
-     /etc/xdg/autostart/colony-firewall.desktop
-sudo install -Dm644 pkg/colony-firewall.svg \
-     /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg
-sudo install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
-     /etc/xdg/autostart/colony-firewall-tray.desktop
-
-# polkit actions the daemon asks about when the app or tray pauses,
-# resumes, imports rules or saves an Allow rule that names no program.
-# Without it those requests are refused (see Who can change what).
-sudo install -Dm644 pkg/org.projectcolony.firewall.policy \
-     /usr/share/polkit-1/actions/org.projectcolony.firewall.policy
-
-# Shell completions and man pages, generated by the binary itself
-target/release/cfc completions bash | sudo install -Dm644 /dev/stdin \
-     /usr/share/bash-completion/completions/cfc
-target/release/cfc completions zsh | sudo install -Dm644 /dev/stdin \
-     /usr/share/zsh/site-functions/_cfc
-target/release/cfc completions fish | sudo install -Dm644 /dev/stdin \
-     /usr/share/fish/vendor_completions.d/cfc.fish
-sudo target/release/cfc man --dir /usr/share/man/man1
-
-# Optional: the eBPF object. Building it needs the pinned nightly and
-# bpf-linker (see crates/cfc-ebpf/README.md); without it the daemon runs on
-# sock_diag + /proc.
-cargo xtask build-ebpf
-sudo install -Dm644 "$(cargo xtask ebpf-path)" \
-     /usr/lib/colony-firewall/cfc-ebpf.o
-
-sudo systemctl daemon-reload
-
-# The control socket is root:colony-firewall 0660. Join the group, then
-# log out and back in, or the GUI, the tray and cfc get "permission denied".
-# Membership gives read access and lets the installed app and tray connect;
-# changes come from those two or from sudo cfc (see Who can change what).
-sudo usermod -aG colony-firewall "$USER"
-```
-
-On RHEL, Rocky, AlmaLinux or Fedora, where SELinux is enforcing, also load
-the policy module from [packaging/selinux](packaging/selinux/README.md)
-before the first start: without it the daemon cannot bind NFQUEUE.
-
-Enable the installed daemon and enforcement in First run below.
-
-## First run
-
-A fresh install has **zero rules**: once enforcement is on, every new
-remote outbound connection prompts (or falls back to the profile default). Do
-these three things, in order:
-
-**1. Enable enforcement persistently.** A companion unit loads the
-nftables ruleset at boot and removes it on stop:
+Check a download as described under [Code signing policy](#code-signing-policy),
+then install the tarball as root:
 
 ```sh
-sudo systemctl enable --now colony-firewalld.service colony-firewall-nft.service
+tar --zstd -xf colony-firewall-control-<V>-linux-x86_64.tar.zst
+cd colony-firewall-control-<V>-linux-x86_64
+sudo ./install.sh      # then First run
 ```
 
-Applying the snippet by hand does **not** create the boot dependencies:
+`sudo ./uninstall.sh` from the same directory removes it again. What the
+tarball contains and how its scripts are generated:
+[packaging/README.md](packaging/README.md#release-tarball).
+
+### Build from source
 
 ```sh
-sudo nft -f /usr/share/colony-firewall/nftables-snippet.conf   # installed
-sudo nft -f systemd/nftables-snippet.conf                      # from a checkout
+git clone https://github.com/Project-Colony/Colony-Firewall-Control
+cd Colony-Firewall-Control
+cargo build --workspace --release --locked
 ```
 
-**2. Seed the starter rules** so always-on system services keep working
-without prompting:
+Requires Rust 1.89 or newer and `protobuf-compiler`. Installing the build by
+hand (binaries, units, nftables ruleset, group, polkit policy) is in
+[docs/guide/first-run.md](docs/guide/first-run.md#manual-install); building
+and testing for development is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
-```sh
-sudo cfc rules bootstrap-defaults   # same as: cfc rules bundle add system
+## Documentation
+
+Full documentation is in [docs/](docs/). Start at
+[docs/README.md](docs/README.md): first run, the CLI, profiles, hardening,
+troubleshooting and the architecture.
+
+## Code signing policy
+
+Every release asset is signed by the Project Colony organisation in CI, never on
+a developer machine. Next to each asset on the release page:
+
+| File | What it is |
+|---|---|
+| `<asset>.sig` | an ed25519 signature over the asset, made with the organisation's release key |
+| `<asset>.meta` | three lines binding the asset to its file name, its sha256 and the release version |
+| `<asset>.meta.sig` | an ed25519 signature over the `.meta` |
+
+The private key is an organisation secret, used only by the shared
+[sign-and-publish workflow](https://github.com/Project-Colony/Project-Colony-Resources/blob/main/.github/workflows/sign-and-publish.yml)
+in a job that builds nothing; the jobs that compile Colony Firewall Control
+never see it. Colony checks all three files before it installs or updates
+Colony Firewall Control, and refuses a release older than the one installed.
+To check a download yourself with OpenSSL 3 (the same commands work for every
+asset):
+
+```bash
+cat > colony-release.pub <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEARNjg3Nn8H6/aBg1unwGjkUTcrdTxERNefVaqU8cFu0s=
+-----END PUBLIC KEY-----
+EOF
+a=colony-firewall-control-linux
+openssl pkeyutl -verify -pubin -inkey colony-release.pub -rawin -in "$a" -sigfile "$a.sig"
+openssl pkeyutl -verify -pubin -inkey colony-release.pub -rawin -in "$a.meta" -sigfile "$a.meta.sig"
+cat "$a.meta"     # version=<tag>, asset=<file name>, sha256=<digest>
+sha256sum "$a"    # the digest must equal the sha256 line
 ```
 
-(`sudo` because `cfc` run as a regular user is read-only: it can show status,
-rules and the logs, but only root, or the installed Colony Firewall app and
-tray, can change the firewall.)
-
-This installs twelve allow rules - systemd-resolved DNS (:53),
-systemd-timesyncd and chronyd NTP (:123/udp), the DHCP clients (dhcpcd,
-NetworkManager and systemd-networkd, :67 and :547/udp), pacman and paru
-HTTPS mirrors (:443/tcp), and the SSH client (:22/tcp) - and is
-idempotent (rules it installed are skipped, as are identical same-named
-rules seeded before 0.7.0, which `bundle remove` also removes; a different rule with one of its names stops it
-before anything changes; `--dry-run` previews). **Do not skip this step.** No profile allows unmatched remote flows
-on its own. With no rules and no UI connected, unmatched queued remote
-connections are denied. Filtering starts before the network is configured
-(see below), and these rules keep DHCP, DNS and NTP usable.
-
-For everything else, there are bundles:
-
-```sh
-cfc rules bundle list                 # what there is, and what applies here
-cfc rules bundle add web --dry-run    # preview
-sudo cfc rules bundle add web         # installed browsers -> 443 and 80
-sudo cfc rules bundle add dev         # git, ssh, cargo, docker/podman
-sudo cfc rules bundle add updates     # apt, dnf, flatpak, yay
-sudo cfc rules bundle remove web      # exactly the rules that bundle owns
-```
-
-Two properties worth knowing. **Every rule names an executable** - there
-is no way to write "allow tcp/443" here, because a payload phoning home
-uses 443 exactly like a browser does and a port-shaped rule cannot tell
-them apart. And entries whose program is not installed on this machine
-are **skipped and reported**, so "4 added, 8 skipped" is the normal
-outcome of `bundle add web` on a box with two browsers. Each rule names the
-binary that actually connects, never a launcher script, so tools where only
-an interpreter connects (npm, pip) have no bundle entry.
-
-**3. Give prompts somewhere to go.** On a desktop, launch the GUI:
-
-```sh
-colony-firewall
-```
-
-On a headless machine, answer them from the terminal instead:
-
-```sh
-sudo cfc prompts
-```
-
-With no subscriber at all the daemon applies `no_ui_action` to unmatched
-remote flows without asking anyone. **That is a denial under every
-profile.** "Nobody is connected" is a permanent condition on a headless
-box, not a passing one, and answering it with an allow would mean those
-hosts had no outbound firewall whatsoever. Stored rules are what such a
-machine runs on; `sudo cfc prompts` is how you add more without a GUI. A
-`cfc prompts` without sudo only watches: the daemon neither counts it as a UI
-nor accepts its answers.
-
-This does not refuse inbound SSH: the ruleset hooks `output` on
-`ct state new` only, so an inbound SSH session's replies are
-`ct state established` and are never queued. Outbound lookups the login
-itself makes (reverse DNS, LDAP or Kerberos from `sshd`'s PAM stack) are
-new flows and are judged like any other; see
-[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out).
-
-**Boot behaviour.** The nft units load independently before the daemon,
-`network-pre.target`, NetworkManager and systemd-networkd, after the
-distribution's `nftables.service` when it is in the same boot transaction.
-Enabling enforcement creates native requirements from those two network
-managers: a failed nft load blocks their startup. A failed daemon start leaves
-the loaded tables dropping new flows. The daemon also requires the outbound
-table before initialization. Tables survive daemon stops and restarts; to
-remove one, `sudo systemctl disable --now` its nft unit (a plain stop also
-stops the network managers that require it). Inbound stays opt-in. Its lockout
-guard reads saved SQLite rules without a running daemon. With inbound
-enabled, ping and other ICMP requests need a rule like any other inbound
-flow, so allow your monitoring hosts:
-`sudo cfc rules add --direction in --action allow --protocol icmp --src-net <monitor> --name monitoring`.
-
-This contract covers systemd-managed NetworkManager and systemd-networkd
-after enforcement is enabled. It does not cover networking configured in an
-initramfs, interfaces already configured before these units, other network
-managers, or a later external ruleset flush. Early unmatched flows use
-`no_ui_action`; bootstrap DHCP/DNS/NTP rules keep strict configurations usable.
-
-**Scope.** Normal mode decides new tracked IP flows from socket attribution;
-established and related traffic retains its connection-wide authorization.
-With inbound filtering off (the default) a connection a remote peer opens is
-never judged at all, so a program that outbound rules deny still answers on
-any port it listens on.
-Passed or inherited sockets are not reauthorized for each sending executable.
-A current descriptor holder does not prove which process sent a packet.
-While the daemon runs, new direct loopback flows follow explicit rules;
-unmatched local IPC is allowed without prompting. While no daemon listens on
-the queue, new loopback flows are allowed (`queue ... bypass` on `lo` only), so
-local services keep working; resolving names that are not cached still needs
-the daemon. An allowed local resolver or proxy can still relay remote
-traffic. CFC cannot establish the originating application's identity from
-remote flows delegated through local brokers, including AF_UNIX and D-Bus.
-
-Applications with `CAP_NET_RAW` can use AF_PACKET outside the `inet OUTPUT`
-hook. Raw IP packets can also coincide with another socket's tuple; socket
-attribution does not prove their origin. Use explicit application confinement
-or OS containment for those cases. Docker grants `CAP_NET_RAW` to containers
-by default, so a `--network=host` container has it; drop it with
-`--cap-drop NET_RAW` for workloads CFC should govern.
-
-Executables over 64 MiB (Chromium, Electron apps, VS Code) are never hashed.
-A hash-pinned rule naming one cannot be decided, so its flows are prompted
-(or take `no_ui_action` with no UI connected), and outside a root-owned
-path an "Allow always" for one cannot be saved, so it prompts for every new
-flow. See [docs/HARDENING.md](docs/HARDENING.md#rule-design-principles).
-The complete list of non-goals is in
-[docs/HARDENING.md](docs/HARDENING.md#what-this-firewall-does-not-protect-against).
-
-Fast Allow was removed: a socket mark cannot prove which process sends, so it
-opened bypasses. The old `[ebpf] fast_allow` and `fast_allow_mark` keys are
-ignored with a warning, and allowed flows use the normal NFQUEUE path.
-
-Then confirm it is really filtering:
-
-```sh
-cfc status     # "enforcing yes", and it warns on stderr when it is not
-```
-
-> **WARNING - remote / SSH machines:** the shipped nftables snippet is
-> fail-closed for everything except new loopback flows, which are allowed
-> while no daemon listens. If the daemon is down while the rule is loaded,
-> **all new non-loopback outbound connections drop**. Inbound SSH still
-> connects, but a login that needs the network (LDAP, Kerberos, reverse DNS)
-> can fail, and the opt-in inbound table drops new SSH sessions outright
-> while the daemon is down. Read
-> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out) -
-> specifically the dead-man's switch - *before* enabling enforcement
-> remotely.
-
-### Explicit application confinement
-
-**Experimental.** This mode is new in 0.7.0, has not been externally
-audited, and its interface and platform requirements may change.
-
-`cfc applications run` starts a separate, headless application tree with an
-empty network permission list. Administrators may approve exact numeric peer
-addresses with `--allow IP`. Permissions apply to the entire tree across
-TCP/UDP ports; ordinary CFC rules can additionally restrict new connections.
-Changing permissions requires stopping the complete tree and launching a fresh
-one. This first interface does not provide live grant changes or GUI prompts
-for the native tree filter.
-
-The initial supported platform is x86_64 Linux with cgroup v2, systemd 262 or
-newer, a working system D-Bus, Bubblewrap 0.13.0 or newer, and libbpf-backed
-interface filtering. CFC verifies actual IP/interface BPF attachments, their
-policy maps and synthetic decisions before starting the application. Missing
-support or failed verification refuses the launch: the launcher reports
-status 125 and the reason is in `journalctl -u cfc-app-ID.service`. Local routes through `lo`
-remain blocked even when an approved address later belongs to the host.
-
-Prepare an administrator-owned runtime containing the executable and all its
-dependencies as regular files and directories. Every entry must be owned by
-root and must not be writable by another account. Symlinks, special files and
-nested mounts are rejected. The runtime must contain empty `dev`, `proc`,
-`sys`, `tmp`, `run` and `home` directories. For a statically linked program:
-
-```sh
-sudo install -d -m755 /var/lib/colony-firewall/runtimes/example/{app,dev,proc,sys,tmp,run,home}
-sudo install -m755 /path/to/static-program /var/lib/colony-firewall/runtimes/example/app/program
-sudo cfc applications run --runtime /var/lib/colony-firewall/runtimes/example -- /app/program
-```
-
-Covering mounts must use a supported local filesystem: ext2/3/4, XFS, Btrfs,
-F2FS, tmpfs, ramfs/rootfs, SquashFS or EROFS. FUSE, network filesystems and
-overlay mounts are rejected because ownership metadata alone cannot exclude
-an external filesystem broker or concealed lower storage.
-
-To approve a peer, repeat the launch with `--allow IP` before `--`; repeat the
-flag for additional peers. The launcher prints the tree identity. Use
-`sudo cfc applications stop ID` to terminate it from another terminal, or
-Ctrl-C in the launching terminal; closing that terminal or losing its SSH
-session also stops the tree. A launcher killed outright (SIGKILL) cannot
-clean up: the tree keeps running until `cfc applications stop ID`.
-
-Each active tree receives a reserved host UID and private PID, mount, user,
-IPC, UTS and cgroup namespaces. Its writable state is private and its runtime
-is read-only. The application runs as PID 1 in its private PID namespace and
-must reap its own children; CFC stops the entire tree on revocation. Inherited
-descriptors and environment are removed; all three
-standard streams are `/dev/null`. There are no host desktop, D-Bus, audio,
-shared-home or output brokers. This mode therefore suits unattended local
-workloads; programs requiring those services need an explicitly designed
-broker before they can use it.
-
-This mode protects explicitly launched trees. It does not change normal-mode
-socket attribution or revoke established flows when an ordinary rule is
-edited. Stop the tree to revoke its permissions. Approving a peer approves
-that endpoint, including any remote relay it provides. Trusted host root,
-the operating system and kernel vulnerabilities are outside this boundary.
-
-The tree shares the host network namespace. An approved peer may also
-connect in to anything the tree listens on, a listener takes the port from
-the whole host, and `/proc/net` shows the host's sockets and connections.
-Nor is the tree resource-isolated: memory, including its tmpfs directories,
-is not capped, and only systemd's default `TasksMax` bounds its processes.
-
-## Quick start
-
-Open the GUI:
-
-```sh
-colony-firewall
-```
-
-Or drive everything from the CLI:
-
-```sh
-# Status: version, uptime, whether it is actually enforcing, policy
-cfc status
-
-# Answer prompts from this terminal - no GUI needed.
-# a=allow d=deny r=reject s=skip q=quit, then duration and scope.
-sudo cfc prompts
-
-# Add a rule from the command line (changes need sudo; reading does not)
-sudo cfc rules add --action allow --exe /usr/bin/curl --dst-port 443 --name curl-https
-
-# Rules take an id, a unique id prefix, or the rule's name
-cfc rules show curl-https
-sudo cfc rules disable 3f2a
-
-# Watch traffic decisions in real time (colorized), with filters
-cfc live --denied
-cfc live --exe firefox --follow
-
-# What has this machine been talking to?
-cfc log --since 24h
-cfc log --exe firefox --action deny
-
-# Pause enforcement for a bounded window (the daemon auto-resumes).
-# From the app or tray, Pause asks for an administrator password instead.
-sudo cfc pause --for 30m
-sudo cfc resume
-
-# Back up rules
-cfc rules export --out rules.json
-
-# Migrate from an existing opensnitch install. A rule with no equivalent
-# here (hostname, regexp) stops it; --skip-unconvertible imports the rest.
-sudo cfc rules import-opensnitch /etc/opensnitchd/rules
-```
-
-Every binary (`colony-firewalld`, `colony-firewall`, `colony-firewall-tray`
-and `cfc`) prints its name and version with `--version` (or `-V`) and
-exits. The app and tray answer it before they open a window, a tray icon
-or a daemon connection, so it also works over SSH or in a script.
-
-### Who can change what
-
-| who | read status, rules, logs, live view, prompts | answer prompts, add/edit/delete rules | pause, resume, import rules, Allow rules that name no program |
-|---|---|---|---|
-| root (`sudo cfc`) | yes | yes | yes |
-| the installed Colony Firewall app and tray, run by a `colony-firewall` group member | yes | yes | after an administrator password (polkit; asked for every pause or resume, kept a few minutes for the others) |
-| any other program of a group member, including `cfc` without sudo | yes | no | no |
-
-The daemon recognises the app and tray by the running image: it must be the
-installed, root-owned `/usr/bin/colony-firewall` or `colony-firewall-tray`,
-started normally (not traced, no seccomp filter, no library preloaded from
-your files). After an upgrade, restart both; until then they are read-only.
-Details and limits are in [docs/HARDENING.md](docs/HARDENING.md).
-
-Executable rules require the canonical mapped target explicitly. An alias
-such as `/bin/tool` on a system where `/bin` links to `/usr/bin` is refused;
-review and name `/usr/bin/tool` instead. Rules remain attached to that fixed
-target and do not follow later alias changes. Missing canonical paths can be
-prepared before installation, but installing an alias there requires review.
-Legacy rules retain their stored targets; lost original alias intent cannot
-be migrated automatically.
-
-### Scripting
-
-Every command takes `--json` (or `-o json`). One-shot commands print a
-single JSON document; the streaming ones (`live`, `prompts`) print NDJSON,
-one object per line, flushed as events arrive:
-
-```sh
-cfc --json status | jq .enforcing
-cfc --json log --since 1h --action deny | jq -r '.[].exe' | sort | uniq -c
-cfc --json live --denied | jq -r '"blocked: \(.exe)"'
-```
-
-Exit codes are a contract, so failures are distinguishable without
-parsing stderr:
-
-| Code | Meaning                                                  |
-|------|----------------------------------------------------------|
-| 0    | success                                                  |
-| 1    | runtime or RPC error                                     |
-| 2    | usage error (bad flags or arguments)                     |
-| 3    | not found (no rule matches that id, prefix or name)      |
-| 4    | daemon unreachable (not running, stale socket, no access)|
-
-Shell completions and man pages are generated by the binary itself, so
-they cannot drift from the CLI. The packages install both, and so does the
-[manual install](#manual); `cfc completions <shell>` prints a script to
-stdout and `cfc man --dir <dir>` writes one page per subcommand.
-
-## Profiles
-
-`daemon.toml` accepts a `profile` key with three presets:
-
-| Profile            | No UI | Timeout | Window | Inbound, no rule |
-|--------------------|-------|---------|--------|------------------|
-| relaxed            | Deny  | Deny    | 60s    | Reject           |
-| balanced (default) | Deny  | Deny    | 30s    | Deny             |
-| strict             | Deny  | Deny    | 15s    | Deny             |
-
-No profile permits a connection on its own: a prompt you were shown and did
-not answer must not become an allow, and with nobody subscribed to ask an
-unmatched remote flow is denied too. The profiles differ in how long a
-prompt waits, and in whether an unmatched inbound flow (only when the
-inbound table is enabled) is refused or dropped. Every profile therefore
-needs the starter rules from First run before enforcement goes on.
-
-A profile is a base, not a lock: any field you set under
-`[default_policy]` overrides just that field. The profile and every
-`[default_policy]` field hot-reload on `SIGHUP`, so you can retune the
-policy without dropping a packet.
-
-## Development
-
-Requires Rust stable (MSRV 1.89, gated in CI) and `protobuf-compiler`.
-On Debian/Ubuntu:
-
-```sh
-sudo apt install protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
-```
-
-```sh
-cargo build --workspace --profile fast
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
-```
-
-The daemon needs `CAP_NET_ADMIN` to bind NFQUEUE, so run it as root or via
-the bundled systemd unit. The UI and CLI run as your regular user.
-
-For development without root, the daemon accepts `--dry-run` which skips
-the NFQUEUE bind and lets you exercise the gRPC server and UI against a
-daemon that just reports rules and a stub status feed. Point its rule
-database somewhere writable (the default is under `/var/lib`), and point
-the clients at its socket: `cfc` takes `--socket`, the GUI and tray read
-`CFC_SOCKET`. A daemon running as your own user accepts changes from
-anything else you run, a development build of the GUI included:
-
-```sh
-mkdir -p /tmp/cfc-dev
-printf '[storage]\npath = "/tmp/cfc-dev/rules.db"\n' > /tmp/cfc-dev/daemon.toml
-cargo run -p cfc-daemon -- --debug --dry-run \
-    --config /tmp/cfc-dev/daemon.toml --socket /tmp/cfc-dev/cfc.sock
-# in another terminal
-CFC_SOCKET=/tmp/cfc-dev/cfc.sock cargo run -p cfc-ui
-cargo run -p cfc-cli -- --socket /tmp/cfc-dev/cfc.sock status
-```
-
-## Status
-
-| Phase                        | State |
-|------------------------------|-------|
-| 0  Foundation                | done  |
-| 1  Daemon MVP                | done  |
-| 2  UI MVP                    | done  |
-| 3  CLI                       | done  |
-| 3.5 Hardening & correctness  | done  |
-| 4  eBPF backend              | done; compiled in by default, loads where the kernel supports it and the object is installed (`[ebpf] enabled`, default `"auto"`) |
-| 5a CI                        | done  |
-| 5b Packaging                 | in progress (AUR-ready PKGBUILD in `pkg/`, not yet published) |
-| 5  Polish                    | done, except VirusTotal (opt-in lookup, not started) and the Colony store listing |
-
-One honest caveat: the Arch package is built end to end on every push
-(`makepkg` on the `-git` recipe), but it has never been published to the
-AUR, so the release recipe's tag tarball and checksums are only exercised
-at tag time.
-
-Real packet verdicts are tested in CI. The `e2e` workflow
-(`.github/workflows/e2e.yml`) runs `scripts/armed-e2e.sh` on pushes to
-`main` and on pull requests: it loads the shipped nftables snippet in a throwaway network
-namespace, runs the daemon (built without the eBPF layer) on a real NFQUEUE
-and asserts that an allowed flow gets HTTP 200, while a denied or unmatched
-one is silently dropped (curl exit 28). It also checks that new flows drop
-before the daemon starts and after it stops on SIGTERM or is killed with
-SIGKILL, that rules survive a restart, that the event log names the deciding
-rule and that new loopback flows still pass with no daemon. The separate
-`smoke` workflow drives a `--dry-run` daemon to cover the gRPC and CLI
-surface.
-
-See `docs/ROADMAP.md` for the full checklist.
+Releases up to 0.8.0 predate this policy and carry no signatures. The app and
+the tarball also carry a build provenance attestation, see
+[SECURITY.md](SECURITY.md#verifying-releases).
+
+How releases are built, signed and published:
+[design/releases.md](https://github.com/Project-Colony/Project-Colony-Resources/blob/main/design/releases.md#5-signing).
+
+## Privacy
+
+Colony Firewall Control sends no telemetry, no analytics and no crash
+reports, checks for no updates and has no server of its own. What it keeps
+stays on this machine:
+
+| Data | Stored or sent | Where, and why |
+|---|---|---|
+| Rules | stored | `/var/lib/colony-firewall/rules.db`, readable by root only: what you allowed or blocked, with program paths, and a hash for rules pinned to a binary |
+| Connection log | stored | the same database. For every decided flow: the time, protocol, source and destination address and port, destination host name, program path, pid, uid, verdict and deciding rule. `cfc log` reads it. Capped at `[events] max_rows` rows (100000 by default), oldest first; set it to 0 in `/etc/colony-firewall/daemon.toml` and restart the daemon to keep none |
+| System journal | stored | blocked connections (program, pid, uid, destination) and every accepted or refused change (who asked, which program, the polkit answer), through systemd-journald like any service log |
+| Host names | sent | the daemon names a destination by a reverse (PTR) lookup, confirmed by a forward lookup, through the system resolver, so your DNS server sees those lookups. With the eBPF layer on, DNS answers this machine receives are also read in the kernel; they stay in the daemon's memory |
+| App and tray | stored | no files. The tray writes its icon to `$XDG_RUNTIME_DIR/cfc-tray/icons`, which lives in memory until you log out, only when the icon theme lacks it |
+| Rule exports | stored | only where `cfc rules export --out` is told to write |
+
+The app, the tray and `cfc` talk to the daemon only through the local socket
+`/run/colony-firewall/cfc.sock` (`root:colony-firewall`, 0660). Colony
+Firewall Control connects to no server: the DNS lookups above are the only
+network traffic it causes itself.
 
 ## License
 
-GPL-3.0-or-later. Inherited from
+GPL-3.0-or-later, see [LICENSE](LICENSE). Inherited from
 [opensnitch](https://github.com/evilsocket/opensnitch) since this is a
 derivative port.
 
-## Credits
+### Credits
 
 - [opensnitch](https://github.com/evilsocket/opensnitch) by Simone
   Margaritelli (evilsocket) and Gustavo Iniguez Goia - the project we are

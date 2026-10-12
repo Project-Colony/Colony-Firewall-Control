@@ -20,3 +20,8 @@ pub use v1::{
 
 /// Default socket path used by the daemon and clients.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/colony-firewall/cfc.sock";
+
+/// How the daemon's refusal of a change from a peer that may only read
+/// begins. The app shows a lasting read-only notice when a refusal starts
+/// with it, so the daemon builds that refusal from this constant.
+pub const READ_ONLY_DENIAL: &str = "read-only access";

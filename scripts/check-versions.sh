@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # Asserts that the project version is identical everywhere it is hardcoded:
 #
-#   - Cargo.toml         [workspace.package] version
-#   - pkg/PKGBUILD       pkgver=
-#   - pkg/colony.json    every "version" field and every version embedded
-#                        in an "asset" filename
+#   - Cargo.toml                         [workspace.package] version
+#   - packaging/arch/PKGBUILD            pkgver=
+#   - packaging/tarball-manifest.json    every "version" field
 #   - packaging/rpm/colony-firewall-control.spec   Version:
-#   - crates/cfc-ebpf/Cargo.lock   the `cfc-ebpf-common` entry. The kernel
+#   - crates/cfc-ebpf/Cargo.lock   the `cfc-ebpf-proto` entry. The kernel
 #                                  crate is its own workspace with its own
 #                                  committed lock, and nothing builds it with
 #                                  --locked, so a bump that regenerated only
 #                                  the root lock shipped 0.3.0 with this one
 #                                  still saying 0.2.3, and 0.4.0 nearly did
-#                                  the same. `cargo update -p cfc-ebpf-common`
-#                                  from crates/cfc-ebpf moves it.
+#                                  the same.
+#
+# release-please rewrites every one of these in its release PR (extra-files in
+# release-please-config.json); this script is what notices a file it missed.
 #
 # The spec is here because the job that compared it lived in rhel.yml, which
 # only runs when packaging paths change - so a version bump that touched none
@@ -29,7 +30,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 mismatches=()
 
-cargo_ver="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' "${ROOT}/Cargo.toml" | head -n1)"
+cargo_ver="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' "${ROOT}/Cargo.toml" | head -n1)"
 if [[ -z "${cargo_ver}" ]]; then
     echo "error: could not extract version from Cargo.toml [workspace.package]" >&2
     exit 1
@@ -46,31 +47,19 @@ check() {
     fi
 }
 
-# pkg/PKGBUILD -> pkgver=X.Y.Z
-pkgbuild_ver="$(sed -n 's/^pkgver=//p' "${ROOT}/pkg/PKGBUILD" | head -n1)"
-check "pkg/PKGBUILD pkgver" "${pkgbuild_ver}"
+# packaging/arch/PKGBUILD -> pkgver=X.Y.Z
+pkgbuild_ver="$(sed -n 's/^pkgver=//p' "${ROOT}/packaging/arch/PKGBUILD" | head -n1)"
+check "packaging/arch/PKGBUILD pkgver" "${pkgbuild_ver}"
 
-# pkg/colony.json -> every "version": "X.Y.Z" field
+# packaging/tarball-manifest.json -> every "version": "X.Y.Z" field
 n=0
 while IFS= read -r v; do
     n=$((n + 1))
-    check "pkg/colony.json \"version\" field #${n}" "${v}"
-done < <(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "${ROOT}/pkg/colony.json" \
+    check "packaging/tarball-manifest.json \"version\" field #${n}" "${v}"
+done < <(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "${ROOT}/packaging/tarball-manifest.json" \
     | sed 's/.*:[[:space:]]*"\(.*\)"/\1/')
 if [[ "${n}" -eq 0 ]]; then
-    mismatches+=("pkg/colony.json: no \"version\" field found")
-    fail=1
-fi
-
-# pkg/colony.json -> version embedded in every "asset" filename
-n=0
-while IFS= read -r v; do
-    n=$((n + 1))
-    check "pkg/colony.json \"asset\" filename #${n}" "${v}"
-done < <(grep -oE '"asset"[[:space:]]*:[[:space:]]*"[^"]*"' "${ROOT}/pkg/colony.json" \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
-if [[ "${n}" -eq 0 ]]; then
-    mismatches+=("pkg/colony.json: no \"asset\" filename with a version found")
+    mismatches+=("packaging/tarball-manifest.json: no \"version\" field found")
     fail=1
 fi
 
@@ -78,9 +67,9 @@ fi
 spec_ver="$(sed -n 's/^Version:[[:space:]]*//p' "${ROOT}/packaging/rpm/colony-firewall-control.spec" | head -n1)"
 check "packaging/rpm/colony-firewall-control.spec Version" "${spec_ver}"
 
-# crates/cfc-ebpf/Cargo.lock -> the version recorded for cfc-ebpf-common
-ebpf_lock_ver="$(awk '/^name = "cfc-ebpf-common"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' "${ROOT}/crates/cfc-ebpf/Cargo.lock")"
-check "crates/cfc-ebpf/Cargo.lock cfc-ebpf-common" "${ebpf_lock_ver}"
+# crates/cfc-ebpf/Cargo.lock -> the version recorded for cfc-ebpf-proto
+ebpf_lock_ver="$(awk '/^name = "cfc-ebpf-proto"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' "${ROOT}/crates/cfc-ebpf/Cargo.lock")"
+check "crates/cfc-ebpf/Cargo.lock cfc-ebpf-proto" "${ebpf_lock_ver}"
 
 if [[ "${fail}" -ne 0 ]]; then
     echo "version mismatch (canonical: Cargo.toml [workspace.package] = ${cargo_ver}):" >&2

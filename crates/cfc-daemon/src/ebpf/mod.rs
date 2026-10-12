@@ -138,7 +138,7 @@ pub enum NoteLevel {
 /// Where the BPF object is expected to live.
 ///
 /// The release tarball's `install.sh` installs it here (generated from
-/// `pkg/colony.json` postInstall, 0644 root:root, which is also what
+/// `packaging/tarball-manifest.json` postInstall, 0644 root:root, which is also what
 /// `loader::vet_object` requires before loading it unasked). `.github/workflows/release.yml` builds it with
 /// `cargo xtask build-ebpf` and stages it into the tarball;
 /// `scripts/check-release-assets.sh` fails the build if the manifest and the
@@ -154,8 +154,8 @@ pub enum NoteLevel {
 /// stable. An AUR install therefore has no object, `Degrade::ObjectMissing`,
 /// and the firewall runs on `sock_diag` + `/proc` exactly as it always has.
 ///
-/// This string is duplicated by `pkg/colony.json`, both PKGBUILDs and
-/// `systemd/daemon.toml.sample`; `default_object_path_matches_the_packaging`
+/// This string is duplicated by `packaging/tarball-manifest.json`, both PKGBUILDs and
+/// `packaging/systemd/daemon.toml.sample`; `default_object_path_matches_the_packaging`
 /// is what keeps them honest.
 pub const DEFAULT_OBJECT_PATH: &str = "/usr/lib/colony-firewall/cfc-ebpf.o";
 
@@ -929,13 +929,16 @@ mod tests {
             .expect("crates/cfc-daemon is two levels below the repo root")
             .to_path_buf();
 
-        // pkg/PKGBUILD is deliberately absent from this list: the AUR package
+        // packaging/arch/PKGBUILD is deliberately absent from this list: the AUR package
         // does not ship the object at all (on Arch `rustup` conflicts with
         // `rust`, so the pinned nightly is unavailable inside makepkg). An AUR
         // install gets Degrade::ObjectMissing and runs on sock_diag + /proc,
         // which is a supported configuration - so requiring the path to appear
         // there would assert a promise the package does not make.
-        for rel in ["pkg/colony.json", "systemd/daemon.toml.sample"] {
+        for rel in [
+            "packaging/tarball-manifest.json",
+            "packaging/systemd/daemon.toml.sample",
+        ] {
             let path = root.join(rel);
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;

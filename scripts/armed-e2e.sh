@@ -107,7 +107,7 @@ sudo -v
 command -v jq >/dev/null || fail "jq is required"
 
 say "Building colony-firewalld (no eBPF) and cfc"
-cargo build --locked -p cfc-daemon -p cfc-cli --no-default-features
+cargo build --locked -p cfc-daemon -p cfc --no-default-features
 
 say "Namespaces, veth pair, HTTP servers"
 sudo modprobe -a nfnetlink_queue nft_queue
@@ -137,7 +137,7 @@ for p in "${ALLOW_PORT}" "${DENY_PORT}" "${UNMATCHED_PORT}"; do
 done
 
 say "Load the shipped snippet in FW (as README: nft -f from a checkout)"
-in_fw nft -f "${ROOT}/systemd/nftables-snippet.conf"
+in_fw nft -f "${ROOT}/packaging/systemd/nftables-snippet.conf"
 table_loaded || fail "table inet colony_firewall not loaded in ${FW}"
 queue_bound && fail "something is already bound to NFQUEUE 0"
 

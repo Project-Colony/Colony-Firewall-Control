@@ -23,7 +23,7 @@ headless machine gets a say. Run without sudo it is read-only (see
 
 ```
 +----------------------------+     +----------------+
-|  cfc-ui   (iced, user)     |     |  cfc-cli (tty) |
+|  cfc-ui   (iced, user)     |     |  cfc (tty)     |
 |   prompts, rules, live     |     |   status, rules|
 |   stats                    |     |   prompts, log |
 +------------+---------------+     +-------+--------+
@@ -49,6 +49,54 @@ headless machine gets a say. Run without sudo it is read-only (see
 |   sd_notify: READY / WATCHDOG / STOPPING          |
 +--------------------------------------------------+
 ```
+
+## Repository layout
+
+```
+crates/
+  cfc/              cfc, the command-line tool
+  cfc-core/         shared types and rule matching: Rule, Verdict, Connection, Process
+  cfc-proto/        gRPC schema between the daemon and its clients (tonic + tonic-prost)
+  cfc-client/       UDS gRPC client shared by the app, the tray and cfc
+  cfc-daemon/       colony-firewalld, the privileged daemon
+  cfc-ui/           colony-firewall, the iced app
+  cfc-tray/         colony-firewall-tray, the StatusNotifierItem companion
+  cfc-ebpf-proto/   POD event types and pure parsers shared by the eBPF programs and the daemon
+  cfc-ebpf/         kernel-side eBPF programs, a workspace of its own
+  cfc-xtask/        build automation, run as `cargo xtask` (builds the eBPF object)
+assets/icons/       the app icon, also embedded in the tray at compile time
+packaging/
+  arch/             PKGBUILD (release), PKGBUILD-git and the pacman install scriptlet
+  linux/            .desktop launchers, autostart entries and the polkit policy
+  systemd/          units, the sysusers fragment, both nftables tables, daemon.toml.sample
+  rpm/              RPM spec
+  selinux/          SELinux policy module
+  tarball-manifest.json   install and remove steps of the release tarball
+scripts/            CI checks, the tarball installer generator, test and bench helpers
+docs/               this file and the other guides
+```
+
+Every root workspace member inherits `version`, `edition`, `rust-version`,
+`license` and `repository` from `[workspace.package]`, so the whole workspace
+carries one version. `crates/cfc-ebpf` is excluded from the root workspace: it
+builds for `bpfel-unknown-none` with the nightly pinned in its own
+`rust-toolchain.toml`, keeps its own `Cargo.lock`, and only `cargo xtask
+build-ebpf` (or a build from inside that directory) compiles it. Stable builds,
+clippy and the MSRV check never see it. See [The eBPF layer](#the-ebpf-layer).
+
+`scripts/tarball-installers.sh` turns `packaging/tarball-manifest.json` into
+the tarball's `install.sh` and `uninstall.sh`, and
+`scripts/check-release-assets.sh` checks that every file the manifest installs
+is staged into the tarball. The packaging notes are in
+[packaging/README.md](../packaging/README.md).
+
+Releases are cut by release-please and built by
+`.github/workflows/release.yml` from the tag: the workspace and the eBPF
+object, the tarball, the app under the name Colony installs
+(`colony-firewall-control-linux`) and the Arch recipe. The shared
+sign-and-publish workflow of Project-Colony-Resources then signs every
+asset and publishes the release. Details in
+[packaging/README.md](../packaging/README.md#releases).
 
 ## Packet flow
 

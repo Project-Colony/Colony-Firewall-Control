@@ -6,7 +6,7 @@
 //! the daemon asks polkit's `CheckAuthorization` for the calling process,
 //! with user interaction allowed, and the user's polkit agent shows its
 //! password dialog. The shipped policy
-//! (`pkg/org.projectcolony.firewall.policy`) asks every time for pause and
+//! (`packaging/linux/org.projectcolony.firewall.policy`) asks every time for pause and
 //! resume (`auth_admin`: any same-user program can click the tray's menu
 //! over D-Bus, so a kept authorization would let it pause unseen) and keeps
 //! an import or allow-every-program authorization a few minutes
@@ -154,7 +154,8 @@ mod tests {
 
     /// The `<defaults>` the shipped policy file gives `action`.
     fn shipped_defaults(action: &str) -> Vec<&'static str> {
-        const POLICY: &str = include_str!("../../../pkg/org.projectcolony.firewall.policy");
+        const POLICY: &str =
+            include_str!("../../../packaging/linux/org.projectcolony.firewall.policy");
         let block = POLICY
             .split("<action id=\"")
             .find(|block| block.starts_with(&format!("{action}\"")))

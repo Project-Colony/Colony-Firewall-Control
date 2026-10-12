@@ -688,7 +688,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfc-cli"
+name = "cfc"
 version = "0.8.0"
 dependencies = [
  "anyhow",
@@ -750,7 +750,7 @@ dependencies = [
  "aya",
  "cfc-client",
  "cfc-core",
- "cfc-ebpf-common",
+ "cfc-ebpf-proto",
  "cfc-proto",
  "chrono",
  "clap",
@@ -781,7 +781,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfc-ebpf-common"
+name = "cfc-ebpf-proto"
 version = "0.8.0"
 
 [[package]]
@@ -830,6 +830,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "cfc-xtask"
+version = "0.8.0"
 
 [[package]]
 name = "cfg-if"
@@ -6099,10 +6103,6 @@ name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
-
-[[package]]
-name = "xtask"
-version = "0.8.0"
 
 [[package]]
 name = "y4m"

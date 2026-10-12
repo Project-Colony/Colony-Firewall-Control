@@ -16,12 +16,12 @@ VirusTotal lookups, the Colony store listing and publishing to the AUR.
 - [x] `cfc-client`: shared UDS gRPC client
 - [x] `cfc-daemon`: module skeletons
 - [x] `cfc-ui`: iced skeleton with parchment theme + 4 tabs
-- [x] `cfc-cli`: clap skeleton
+- [x] `cfc` (CLI crate): clap skeleton
 - [x] systemd unit + nft snippet
 - [x] CI: cargo fmt + clippy + test + build
 - [x] AUR PKGBUILD draft
-- [x] Release tarball recipe (`pkg/colony.json`; no Colony store client reads
-      it, `scripts/tarball-installers.sh` turns it into the tarball's
+- [x] Release tarball recipe (`packaging/tarball-manifest.json`; no Colony
+      store client reads it, `scripts/tarball-installers.sh` turns it into the tarball's
       `install.sh`)
 
 ## Phase 1 - Daemon MVP [done]
@@ -183,7 +183,7 @@ end to end on kernel 7.1.8.
 - [x] Import rules from opensnitch JSON
 - [ ] Colony app store listing (needs a root `colony.json` in Colony's real
       schema; the store installs one per-user binary, never units or tables)
-- [x] AUR PKGBUILD draft (now AUR-ready in `pkg/`; not yet published,
+- [x] AUR PKGBUILD draft (now AUR-ready in `packaging/arch/`; not yet published,
       signed release pending)
 - [x] Shell completions + man pages
 - [x] Persistent verdict log (`cfc log`)

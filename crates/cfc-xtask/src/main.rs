@@ -131,7 +131,7 @@ const REQUIRED_SYMBOLS: &[&str] = &[
     "TASK_TGID_OFFSET",
     "EXEC_FILENAME_DATA_LOC",
     // the ABI stamp the loader requires with must_exist = true. Keep in step
-    // with `cfc_ebpf_common::ABI_SYMBOL`.
+    // with `cfc_ebpf_proto::ABI_SYMBOL`.
     "CFC_EBPF_ABI_V4",
 ];
 
@@ -395,12 +395,12 @@ impl Options {
     }
 }
 
-/// Repository root, derived from this crate's manifest dir (`crates/xtask`).
+/// Repository root, derived from this crate's manifest dir (`crates/cfc-xtask`).
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
-        .expect("crates/xtask is two levels below the repo root")
+        .expect("crates/cfc-xtask is two levels below the repo root")
         .to_path_buf()
 }
 
@@ -419,7 +419,7 @@ fn cargo_output_path(opts: &Options) -> PathBuf {
 
 /// What everything downstream expects: `cfc-ebpf.o`.
 ///
-/// The daemon's `DEFAULT_OBJECT_PATH`, both PKGBUILDs, `pkg/colony.json` and
+/// The daemon's `DEFAULT_OBJECT_PATH`, both PKGBUILDs, `packaging/tarball-manifest.json` and
 /// the release tarball all use the `.o` name, while cargo emits the bare crate
 /// name. Renaming it here rather than in each recipe is what stops
 /// `check-release-assets.sh` from comparing a staged `cfc-ebpf` against a

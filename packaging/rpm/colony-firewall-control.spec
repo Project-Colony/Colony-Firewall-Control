@@ -11,7 +11,9 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
+# x-release-please-start-version
 Version:        0.8.0
+# x-release-please-end
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 
@@ -112,33 +114,33 @@ install -Dpm 0755 target/release/colony-firewall      %{buildroot}%{_bindir}/col
 install -Dpm 0755 target/release/colony-firewall-tray %{buildroot}%{_bindir}/colony-firewall-tray
 install -Dpm 0755 target/release/cfc                  %{buildroot}%{_bindir}/cfc
 
-install -Dpm 0644 systemd/colony-firewalld.service \
+install -Dpm 0644 packaging/systemd/colony-firewalld.service \
     %{buildroot}%{_unitdir}/colony-firewalld.service
-install -Dpm 0644 systemd/colony-firewall-nft.service \
+install -Dpm 0644 packaging/systemd/colony-firewall-nft.service \
     %{buildroot}%{_unitdir}/colony-firewall-nft.service
-install -Dpm 0644 systemd/colony-firewall-nft-inbound.service \
+install -Dpm 0644 packaging/systemd/colony-firewall-nft-inbound.service \
     %{buildroot}%{_unitdir}/colony-firewall-nft-inbound.service
-install -Dpm 0644 systemd/colony-firewall.sysusers \
+install -Dpm 0644 packaging/systemd/colony-firewall.sysusers \
     %{buildroot}%{_sysusersdir}/colony-firewall.conf
 
-install -Dpm 0644 systemd/daemon.toml.sample \
+install -Dpm 0644 packaging/systemd/daemon.toml.sample \
     %{buildroot}%{_sysconfdir}/colony-firewall/daemon.toml
-install -Dpm 0644 systemd/nftables-snippet.conf \
+install -Dpm 0644 packaging/systemd/nftables-snippet.conf \
     %{buildroot}%{_datadir}/colony-firewall/nftables-snippet.conf
-install -Dpm 0644 systemd/nftables-inbound.conf \
+install -Dpm 0644 packaging/systemd/nftables-inbound.conf \
     %{buildroot}%{_datadir}/colony-firewall/nftables-inbound.conf
 install -Dpm 0755 scripts/inbound-lockout-guard.sh \
     %{buildroot}%{_prefix}/lib/colony-firewall/inbound-lockout-guard.sh
 
-install -Dpm 0644 pkg/colony-firewall.desktop \
+install -Dpm 0644 packaging/linux/colony-firewall.desktop \
     %{buildroot}%{_datadir}/applications/colony-firewall.desktop
-install -Dpm 0644 pkg/colony-firewall-autostart.desktop \
+install -Dpm 0644 packaging/linux/colony-firewall-autostart.desktop \
     %{buildroot}%{_sysconfdir}/xdg/autostart/colony-firewall.desktop
-install -Dpm 0644 pkg/colony-firewall-tray-autostart.desktop \
+install -Dpm 0644 packaging/linux/colony-firewall-tray-autostart.desktop \
     %{buildroot}%{_sysconfdir}/xdg/autostart/colony-firewall-tray.desktop
-install -Dpm 0644 pkg/colony-firewall.svg \
+install -Dpm 0644 assets/icons/colony-firewall.svg \
     %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/colony-firewall.svg
-install -Dpm 0644 pkg/org.projectcolony.firewall.policy \
+install -Dpm 0644 packaging/linux/org.projectcolony.firewall.policy \
     %{buildroot}%{_datadir}/polkit-1/actions/org.projectcolony.firewall.policy
 
 # Where the eBPF object goes if one is installed later. Shipping the directory
@@ -234,7 +236,7 @@ fi
 
 %files
 %license LICENSE
-%doc README.md docs/ARCHITECTURE.md docs/HARDENING.md docs/TROUBLESHOOTING.md
+%doc README.md docs/ARCHITECTURE.md docs/HARDENING.md docs/TROUBLESHOOTING.md docs/guide/first-run.md
 %{_bindir}/colony-firewalld
 %{_bindir}/colony-firewall
 %{_bindir}/colony-firewall-tray
