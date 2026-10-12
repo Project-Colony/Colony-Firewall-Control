@@ -1,13 +1,12 @@
 use cfc_client::{convert, proto};
-use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_input, Space,
-};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text_input, Space};
 use iced::{Element, Length};
 use std::cmp::Ordering;
 
 use crate::app::{Message, DELETE_CONFIRM_MS};
 use crate::editor::{hidden_scope_is_set, hidden_scope_summary, RuleEditor};
 use crate::format;
+use crate::theme::{self, sz, ui_text};
 
 /// Which column the list is ordered by, and in which direction.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -144,22 +143,23 @@ fn list_view(args: ListArgs<'_>) -> Element<'_, Message> {
     filtered.sort_by(|a, b| compare_rules(a, b, sort));
 
     let toolbar = row![
-        button(text("+ Add rule").size(12))
+        button(ui_text("+ Add rule").size(sz(12)))
             .padding([4, 12])
             .on_press(Message::OpenEditor)
             .style(iced::widget::button::primary),
         text_input("Search by name / exe / host", filter)
+            .font(colony_ui::ui_font())
             .on_input(Message::RulesFilterChanged)
             .padding(4)
-            .size(12)
-            .width(Length::Fixed(260.0)),
+            .size(sz(12))
+            .width(theme::scaled(260.0)),
         Space::new().width(Length::Fill),
-        text(if filter.trim().is_empty() {
+        ui_text(if filter.trim().is_empty() {
             format!("{} rules", rules.len())
         } else {
             format!("{}/{} rules", filtered.len(), rules.len())
         })
-        .size(11),
+        .size(sz(11)),
     ]
     .spacing(8)
     .padding(6)
@@ -170,8 +170,9 @@ fn list_view(args: ListArgs<'_>) -> Element<'_, Message> {
             toolbar,
             container(
                 column![
-                    text("No rules yet").size(18),
-                    text("Click \"+ Add rule\" or answer a prompt with a persist option.").size(12),
+                    ui_text("No rules yet").size(sz(18)),
+                    ui_text("Click \"+ Add rule\" or answer a prompt with a persist option.")
+                        .size(sz(12)),
                 ]
                 .spacing(8),
             )
@@ -184,20 +185,20 @@ fn list_view(args: ListArgs<'_>) -> Element<'_, Message> {
     if filtered.is_empty() {
         return column![
             toolbar,
-            container(text(format!("No rules match \"{filter}\"")).size(13)).padding(16),
+            container(ui_text(format!("No rules match \"{filter}\"")).size(sz(13))).padding(16),
         ]
         .spacing(6)
         .into();
     }
 
     let header = row![
-        text("on").size(11).width(Length::Fixed(40.0)),
-        text("action").size(11).width(Length::Fixed(56.0)),
-        text("duration").size(11).width(Length::Fixed(84.0)),
+        ui_text("on").size(sz(11)).width(theme::scaled(40.0)),
+        ui_text("action").size(sz(11)).width(theme::scaled(56.0)),
+        ui_text("duration").size(sz(11)).width(theme::scaled(84.0)),
         sort_header("name / scope", SortKey::Name, sort, Length::Fill),
-        sort_header("created", SortKey::Created, sort, Length::Fixed(110.0)),
-        sort_header("hits", SortKey::Hits, sort, Length::Fixed(54.0)),
-        text("").width(Length::Fixed(140.0)),
+        sort_header("created", SortKey::Created, sort, theme::scaled(110.0)),
+        sort_header("hits", SortKey::Hits, sort, theme::scaled(54.0)),
+        ui_text("").width(theme::scaled(140.0)),
     ]
     .spacing(6)
     .padding([0, 6])
@@ -223,11 +224,11 @@ fn sort_header<'a>(
     sort: RuleSort,
     width: Length,
 ) -> Element<'a, Message> {
-    button(text(format!("{label}{}", sort.arrow(key))).size(11))
+    button(ui_text(format!("{label}{}", sort.arrow(key))).size(sz(11)))
         .padding([4, 4])
         .width(width)
         .on_press(Message::RulesSortBy(sort.toggled(key)))
-        .style(crate::theme::column_header)
+        .style(theme::column_header)
         .into()
 }
 
@@ -250,39 +251,39 @@ fn rule_row<'a>(
     let delete_label = if armed { "Confirm?" } else { "Delete" };
 
     row![
-        button(text(toggle_label).size(11))
+        button(ui_text(toggle_label).size(sz(11)))
             .padding([2, 6])
             .on_press(Message::ToggleRuleEnabled(r.id.clone()))
             .style(toggle_style)
-            .width(Length::Fixed(40.0)),
-        text(convert::action_label(r.action))
-            .size(12)
-            .width(Length::Fixed(56.0)),
-        text(convert::rule_duration_label(r))
-            .size(12)
-            .width(Length::Fixed(84.0)),
+            .width(theme::scaled(40.0)),
+        ui_text(convert::action_label(r.action))
+            .size(sz(12))
+            .width(theme::scaled(56.0)),
+        ui_text(convert::rule_duration_label(r))
+            .size(sz(12))
+            .width(theme::scaled(84.0)),
         column![
-            text(if r.name.is_empty() {
+            ui_text(if r.name.is_empty() {
                 "(unnamed)".to_string()
             } else {
                 convert::display_safe(&r.name)
             })
-            .size(12),
-            text(convert::rule_summary(r)).size(10),
+            .size(sz(12)),
+            ui_text(convert::rule_summary(r)).size(sz(10)),
         ]
         .spacing(1)
         .width(Length::Fill),
-        text(format::format_unix_ms(r.created_at_unix_ms))
-            .size(11)
-            .width(Length::Fixed(110.0)),
-        text(r.hit_count.to_string())
-            .size(12)
-            .width(Length::Fixed(54.0)),
-        button(text("Edit").size(11))
+        ui_text(format::format_unix_ms(r.created_at_unix_ms))
+            .size(sz(11))
+            .width(theme::scaled(110.0)),
+        ui_text(r.hit_count.to_string())
+            .size(sz(12))
+            .width(theme::scaled(54.0)),
+        button(ui_text("Edit").size(sz(11)))
             .padding([2, 8])
             .on_press(Message::EditExistingRule(r.id.clone()))
             .style(iced::widget::button::secondary),
-        button(text(delete_label).size(11))
+        button(ui_text(delete_label).size(sz(11)))
             .padding([2, 8])
             .on_press(Message::DeleteRule(r.id.clone()))
             .style(if armed {
@@ -299,19 +300,19 @@ fn rule_row<'a>(
 
 fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     let title = row![
-        text(if ed.editing_id.is_some() {
+        ui_text(if ed.editing_id.is_some() {
             "Edit rule"
         } else {
             "New rule"
         })
-        .size(18),
+        .size(sz(18)),
         Space::new().width(Length::Fill),
-        text("Esc cancel · Enter save").size(10),
-        button(text("Cancel").size(12))
+        ui_text("Esc cancel · Enter save").size(sz(10)),
+        button(ui_text("Cancel").size(sz(12)))
             .padding([4, 10])
             .on_press(Message::CloseEditor)
             .style(iced::widget::button::secondary),
-        button(text("Save").size(12))
+        button(ui_text("Save").size(sz(12)))
             .padding([4, 12])
             .on_press(Message::SaveRule)
             .style(iced::widget::button::primary),
@@ -330,7 +331,9 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
         ],
         Some(ActionOption::from(ed.action)),
         |a| Message::EditorAction(a.into()),
-    );
+    )
+    .font(colony_ui::ui_font())
+    .text_size(sz(13));
     // Once is intentionally absent: the daemon rejects a persisted Once
     // rule, so offering it here would only produce an error.
     let duration_pick = pick_list(
@@ -341,7 +344,9 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
         },
         Some(DurationOption::from(ed.duration)),
         |d| Message::EditorDuration(d.into()),
-    );
+    )
+    .font(colony_ui::ui_font())
+    .text_size(sz(13));
     let protocol_pick = pick_list(
         [
             ProtoOption::Any,
@@ -351,7 +356,9 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
         ],
         Some(ProtoOption::from(ed.protocol)),
         |p| Message::EditorProtocol(p.into()),
-    );
+    )
+    .font(colony_ui::ui_font())
+    .text_size(sz(13));
 
     let policy_row = row![
         labeled(action_pick.into(), "Action", 200.0),
@@ -360,7 +367,7 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     ]
     .spacing(12);
 
-    let scope_intro = text("At least one match below is required:").size(11);
+    let scope_intro = ui_text("At least one match below is required:").size(sz(11));
     let exe_field = labeled_input(
         "Executable path",
         &ed.exe,
@@ -368,17 +375,17 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
         "/usr/bin/curl",
     );
     let host_field: Element<'_, Message> = if ed.dst_host.is_empty() {
-        text("Destination rules use numeric IPs. DNS names are diagnostic only.")
-            .size(11)
+        ui_text("Destination rules use numeric IPs. DNS names are diagnostic only.")
+            .size(sz(11))
             .into()
     } else {
         column![
-            text(format!(
+            ui_text(format!(
                 "Legacy hostname: {} (policy is uncertain; saving requires explicit removal)",
                 ed.dst_host
             ))
-            .size(11),
-            button(text("Remove legacy hostname from this rule"))
+            .size(sz(11)),
+            button(ui_text("Remove legacy hostname from this rule").size(sz(12)))
                 .on_press(Message::EditorDstHost(String::new())),
         ]
         .spacing(6)
@@ -398,10 +405,10 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     );
 
     let validation: Element<'_, Message> = match &ed.validation {
-        Some(msg) => container(text(msg.clone()).size(11))
+        Some(msg) => container(ui_text(msg.clone()).size(sz(11)))
             .padding(6)
             .width(Length::Fill)
-            .style(crate::theme::banner_err)
+            .style(theme::banner_err)
             .into(),
         None => Space::new().into(),
     };
@@ -411,15 +418,15 @@ fn editor_view(ed: &RuleEditor) -> Element<'_, Message> {
     // read the visible fields as the whole rule.
     let carried: Element<'_, Message> = if hidden_scope_is_set(&ed.carried_scope) {
         container(
-            text(format!(
+            ui_text(format!(
                 "also restricted to {} - kept on save, edit with cfc",
                 hidden_scope_summary(&ed.carried_scope)
             ))
-            .size(11),
+            .size(sz(11)),
         )
         .padding(6)
         .width(Length::Fill)
-        .style(crate::theme::banner_warn)
+        .style(theme::banner_warn)
         .into()
     } else {
         Space::new().into()
@@ -451,12 +458,13 @@ fn labeled_input<'a>(
     placeholder: &'a str,
 ) -> Element<'a, Message> {
     column![
-        text(label).size(11),
+        ui_text(label).size(sz(11)),
         text_input(placeholder, value)
+            .font(colony_ui::ui_font())
             .on_input(on_change)
             .on_submit(Message::SaveRule)
             .padding(6)
-            .size(13),
+            .size(sz(13)),
     ]
     .spacing(3)
     .into()
@@ -464,9 +472,9 @@ fn labeled_input<'a>(
 
 fn labeled<'a>(field: Element<'a, Message>, label: &'a str, width: f32) -> Element<'a, Message> {
     container(
-        column![text(label).size(11), field]
+        column![ui_text(label).size(sz(11)), field]
             .spacing(3)
-            .width(Length::Fixed(width)),
+            .width(theme::scaled(width)),
     )
     .into()
 }

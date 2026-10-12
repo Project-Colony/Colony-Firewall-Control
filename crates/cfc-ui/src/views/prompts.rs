@@ -10,11 +10,13 @@
 //! the same clock the daemon will act on - not a guess.
 
 use cfc_client::{convert, proto};
-use iced::widget::{button, column, container, progress_bar, row, scrollable, text, Space};
-use iced::{Element, Font, Length};
+use colony_ui::Palette;
+use iced::widget::{button, column, container, progress_bar, row, scrollable, Space};
+use iced::{Element, Length};
 
 use crate::app::{Message, PromptCard};
 use crate::format;
+use crate::theme::{self, sz, ui_text, ui_text_bold};
 
 /// Below this many seconds the countdown turns amber.
 const URGENT_SECS: i64 = 5;
@@ -39,9 +41,9 @@ pub fn view<'a>(
     if prompts.is_empty() {
         return container(
             column![
-                text("No pending prompts").size(18),
-                text("Outbound flows that no rule decides will appear here for you to allow or block.").size(12),
-                text("Keyboard, on the top prompt: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(11),
+                ui_text("No pending prompts").size(sz(18)),
+                ui_text("Outbound flows that no rule decides will appear here for you to allow or block.").size(sz(12)),
+                ui_text("Keyboard, on the top prompt: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(sz(11)),
             ]
             .spacing(8),
         )
@@ -416,15 +418,15 @@ fn prompt_card<'a>(
     let armed = card.armed(now_ms);
 
     let marker: Element<'a, Message> = if key_target {
-        text("A / D answer this prompt")
-            .size(10)
-            .color(crate::theme::PARCHMENT_MUTED)
+        ui_text("A / D answer this prompt")
+            .size(sz(10))
+            .color(Palette::TEXT_MUTED())
             .into()
     } else {
         Space::new().into()
     };
     let header = row![
-        text(heading(ev)).size(16),
+        ui_text(heading(ev)).size(sz(16)),
         Space::new().width(Length::Fill),
         marker
     ]
@@ -439,10 +441,10 @@ fn prompt_card<'a>(
     )
     .spacing(3);
 
-    let customize = button(text("Customize this rule before creating it").size(11))
+    let customize = button(ui_text("Customize this rule before creating it").size(sz(11)))
         .padding([2, 4])
         .on_press(Message::CustomizePromptRule(ev.prompt_id.clone()))
-        .style(crate::theme::link_button);
+        .style(theme::link_button);
 
     let actions = column![
         action_row(
@@ -473,7 +475,7 @@ fn prompt_card<'a>(
             PromptAction::AllowOnce,
             ev,
             &program,
-            crate::theme::action_secondary,
+            theme::action_secondary,
             false,
             armed
         ),
@@ -486,20 +488,17 @@ fn prompt_card<'a>(
     {
         Space::new().into()
     } else {
-        text(
+        ui_text(
             "No executable path for this flow - a \"this program\" rule would have an empty \
              program and match everything, so only the one-off answers are available.",
         )
-        .size(10)
-        .color(crate::theme::BURGUNDY_DARK)
+        .size(sz(10))
+        .color(Palette::ERROR())
         .into()
     };
 
     let undecided: Element<'a, Message> = match undecided_warning(ev, rules) {
-        Some(warning) => text(warning)
-            .size(11)
-            .color(crate::theme::BURGUNDY_DARK)
-            .into(),
+        Some(warning) => ui_text(warning).size(sz(11)).color(Palette::ERROR()).into(),
         None => Space::new().into(),
     };
 
@@ -507,26 +506,24 @@ fn prompt_card<'a>(
         column![header, countdown, undecided, table, customize, actions, unscopable].spacing(9),
     )
     .padding(12)
-    .style(crate::theme::panel)
+    .style(theme::panel)
     .into()
 }
 
 fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
     let emphasised = r.label == PROGRAM_LABEL;
-    let value = text(r.value)
-        .size(if emphasised { 14 } else { 11 })
-        .font(if emphasised {
-            Font::DEFAULT
-        } else {
-            Font::MONOSPACE
-        });
+    let value = if emphasised {
+        ui_text_bold(r.value).size(sz(14))
+    } else {
+        ui_text(r.value).size(sz(11))
+    };
 
     let note: Element<'a, Message> = if r.note.is_empty() {
         Space::new().into()
     } else {
-        text(r.note)
-            .size(10)
-            .color(crate::theme::PARCHMENT_MUTED)
+        ui_text(r.note)
+            .size(sz(10))
+            .color(Palette::TEXT_MUTED())
             .into()
     };
 
@@ -536,8 +533,8 @@ fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
     };
 
     row![
-        container(text(r.label).size(11).color(crate::theme::PARCHMENT_MUTED))
-            .width(Length::Fixed(LABEL_WIDTH)),
+        container(ui_text(r.label).size(sz(11)).color(Palette::TEXT_MUTED()))
+            .width(theme::scaled(LABEL_WIDTH)),
         value,
         note,
         copy,
@@ -577,8 +574,8 @@ fn action_row<'a>(
 
     button(
         column![
-            text(action_title(choice)).size(title_size),
-            text(action_consequence(choice, program)).size(sub_size),
+            ui_text(action_title(choice)).size(sz(title_size)),
+            ui_text(action_consequence(choice, program)).size(sz(sub_size)),
         ]
         .spacing(1),
     )
@@ -596,16 +593,16 @@ fn countdown_row<'a>(
     now_ms: i64,
 ) -> Element<'a, Message> {
     let Some(left) = format::remaining_secs(card.event.deadline_unix_ms, now_ms) else {
-        return text("no deadline - waiting for your answer")
-            .size(10)
+        return ui_text("no deadline - waiting for your answer")
+            .size(sz(10))
             .into();
     };
 
     let fraction = format::countdown_fraction(card.event.deadline_unix_ms, now_ms, timeout_secs);
     let style = if left <= URGENT_SECS {
-        crate::theme::countdown_bar_urgent
+        theme::countdown_bar_urgent
     } else {
-        crate::theme::countdown_bar
+        theme::countdown_bar
     };
 
     column![
@@ -613,12 +610,12 @@ fn countdown_row<'a>(
             .length(Length::Fill)
             .girth(Length::Fixed(4.0))
             .style(style),
-        text(format!(
+        ui_text(format!(
             "daemon {} automatically in {}",
             format::fallback_verb(timeout_action),
             format::format_countdown(left)
         ))
-        .size(10),
+        .size(sz(10)),
     ]
     .spacing(3)
     .into()
@@ -628,10 +625,10 @@ fn copy_button<'a>(value: String) -> Element<'a, Message> {
     if value.is_empty() {
         return Space::new().into();
     }
-    button(text("copy").size(9))
+    button(ui_text("copy").size(sz(9)))
         .padding([1, 5])
         .on_press(Message::CopyText(value))
-        .style(crate::theme::subtle_icon)
+        .style(theme::subtle_icon)
         .into()
 }
 

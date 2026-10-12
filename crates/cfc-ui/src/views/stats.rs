@@ -2,12 +2,13 @@
 //! breakdowns computed from the live feed this session.
 
 use cfc_client::{convert, proto};
-use iced::widget::{column, container, row, scrollable, text, Space};
+use iced::widget::{column, container, row, scrollable, Space};
 use iced::{Element, Length};
 
 use crate::app::Message;
 use crate::format;
 use crate::session_stats::{Counts, SessionStats};
+use crate::theme::{self, sz, ui_text};
 
 const TOP_N: usize = 10;
 
@@ -17,7 +18,7 @@ pub fn view<'a>(
     now_ms: i64,
 ) -> Element<'a, Message> {
     let Some(s) = status else {
-        return container(text("Waiting for daemon status...").size(13))
+        return container(ui_text("Waiting for daemon status...").size(sz(13)))
             .padding(16)
             .into();
     };
@@ -28,14 +29,14 @@ pub fn view<'a>(
     // looks exactly like everything being fine.
     if !s.enforcing {
         blocks.push(banner(
-            crate::theme::banner_err,
+            theme::banner_err,
             "⚠ not enforcing",
             "No packets seen - is the nftables/iptables NFQUEUE rule loaded? (Also expected under --dry-run.)",
         ));
     }
     if s.skipped_rules > 0 {
         blocks.push(banner(
-            crate::theme::banner_warn,
+            theme::banner_warn,
             "⚠ rules skipped",
             &format!(
                 "{} rule row(s) on disk could not be loaded and are NOT being enforced.",
@@ -45,7 +46,7 @@ pub fn view<'a>(
     }
     if s.paused {
         blocks.push(banner(
-            crate::theme::banner_warn,
+            theme::banner_warn,
             "⚠ paused",
             &format!(
                 "Everything is being accepted without consulting rules - {}.",
@@ -95,11 +96,11 @@ pub fn view<'a>(
     );
 
     blocks.push(
-        text(format!(
+        ui_text(format!(
             "Breakdowns below cover this UI session only ({} events observed since the window opened).",
             session.events()
         ))
-        .size(10)
+        .size(sz(10))
         .into(),
     );
     blocks.push(
@@ -127,26 +128,32 @@ fn banner<'a>(
     title: &'a str,
     body: &str,
 ) -> Element<'a, Message> {
-    container(column![text(title).size(14), text(body.to_string()).size(11)].spacing(3))
-        .padding(10)
-        .width(Length::Fill)
-        .style(style)
-        .into()
+    container(
+        column![
+            ui_text(title).size(sz(14)),
+            ui_text(body.to_string()).size(sz(11))
+        ]
+        .spacing(3),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(style)
+    .into()
 }
 
 fn stat_card<'a>(label: &'a str, value: String) -> Element<'a, Message> {
-    container(column![text(label).size(11), text(value).size(22)].spacing(4))
+    container(column![ui_text(label).size(sz(11)), ui_text(value).size(sz(22))].spacing(4))
         .padding(12)
-        .width(Length::Fixed(170.0))
-        .style(crate::theme::panel)
+        .width(theme::scaled(170.0))
+        .style(theme::panel)
         .into()
 }
 
 fn stat_small<'a>(label: &'a str, value: String) -> Element<'a, Message> {
-    container(column![text(label).size(10), text(value).size(14)].spacing(2))
+    container(column![ui_text(label).size(sz(10)), ui_text(value).size(sz(14))].spacing(2))
         .padding(8)
-        .width(Length::Fixed(150.0))
-        .style(crate::theme::panel)
+        .width(theme::scaled(150.0))
+        .style(theme::panel)
         .into()
 }
 
@@ -158,27 +165,27 @@ fn top_table<'a>(
     shorten_path: bool,
 ) -> Element<'a, Message> {
     let mut body: Vec<Element<'a, Message>> = vec![row![
-        text(title).size(13),
+        ui_text(title).size(sz(13)),
         Space::new().width(Length::Fill),
-        text("conn / allow / deny").size(9),
+        ui_text("conn / allow / deny").size(sz(9)),
     ]
     .align_y(iced::Alignment::Center)
     .into()];
 
     if rows.is_empty() {
-        body.push(text("(nothing observed yet)").size(11).into());
+        body.push(ui_text("(nothing observed yet)").size(sz(11)).into());
     }
 
     for (key, counts) in rows {
         let label = if shorten_path { basename(key) } else { key };
         body.push(
             row![
-                text(label.to_string()).size(11).width(Length::Fill),
-                text(format!(
+                ui_text(label.to_string()).size(sz(11)).width(Length::Fill),
+                ui_text(format!(
                     "{} / {} / {}",
                     counts.total, counts.allowed, counts.denied
                 ))
-                .size(11),
+                .size(sz(11)),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -189,7 +196,7 @@ fn top_table<'a>(
     container(column(body).spacing(3))
         .padding(10)
         .width(Length::Fill)
-        .style(crate::theme::panel)
+        .style(theme::panel)
         .into()
 }
 

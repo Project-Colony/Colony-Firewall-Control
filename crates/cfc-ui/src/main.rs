@@ -35,7 +35,16 @@ fn main() -> iced::Result {
         );
     }
 
-    iced::application(App::new, App::update, App::view)
+    // Parchment is this app's identity, and stays the theme until the user
+    // picks another.
+    colony_ui::set_active_theme("parchment", "light");
+    colony_ui::fonts::BYTES
+        .into_iter()
+        .fold(
+            iced::application(App::new, App::update, App::view),
+            |app, font| app.font(font),
+        )
+        .default_font(colony_ui::ui_font())
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)

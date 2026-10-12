@@ -4,14 +4,13 @@
 //! unclickable), and every row can seed a rule.
 
 use cfc_client::{convert, proto};
-use iced::widget::{
-    button, column, container, pick_list, row, scrollable, text, text_input, Space,
-};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text_input, Space};
 use iced::{Element, Length};
 use std::collections::VecDeque;
 
 use crate::app::Message;
 use crate::format;
+use crate::theme::{self, sz, ui_text};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum VerdictFilter {
@@ -127,18 +126,20 @@ pub fn view(args: ListArgs<'_>) -> Element<'_, Message> {
 
     let toolbar = row![
         text_input("Filter by process / host / ip / port", filter)
+            .font(colony_ui::ui_font())
             .on_input(Message::LiveFilterChanged)
             .padding(4)
-            .size(12)
-            .width(Length::Fixed(280.0)),
+            .size(sz(12))
+            .width(theme::scaled(280.0)),
         pick_list(
             VerdictFilter::ALL,
             Some(verdict),
             Message::LiveVerdictFilter
         )
-        .text_size(12)
+        .font(colony_ui::ui_font())
+        .text_size(sz(12))
         .padding([2, 6]),
-        button(text(pause_label).size(12))
+        button(ui_text(pause_label).size(sz(12)))
             .padding([4, 12])
             .on_press(Message::ToggleLivePause)
             .style(if paused {
@@ -147,19 +148,19 @@ pub fn view(args: ListArgs<'_>) -> Element<'_, Message> {
                 iced::widget::button::secondary
             }),
         Space::new().width(Length::Fill),
-        text(format!("{}/{total} rows", shown.len())).size(11),
+        ui_text(format!("{}/{total} rows", shown.len())).size(sz(11)),
     ]
     .spacing(8)
     .padding(6)
     .align_y(iced::Alignment::Center);
 
     let header = row![
-        text("time").size(11).width(Length::Fixed(70.0)),
-        text("proto").size(11).width(Length::Fixed(44.0)),
-        text("process").size(11).width(Length::Fixed(150.0)),
-        text("dest").size(11).width(Length::Fill),
-        text("verdict").size(11).width(Length::Fixed(64.0)),
-        text("").width(Length::Fixed(90.0)),
+        ui_text("time").size(sz(11)).width(theme::scaled(70.0)),
+        ui_text("proto").size(sz(11)).width(theme::scaled(44.0)),
+        ui_text("process").size(sz(11)).width(theme::scaled(150.0)),
+        ui_text("dest").size(sz(11)).width(Length::Fill),
+        ui_text("verdict").size(sz(11)).width(theme::scaled(64.0)),
+        ui_text("").width(theme::scaled(90.0)),
     ]
     .spacing(6)
     .padding(6);
@@ -171,7 +172,12 @@ pub fn view(args: ListArgs<'_>) -> Element<'_, Message> {
             "(no rows match the current filter)".to_string()
         };
         return container(
-            column![toolbar, header, container(text(msg).size(12)).padding(12)].spacing(4),
+            column![
+                toolbar,
+                header,
+                container(ui_text(msg).size(sz(12))).padding(12)
+            ]
+            .spacing(4),
         )
         .padding(8)
         .into();
@@ -210,25 +216,25 @@ fn live_row(ev: &proto::ConnectionEvent) -> Element<'_, Message> {
 
     let action = proto::Action::try_from(ev.verdict).unwrap_or(proto::Action::Unspecified);
     let denied = matches!(action, proto::Action::Deny | proto::Action::Reject);
-    let verdict_badge = container(text(convert::action_label(ev.verdict)).size(10))
+    let verdict_badge = container(ui_text(convert::action_label(ev.verdict)).size(sz(10)))
         .padding([1, 6])
         .style(if action == proto::Action::Allow {
-            crate::theme::badge_ok
+            theme::badge_ok
         } else if denied {
-            crate::theme::badge_err
+            theme::badge_err
         } else {
-            crate::theme::badge_warn
+            theme::badge_warn
         });
 
     let copy: Element<'_, Message> = match conn {
-        Some(c) => button(text("⧉").size(10))
+        Some(c) => button(ui_text("⧉").size(sz(10)))
             .padding([0, 4])
             .on_press(Message::CopyText(format::dest_display(
                 &c.dst_host,
                 &c.dst_ip,
                 c.dst_port,
             )))
-            .style(crate::theme::subtle_icon)
+            .style(theme::subtle_icon)
             .into(),
         None => Space::new().into(),
     };
@@ -236,7 +242,7 @@ fn live_row(ev: &proto::ConnectionEvent) -> Element<'_, Message> {
     // Seeds the rule editor from this exact flow - the shortcut people
     // reach for most in opensnitch.
     let make_rule: Element<'_, Message> = match conn {
-        Some(c) => button(text("make rule").size(10))
+        Some(c) => button(ui_text("make rule").size(sz(10)))
             .padding([1, 6])
             .on_press(Message::MakeRuleFromEvent {
                 exe: proc.map(|p| p.exe.clone()).unwrap_or_default(),
@@ -246,28 +252,30 @@ fn live_row(ev: &proto::ConnectionEvent) -> Element<'_, Message> {
                 protocol: c.protocol,
                 direction: c.direction,
             })
-            .style(crate::theme::subtle_icon)
+            .style(theme::subtle_icon)
             .into(),
         None => Space::new().into(),
     };
 
     let inner = row![
-        text(t).size(11).width(Length::Fixed(70.0)),
-        text(proto_label).size(11).width(Length::Fixed(44.0)),
-        text(process_label).size(11).width(Length::Fixed(150.0)),
-        row![text(dest).size(11), copy]
+        ui_text(t).size(sz(11)).width(theme::scaled(70.0)),
+        ui_text(proto_label).size(sz(11)).width(theme::scaled(44.0)),
+        ui_text(process_label)
+            .size(sz(11))
+            .width(theme::scaled(150.0)),
+        row![ui_text(dest).size(sz(11)), copy]
             .spacing(4)
             .width(Length::Fill)
             .align_y(iced::Alignment::Center),
-        container(verdict_badge).width(Length::Fixed(64.0)),
-        container(make_rule).width(Length::Fixed(90.0)),
+        container(verdict_badge).width(theme::scaled(64.0)),
+        container(make_rule).width(theme::scaled(90.0)),
     ]
     .spacing(6)
     .padding(2)
     .align_y(iced::Alignment::Center);
 
     if denied {
-        container(inner).style(crate::theme::row_denied).into()
+        container(inner).style(theme::row_denied).into()
     } else {
         inner.into()
     }

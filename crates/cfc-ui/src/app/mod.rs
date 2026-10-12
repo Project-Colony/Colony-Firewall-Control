@@ -8,7 +8,7 @@ mod tests;
 
 use cfc_client::{proto, Client};
 use iced::keyboard;
-use iced::widget::{button, column, container, row, text, Space};
+use iced::widget::{button, column, container, row, Space};
 use iced::{Element, Length, Subscription, Task};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ use tracing::info;
 use crate::editor::{saved_rule_line, RuleEditor};
 use crate::session_stats::SessionStats;
 use crate::status_log::StatusLog;
+use crate::theme::{sz, ui_text};
 use crate::views::live::VerdictFilter;
 use crate::views::rules::RuleSort;
 use crate::{format, streams, theme, views};
@@ -563,7 +564,7 @@ impl App {
         if hint.is_empty() {
             return Space::new().into();
         }
-        container(text(hint).size(11))
+        container(ui_text(hint).size(sz(11)))
             .padding([6, 16])
             .width(Length::Fill)
             .style(theme::banner_err)
@@ -580,15 +581,15 @@ impl App {
         for (i, entry) in self.log.iter().enumerate() {
             lines.push(
                 row![
-                    text(format!(
+                    ui_text(format!(
                         "{} {} {}",
                         entry.severity.glyph(),
                         format::format_clock_ms(entry.at_ms),
                         entry.display()
                     ))
-                    .size(11),
+                    .size(sz(11)),
                     Space::new().width(Length::Fill),
-                    button(text("×").size(11))
+                    button(ui_text("×").size(sz(11)))
                         .padding([0, 6])
                         .on_press(Message::DismissLogEntry(i))
                         .style(theme::subtle_icon),
@@ -602,7 +603,7 @@ impl App {
             lines.push(
                 row![
                     Space::new().width(Length::Fill),
-                    button(text("dismiss all").size(10))
+                    button(ui_text("dismiss all").size(sz(10)))
                         .padding([0, 6])
                         .on_press(Message::DismissAllLog)
                         .style(theme::subtle_icon),
@@ -634,7 +635,7 @@ impl App {
                 DaemonState::Failed(_) => ("● disconnected", theme::badge_err),
             };
 
-        let badge = container(text(badge_label).size(11))
+        let badge = container(ui_text(badge_label).size(sz(11)))
             .padding([3, 10])
             .style(badge_style);
 
@@ -642,7 +643,7 @@ impl App {
         // that deserves its own badge, not a green "connected".
         let enforcing_badge: Element<'_, Message> = match &self.status {
             Some(s) if self.connected() && !s.enforcing => {
-                container(text("⚠ not enforcing").size(11))
+                container(ui_text("⚠ not enforcing").size(sz(11)))
                     .padding([3, 10])
                     .style(theme::badge_err)
                     .into()
@@ -652,13 +653,13 @@ impl App {
 
         let pause_btn: Element<'_, Message> = if self.connected() {
             if paused {
-                button(text("Resume").size(12))
+                button(ui_text("Resume").size(sz(12)))
                     .padding([4, 14])
                     .on_press_maybe((!self.pause_pending).then_some(Message::TogglePaused))
                     .style(iced::widget::button::primary)
                     .into()
             } else {
-                button(text("Pause").size(12))
+                button(ui_text("Pause").size(sz(12)))
                     .padding([4, 14])
                     .on_press_maybe(
                         (self.pause_armed() && !self.pause_pending)
@@ -680,7 +681,7 @@ impl App {
                     Some(s) => format!("Reconnect ({s}s)"),
                     None => "Reconnect".to_string(),
                 };
-                button(text(label).size(12))
+                button(ui_text(label).size(sz(12)))
                     .padding([4, 14])
                     .on_press(Message::Reconnect)
                     .style(iced::widget::button::primary)
@@ -697,7 +698,7 @@ impl App {
         };
 
         let inner = row![
-            text(title_text).size(18),
+            ui_text(title_text).size(sz(18)),
             Space::new().width(Length::Fill),
             enforcing_badge,
             badge,
@@ -715,7 +716,7 @@ impl App {
     }
 
     pub fn theme(&self) -> iced::Theme {
-        theme::parchment()
+        theme::iced_theme()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {

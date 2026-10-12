@@ -639,3 +639,6 @@ derivative port.
 - The Rust [tonic](https://github.com/hyperium/tonic),
   [aya](https://github.com/aya-rs/aya), [iced](https://iced.rs/), and
   [nfq](https://crates.io/crates/nfq) crates.
+- The interface fonts, embedded through
+  [colony-ui](https://crates.io/crates/colony-ui) under the SIL Open Font
+  License: JetBrains Mono Nerd Font, OpenDyslexic and Font Awesome 6 Free.
