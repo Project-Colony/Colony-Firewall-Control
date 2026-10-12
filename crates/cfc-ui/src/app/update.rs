@@ -71,6 +71,7 @@ impl App {
                 Task::perform(delete_rule(socket, id), Message::RuleDeleted)
             }
             Message::RuleDeleted(Ok((id, true))) => {
+                self.read_only = None;
                 self.rules.retain(|r| r.id != id);
                 self.log.info(t("log_rule_deleted"), self.now_ms);
                 Task::none()
@@ -80,6 +81,7 @@ impl App {
                 Task::none()
             }
             Message::RuleDeleted(Err(e)) => {
+                self.note_denial(&e);
                 self.log
                     .error(t_fmt("log_delete_failed", &[("error", &e)]), self.now_ms);
                 Task::none()
@@ -186,6 +188,9 @@ impl App {
                 }
             }
             Message::PromptStreamEnded(e) => {
+                // An installed app whose binary an upgrade replaced is told
+                // here that it no longer answers prompts.
+                self.note_denial(&e);
                 self.stream_trouble = true;
                 self.prompts.clear();
                 self.detach_orphaned_editor();
@@ -225,6 +230,7 @@ impl App {
                 )
             }
             Message::VerdictSubmitted(Ok((prompt_id, true, note))) => {
+                self.read_only = None;
                 self.settle_card(&prompt_id, true);
                 // The daemon telling the user something true about the rule
                 // it stored - today, that a user-writable binary was
@@ -248,6 +254,7 @@ impl App {
                 Task::none()
             }
             Message::VerdictSubmitted(Err(failure)) => {
+                self.note_denial(&failure.message);
                 self.settle_card(&failure.prompt_id, failure.applied);
                 let key = if failure.applied {
                     "log_verdict_failed"
@@ -347,6 +354,7 @@ impl App {
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
             Message::PausedSet(Ok((paused, resume_at_unix_ms))) => {
+                self.read_only = None;
                 self.pause_pending = false;
                 if !paused {
                     self.now_ms = now_ms();
@@ -373,6 +381,7 @@ impl App {
                 Task::none()
             }
             Message::PausedSet(Err(e)) => {
+                self.note_denial(&e);
                 self.pause_pending = false;
                 self.log
                     .error(t_fmt("log_pause_failed", &[("error", &e)]), self.now_ms);
@@ -491,6 +500,7 @@ impl App {
                 self.update(Message::RuleSaved(Err(failure.message)))
             }
             Message::RuleSaved(Ok(line)) => {
+                self.read_only = None;
                 // Say what was stored: closing the editor in silence read
                 // as accepted whatever scope the rule ended up with.
                 self.log.info(line, self.now_ms);
@@ -544,6 +554,7 @@ impl App {
                 Task::none()
             }
             Message::RuleSaved(Err(e)) => {
+                self.note_denial(&e);
                 if let Some(ed) = &mut self.editor {
                     ed.validation = Some(e.clone());
                 }

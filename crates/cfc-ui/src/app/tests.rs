@@ -92,6 +92,38 @@ fn a_failed_connection_logs_the_actionable_reason_once() {
 }
 
 #[test]
+fn a_read_only_refusal_stays_on_screen_until_a_change_goes_through() {
+    let (mut app, _) = App::new(Startup::default());
+    // A dismissed polkit dialog says nothing about what the app may do.
+    let _ = app.update(Message::PausedSet(Err(
+        "authorization dialog dismissed (polkit action org.projectcolony.firewall.pause)".into(),
+    )));
+    assert!(app.read_only.is_none());
+
+    let refusal = format!(
+        "{}: /home/u/.local/share/colony/apps/colony-firewall-control-linux is not an \
+         installed Colony Firewall app or tray. Firewall changes are accepted only from \
+         the installed Colony Firewall app and tray, or from root (sudo cfc ...).",
+        cfc_client::READ_ONLY_DENIAL
+    );
+    let _ = app.update(Message::RuleSaved(Err(refusal.clone())));
+    let shown = app.read_only.clone().expect("the refusal is kept");
+    assert!(shown.contains("is not an installed"), "{shown}");
+    assert!(
+        shown.ends_with("(sudo cfc ...)."),
+        "the advice is cut: {shown}"
+    );
+
+    // An upgraded app learns it from the prompt stream instead.
+    app.read_only = None;
+    let _ = app.update(Message::PromptStreamEnded(refusal));
+    assert!(app.read_only.is_some());
+
+    let _ = app.update(Message::PausedSet(Ok((false, 0))));
+    assert!(app.read_only.is_none(), "a change went through");
+}
+
+#[test]
 fn customization_waits_for_a_verdict_and_drops_stale_actions() {
     let (mut app, _) = App::new(Startup::default());
     let event = prompt_event();

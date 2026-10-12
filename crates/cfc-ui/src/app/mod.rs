@@ -21,7 +21,7 @@ use crate::i18n::{t, t_fmt};
 use crate::preferences::{Config, Language};
 use crate::session_stats::SessionStats;
 use crate::status_log::StatusLog;
-use crate::theme::{sz, ui_text};
+use crate::theme::{sz, ui_text, ui_text_bold};
 use crate::views::live::VerdictFilter;
 use crate::views::rules::RuleSort;
 use crate::{format, streams, theme, views};
@@ -114,6 +114,11 @@ pub struct App {
     /// Set when a gRPC stream drops; the badge shows "reconnecting" instead
     /// of the footer being rewritten every two seconds.
     pub stream_trouble: bool,
+    /// The daemon's reason when it last refused a change because this app
+    /// may only read (a copy that is not the installed, root-owned app).
+    /// Shown as a banner until a change goes through, so it does not scroll
+    /// out of the status log or live only in the log file.
+    pub read_only: Option<String>,
     /// Cached wall clock, refreshed on every tick so views stay pure.
     pub now_ms: i64,
 }
@@ -368,6 +373,7 @@ impl App {
             pause_shown_at_ms: 0,
             pause_pending: false,
             stream_trouble: false,
+            read_only: None,
             now_ms: now_ms(),
         };
         let socket = app.socket_path.clone();
@@ -625,6 +631,7 @@ impl App {
         let main_panel = column![
             header,
             self.connection_hint(),
+            self.read_only_hint(),
             container(body_card).padding([10, 12]).height(Length::Fill),
             self.status_area(),
         ];
@@ -651,6 +658,35 @@ impl App {
             .width(Length::Fill)
             .style(theme::banner_err)
             .into()
+    }
+
+    /// Why this app may not change the firewall, under the header for as
+    /// long as it holds: a translated headline, then the daemon's own words,
+    /// which name the program it judged and where changes are accepted from.
+    fn read_only_hint(&self) -> Element<'_, Message> {
+        let Some(reason) = &self.read_only else {
+            return Space::new().into();
+        };
+        container(
+            column![
+                ui_text_bold(t("read_only_banner")).size(sz(11)),
+                ui_text(reason.as_str()).size(sz(11)),
+            ]
+            .spacing(2),
+        )
+        .padding([6, 16])
+        .width(Length::Fill)
+        .style(theme::banner_warn)
+        .into()
+    }
+
+    /// Keeps the daemon's reason when it refused a change because this app
+    /// may only read. Other refusals (a dismissed polkit dialog, a rule the
+    /// daemon rejects) say nothing about what this app may do.
+    fn note_denial(&mut self, error: &str) {
+        if error.starts_with(cfc_client::READ_ONLY_DENIAL) {
+            self.read_only = Some(format::connection_hint(error, format::READ_ONLY_HINT_MAX));
+        }
     }
 
     /// The status ring: newest first, each line individually dismissable.

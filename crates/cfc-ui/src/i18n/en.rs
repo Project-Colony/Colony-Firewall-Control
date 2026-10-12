@@ -28,6 +28,7 @@ pub(super) const STRINGS: &[(&str, &str)] = &[
     ("button_reconnect", "Reconnect"),
     ("button_reconnect_in", "Reconnect ({secs}s)"),
     ("log_dismiss_all", "dismiss all"),
+    ("read_only_banner", "This copy may only read: the daemon refused the change."),
     ("unknown", "unknown"),
     (
         "log_prompt_expired",
