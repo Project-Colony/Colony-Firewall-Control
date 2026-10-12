@@ -352,7 +352,7 @@ jobs:
 
           # Docs, for parity with what packaging/arch/PKGBUILD puts in
           # /usr/share/doc. `cfc status` points users at TROUBLESHOOTING.md
-          # by name, so it has to actually ship.
+          # by name, and install.sh at first-run.md, so both have to ship.
           install -m644 \
             README.md \
             CHANGELOG.md \
@@ -360,6 +360,7 @@ jobs:
             docs/ARCHITECTURE.md \
             docs/HARDENING.md \
             docs/TROUBLESHOOTING.md \
+            docs/guide/first-run.md \
             "${STAGE}/"
 
           # The tarball's installer and uninstaller, from the same manifest.

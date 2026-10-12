@@ -20,7 +20,7 @@ PLATFORM=linux-x86_64
     printf '#!/bin/sh\n# Generated from packaging/tarball-manifest.json. Run as root: sudo ./install.sh\nset -e\ncd "$(dirname "$0")"\n'
     jq -er --arg p "${PLATFORM}" '.platforms[$p]
         | "install -m 0755 \(.binaries | join(" ")) \(.installPath)/", .postInstall[]' "${MANIFEST}"
-    printf 'echo "Installed. Enable enforcement as described under First run in README.md."\n'
+    printf 'echo "Installed. Enable enforcement as described under First run in first-run.md."\n'
 } >"${STAGE}/install.sh"
 
 {

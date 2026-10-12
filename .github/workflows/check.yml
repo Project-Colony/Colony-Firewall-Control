@@ -333,5 +333,6 @@ jobs:
           usr/share/icons/hicolor/scalable/apps/colony-firewall.svg
           etc/colony-firewall/daemon.toml
           usr/share/doc/colony-firewall-control-git/TROUBLESHOOTING.md
+          usr/share/doc/colony-firewall-control-git/first-run.md
           EOF
           exit "${missing}"

@@ -234,7 +234,7 @@ nobody is watching: a program can make its own UDP attribution ambiguous
 
 Normal mode follows the desktop application firewall model of OpenSnitch and
 Windows Firewall Control. It filters new tracked IP flows using socket
-attribution. [Explicit application confinement](../README.md#explicit-application-confinement)
+attribution. [Explicit application confinement](guide/first-run.md#explicit-application-confinement)
 is a separate launch mode.
 
 - **Anything from root**: `/usr/bin/colony-firewalld` itself is trusted,

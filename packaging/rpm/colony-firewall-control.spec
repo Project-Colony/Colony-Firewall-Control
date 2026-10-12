@@ -236,7 +236,7 @@ fi
 
 %files
 %license LICENSE
-%doc README.md docs/ARCHITECTURE.md docs/HARDENING.md docs/TROUBLESHOOTING.md
+%doc README.md docs/ARCHITECTURE.md docs/HARDENING.md docs/TROUBLESHOOTING.md docs/guide/first-run.md
 %{_bindir}/colony-firewalld
 %{_bindir}/colony-firewall
 %{_bindir}/colony-firewall-tray
