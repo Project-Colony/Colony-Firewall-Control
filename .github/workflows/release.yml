@@ -278,7 +278,11 @@ jobs:
             && grep -qx "sha256=$digest" "$d/colony-linux.meta" \
             || { echo "::error::colony-linux.meta does not describe the downloaded colony-linux"; exit 1; }
           chmod +x "$d/colony-linux"
-          "$d/colony-linux" validate-manifest colony.json \
+          # An absolute path: validate-manifest takes the repository name,
+          # which the asset names start with, from the manifest's directory.
+          # A bare `colony.json` has none, and its fallback is the display
+          # name, "Colony Firewall Control", which no asset name matches.
+          "$d/colony-linux" validate-manifest "$PWD/colony.json" \
             colony-firewall-control-linux \
             "colony-firewall-control-${VERSION}-linux-x86_64.tar.zst" \
             SHA256SUMS PKGBUILD SRCINFO
