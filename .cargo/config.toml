@@ -8,4 +8,4 @@
 # that directory as its cwd (which is what `cargo xtask build-ebpf` does).
 
 [alias]
-xtask = "run --quiet --package xtask --"
+xtask = "run --quiet --package cfc-xtask --"

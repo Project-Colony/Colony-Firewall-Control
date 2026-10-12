@@ -11,7 +11,7 @@ real daemon. Nothing is downloaded; nothing outside `target/vm-bench` is
 written; the guest exists for one boot.
 
 ```sh
-cargo build --release -p cfc-daemon -p cfc-cli
+cargo build --release -p cfc-daemon -p cfc
 cargo xtask build-ebpf
 ./scripts/vm-bench/run.sh
 ```

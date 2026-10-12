@@ -29,12 +29,10 @@ on:
     branches: [main]
     paths:
       - "packaging/**"
-      - "systemd/**"
       - ".github/workflows/rhel.yml"
   pull_request:
     paths:
       - "packaging/**"
-      - "systemd/**"
       - ".github/workflows/rhel.yml"
   # The policy names types from selinux-policy-devel, which moves under us
   # between releases. A weekly run catches a rename before a user does.
@@ -89,10 +87,10 @@ jobs:
           dnf -y install polkit libxml2
           dtd="$(find / -xdev -name policyconfig-1.dtd 2>/dev/null | head -n1)"
           if [ -n "${dtd}" ]; then
-            xmllint --noout --nonet --dtdvalid "${dtd}" pkg/org.projectcolony.firewall.policy
+            xmllint --noout --nonet --dtdvalid "${dtd}" packaging/linux/org.projectcolony.firewall.policy
           else
             echo "::warning::no policyconfig-1.dtd in this image; checking well-formedness only"
-            xmllint --noout --nonet pkg/org.projectcolony.firewall.policy
+            xmllint --noout --nonet packaging/linux/org.projectcolony.firewall.policy
           fi
 
       - name: Show what the source declares

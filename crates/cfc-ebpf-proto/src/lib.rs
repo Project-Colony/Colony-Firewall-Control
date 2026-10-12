@@ -27,9 +27,9 @@
 //! userspace consumer should instead write, next to its map handles:
 //!
 //! ```ignore
-//! unsafe impl aya::Pod for cfc_ebpf_common::ExecEvent {}
-//! unsafe impl aya::Pod for cfc_ebpf_common::ExitEvent {}
-//! unsafe impl aya::Pod for cfc_ebpf_common::DnsPacket {}
+//! unsafe impl aya::Pod for cfc_ebpf_proto::ExecEvent {}
+//! unsafe impl aya::Pod for cfc_ebpf_proto::ExitEvent {}
+//! unsafe impl aya::Pod for cfc_ebpf_proto::DnsPacket {}
 //! ```
 //!
 //! which is sound precisely because of the layout rules above.

@@ -18,12 +18,12 @@
 //! is the one decision that must NOT survive it, and `FAST_ALLOW_UNTIL` is
 //! how it does not.
 //!
-//! All the interesting arithmetic lives in `cfc-ebpf-common` so it can be
+//! All the interesting arithmetic lives in `cfc-ebpf-proto` so it can be
 //! unit-tested on the host; this file is the thin, verifier-shaped shell around
 //! it: map declarations, helper calls and bounded copies.
 //!
 //! The DNS program does **no parsing**. It classifies the packet with the
-//! cheap header arithmetic in `cfc_ebpf_common::net`, checks two bytes of the
+//! cheap header arithmetic in `cfc_ebpf_proto::net`, checks two bytes of the
 //! DNS header, and copies the payload out. Parsing it in the kernel cost more
 //! than the verifier's 1,000,000-instruction budget; see `README.md`.
 
@@ -39,9 +39,9 @@ use aya_ebpf::macros::{cgroup_skb, cgroup_sock_addr, map, tracepoint};
 use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::{SkBuffContext, SockAddrContext, TracePointContext};
 use aya_ebpf::{EbpfContext as _, Global};
-use cfc_ebpf_common::dns::DNS_HEADER_LEN;
-use cfc_ebpf_common::net::{self, IPV4_MIN_HEADER_LEN, UDP_HEADER_LEN};
-use cfc_ebpf_common::{ConnectReport, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent, FILENAME_LEN};
+use cfc_ebpf_proto::dns::DNS_HEADER_LEN;
+use cfc_ebpf_proto::net::{self, IPV4_MIN_HEADER_LEN, UDP_HEADER_LEN};
+use cfc_ebpf_proto::{ConnectReport, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent, FILENAME_LEN};
 
 // ---------------------------------------------------------------------------
 // Maps
@@ -123,10 +123,10 @@ static EXE_RULES: HashMap<u64, u32> = HashMap::with_max_entries(4_096, 0);
 #[map]
 static EXE_RULES_ON: Array<u32> = Array::with_max_entries(1, 0);
 
-/// Counters for the connect path. See `cfc_ebpf_common::enforce_stat`.
+/// Counters for the connect path. See `cfc_ebpf_proto::enforce_stat`.
 #[map]
 static ENFORCE_STATS: PerCpuArray<u64> =
-    PerCpuArray::with_max_entries(cfc_ebpf_common::enforce_stat::SLOTS, 0);
+    PerCpuArray::with_max_entries(cfc_ebpf_proto::enforce_stat::SLOTS, 0);
 
 /// Stream of `connect()` calls refused in-kernel.
 ///
@@ -241,7 +241,7 @@ static PKT_SCRATCH: PerCpuArray<[u8; PKT_SCRATCH_LEN]> = PerCpuArray::with_max_e
 
 /// Declares which event layout this object was built against.
 ///
-/// The name **must** equal `cfc_ebpf_common::ABI_SYMBOL`, and the version in
+/// The name **must** equal `cfc_ebpf_proto::ABI_SYMBOL`, and the version in
 /// it must match `ABI_VERSION`. The loader requires this exact symbol to exist
 /// before it attaches anything, so an object built against a different layout
 /// fails to load instead of feeding userspace prefix-decoded garbage. A
@@ -249,10 +249,10 @@ static PKT_SCRATCH: PerCpuArray<[u8; PKT_SCRATCH_LEN]> = PerCpuArray::with_max_e
 /// which the root test catches immediately.
 ///
 /// Rust needs a literal for the symbol name, so this cannot be spelled in
-/// terms of the constant. The `const` assertions in `cfc-ebpf-common` are what
+/// terms of the constant. The `const` assertions in `cfc-ebpf-proto` are what
 /// make a layout change that forgets to bump it a build error.
 #[unsafe(no_mangle)]
-static CFC_EBPF_ABI_V4: Global<u32> = Global::new(cfc_ebpf_common::ABI_VERSION);
+static CFC_EBPF_ABI_V4: Global<u32> = Global::new(cfc_ebpf_proto::ABI_VERSION);
 
 /// Byte offset of `task_struct::real_parent`. 0 means "unresolved".
 #[unsafe(no_mangle)]
@@ -306,7 +306,7 @@ static EXEC_FILENAME_DATA_LOC: Global<u32> = Global::new(8);
 /// values before patching: this side can only refuse *silently*, and a loader
 /// with a looser bound used to patch such an offset in and report the
 /// filename read as working while this early return read nothing.
-const EXEC_FILENAME_DATA_LOC_MAX: u32 = cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX;
+const EXEC_FILENAME_DATA_LOC_MAX: u32 = cfc_ebpf_proto::TRACEPOINT_FIELD_OFFSET_MAX;
 
 /// Byte offset of `group_dead` in `sched_process_exit`'s record, or
 /// [`EXIT_GROUP_DEAD_ABSENT`] when this kernel does not carry it.
@@ -334,7 +334,7 @@ const EXIT_GROUP_DEAD_ABSENT: u32 = u32::MAX;
 
 /// Largest plausible offset for it, bounding the read the same way the exec
 /// filename offset is bounded - same shared constant, same reason.
-const EXIT_GROUP_DEAD_MAX: u32 = cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX;
+const EXIT_GROUP_DEAD_MAX: u32 = cfc_ebpf_proto::TRACEPOINT_FIELD_OFFSET_MAX;
 
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 pub fn cfc_sched_process_exec(ctx: TracePointContext) -> u32 {
@@ -522,15 +522,15 @@ fn precommit_verdict(tgid: u32, event: &ExecEvent) {
         return;
     }
     // The slice bound is what lets the verifier prove every index is in range.
-    let key = cfc_ebpf_common::hash_exe_path(&event.filename[..len]);
+    let key = cfc_ebpf_proto::hash_exe_path(&event.filename[..len]);
     // Clear as well as write, mirroring userspace's `on_exec`. A pid that
     // re-execs *out* of a denied binary must not keep the denial: the tgid is
     // the same, so an entry written for the old program would go on refusing
     // the new one. Only the write half was here at first, which made the
     // failure look like the pid-reuse rot this layer was built to remove.
     match unsafe { EXE_RULES.get(&key) } {
-        Some(a) if *a == cfc_ebpf_common::verdict::DENY => {
-            let _ = VERDICTS.insert(&tgid, &cfc_ebpf_common::verdict::DENY, 0);
+        Some(a) if *a == cfc_ebpf_proto::verdict::DENY => {
+            let _ = VERDICTS.insert(&tgid, &cfc_ebpf_proto::verdict::DENY, 0);
         }
         _ => {
             let _ = VERDICTS.remove(&tgid);
@@ -989,7 +989,7 @@ fn bump(slot: u32) {
 /// paths every process on the machine takes.
 #[inline(always)]
 fn fast_path_armed() -> bool {
-    matches!(FAST_ALLOW_MARK.get(0), Some(&m) if m != cfc_ebpf_common::fast_allow::UNARMED)
+    matches!(FAST_ALLOW_MARK.get(0), Some(&m) if m != cfc_ebpf_proto::fast_allow::UNARMED)
 }
 
 /// Reports an in-kernel decision so it is not a silent one - a refusal to
@@ -1003,7 +1003,7 @@ fn report_connect(ring: &RingBuf, ctx: &SockAddrContext, tgid: u32, family: u8) 
     let Some(mut entry) = ring.reserve::<ConnectReport>(0) else {
         // The connection is already decided; this record is the only thing
         // lost. Counted rather than dropped in silence - see REPORT_DROPPED.
-        bump(cfc_ebpf_common::enforce_stat::REPORT_DROPPED);
+        bump(cfc_ebpf_proto::enforce_stat::REPORT_DROPPED);
         return;
     };
     let mut ev = ConnectReport::zeroed();
@@ -1074,8 +1074,8 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
     // SAFETY: `get` on a BPF hash map from a program context; the returned
     // reference borrows map memory that stays valid for this program run.
     match unsafe { VERDICTS.get(&tgid) } {
-        Some(&v) if v == cfc_ebpf_common::verdict::DENY => {
-            bump(cfc_ebpf_common::enforce_stat::DENIED);
+        Some(&v) if v == cfc_ebpf_proto::verdict::DENY => {
+            bump(cfc_ebpf_proto::enforce_stat::DENIED);
             report_connect(&DENY_EVENTS, ctx, tgid, family);
             CONNECT_REFUSE
         }
@@ -1087,7 +1087,7 @@ fn connect_verdict(ctx: &SockAddrContext, family: u8, record_cookie: bool) -> i3
             if record_cookie {
                 mark_decision(ctx, tgid, family);
             } else {
-                bump(cfc_ebpf_common::enforce_stat::UNKNOWN);
+                bump(cfc_ebpf_proto::enforce_stat::UNKNOWN);
             }
             CONNECT_PROCEED
         }
@@ -1134,7 +1134,7 @@ const SO_MARK: i32 = 36;
 /// the flow, and no interference with the routing the mark was there for.
 #[inline(always)]
 fn mark_decision(ctx: &SockAddrContext, tgid: u32, family: u8) {
-    use cfc_ebpf_common::{enforce_stat, fast_allow};
+    use cfc_ebpf_proto::{enforce_stat, fast_allow};
 
     // Only a TCP socket is ever marked, from either hook.
     //
@@ -1322,7 +1322,7 @@ pub fn cfc_connect6_basic(ctx: SockAddrContext) -> i32 {
 pub static LICENSE: [u8; 4] = *b"GPL\0";
 
 /// Unreachable by construction: every fallible operation in this crate and in
-/// `cfc-ebpf-common` returns `Option`/`Result`, and there is no indexing that
+/// `cfc-ebpf-proto` returns `Option`/`Result`, and there is no indexing that
 /// could bounds-check.
 ///
 /// A plain `loop {}` rather than `unreachable_unchecked()` on purpose: if a

@@ -1,5 +1,5 @@
 [package]
-name = "cfc-ebpf-common"
+name = "cfc-ebpf-proto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

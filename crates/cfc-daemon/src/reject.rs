@@ -906,7 +906,7 @@ mod tests {
     /// come back.
     #[test]
     fn the_snippet_accepts_marks_only_for_root_refusals() {
-        let snippet = include_str!("../../../systemd/nftables-snippet.conf");
+        let snippet = include_str!("../../../packaging/systemd/nftables-snippet.conf");
         let exception = format!("meta skuid 0 meta mark {REJECT_MARK:#x} ");
         let marked: Vec<&str> = snippet
             .lines()

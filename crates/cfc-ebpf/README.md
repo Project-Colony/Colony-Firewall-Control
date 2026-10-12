@@ -5,11 +5,11 @@ to a single BPF ELF object containing three programs and seven maps. Nothing
 here loads or attaches anything - that is the daemon's job (see
 [Loading](#loading-attaching-and-capabilities)).
 
-Its userspace counterpart is [`cfc-ebpf-common`](../cfc-ebpf-common), which owns
+Its userspace counterpart is [`cfc-ebpf-proto`](../cfc-ebpf-proto), which owns
 the shared `#[repr(C)]` event structs **and** all the DNS/IP parsing arithmetic.
 That split is deliberate: verifier-constrained code is close to untestable in
 place, so every branch that can be expressed as pure `no_std` arithmetic lives in
-`cfc-ebpf-common` and is unit-tested on the host against hand-built packets.
+`cfc-ebpf-proto` and is unit-tested on the host against hand-built packets.
 
 ---
 
@@ -143,7 +143,7 @@ What the kernel half does, in order:
 
 1. `skb->len >= 40` (the shortest possible IPv4 + UDP + DNS header);
 2. copy up to 80 bytes - the worst-case header stack - into `PKT_SCRATCH`;
-3. `cfc_ebpf_common::net::udp_payload_from_l3` to confirm IPv4/IPv6 + UDP,
+3. `cfc_ebpf_proto::net::udp_payload_from_l3` to confirm IPv4/IPv6 + UDP,
    unfragmented, and to locate the payload;
 4. source port == 53;
 5. payload length >= 12 and the **QR bit** set (`payload[2] & 0x80`) - one byte
@@ -172,7 +172,7 @@ covers everything.
 
 #### What the DNS parser supports
 
-The parser is `cfc_ebpf_common::dns`, running in the **daemon**, over
+The parser is `cfc_ebpf_proto::dns`, running in the **daemon**, over
 `DnsPacket::payload()`. It still obeys the panic-free, constant-loop-bound,
 no-dynamic-slicing style it was written in - that style is worth keeping for a
 parser fed attacker-influenced bytes, and it keeps the option of moving pieces
@@ -279,7 +279,7 @@ Two independent causes, both fixed here:
    unconditionally, and the two large byte arrays (`ExecEvent::filename`,
    `DnsAnswer::name`) are written as "prefix + one NUL terminator". The stale
    tail is unreachable from userspace: `filename_len`/`name_len` bound it and
-   `cfc_ebpf_common::nul_terminated` stops at the NUL as well. The per-CPU slots
+   `cfc_ebpf_proto::nul_terminated` stops at the NUL as well. The per-CPU slots
    start out zeroed by the kernel, so this is never *uninitialised* memory.
 
    The same rule killed the obvious `for i in written..MAX { out[i] = 0 }` tail
@@ -350,7 +350,7 @@ exhaustively; shaving a factor off one term leaves the shape intact.
 So the parsing moved out. The kernel now does only what the kernel is uniquely
 able to do - see the packet, cheaply, in flight - and the daemon does the part
 that needs loops, where there is no verifier and where the parser
-(`cfc_ebpf_common::dns`, 63 host tests) already lived.
+(`cfc_ebpf_proto::dns`, 63 host tests) already lived.
 
 The result, measured on the same kernel:
 
@@ -500,11 +500,11 @@ three programs should be attachable independently, so losing the cgroup attach
 
 ### Consuming the types
 
-`cfc-ebpf-common` deliberately does **not** depend on `aya`, so that the marker
+`cfc-ebpf-proto` deliberately does **not** depend on `aya`, so that the marker
 trait does not drag aya into the stable workspace's dependency graph.
 
 An earlier version of this section told the loader to write
-`unsafe impl aya::Pod for cfc_ebpf_common::ExecEvent {}`. **That does not
+`unsafe impl aya::Pod for cfc_ebpf_proto::ExecEvent {}`. **That does not
 compile**, and cannot: `aya::Pod` and `ExecEvent` are both foreign to
 `cfc-daemon`, so the impl is refused by the orphan rule (E0117). It is also
 unnecessary - `aya::Pod` is needed for *typed map access*

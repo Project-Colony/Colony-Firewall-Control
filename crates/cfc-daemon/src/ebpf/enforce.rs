@@ -39,7 +39,7 @@
 //! Observed exactly that way on a real machine: 48 refusals counted, none
 //! reported.
 //!
-//! The `v<N>` component is [`cfc_ebpf_common::ABI_VERSION`]. It is in the *path* because an
+//! The `v<N>` component is [`cfc_ebpf_proto::ABI_VERSION`]. It is in the *path* because an
 //! object built against a different event layout is a different program and
 //! must not inherit the previous one's pins; putting the version in a file
 //! inside a shared directory would mean reading it before knowing whether it
@@ -63,7 +63,7 @@ use aya::programs::links::FdLink;
 use aya::programs::{CgroupAttachMode, CgroupSockAddr};
 use aya::Ebpf;
 use cfc_core::Process;
-use cfc_ebpf_common::{enforce_stat, ABI_VERSION};
+use cfc_ebpf_proto::{enforce_stat, ABI_VERSION};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
@@ -330,7 +330,7 @@ impl VerdictSink {
         for &(pid, deny) in &deny_work {
             let r = if deny {
                 denied += 1;
-                map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
+                map.insert(pid, cfc_ebpf_proto::verdict::DENY, 0)
             } else {
                 clear(&mut map, pid)
             };
@@ -479,7 +479,7 @@ impl VerdictSink {
         // pid was written for the binary it just exec'd away from, and the
         // packet path decides the ambiguous case with the real hash in hand.
         let r = if deny {
-            map.insert(pid, cfc_ebpf_common::verdict::DENY, 0)
+            map.insert(pid, cfc_ebpf_proto::verdict::DENY, 0)
         } else {
             clear(&mut map, pid)
         };
@@ -536,8 +536,8 @@ impl VerdictSink {
                 ..Process::unknown(0)
             };
             if self.engine.denies_process_wide(&proc) {
-                let key = cfc_ebpf_common::hash_exe_path(exe.as_os_str().as_encoded_bytes());
-                wanted.insert(key, cfc_ebpf_common::verdict::DENY);
+                let key = cfc_ebpf_proto::hash_exe_path(exe.as_os_str().as_encoded_bytes());
+                wanted.insert(key, cfc_ebpf_proto::verdict::DENY);
             }
         }
 
@@ -901,7 +901,7 @@ pub(super) fn disarm_legacy_fast_allow(bpf: &mut Ebpf) {
     if let Some(m) = bpf.map_mut(MAP_FAST_ALLOW_MARK) {
         match aya::maps::Array::<_, u32>::try_from(m) {
             Ok(mut mark) => {
-                if let Err(e) = mark.set(0, cfc_ebpf_common::fast_allow::UNARMED, 0) {
+                if let Err(e) = mark.set(0, cfc_ebpf_proto::fast_allow::UNARMED, 0) {
                     warn!("could not unarm the legacy {MAP_FAST_ALLOW_MARK}: {e}");
                 }
             }
@@ -1316,7 +1316,7 @@ mod tests {
         // 4. Denied.
         let mut denied = spawn();
         verdicts
-            .insert(denied.id(), cfc_ebpf_common::verdict::DENY, 0)
+            .insert(denied.id(), cfc_ebpf_proto::verdict::DENY, 0)
             .expect("insert the deny");
         let refused = go(&mut denied);
         verdicts.remove(&denied.id()).ok();
@@ -1410,11 +1410,11 @@ mod tests {
             let mut verdicts = BpfHashMap::<_, u32, u32>::try_from(aya::maps::Map::HashMap(data))
                 .expect("VERDICTS is a hash map");
             verdicts
-                .insert(pid, cfc_ebpf_common::verdict::DENY, 0)
+                .insert(pid, cfc_ebpf_proto::verdict::DENY, 0)
                 .expect("write the verdict");
             assert_eq!(
                 verdicts.get(&pid, 0).ok(),
-                Some(cfc_ebpf_common::verdict::DENY)
+                Some(cfc_ebpf_proto::verdict::DENY)
             );
         }
 

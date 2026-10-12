@@ -1378,7 +1378,7 @@ fn secure_socket(path: &Path, ipc: &IpcConfig) -> SocketAuth {
                 socket = %path.display(),
                 "group '{}' does not exist: leaving the control socket root-only. \
                  The UI and non-root CLI cannot connect. Install the sysusers fragment \
-                 (systemd/colony-firewall.sysusers -> /usr/lib/sysusers.d/colony-firewall.conf, \
+                 (packaging/systemd/colony-firewall.sysusers -> /usr/lib/sysusers.d/colony-firewall.conf, \
                  then `systemd-sysusers`) or create it with \
                  `groupadd -r {}`, then add your desktop user with \
                  `usermod -aG {} <user>` and restart the daemon.",

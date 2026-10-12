@@ -37,12 +37,12 @@ default = ["ebpf"]
 #
 # To build without it: `cargo build -p cfc-daemon --no-default-features`.
 # Package-scoped on purpose -- an unscoped `--workspace --no-default-features`
-# also strips `default = ["std"]` from cfc-ebpf-common, which builds today only
+# also strips `default = ["std"]` from cfc-ebpf-proto, which builds today only
 # by feature unification.
 #
 # Note that the object itself is NOT built by this feature and is NOT embedded
 # in the binary: it is loaded at runtime from `[ebpf] object_path`. See the
-# module docs in src/ebpf.rs for why.
+# module docs in src/ebpf/mod.rs for why.
 ebpf = ["dep:aya"]
 
 [dependencies]
@@ -52,7 +52,7 @@ cfc-proto = { path = "../cfc-proto" }
 # kernel process table is compiled (and unit-tested) in every configuration,
 # it is simply never fed without the `ebpf` feature. The crate is
 # dependency-free, so this costs nothing.
-cfc-ebpf-common = { workspace = true }
+cfc-ebpf-proto = { workspace = true }
 aya = { workspace = true, optional = true }
 
 tokio = { workspace = true }

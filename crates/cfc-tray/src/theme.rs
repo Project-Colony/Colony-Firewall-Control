@@ -26,12 +26,12 @@ use tracing::{debug, info, warn};
 pub const ICON_NAME: &str = "colony-firewall";
 
 /// The packaged theme icon. `include_str!` reaches outside the crate on
-/// purpose: `pkg/colony-firewall.svg` is the file `PKGBUILD` installs
+/// purpose: `assets/icons/colony-firewall.svg` is the file `PKGBUILD` installs
 /// into hicolor, and embedding *that* file keeps one artwork - the tray
 /// shows the same icon whether the package installed it or this module
 /// wrote it at runtime. If the asset moves, this stops compiling, which
 /// is the right way to find out.
-const ICON_SVG: &str = include_str!("../../../pkg/colony-firewall.svg");
+const ICON_SVG: &str = include_str!("../../../assets/icons/colony-firewall.svg");
 
 /// Extensions an icon lookup accepts, per the icon theme spec.
 const ICON_EXTENSIONS: [&str; 3] = ["svg", "png", "xpm"];

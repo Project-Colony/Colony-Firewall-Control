@@ -1,28 +1,34 @@
 # Maintainer: MotherSphere <linhajahad@gmail.com>
 #
-# Development / VCS variant of colony-firewall-control.
-#
-# Usage (from anywhere):
-#     build=$(mktemp -d) && cp pkg/PKGBUILD-git "$build"/PKGBUILD
-#     cp pkg/colony-firewall-control.install "$build"/
-#     cd "$build" && makepkg -si
-#
-# To build from your local checkout instead of GitHub (fast iteration,
-# uses your working tree's HEAD), point _giturl at the repo root, e.g.:
-#     _giturl="git+file:///home/you/Colony-Firewall-Control"
+# AUR release PKGBUILD for Colony Firewall Control.
+# For building from a git checkout during development, see PKGBUILD-git.
 
-pkgname=colony-firewall-control-git
-pkgver=r0.0000000
+pkgname=colony-firewall-control
+pkgver=0.8.0
 pkgrel=1
-pkgdesc="Application-aware outbound firewall for Linux, written in Rust (git version)"
+pkgdesc="Application-aware outbound firewall for Linux, written in Rust"
 arch=('x86_64')
 url="https://github.com/Project-Colony/Colony-Firewall-Control"
 license=('GPL-3.0-or-later')
+# Runtime deps, deliberately minimal:
+# - nftables: /usr/bin/nft is required by colony-firewall-nft.service and
+#   by the pre_remove cleanup (table inet colony_firewall).
+# - libxkbcommon / wayland: dlopen'd at runtime by the iced (winit/wgpu) GUI.
+# - No 'sqlite': rusqlite is built with the 'bundled' feature.
+# - No 'libnetfilter_queue'/'libnfnetlink': the nfq crate speaks netlink
+#   directly in pure Rust.
 depends=('gcc-libs' 'glibc' 'nftables' 'libxkbcommon' 'wayland' 'hicolor-icon-theme')
-makedepends=('cargo' 'protobuf' 'pkgconf' 'git')
-# See the note in pkg/PKGBUILD: makepkg's global LTO turns the bundled sqlite3.c
-# into GCC bitcode that ld.lld cannot read, and every sqlite3_* symbol comes back
-# undefined in a clean chroot.
+makedepends=('cargo' 'protobuf' 'pkgconf')
+# !lto is required for this recipe to link at all in a clean chroot, which is
+# where the AUR and every rebuilder actually build it. Arch's makepkg.conf turns
+# LTO on globally, so -flto=auto lands in CFLAGS; rusqlite is built `bundled`, so
+# libsqlite3-sys compiles sqlite3.c through the cc crate, and the resulting
+# archive is GCC LTO bitcode that ld.lld cannot read. Every sqlite3_* symbol
+# comes back undefined while libsqlite3.a sits in the build directory, correctly
+# built, with cargo:rustc-link-lib=static=sqlite3 duly emitted.
+#
+# It builds on a developer machine because a warm target dir hides it. Measured
+# in a clean chroot on 2026-08-21.
 options=('!lto')
 optdepends=(
     'bubblewrap>=0.13.0: explicit headless application confinement'
@@ -31,46 +37,41 @@ optdepends=(
     'libx11: run the GUI in X11/XWayland sessions'
     'polkit: administrator prompt when the app or tray pauses filtering or imports rules'
 )
-provides=('colony-firewall-control')
-conflicts=('colony-firewall-control')
 backup=('etc/colony-firewall/daemon.toml')
 install=colony-firewall-control.install
-_giturl="git+https://github.com/Project-Colony/Colony-Firewall-Control.git"
-source=("colony-firewall-control::$_giturl")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Project-Colony/Colony-Firewall-Control/archive/v$pkgver.tar.gz")
+# 'SKIP' is a placeholder: fill in the real checksum per release with
+# `updpkgsums` (pacman-contrib) before pushing to the AUR.
 sha256sums=('SKIP')
 
-pkgver() {
-    cd "$srcdir/colony-firewall-control"
-    # v0.1.0-5-gabc1234 -> 0.1.0.r5.gabc1234 ; falls back to rN.hash before
-    # the first tag.
-    #
-    # The describe result is captured rather than piped: in `git describe |
-    # sed || fallback` the exit status is sed's, never git's, so before the
-    # first tag the fallback would not fire and pkgver() would print
-    # nothing at all ("pkgver is not allowed to be empty").
-    local _desc
-    if _desc="$(git describe --long --tags 2>/dev/null)" && [[ -n $_desc ]]; then
-        printf '%s' "$_desc" | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
-    else
-        printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+# GitHub release tarballs extract to <repo>-<version> (no leading 'v').
+_srcname=Colony-Firewall-Control-$pkgver
+
+# Called from build() too: `makepkg --noprepare` skips prepare().
+_require_checksum() {
+    if [[ "${sha256sums[0]}" == 'SKIP' ]]; then
+        printf '%s\n' 'Release template has no source checksum. Run updpkgsums before building.' >&2
+        return 1
     fi
 }
 
 prepare() {
-    cd "$srcdir/colony-firewall-control"
+    _require_checksum
+    cd "$srcdir/$_srcname"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$srcdir/colony-firewall-control"
+    _require_checksum
+    cd "$srcdir/$_srcname"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     cargo build --workspace --profile release --locked
 }
 
 check() {
-    cd "$srcdir/colony-firewall-control"
+    cd "$srcdir/$_srcname"
     export RUSTUP_TOOLCHAIN=stable
     # Dev profile: the release profile sets panic=abort, which the libtest
     # harness cannot use.
@@ -78,7 +79,7 @@ check() {
 }
 
 package() {
-    cd "$srcdir/colony-firewall-control"
+    cd "$srcdir/$_srcname"
 
     # Binaries
     install -Dm755 target/release/colony-firewalld     "$pkgdir/usr/bin/colony-firewalld"
@@ -87,49 +88,49 @@ package() {
     install -Dm755 target/release/cfc                  "$pkgdir/usr/bin/cfc"
 
     # systemd units
-    install -Dm644 systemd/colony-firewalld.service \
+    install -Dm644 packaging/systemd/colony-firewalld.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewalld.service"
-    install -Dm644 systemd/colony-firewall-nft.service \
+    install -Dm644 packaging/systemd/colony-firewall-nft.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewall-nft.service"
-    # Inbound: shipped, never enabled. Turning it on can strand a machine that
-    # is only reachable over the network, so it must stay something a person
-    # chooses rather than something an install does to them.
-    install -Dm644 systemd/colony-firewall-nft-inbound.service \
+    # Inbound is a separate unit, and stays disabled until someone enables it:
+    # switching it on can strand a machine reached over the network, so it must
+    # never be something an upgrade does to them.
+    install -Dm644 packaging/systemd/colony-firewall-nft-inbound.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewall-nft-inbound.service"
 
     # sysusers: creates the 'colony-firewall' group for gRPC socket access
-    install -Dm644 systemd/colony-firewall.sysusers \
+    install -Dm644 packaging/systemd/colony-firewall.sysusers \
         "$pkgdir/usr/lib/sysusers.d/colony-firewall.conf"
 
     # Config (protected by backup=)
-    install -Dm644 systemd/daemon.toml.sample \
+    install -Dm644 packaging/systemd/daemon.toml.sample \
         "$pkgdir/etc/colony-firewall/daemon.toml"
 
     # nftables snippet, loaded by colony-firewall-nft.service
-    install -Dm644 systemd/nftables-snippet.conf \
+    install -Dm644 packaging/systemd/nftables-snippet.conf \
         "$pkgdir/usr/share/colony-firewall/nftables-snippet.conf"
     # inbound chain, loaded by colony-firewall-nft-inbound.service
-    install -Dm644 systemd/nftables-inbound.conf \
+    install -Dm644 packaging/systemd/nftables-inbound.conf \
         "$pkgdir/usr/share/colony-firewall/nftables-inbound.conf"
 
-    # The lockout pre-flight, run as the inbound unit's ExecStartPre. 0755:
-    # systemd execs it directly.
+    # The lockout pre-flight, run as that unit's ExecStartPre. 0755: systemd
+    # execs it directly.
     install -Dm755 scripts/inbound-lockout-guard.sh \
         "$pkgdir/usr/lib/colony-firewall/inbound-lockout-guard.sh"
 
     # Desktop integration
-    install -Dm644 pkg/colony-firewall.desktop \
+    install -Dm644 packaging/linux/colony-firewall.desktop \
         "$pkgdir/usr/share/applications/colony-firewall.desktop"
-    install -Dm644 pkg/colony-firewall-autostart.desktop \
+    install -Dm644 packaging/linux/colony-firewall-autostart.desktop \
         "$pkgdir/etc/xdg/autostart/colony-firewall.desktop"
-    install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
+    install -Dm644 packaging/linux/colony-firewall-tray-autostart.desktop \
         "$pkgdir/etc/xdg/autostart/colony-firewall-tray.desktop"
-    install -Dm644 pkg/colony-firewall.svg \
+    install -Dm644 assets/icons/colony-firewall.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/colony-firewall.svg"
 
     # polkit actions the daemon asks about when the app or tray pauses,
     # resumes or imports rules.
-    install -Dm644 pkg/org.projectcolony.firewall.policy \
+    install -Dm644 packaging/linux/org.projectcolony.firewall.policy \
         "$pkgdir/usr/share/polkit-1/actions/org.projectcolony.firewall.policy"
 
     # Docs & license

@@ -101,11 +101,11 @@ name = "cfc-ebpf"
 version = "0.2.0"
 dependencies = [
  "aya-ebpf",
- "cfc-ebpf-common",
+ "cfc-ebpf-proto",
 ]
 
 [[package]]
-name = "cfc-ebpf-common"
+name = "cfc-ebpf-proto"
 version = "0.8.0"
 
 [[package]]

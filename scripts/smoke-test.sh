@@ -2,7 +2,7 @@
 # End-to-end smoke test for Colony Firewall Control.
 #
 # Spawns colony-firewalld in --dry-run mode (no NFQUEUE bind, no root
-# required), then drives it through every cfc-cli subcommand. Tears down
+# required), then drives it through every cfc subcommand. Tears down
 # at the end. Exits non-zero on any failure.
 
 set -euo pipefail

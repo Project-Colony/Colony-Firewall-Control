@@ -49,7 +49,7 @@ NFQUEUE in the kernel, per-app pop-ups in iced, gRPC IPC over a Unix socket.
 
 ```
 +----------------------------+     +----------------+
-|  cfc-ui   (iced, user)     |     |  cfc-cli (tty) |
+|  cfc-ui   (iced, user)     |     |  cfc (tty)     |
 |   pop-ups, rules editor    |     |   status, rules|
 |   live feed, stats         |     |   prompts, log |
 +------------+---------------+     +-------+--------+
@@ -79,11 +79,11 @@ build-ebpf`) so stable builds never see it:
 | `cfc-client`      | Shared UDS gRPC client wrapper                                             |
 | `cfc-daemon`      | Privileged daemon                                                          |
 | `cfc-ui`          | iced GUI                                                                   |
-| `cfc-cli`         | Terminal control tool                                                      |
+| `cfc`             | Terminal control tool (the `cfc` binary)                                   |
 | `cfc-tray`        | System-tray companion (StatusNotifierItem)                                 |
-| `cfc-ebpf-common` | POD types and pure parsers shared by eBPF and userspace                    |
+| `cfc-ebpf-proto`  | POD types and pure parsers shared by eBPF and userspace                    |
 | `cfc-ebpf`        | Kernel-side programs of the optional eBPF backend                          |
-| `xtask`           | Build automation (eBPF object build)                                       |
+| `cfc-xtask`       | Build automation (eBPF object build, run as `cargo xtask`)                 |
 
 More docs:
 
@@ -99,27 +99,27 @@ More docs:
 
 ### Arch Linux
 
-Not on the AUR yet. Two recipes ship in `pkg/`; the `-git` one works
+Not on the AUR yet. Two recipes ship in `packaging/arch/`; the `-git` one works
 today, without a published release:
 
 ```sh
 build=$(mktemp -d)
-cp pkg/PKGBUILD-git "$build"/PKGBUILD
-cp pkg/colony-firewall-control.install "$build"/
+cp packaging/arch/PKGBUILD-git "$build"/PKGBUILD
+cp packaging/arch/colony-firewall-control.install "$build"/
 cd "$build" && makepkg -si
 ```
 
-`pkg/PKGBUILD` is the AUR release recipe instead: it builds from the
+`packaging/arch/PKGBUILD` is the AUR release recipe instead: it builds from the
 `v$pkgver` GitHub tag tarball, so it only resolves once that tag is
 pushed, and its checksums have to be filled in with `updpkgsums` first.
-See [pkg/README.md](pkg/README.md) for the submission procedure.
+See [packaging/README.md](packaging/README.md) for the submission procedure.
 
 Either package installs everything except the eBPF object - the three
 units, the sysusers fragment, both nftables rulesets and the inbound
 lockout guard, the polkit policy, the desktop entries and icon,
 completions and man pages - and prints the first-run steps on install.
 Without the object the daemon runs on `sock_diag` + `/proc`; the release
-tarball ships it, see [pkg/README.md](pkg/README.md#release-tarball).
+tarball ships it, see [packaging/README.md](packaging/README.md#release-tarball).
 
 ### Manual
 
@@ -134,43 +134,43 @@ sudo install -Dm755 target/release/colony-firewall-tray /usr/bin/colony-firewall
 
 # All units. colony-firewall-nft.service is what First run step 1
 # enables; without it that step fails with "Unit ... not found".
-sudo install -Dm644 systemd/colony-firewalld.service \
+sudo install -Dm644 packaging/systemd/colony-firewalld.service \
      /usr/lib/systemd/system/colony-firewalld.service
-sudo install -Dm644 systemd/colony-firewall-nft.service \
+sudo install -Dm644 packaging/systemd/colony-firewall-nft.service \
      /usr/lib/systemd/system/colony-firewall-nft.service
-sudo install -Dm644 systemd/colony-firewall-nft-inbound.service \
+sudo install -Dm644 packaging/systemd/colony-firewall-nft-inbound.service \
      /usr/lib/systemd/system/colony-firewall-nft-inbound.service
 
 # The ruleset colony-firewall-nft.service loads. The unit hardcodes this
 # path, so it is not optional either.
-sudo install -Dm644 systemd/nftables-snippet.conf \
+sudo install -Dm644 packaging/systemd/nftables-snippet.conf \
      /usr/share/colony-firewall/nftables-snippet.conf
-sudo install -Dm644 systemd/nftables-inbound.conf \
+sudo install -Dm644 packaging/systemd/nftables-inbound.conf \
      /usr/share/colony-firewall/nftables-inbound.conf
 sudo install -Dm755 scripts/inbound-lockout-guard.sh \
      /usr/lib/colony-firewall/inbound-lockout-guard.sh
 
 # Config, and the group that gates the control socket
-sudo install -Dm644 systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
-sudo install -Dm644 systemd/colony-firewall.sysusers \
+sudo install -Dm644 packaging/systemd/daemon.toml.sample /etc/colony-firewall/daemon.toml
+sudo install -Dm644 packaging/systemd/colony-firewall.sysusers \
      /usr/lib/sysusers.d/colony-firewall.conf
 sudo systemd-sysusers
 
 # Desktop integration: launcher, autostart entry (so prompts reach you in
 # every session) and icon. Skip on a headless box.
-sudo install -Dm644 pkg/colony-firewall.desktop \
+sudo install -Dm644 packaging/linux/colony-firewall.desktop \
      /usr/share/applications/colony-firewall.desktop
-sudo install -Dm644 pkg/colony-firewall-autostart.desktop \
+sudo install -Dm644 packaging/linux/colony-firewall-autostart.desktop \
      /etc/xdg/autostart/colony-firewall.desktop
-sudo install -Dm644 pkg/colony-firewall.svg \
+sudo install -Dm644 assets/icons/colony-firewall.svg \
      /usr/share/icons/hicolor/scalable/apps/colony-firewall.svg
-sudo install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
+sudo install -Dm644 packaging/linux/colony-firewall-tray-autostart.desktop \
      /etc/xdg/autostart/colony-firewall-tray.desktop
 
 # polkit actions the daemon asks about when the app or tray pauses,
 # resumes, imports rules or saves an Allow rule that names no program.
 # Without it those requests are refused (see Who can change what).
-sudo install -Dm644 pkg/org.projectcolony.firewall.policy \
+sudo install -Dm644 packaging/linux/org.projectcolony.firewall.policy \
      /usr/share/polkit-1/actions/org.projectcolony.firewall.policy
 
 # Shell completions and man pages, generated by the binary itself
@@ -221,7 +221,7 @@ Applying the snippet by hand does **not** create the boot dependencies:
 
 ```sh
 sudo nft -f /usr/share/colony-firewall/nftables-snippet.conf   # installed
-sudo nft -f systemd/nftables-snippet.conf                      # from a checkout
+sudo nft -f packaging/systemd/nftables-snippet.conf                      # from a checkout
 ```
 
 **2. Seed the starter rules** so always-on system services keep working
@@ -589,7 +589,7 @@ cargo run -p cfc-daemon -- --debug --dry-run \
     --config /tmp/cfc-dev/daemon.toml --socket /tmp/cfc-dev/cfc.sock
 # in another terminal
 CFC_SOCKET=/tmp/cfc-dev/cfc.sock cargo run -p cfc-ui
-cargo run -p cfc-cli -- --socket /tmp/cfc-dev/cfc.sock status
+cargo run -p cfc -- --socket /tmp/cfc-dev/cfc.sock status
 ```
 
 ## Status
@@ -603,7 +603,7 @@ cargo run -p cfc-cli -- --socket /tmp/cfc-dev/cfc.sock status
 | 3.5 Hardening & correctness  | done  |
 | 4  eBPF backend              | done; compiled in by default, loads where the kernel supports it and the object is installed (`[ebpf] enabled`, default `"auto"`) |
 | 5a CI                        | done  |
-| 5b Packaging                 | in progress (AUR-ready PKGBUILD in `pkg/`, not yet published) |
+| 5b Packaging                 | in progress (AUR-ready PKGBUILD in `packaging/arch/`, not yet published) |
 | 5  Polish                    | done, except VirusTotal (opt-in lookup, not started) and the Colony store listing |
 
 One honest caveat: the Arch package is built end to end on every push

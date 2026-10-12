@@ -45,7 +45,7 @@ jobs:
       - name: Check version consistency (Cargo.toml / PKGBUILD / colony.json)
         run: ./scripts/check-versions.sh
 
-      - name: Check release assets against pkg/colony.json
+      - name: Check release assets against packaging/tarball-manifest.json
         run: ./scripts/check-release-assets.sh
 
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
@@ -173,7 +173,7 @@ jobs:
             scripts/inbound-lockout-guard.sh \
             "${STAGE}/"
 
-          # Everything pkg/colony.json's postInstall installs. The tarball
+          # Everything packaging/tarball-manifest.json's postInstall installs. The tarball
           # layout is FLAT: install.sh, generated from postInstall, runs
           # from the extracted directory, so each file must be present under
           # its own basename. scripts/check-release-assets.sh gates this
@@ -181,18 +181,18 @@ jobs:
           # postInstall but not staged here fails CI instead of silently
           # vanishing from tarball installs.
           install -m644 \
-            systemd/colony-firewalld.service \
-            systemd/colony-firewall-nft.service \
-            systemd/colony-firewall-nft-inbound.service \
-            systemd/colony-firewall.sysusers \
-            systemd/daemon.toml.sample \
-            systemd/nftables-snippet.conf \
-            systemd/nftables-inbound.conf \
-            pkg/colony-firewall.desktop \
-            pkg/colony-firewall-autostart.desktop \
-            pkg/colony-firewall-tray-autostart.desktop \
-            pkg/colony-firewall.svg \
-            pkg/org.projectcolony.firewall.policy \
+            packaging/systemd/colony-firewalld.service \
+            packaging/systemd/colony-firewall-nft.service \
+            packaging/systemd/colony-firewall-nft-inbound.service \
+            packaging/systemd/colony-firewall.sysusers \
+            packaging/systemd/daemon.toml.sample \
+            packaging/systemd/nftables-snippet.conf \
+            packaging/systemd/nftables-inbound.conf \
+            packaging/linux/colony-firewall.desktop \
+            packaging/linux/colony-firewall-autostart.desktop \
+            packaging/linux/colony-firewall-tray-autostart.desktop \
+            assets/icons/colony-firewall.svg \
+            packaging/linux/org.projectcolony.firewall.policy \
             "${STAGE}/"
 
           # The kernel-side object. Fatal if absent: install.sh cannot express
@@ -201,7 +201,7 @@ jobs:
             crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o \
             "${STAGE}/"
 
-          # Docs, for parity with what pkg/PKGBUILD puts in
+          # Docs, for parity with what packaging/arch/PKGBUILD puts in
           # /usr/share/doc. `cfc status` points users at TROUBLESHOOTING.md
           # by name, so it has to actually ship.
           install -m644 \
@@ -251,7 +251,7 @@ jobs:
             SHA256SUMS
             RELEASE_BODY.md
 
-  # Build pkg/PKGBUILD for real against the freshly pushed tag, and attach
+  # Build packaging/arch/PKGBUILD for real against the freshly pushed tag, and attach
   # the Arch packaging recipe (PKGBUILD with real checksums + .SRCINFO) to
   # the release. The project is not published on the AUR.
   #
@@ -276,7 +276,7 @@ jobs:
           # Both makedepends and depends: without -s, makepkg aborts on any
           # missing dependency rather than installing it. pacman-contrib
           # provides updpkgsums.
-          # This list MIRRORS pkg/PKGBUILD depends= + makedepends=, the same
+          # This list MIRRORS packaging/arch/PKGBUILD depends= + makedepends=, the same
           # way check.yml's pkgbuild-build mirrors PKGBUILD-git. 4fe0509 added
           # hicolor-icon-theme to THAT copy when makepkg refused the build; this
           # copy was missed, and the first tag run to get this far failed on
@@ -293,20 +293,20 @@ jobs:
           chown -R builder: .
 
       - name: updpkgsums - replace the SKIP placeholder with real checksums
-        working-directory: pkg
+        working-directory: packaging/arch
         run: |
           runuser -u builder -- updpkgsums PKGBUILD
           # A remote (non-VCS) source with sha256sums=('SKIP') is not
           # acceptable Arch packaging practice: it disables integrity checking of the
           # release tarball entirely.
           if grep -qE "^sha256sums=\(.*'SKIP'" PKGBUILD; then
-            echo "::error::pkg/PKGBUILD still has a SKIP checksum after updpkgsums"
+            echo "::error::packaging/arch/PKGBUILD still has a SKIP checksum after updpkgsums"
             exit 1
           fi
           grep -A2 '^sha256sums=' PKGBUILD
 
       - name: Generate .SRCINFO
-        working-directory: pkg
+        working-directory: packaging/arch
         # pipefail, because the pipeline's status is otherwise tee's 0: a
         # failed printsrcinfo would tee an empty .SRCINFO that the attach
         # step below happily uploads. The grep is check.yml's twin - a file
@@ -323,7 +323,7 @@ jobs:
           cp .SRCINFO SRCINFO
 
       - name: namcap the PKGBUILD
-        working-directory: pkg
+        working-directory: packaging/arch
         # pipefail: namcap exits 0 even when it prints E: lines, so its
         # nonzero exit means namcap itself crashed - traceback to stderr,
         # nothing in the log, and without pipefail the grep below would wave
@@ -333,12 +333,12 @@ jobs:
           namcap PKGBUILD | tee namcap.log
           # Warnings are advisory; errors are not.
           if grep -q ' E: ' namcap.log; then
-            echo "::error::namcap reported errors in pkg/PKGBUILD"
+            echo "::error::namcap reported errors in packaging/arch/PKGBUILD"
             exit 1
           fi
 
       - name: Build the package (makepkg)
-        working-directory: pkg
+        working-directory: packaging/arch
         run: |
           # --nocheck: check() re-runs the workspace test suite, which the
           # `test` job in check.yml already gates. Deps are preinstalled
@@ -347,7 +347,7 @@ jobs:
           ls -l ./*.pkg.tar.*
 
       - name: namcap the built package
-        working-directory: pkg
+        working-directory: packaging/arch
         run: |
           # Lint the package this recipe defines, not the -debug split makepkg
           # generates beside it. The debug package's .build-id symlinks point
@@ -375,8 +375,8 @@ jobs:
           name: aur-assets
           if-no-files-found: error
           path: |
-            pkg/PKGBUILD
-            pkg/SRCINFO
+            packaging/arch/PKGBUILD
+            packaging/arch/SRCINFO
 
   publish:
     needs: [build, pkgbuild]

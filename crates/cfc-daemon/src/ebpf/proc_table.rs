@@ -51,7 +51,7 @@
 //!   The start-time binding catches the reuse anyway; the TTL below is the
 //!   backstop for the case where nothing ever looks the pid up again.
 
-use cfc_ebpf_common::ExecEvent;
+use cfc_ebpf_proto::ExecEvent;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -319,7 +319,7 @@ impl KernelProcTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cfc_ebpf_common::{COMM_LEN, FILENAME_LEN};
+    use cfc_ebpf_proto::{COMM_LEN, FILENAME_LEN};
 
     fn exec(pid: u32, exe: &str, uid: u32, ppid: u32) -> ExecEvent {
         let mut e = ExecEvent::zeroed();

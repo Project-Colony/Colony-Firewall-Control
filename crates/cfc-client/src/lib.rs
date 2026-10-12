@@ -1,7 +1,7 @@
 //! Colony Firewall Control - shared client.
 //!
 //! Wraps the tonic-generated `FirewallClient` with a Unix-domain-socket
-//! transport. Used by `cfc-ui` and `cfc-cli`.
+//! transport. Used by `cfc-ui`, `cfc-tray` and `cfc`.
 
 use anyhow::Context;
 use cfc_proto::v1::firewall_client::FirewallClient;
