@@ -1,0 +1,5 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Project-Colony/Project-Colony-Resources/main/generated/colony.schema.json",
+  "name": "Colony Firewall Control",
+  "category": "security"
+}

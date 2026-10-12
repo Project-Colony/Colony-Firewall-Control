@@ -11,7 +11,9 @@
 %global debug_package %{nil}
 
 Name:           colony-firewall-control
+# x-release-please-start-version
 Version:        0.8.0
+# x-release-please-end
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
 

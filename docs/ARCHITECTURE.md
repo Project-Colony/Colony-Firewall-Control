@@ -90,6 +90,14 @@ the tarball's `install.sh` and `uninstall.sh`, and
 is staged into the tarball. The packaging notes are in
 [packaging/README.md](../packaging/README.md).
 
+Releases are cut by release-please and built by
+`.github/workflows/release.yml` from the tag: the workspace and the eBPF
+object, the tarball, the app under the name Colony installs
+(`colony-firewall-control-linux`) and the Arch recipe. The shared
+sign-and-publish workflow of Project-Colony-Resources then signs every
+asset and publishes the release. Details in
+[packaging/README.md](../packaging/README.md#releases).
+
 ## Packet flow
 
 ```

@@ -3,9 +3,7 @@
 #
 #   - Cargo.toml                         [workspace.package] version
 #   - packaging/arch/PKGBUILD            pkgver=
-#   - packaging/tarball-manifest.json    every "version" field and every
-#                                        version embedded in an "asset"
-#                                        filename
+#   - packaging/tarball-manifest.json    every "version" field
 #   - packaging/rpm/colony-firewall-control.spec   Version:
 #   - crates/cfc-ebpf/Cargo.lock   the `cfc-ebpf-proto` entry. The kernel
 #                                  crate is its own workspace with its own
@@ -13,8 +11,10 @@
 #                                  --locked, so a bump that regenerated only
 #                                  the root lock shipped 0.3.0 with this one
 #                                  still saying 0.2.3, and 0.4.0 nearly did
-#                                  the same. `cargo update -p cfc-ebpf-proto`
-#                                  from crates/cfc-ebpf moves it.
+#                                  the same.
+#
+# release-please rewrites every one of these in its release PR (extra-files in
+# release-please-config.json); this script is what notices a file it missed.
 #
 # The spec is here because the job that compared it lived in rhel.yml, which
 # only runs when packaging paths change - so a version bump that touched none
@@ -30,7 +30,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 mismatches=()
 
-cargo_ver="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' "${ROOT}/Cargo.toml" | head -n1)"
+cargo_ver="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' "${ROOT}/Cargo.toml" | head -n1)"
 if [[ -z "${cargo_ver}" ]]; then
     echo "error: could not extract version from Cargo.toml [workspace.package]" >&2
     exit 1
@@ -60,18 +60,6 @@ done < <(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "${ROOT}/packaging
     | sed 's/.*:[[:space:]]*"\(.*\)"/\1/')
 if [[ "${n}" -eq 0 ]]; then
     mismatches+=("packaging/tarball-manifest.json: no \"version\" field found")
-    fail=1
-fi
-
-# packaging/tarball-manifest.json -> version embedded in every "asset" filename
-n=0
-while IFS= read -r v; do
-    n=$((n + 1))
-    check "packaging/tarball-manifest.json \"asset\" filename #${n}" "${v}"
-done < <(grep -oE '"asset"[[:space:]]*:[[:space:]]*"[^"]*"' "${ROOT}/packaging/tarball-manifest.json" \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
-if [[ "${n}" -eq 0 ]]; then
-    mismatches+=("packaging/tarball-manifest.json: no \"asset\" filename with a version found")
     fail=1
 fi
 

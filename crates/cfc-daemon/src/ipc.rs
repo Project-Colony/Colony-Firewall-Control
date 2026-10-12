@@ -530,9 +530,10 @@ impl Control {
                     .map(Some)
                     .map_err(|reason| {
                         Status::permission_denied(format!(
-                            "read-only access: {reason}. Firewall changes are accepted only \
-                             from the installed Colony Firewall app and tray, or from root \
-                             (sudo cfc ...)."
+                            "{}: {reason}. Firewall changes are accepted only from the \
+                             installed Colony Firewall app and tray, or from root \
+                             (sudo cfc ...).",
+                            cfc_proto::READ_ONLY_DENIAL
                         ))
                     })
             }

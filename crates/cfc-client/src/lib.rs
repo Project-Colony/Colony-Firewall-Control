@@ -17,6 +17,7 @@ use tower::service_fn;
 pub mod convert;
 
 pub use cfc_proto::v1 as proto;
+pub use cfc_proto::READ_ONLY_DENIAL;
 
 /// First reconnect delay used by the resilient streams.
 pub const RECONNECT_INITIAL: Duration = Duration::from_millis(250);
