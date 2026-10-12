@@ -7,7 +7,7 @@
 # or restart propagates through that Requires= to NetworkManager and
 # systemd-networkd, and restart also leaves a moment without the table:
 # refresh the rules with reload. To load a local copy of the snippet, override
-# both ExecStart= and ExecReload= in a drop-in (docs/TROUBLESHOOTING.md).
+# both ExecStart= and ExecReload= in a drop-in (docs/guide/troubleshooting.md).
 
 [Unit]
 Description=Colony Firewall nftables NFQUEUE rules

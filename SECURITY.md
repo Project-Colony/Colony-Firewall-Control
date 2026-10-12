@@ -31,12 +31,12 @@ other than the installed app and tray getting a firewall change accepted,
 etc.).
 
 Out of scope: the limits documented in
-[What this firewall does not protect against](docs/HARDENING.md#what-this-firewall-does-not-protect-against),
+[What this firewall does not protect against](docs/guide/hardening.md#what-this-firewall-does-not-protect-against),
 such as root processes, established or inherited flows, replies on
 inbound-initiated connections while inbound filtering is off, local relays,
 AF_PACKET and raw sockets, and code running as an allowed program's user,
 and the residual risks listed under
-[The control socket and who can talk to it](docs/HARDENING.md#the-control-socket-and-who-can-talk-to-it)
+[The control socket and who can talk to it](docs/guide/hardening.md#the-control-socket-and-who-can-talk-to-it)
 (code already running inside the official app or tray).
 A way around the firewall that this list does not describe, or a
 description that turns out to be wrong, is in scope.

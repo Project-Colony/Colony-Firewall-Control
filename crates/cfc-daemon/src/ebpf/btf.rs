@@ -8,7 +8,7 @@
 //! Rust/aya has no CO-RE field relocation (LLVM only emits the relocation
 //! records for C's `__builtin_preserve_access_index`), so the BPF programs
 //! cannot look a field offset up themselves - see
-//! `crates/cfc-ebpf/README.md`. The loader has to do it, which means parsing
+//! `docs/internals/architecture.md`. The loader has to do it, which means parsing
 //! the running kernel's BTF.
 //!
 //! aya *does* parse BTF (`aya::Btf`, re-exported from `aya-obj`), but as of

@@ -105,7 +105,7 @@ queue_max_len = 4096
 # Not to be confused with the `bypass` keyword on the nftables rule, which
 # decides what happens when NO daemon is attached to the queue at all. This
 # setting only applies while the daemon is running. See
-# docs/TROUBLESHOOTING.md for the full matrix.
+# docs/guide/troubleshooting.md for the full matrix.
 fail_open = false
 
 # Needs a restart.
@@ -204,7 +204,7 @@ enabled = true
 # #     so a recycled pid can never inherit another program's identity.
 # #   cgroup_skb/ingress  - observes DNS-shaped responses for diagnostics only.
 # #     The hook does not authenticate a resolver transaction. Confirmed PTR
-# #     policy names are cached independently; see docs/HARDENING.md.
+# #     policy names are cached independently; see docs/guide/hardening.md.
 # #
 # # WHAT IT DOES NOT DO
 # # A process-wide Deny can refuse connect() in the kernel. Allow decisions and

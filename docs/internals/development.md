@@ -64,5 +64,5 @@ AUR, so the release recipe's tag tarball and checksums are only exercised
 at tag time.
 
 The release workflow and what it publishes are described in
-[packaging/README.md](../packaging/README.md#releases). The phase checklist
-is [ROADMAP.md](ROADMAP.md).
+[packaging](packaging.md#releases). The phase checklist
+is [roadmap](../project/roadmap.md).

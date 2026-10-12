@@ -34,7 +34,7 @@
 //! from any same-user process, and D-Bus carries descriptors) while it
 //! writes a request on it. Step 6 then sees the process holding the
 //! connection. Binding each request to its sender (SO_PASSCRED) or trusting
-//! a connect-time credential (setgid binaries) would; see docs/HARDENING.md.
+//! a connect-time credential (setgid binaries) would; see docs/guide/hardening.md.
 //!
 //! What it cannot see: code already running inside the official image that
 //! moved itself into anonymous memory (anonymous executable mappings are
@@ -42,7 +42,7 @@
 //! image before the prologue ran and then detached (Yama's default
 //! `ptrace_scope = 1` lets a program trace its own child from `exec`; see
 //! [`ptrace_scope_warning`]), and synthetic input to the GUI. See
-//! docs/HARDENING.md.
+//! docs/guide/hardening.md.
 
 use crate::ipc::PeerId;
 use std::collections::HashMap;
@@ -69,7 +69,7 @@ pub fn ptrace_scope_warning(scope: Option<&str>) -> Option<String> {
         "kernel.yama.ptrace_scope is {shown}: a program of the desktop user can start the \
          installed app or tray under ptrace, change its code before it seals itself and \
          make changes as it. Set kernel.yama.ptrace_scope = 2 to close that route (see \
-         docs/HARDENING.md)"
+         docs/guide/hardening.md)"
     ))
 }
 

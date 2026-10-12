@@ -14,13 +14,13 @@
 #   3. the package builds, installs and verifies end to end - in a Fedora
 #      container, not on Rocky 9, because the workspace's MSRV is 1.89 and
 #      Rocky 9's default repos do not reach it. The Rocky-native path
-#      (`rust-toolset`) remains untried; TODO.md 2b says so rather than
+#      (`rust-toolset`) remains untried; docs/project/roadmap.md says so rather than
 #      letting a green Fedora build imply the deployment target can build it.
 #
 # What is deliberately NOT checked: that the rules are *sufficient*. That needs
 # a running enforcing system with the daemon under load, and no amount of
-# compiling proves it. `packaging/selinux/README.md` says so plainly, and
-# `packaging/selinux/TESTING.md` is the protocol for whoever has such a host.
+# compiling proves it. `docs/internals/selinux.md` says so plainly, and carries
+# the protocol for whoever has such a host.
 
 name: rhel
 
@@ -259,7 +259,7 @@ jobs:
         # selinux-policy-targeted in, and its %post runs `semodule -n`: a
         # write into the on-disk module store, never a policy load. Loading
         # needs a kernel with SELinux, which a container does not get -
-        # that half is exactly what packaging/selinux/TESTING.md exists for.
+        # that half is exactly what docs/internals/selinux.md's protocol is for.
         run: |
           set -eux
           dnf -y install \
@@ -314,7 +314,7 @@ jobs:
 
       - name: Keep the RPMs
         # The artifact is what lets the enforcing-host validation
-        # (packaging/selinux/TESTING.md) start from an installable package
+        # (docs/internals/selinux.md) start from an installable package
         # instead of a toolchain bootstrap. Fedora RPMs, so they fit a
         # Fedora VM; a Rocky 9 host still has to build by hand until
         # rust-toolset is tried.

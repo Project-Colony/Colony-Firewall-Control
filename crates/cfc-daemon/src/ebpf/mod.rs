@@ -44,7 +44,7 @@
 //! and that was rejected. The kernel-side crate is deliberately *not* a member
 //! of this workspace: it needs a dated nightly, `-Z build-std=core`, a
 //! `bpfel-unknown-none` target and a matching `bpf-linker`, and the whole
-//! point of excluding it (see `crates/cfc-ebpf/README.md`) is that a plain
+//! point of excluding it (see `docs/internals/architecture.md`) is that a plain
 //! stable `cargo build --workspace` never touches any of that. Embedding would
 //! hand that dependency straight back - and now that the feature is on by
 //! default, it would hand it to *every* build: a plain `cargo build` would

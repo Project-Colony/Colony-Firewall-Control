@@ -5,7 +5,7 @@
 //! [`crate::DnsPacket`]. It used to run in the kernel; it does not any more,
 //! because the nested answer x label x byte loops below cost more than the
 //! verifier's 1,000,000-instruction complexity budget allows (see
-//! `crates/cfc-ebpf/README.md`).
+//! `docs/internals/architecture.md`).
 //!
 //! The style it was written in survives that move intact, and deliberately so -
 //! this is a parser for attacker-influenced bytes:
