@@ -55,17 +55,22 @@ exploitable path through a dependency before CI does.
 
 ## Verifying Releases
 
-Release assets are not signed with a project key. From 0.8.0 the release
-tarball carries a Sigstore-signed build provenance attestation, which ties its
-digest to this repository's release workflow and the commit it built:
+Every release after 0.8.0 has each asset signed with the Project Colony
+organisation's ed25519 release key, in CI and never on a developer machine:
+each asset ships with a `.sig`, a `.meta` binding its name, sha256 and
+version, and a `.meta.sig`. The commands to check them are under
+[Code signing policy](README.md#code-signing-policy). Releases up to 0.8.0
+were not signed with that key.
+
+The app binary and the tarball also carry a Sigstore-signed build
+provenance attestation, which ties their digest to this repository's
+release workflow and the tagged commit (tarballs since 0.8.0):
 
 ```sh
 gh attestation verify colony-firewall-control-<V>-linux-x86_64.tar.zst \
     --repo Project-Colony/Colony-Firewall-Control
 ```
 
-`SHA256SUMS` comes from the same job and is uploaded beside the tarball, so it
-detects a damaged download, not a replaced one. The attached `PKGBUILD` pins
-the hash of the source archive GitHub served when the tag was built; nothing
-compares that archive with the tagged tree, so it binds the recipe to those
-bytes and no further.
+The attached `PKGBUILD` pins the hash of the source archive GitHub served
+when the tag was built; nothing compares that archive with the tagged tree,
+so it binds the recipe to those bytes and no further.

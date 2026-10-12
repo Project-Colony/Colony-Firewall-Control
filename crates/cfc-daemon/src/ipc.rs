@@ -530,9 +530,10 @@ impl Control {
                     .map(Some)
                     .map_err(|reason| {
                         Status::permission_denied(format!(
-                            "read-only access: {reason}. Firewall changes are accepted only \
-                             from the installed Colony Firewall app and tray, or from root \
-                             (sudo cfc ...)."
+                            "{}: {reason}. Firewall changes are accepted only from the \
+                             installed Colony Firewall app and tray, or from root \
+                             (sudo cfc ...).",
+                            cfc_proto::READ_ONLY_DENIAL
                         ))
                     })
             }
@@ -1378,7 +1379,7 @@ fn secure_socket(path: &Path, ipc: &IpcConfig) -> SocketAuth {
                 socket = %path.display(),
                 "group '{}' does not exist: leaving the control socket root-only. \
                  The UI and non-root CLI cannot connect. Install the sysusers fragment \
-                 (systemd/colony-firewall.sysusers -> /usr/lib/sysusers.d/colony-firewall.conf, \
+                 (packaging/systemd/colony-firewall.sysusers -> /usr/lib/sysusers.d/colony-firewall.conf, \
                  then `systemd-sysusers`) or create it with \
                  `groupadd -r {}`, then add your desktop user with \
                  `usermod -aG {} <user>` and restart the daemon.",

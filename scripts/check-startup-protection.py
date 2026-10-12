@@ -17,7 +17,7 @@ MANAGERS = ("NetworkManager.service", "systemd-networkd.service")
 
 def unit(name):
     parser = configparser.ConfigParser(strict=False, interpolation=None)
-    parser.read(ROOT / "systemd" / name)
+    parser.read(ROOT / "packaging" / "systemd" / name)
     return parser
 
 
@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="cfc-startup-check-") as directory:
     stage = Path(directory)
     units = stage / "usr/lib/systemd/system"
     units.mkdir(parents=True)
-    for source in (ROOT / "systemd").glob("*.service"):
+    for source in (ROOT / "packaging" / "systemd").glob("*.service"):
         shutil.copyfile(source, units / source.name)
     for manager in MANAGERS:
         (units / manager).write_text("[Service]\nExecStart=/bin/true\n")
@@ -86,14 +86,15 @@ with tempfile.TemporaryDirectory(prefix="cfc-startup-check-") as directory:
     subprocess.run(["systemctl", "--root", str(stage), "disable", "colony-firewall-nft.service"],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     subprocess.run(["bash", "-c", '. "$1" && post_upgrade >/dev/null', "post_upgrade",
-                    str(ROOT / "pkg/colony-firewall-control.install")],
+                    str(ROOT / "packaging/arch/colony-firewall-control.install")],
                    env=dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"), check=True)
     for manager in MANAGERS:
         assert not (stage / "etc/systemd/system" / (manager + ".requires") /
                     "colony-firewall-nft.service").is_symlink(), "upgrade re-enabled a disabled nft unit"
     loop = "for unit in colony-firewall-nft.service colony-firewall-nft-inbound.service; do"
-    for recipe in ("pkg/colony-firewall-control.install", "packaging/rpm/colony-firewall-control.spec",
-                   "pkg/colony.json"):
+    for recipe in ("packaging/arch/colony-firewall-control.install",
+                   "packaging/rpm/colony-firewall-control.spec",
+                   "packaging/tarball-manifest.json"):
         assert loop in (ROOT / recipe).read_text(), f"{recipe} must reenable only enabled nft units"
     subprocess.run(["systemctl", "--root", str(stage), "disable", "colony-firewalld.service"],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

@@ -4,7 +4,9 @@
 # For building from a git checkout during development, see PKGBUILD-git.
 
 pkgname=colony-firewall-control
+# x-release-please-start-version
 pkgver=0.8.0
+# x-release-please-end
 pkgrel=1
 pkgdesc="Application-aware outbound firewall for Linux, written in Rust"
 arch=('x86_64')
@@ -88,29 +90,29 @@ package() {
     install -Dm755 target/release/cfc                  "$pkgdir/usr/bin/cfc"
 
     # systemd units
-    install -Dm644 systemd/colony-firewalld.service \
+    install -Dm644 packaging/systemd/colony-firewalld.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewalld.service"
-    install -Dm644 systemd/colony-firewall-nft.service \
+    install -Dm644 packaging/systemd/colony-firewall-nft.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewall-nft.service"
     # Inbound is a separate unit, and stays disabled until someone enables it:
     # switching it on can strand a machine reached over the network, so it must
     # never be something an upgrade does to them.
-    install -Dm644 systemd/colony-firewall-nft-inbound.service \
+    install -Dm644 packaging/systemd/colony-firewall-nft-inbound.service \
         "$pkgdir/usr/lib/systemd/system/colony-firewall-nft-inbound.service"
 
     # sysusers: creates the 'colony-firewall' group for gRPC socket access
-    install -Dm644 systemd/colony-firewall.sysusers \
+    install -Dm644 packaging/systemd/colony-firewall.sysusers \
         "$pkgdir/usr/lib/sysusers.d/colony-firewall.conf"
 
     # Config (protected by backup=)
-    install -Dm644 systemd/daemon.toml.sample \
+    install -Dm644 packaging/systemd/daemon.toml.sample \
         "$pkgdir/etc/colony-firewall/daemon.toml"
 
     # nftables snippet, loaded by colony-firewall-nft.service
-    install -Dm644 systemd/nftables-snippet.conf \
+    install -Dm644 packaging/systemd/nftables-snippet.conf \
         "$pkgdir/usr/share/colony-firewall/nftables-snippet.conf"
     # inbound chain, loaded by colony-firewall-nft-inbound.service
-    install -Dm644 systemd/nftables-inbound.conf \
+    install -Dm644 packaging/systemd/nftables-inbound.conf \
         "$pkgdir/usr/share/colony-firewall/nftables-inbound.conf"
 
     # The lockout pre-flight, run as that unit's ExecStartPre. 0755: systemd
@@ -119,24 +121,26 @@ package() {
         "$pkgdir/usr/lib/colony-firewall/inbound-lockout-guard.sh"
 
     # Desktop integration
-    install -Dm644 pkg/colony-firewall.desktop \
+    install -Dm644 packaging/linux/colony-firewall.desktop \
         "$pkgdir/usr/share/applications/colony-firewall.desktop"
-    install -Dm644 pkg/colony-firewall-autostart.desktop \
+    install -Dm644 packaging/linux/colony-firewall-autostart.desktop \
         "$pkgdir/etc/xdg/autostart/colony-firewall.desktop"
-    install -Dm644 pkg/colony-firewall-tray-autostart.desktop \
+    install -Dm644 packaging/linux/colony-firewall-tray-autostart.desktop \
         "$pkgdir/etc/xdg/autostart/colony-firewall-tray.desktop"
-    install -Dm644 pkg/colony-firewall.svg \
+    install -Dm644 assets/icons/colony-firewall.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/colony-firewall.svg"
 
     # polkit actions the daemon asks about when the app or tray pauses,
     # resumes or imports rules.
-    install -Dm644 pkg/org.projectcolony.firewall.policy \
+    install -Dm644 packaging/linux/org.projectcolony.firewall.policy \
         "$pkgdir/usr/share/polkit-1/actions/org.projectcolony.firewall.policy"
 
     # Docs & license
     install -Dm644 README.md            "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 docs/ARCHITECTURE.md "$pkgdir/usr/share/doc/$pkgname/ARCHITECTURE.md"
     install -Dm644 docs/HARDENING.md    "$pkgdir/usr/share/doc/$pkgname/HARDENING.md"
+    install -Dm644 docs/guide/first-run.md \
+        "$pkgdir/usr/share/doc/$pkgname/first-run.md"
     # `cfc status` names this file when it warns that nothing is being
     # enforced, so it has to actually be on disk.
     install -Dm644 docs/TROUBLESHOOTING.md \

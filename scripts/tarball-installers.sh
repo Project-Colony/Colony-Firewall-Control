@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Writes install.sh and uninstall.sh into a staged release tarball directory,
-# generated from pkg/colony.json.
+# generated from packaging/tarball-manifest.json.
 #
 # No Colony app store client reads that manifest: Colony installs a single
 # per-user binary and runs no scripts, so it could not install units, nft
@@ -13,18 +13,18 @@
 set -euo pipefail
 
 STAGE="${1:?usage: $0 <staged-directory>}"
-MANIFEST="$(cd "$(dirname "$0")/.." && pwd)/pkg/colony.json"
+MANIFEST="$(cd "$(dirname "$0")/.." && pwd)/packaging/tarball-manifest.json"
 PLATFORM=linux-x86_64
 
 {
-    printf '#!/bin/sh\n# Generated from pkg/colony.json. Run as root: sudo ./install.sh\nset -e\ncd "$(dirname "$0")"\n'
+    printf '#!/bin/sh\n# Generated from packaging/tarball-manifest.json. Run as root: sudo ./install.sh\nset -e\ncd "$(dirname "$0")"\n'
     jq -er --arg p "${PLATFORM}" '.platforms[$p]
         | "install -m 0755 \(.binaries | join(" ")) \(.installPath)/", .postInstall[]' "${MANIFEST}"
-    printf 'echo "Installed. Enable enforcement as described under First run in README.md."\n'
+    printf 'echo "Installed. Enable enforcement as described under First run in first-run.md."\n'
 } >"${STAGE}/install.sh"
 
 {
-    printf '#!/bin/sh\n# Generated from pkg/colony.json. Run as root: sudo ./uninstall.sh\nset -e\n'
+    printf '#!/bin/sh\n# Generated from packaging/tarball-manifest.json. Run as root: sudo ./uninstall.sh\nset -e\n'
     jq -er --arg p "${PLATFORM}" '.platforms[$p]
         | .preRemove[], "rm -f \(.installPath as $dir | .binaries | map("\($dir)/\(.)") | join(" "))"' "${MANIFEST}"
 } >"${STAGE}/uninstall.sh"

@@ -3,7 +3,7 @@
 # packaging recipes expect to find in it.
 #
 # The release tarball installs from a flat directory: its install.sh,
-# generated from pkg/colony.json's "postInstall" by
+# generated from packaging/tarball-manifest.json's "postInstall" by
 # scripts/tarball-installers.sh, runs from the extracted directory, so every
 # relative source it names must have been staged by the "Assemble tarball"
 # step in .github/workflows/release.yml. When it is not, the install fails
@@ -15,15 +15,15 @@
 #      command exists in the repo, and its basename is staged by
 #      release.yml's assemble step;
 #   2. every binary in colony.json "binaries" is staged;
-#   3. every repo-relative source installed by pkg/PKGBUILD and
-#      pkg/PKGBUILD-git exists in the repo.
+#   3. every repo-relative source installed by packaging/arch/PKGBUILD and
+#      packaging/arch/PKGBUILD-git exists in the repo.
 #
 # Wired into CI (check.yml). Run it by hand with: ./scripts/check-release-assets.sh
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MANIFEST="${ROOT}/pkg/colony.json"
+MANIFEST="${ROOT}/packaging/tarball-manifest.json"
 WORKFLOW="${ROOT}/.github/workflows/release.yml"
 
 for f in "${MANIFEST}" "${WORKFLOW}"; do
@@ -39,9 +39,9 @@ problems=()
 # this list - the staged-path grep, repo_path_for(), and check 3's PKGBUILD grep
 # - and they have to agree. They did not: `scripts` was added to the first two
 # and missed in the third, which meant check 3 silently stopped looking at
-# pkg/PKGBUILD's install of scripts/inbound-lockout-guard.sh. A check that
+# the PKGBUILD's install of scripts/inbound-lockout-guard.sh. A check that
 # passes by not looking is worse than no check, so the list lives here once.
-SEARCH_DIRS=(systemd pkg docs scripts)
+SEARCH_DIRS=(packaging/systemd packaging/linux packaging/arch assets/icons docs scripts)
 DIR_ALT="$(IFS='|'; printf '%s' "${SEARCH_DIRS[*]}")"
 
 # --- what release.yml stages -------------------------------------------------
@@ -156,7 +156,7 @@ PY
 )"
 
 if [[ -z "${manifest_refs}" ]]; then
-    problems+=("pkg/colony.json: no postInstall sources or binaries found - has the manifest schema changed?")
+    problems+=("packaging/tarball-manifest.json: no postInstall sources or binaries found - has the manifest schema changed?")
 fi
 
 while IFS=' ' read -r kind name; do
@@ -164,21 +164,21 @@ while IFS=' ' read -r kind name; do
     case "${kind}" in
     SRC)
         if ! repo_path="$(repo_path_for "${name}")"; then
-            problems+=("pkg/colony.json postInstall installs '${name}', which does not exist in the repo")
+            problems+=("packaging/tarball-manifest.json postInstall installs '${name}', which does not exist in the repo")
         elif ! is_staged "${name}"; then
-            problems+=("pkg/colony.json postInstall installs '${name}' (repo: ${repo_path}), but release.yml never stages it into the tarball")
+            problems+=("packaging/tarball-manifest.json postInstall installs '${name}' (repo: ${repo_path}), but release.yml never stages it into the tarball")
         fi
         ;;
     BIN)
         if ! is_staged "${name}"; then
-            problems+=("pkg/colony.json declares binary '${name}', but release.yml never stages it into the tarball")
+            problems+=("packaging/tarball-manifest.json declares binary '${name}', but release.yml never stages it into the tarball")
         fi
         ;;
     esac
 done <<<"${manifest_refs}"
 
 # --- 3: PKGBUILD sources exist ----------------------------------------------
-for pkgbuild in pkg/PKGBUILD pkg/PKGBUILD-git; do
+for pkgbuild in packaging/arch/PKGBUILD packaging/arch/PKGBUILD-git; do
     [[ -f "${ROOT}/${pkgbuild}" ]] || continue
     while IFS= read -r src; do
         [[ -n "${src}" ]] || continue

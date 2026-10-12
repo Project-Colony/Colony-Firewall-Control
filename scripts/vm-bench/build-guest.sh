@@ -110,7 +110,7 @@ echo "    $(wc -l < "$OUT/modlist") modules"
 
 echo "==> the daemon's own files"
 install -m0644 "$REPO/crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o" "$RFS/cfc-ebpf.o"
-install -m0644 "$REPO/systemd/nftables-snippet.conf" "$RFS/etc/colony-firewall/nftables-snippet.conf"
+install -m0644 "$REPO/packaging/systemd/nftables-snippet.conf" "$RFS/etc/colony-firewall/nftables-snippet.conf"
 install -m0755 "$REPO/scripts/bench-latency.sh" "$RFS/bench/bench-latency.sh"
 install -m0755 "$OUT/plan.sh" "$RFS/bench/plan.sh"
 install -m0755 "$OUT/init"    "$RFS/init"

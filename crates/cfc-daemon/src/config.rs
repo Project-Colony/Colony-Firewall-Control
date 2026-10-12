@@ -159,7 +159,7 @@ impl Profile {
     /// replies are `ct state established` and are never queued. While the
     /// daemon runs, new loopback flows follow explicit policy and unmatched
     /// local IPC is allowed without prompting; while no daemon listens, the
-    /// snippet's `bypass` on `lo` allows them. Rules can still be added with `cfc-cli` from that
+    /// snippet's `bypass` on `lo` allows them. Rules can still be added with `cfc` from that
     /// session. What it *does* mean on a fresh headless install is that
     /// outbound traffic - package updates, NTP, backups - is denied until
     /// rules exist for it.
@@ -168,7 +168,7 @@ impl Profile {
     /// an `ExecStartPre` lockout guard rather than something an upgrade turns
     /// on. Once it is loaded, `inbound_action` below applies to every new
     /// inbound flow that no rule admits - including the next SSH connection.
-    /// See `systemd/nftables-inbound.conf`.
+    /// See `packaging/systemd/nftables-inbound.conf`.
     pub fn policy(self) -> DefaultPolicy {
         match self {
             // `Reject` on the relaxed profile: on a LAN an immediate refusal
@@ -679,7 +679,7 @@ enabled = " Auto ""#
     /// A typo must not be able to take the machine's network away.
     ///
     /// A config parse error propagates out of `Config::load` and the daemon
-    /// exits *before* `READY=1`. `systemd/nftables-snippet.conf` ends with
+    /// exits *before* `READY=1`. `packaging/systemd/nftables-snippet.conf` ends with
     /// `ct state new queue num 0` with **no** `bypass` (only the loopback rule
     /// above it has one), so a loaded table with no daemon behind it drops
     /// every new non-loopback outbound connection. Refusing to
@@ -911,7 +911,7 @@ enabled = " Auto ""#
     #[test]
     fn sample_config_file_parses() {
         // Permanently parse-checks the shipped sample.
-        let sample = include_str!("../../../systemd/daemon.toml.sample");
+        let sample = include_str!("../../../packaging/systemd/daemon.toml.sample");
         let cfg = Config::from_toml_str(sample).unwrap();
         assert_eq!(cfg.profile.as_deref(), Some("balanced"));
         assert_eq!(cfg.default_policy.prompt_timeout_secs, 30);

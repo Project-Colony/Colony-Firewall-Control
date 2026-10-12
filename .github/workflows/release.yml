@@ -1,54 +1,136 @@
-name: release
+# Colony Firewall Control: release workflow
+#
+# From Project-Colony-Resources templates/sign-and-publish-caller.yml, with
+# APP_NAME = colony-firewall-control. Linux only, and five release assets:
+#
+#   colony-firewall-control-linux                     the app (colony-firewall),
+#                                                     the convention name Colony
+#                                                     installs
+#   colony-firewall-control-<V>-linux-x86_64.tar.zst  every binary, the units,
+#                                                     the eBPF object and an
+#                                                     install.sh
+#   SHA256SUMS                                        sha256 of the two above
+#   PKGBUILD, SRCINFO                                 the Arch recipe with the
+#                                                     tag's source checksum
+#
+# The build jobs only build, check and upload artifacts; they never see a key.
+# Ed25519 signing (.sig, .meta, .meta.sig per asset), verification and
+# publishing happen in .github/workflows/sign-and-publish.yml of
+# Project-Colony-Resources, in this same run. The signing key is only ever in
+# that workflow's own job, which checks out nothing and builds nothing.
+#
+# Action refs are pinned to commit SHAs on purpose: this workflow can publish
+# releases, and whoever can move a floating tag can change what it runs.
+
+name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  # Recovery path. release-please only ever emits `release_created` once per
+  # release, so once a tag exists "Re-run all jobs" makes release-please report
+  # nothing to do and every job below skip, while the run goes green. This
+  # input finishes an existing DRAFT release whose run failed. Start it from
+  # the tag: `gh workflow run release.yml --ref v0.9.0 -f tag=v0.9.0`.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing draft release to build, sign and publish (e.g. v0.9.0). Run from that same tag."
+        required: true
+        type: string
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # Assembles a release PR from the conventional commits since the last
+  # release. Merging that PR is what creates the tag. Push only: on a recovery
+  # dispatch the tag already exists, and running release-please would open or
+  # update a release PR as a side effect of repairing an old release.
+  release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # No `release-type` input: when it is set, the action ignores both files.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # release-please publishes the release, and moves /releases/latest,
+      # before any binary exists. Held as a draft; sign-and-publish refuses
+      # anything else and publishes it last. `-R` is not optional: this job has
+      # no checkout, so `gh` has no git remote to infer the repository from.
+      - name: Hold the release as a draft
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=true
+
+  build:
+    name: build linux
+    needs: release-please
+    # Runs on a merge that created a release, or on a recovery dispatch (when
+    # release-please is skipped). NOT `always()`: that would also build after
+    # release-please FAILED.
+    if: ${{ !cancelled() && !failure() && (needs.release-please.outputs.release_created || github.event_name == 'workflow_dispatch') }}
+    # GitHub-hosted runners only: SignPath rejects a signing request if any
+    # job leading to it ran on a self-hosted runner.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      # The tag, not the branch: a recovery dispatch must rebuild the tagged
+      # commit, since the .meta sidecar binds these bytes to that version.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+          persist-credentials: false
 
-      - name: Resolve version and verify it matches the tag
+      # The tarball name and every .meta carry the Cargo version, the release
+      # carries the tag. A mismatch would publish "v0.9.0" holding
+      # colony-firewall-control-0.8.0-*.tar.zst. Refuse.
+      - name: Resolve the version and check it matches the tag
         id: version
         env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+          TAG: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
         run: |
-          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
+          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' Cargo.toml | head -n1)"
           if [ -z "${VERSION}" ]; then
-            echo "::error::could not extract version from Cargo.toml [workspace.package]"
+            echo "::error::could not read the version from Cargo.toml [workspace.package]"
             exit 1
           fi
-          # The release is named after the tag, but every asset filename is
-          # built from the Cargo version. A mismatch publishes "v0.3.0"
-          # containing colony-firewall-control-0.2.0-*.tar.zst. Refuse.
-          if [ "${REF_TYPE}" = "tag" ] && [ "${REF_NAME}" != "v${VERSION}" ]; then
-            echo "::error::tag ${REF_NAME} does not match Cargo.toml [workspace.package] version ${VERSION} (expected tag v${VERSION}). Bump Cargo.toml or retag."
+          if [ "${TAG}" != "v${VERSION}" ]; then
+            echo "::error::tag ${TAG} does not match Cargo.toml [workspace.package] version ${VERSION}"
             exit 1
           fi
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "Releasing ${VERSION}"
 
-      # Same gates as check.yml, re-run here so a tag can never publish a
-      # tarball that the packaging channels cannot install from.
-      - name: Check version consistency (Cargo.toml / PKGBUILD / colony.json)
+      # Same gates as check.yml, re-run on the tagged tree so a release can
+      # never ship a tarball the packaging channels cannot install from.
+      - name: Check version consistency (Cargo.toml / PKGBUILD / spec / manifest)
         run: ./scripts/check-versions.sh
 
-      - name: Check release assets against pkg/colony.json
+      - name: Check release assets against packaging/tarball-manifest.json
         run: ./scripts/check-release-assets.sh
 
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: stable
 
@@ -57,7 +139,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev zstd
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # No build cache here: SignPath forbids release builds that reuse
+      # outputs of earlier, unverified builds, and a cache restored into a
+      # release build is a supply-chain hole either way.
 
       - name: Build (release profile)
         run: cargo build --workspace --profile release --locked
@@ -81,7 +165,7 @@ jobs:
           echo "linker=${LINKER}" >> "${GITHUB_OUTPUT}"
           echo "nightly=${NIGHTLY} bpf-linker=${LINKER}"
 
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ steps.bpfpins.outputs.nightly }}
           components: rust-src
@@ -151,10 +235,79 @@ jobs:
           cargo xtask build-ebpf
           cargo xtask ebpf-check
 
-      - name: Assemble tarball
-        id: assemble
+      # The app under the name Colony installs. Colony puts it in the user's
+      # own directory and runs no install steps, so this copy is a read-only
+      # monitor: the daemon accepts changes only from the root-owned
+      # /usr/bin/colony-firewall installed by the AUR, RPM or tarball.
+      - name: Name the artifact
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          mkdir dist
+          cp target/release/colony-firewall dist/colony-firewall-control-linux
+
+      # A manifest can PARSE perfectly and still leave the program listed in
+      # Colony with no Download button, because none of its assets match a
+      # convention. `colony validate-manifest` given the asset names catches
+      # exactly that. The names are the same list as `assets` in the
+      # sign-and-publish job below.
+      #
+      # Nothing runs until it verifies, the way Colony checks its own updates:
+      # the signature over colony-linux, the signature over its .meta sidecar,
+      # and that sidecar naming colony-linux with these exact bytes.
+      - name: Validate colony.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          # Colony's ed25519 release public key: RELEASE_PUBLIC_KEYS in
+          # src/signing.rs of Project-Colony/Colony, as PEM. It is public.
+          # Change it here when Colony's releases are signed with a new key.
+          COLONY_RELEASE_PUB: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEARNjg3Nn8H6/aBg1unwGjkUTcrdTxERNefVaqU8cFu0s=
+            -----END PUBLIC KEY-----
+        run: |
+          d=$(mktemp -d)
+          gh release download -R Project-Colony/Colony -D "$d" \
+            -p colony-linux -p colony-linux.sig -p colony-linux.meta -p colony-linux.meta.sig
+          printf '%s' "$COLONY_RELEASE_PUB" > "$d/release.pub"
+          openssl pkeyutl -verify -pubin -inkey "$d/release.pub" -rawin \
+            -in "$d/colony-linux" -sigfile "$d/colony-linux.sig"
+          openssl pkeyutl -verify -pubin -inkey "$d/release.pub" -rawin \
+            -in "$d/colony-linux.meta" -sigfile "$d/colony-linux.meta.sig"
+          digest=$(sha256sum "$d/colony-linux" | cut -d' ' -f1)
+          grep -qx 'asset=colony-linux' "$d/colony-linux.meta" \
+            && grep -qx "sha256=$digest" "$d/colony-linux.meta" \
+            || { echo "::error::colony-linux.meta does not describe the downloaded colony-linux"; exit 1; }
+          chmod +x "$d/colony-linux"
+          # An absolute path: validate-manifest takes the repository name,
+          # which the asset names start with, from the manifest's directory.
+          # A bare `colony.json` has none, and its fallback is the display
+          # name, "Colony Firewall Control", which no asset name matches.
+          "$d/colony-linux" validate-manifest "$PWD/colony.json" \
+            colony-firewall-control-linux \
+            "colony-firewall-control-${VERSION}-linux-x86_64.tar.zst" \
+            SHA256SUMS PKGBUILD SRCINFO
+          rm -rf "$d"
+
+      # The signature proves provenance and says nothing about whether the
+      # binary RUNS. Every program answers `--version` before opening a
+      # window, a tray icon, a socket or NFQUEUE, so this works headless and
+      # unprivileged, and the version it prints must be the tag's.
+      - name: Smoke-test the binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for bin in dist/colony-firewall-control-linux target/release/colony-firewalld \
+              target/release/colony-firewall-tray target/release/cfc; do
+            out="$("$bin" --version)"
+            echo "$bin: $out"
+            [[ "$out" == *" ${VERSION}" ]] \
+              || { echo "::error::$bin --version printed '$out', expected version ${VERSION}"; exit 1; }
+          done
+
+      - name: Assemble tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
           NAME="colony-firewall-control-${VERSION}-linux-x86_64"
           STAGE="$(mktemp -d)/${NAME}"
           mkdir -p "${STAGE}"
@@ -173,26 +326,26 @@ jobs:
             scripts/inbound-lockout-guard.sh \
             "${STAGE}/"
 
-          # Everything pkg/colony.json's postInstall installs. The tarball
-          # layout is FLAT: install.sh, generated from postInstall, runs
-          # from the extracted directory, so each file must be present under
-          # its own basename. scripts/check-release-assets.sh gates this
+          # Everything packaging/tarball-manifest.json's postInstall installs.
+          # The tarball layout is FLAT: install.sh, generated from postInstall,
+          # runs from the extracted directory, so each file must be present
+          # under its own basename. scripts/check-release-assets.sh gates this
           # list against the manifest on every push, so a file added to
           # postInstall but not staged here fails CI instead of silently
           # vanishing from tarball installs.
           install -m644 \
-            systemd/colony-firewalld.service \
-            systemd/colony-firewall-nft.service \
-            systemd/colony-firewall-nft-inbound.service \
-            systemd/colony-firewall.sysusers \
-            systemd/daemon.toml.sample \
-            systemd/nftables-snippet.conf \
-            systemd/nftables-inbound.conf \
-            pkg/colony-firewall.desktop \
-            pkg/colony-firewall-autostart.desktop \
-            pkg/colony-firewall-tray-autostart.desktop \
-            pkg/colony-firewall.svg \
-            pkg/org.projectcolony.firewall.policy \
+            packaging/systemd/colony-firewalld.service \
+            packaging/systemd/colony-firewall-nft.service \
+            packaging/systemd/colony-firewall-nft-inbound.service \
+            packaging/systemd/colony-firewall.sysusers \
+            packaging/systemd/daemon.toml.sample \
+            packaging/systemd/nftables-snippet.conf \
+            packaging/systemd/nftables-inbound.conf \
+            packaging/linux/colony-firewall.desktop \
+            packaging/linux/colony-firewall-autostart.desktop \
+            packaging/linux/colony-firewall-tray-autostart.desktop \
+            assets/icons/colony-firewall.svg \
+            packaging/linux/org.projectcolony.firewall.policy \
             "${STAGE}/"
 
           # The kernel-side object. Fatal if absent: install.sh cannot express
@@ -201,9 +354,9 @@ jobs:
             crates/cfc-ebpf/target/bpfel-unknown-none/release/cfc-ebpf.o \
             "${STAGE}/"
 
-          # Docs, for parity with what pkg/PKGBUILD puts in
+          # Docs, for parity with what packaging/arch/PKGBUILD puts in
           # /usr/share/doc. `cfc status` points users at TROUBLESHOOTING.md
-          # by name, so it has to actually ship.
+          # by name, and install.sh at first-run.md, so both have to ship.
           install -m644 \
             README.md \
             CHANGELOG.md \
@@ -211,77 +364,57 @@ jobs:
             docs/ARCHITECTURE.md \
             docs/HARDENING.md \
             docs/TROUBLESHOOTING.md \
+            docs/guide/first-run.md \
             "${STAGE}/"
 
           # The tarball's installer and uninstaller, from the same manifest.
           ./scripts/tarball-installers.sh "${STAGE}"
 
-          tar --zstd -C "$(dirname "${STAGE}")" -cf "${NAME}.tar.zst" "${NAME}"
-          sha256sum "${NAME}.tar.zst" > SHA256SUMS
+          tar --zstd -C "$(dirname "${STAGE}")" -cf "dist/${NAME}.tar.zst" "${NAME}"
+          tar --zstd -tf "dist/${NAME}.tar.zst"
+          (cd dist && sha256sum colony-firewall-control-linux "${NAME}.tar.zst" > SHA256SUMS)
+          cat dist/SHA256SUMS
 
-          echo "tarball=${NAME}.tar.zst" >> "${GITHUB_OUTPUT}"
-          tar --zstd -tf "${NAME}.tar.zst"
-
-      - name: Extract release notes from CHANGELOG.md
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          awk -v ver="${VERSION}" '
-            $0 ~ ("^## \\[" ver "\\]") { in_section = 1; next }
-            /^## \[/ { if (in_section) exit }
-            in_section { print }
-          ' CHANGELOG.md > RELEASE_BODY.md
-          if [ ! -s RELEASE_BODY.md ]; then
-            # On a tag this is fatal: falling back to the whole changelog
-            # publishes the previous release's notes under the new version.
-            if [ "${{ github.ref_type }}" = "tag" ]; then
-              echo "::error::CHANGELOG.md has no '## [${VERSION}]' section - refusing to publish a release with the wrong notes. Rename the [Unreleased] section to [${VERSION}]."
-              exit 1
-            fi
-            echo "::warning::No CHANGELOG section for ${VERSION}; using the full changelog."
-            cp CHANGELOG.md RELEASE_BODY.md
-          fi
-
-      - name: Upload release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # Every file at the artifact root, under its release name, and never to
+      # the release from here. The name prefix is what `artifact-pattern`
+      # below matches.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-assets
+          name: build-linux
+          path: dist/
           if-no-files-found: error
-          path: |
-            ${{ steps.assemble.outputs.tarball }}
-            SHA256SUMS
-            RELEASE_BODY.md
+          retention-days: 1
 
-  # Build pkg/PKGBUILD for real against the freshly pushed tag, and attach
-  # the Arch packaging recipe (PKGBUILD with real checksums + .SRCINFO) to
-  # the release. The project is not published on the AUR.
-  #
-  # Hard gate, no continue-on-error: at tag time the source= URL
-  # (.../archive/v$pkgver.tar.gz) resolves, because GitHub generates the
-  # archive as soon as the tag exists. Skipped on workflow_dispatch, where
-  # there is no tag for the source array to point at.
+  # Builds packaging/arch/PKGBUILD for real against the tag and keeps the
+  # recipe with the real source checksum, plus its SRCINFO, as release assets.
+  # At this point the source= URL (.../archive/v$pkgver.tar.gz) resolves:
+  # release-please created the tag, and the draft hold keeps it.
   pkgbuild:
-    if: github.ref_type == 'tag'
-    # Package only after the main build succeeds. Publishing runs separately
-    # with write permission after both builds complete. build has already
-    # refused a tag other than v<Cargo version> and run check-versions.sh,
-    # which holds pkgver to that version, so pkgver matches the tag here.
-    needs: build
+    name: build PKGBUILD
+    needs: release-please
+    if: ${{ !cancelled() && !failure() && (needs.release-please.outputs.release_created || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    permissions:
+      contents: read
+    # Pinned by digest, like the actions: this job's output is a release
+    # asset. `pacman -Syu` below brings the packages current either way, so
+    # the pin only fixes the base layer; move it when Arch drops a mirror key.
+    container: archlinux:base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+          persist-credentials: false
 
       - name: Install Arch build deps
         run: |
           # Both makedepends and depends: without -s, makepkg aborts on any
           # missing dependency rather than installing it. pacman-contrib
           # provides updpkgsums.
-          # This list MIRRORS pkg/PKGBUILD depends= + makedepends=, the same
-          # way check.yml's pkgbuild-build mirrors PKGBUILD-git. 4fe0509 added
-          # hicolor-icon-theme to THAT copy when makepkg refused the build; this
-          # copy was missed, and the first tag run to get this far failed on
-          # exactly the same missing dependency. Two hand-kept copies of one
-          # list: when one learns something, the other must be taught too.
+          # This list MIRRORS packaging/arch/PKGBUILD depends= + makedepends=,
+          # the same way check.yml's pkgbuild-build mirrors PKGBUILD-git. Two
+          # hand-kept copies of one list: when one learns something, the other
+          # must be taught too.
           pacman -Syu --noconfirm --needed \
             rust protobuf pkgconf git \
             nftables libxkbcommon wayland hicolor-icon-theme \
@@ -293,52 +426,48 @@ jobs:
           chown -R builder: .
 
       - name: updpkgsums - replace the SKIP placeholder with real checksums
-        working-directory: pkg
+        working-directory: packaging/arch
         run: |
           runuser -u builder -- updpkgsums PKGBUILD
-          # A remote (non-VCS) source with sha256sums=('SKIP') is not
-          # acceptable Arch packaging practice: it disables integrity checking of the
-          # release tarball entirely.
+          # A remote (non-VCS) source with sha256sums=('SKIP') disables
+          # integrity checking of the release tarball entirely.
           if grep -qE "^sha256sums=\(.*'SKIP'" PKGBUILD; then
-            echo "::error::pkg/PKGBUILD still has a SKIP checksum after updpkgsums"
+            echo "::error::packaging/arch/PKGBUILD still has a SKIP checksum after updpkgsums"
             exit 1
           fi
           grep -A2 '^sha256sums=' PKGBUILD
 
       - name: Generate .SRCINFO
-        working-directory: pkg
+        working-directory: packaging/arch
         # pipefail, because the pipeline's status is otherwise tee's 0: a
-        # failed printsrcinfo would tee an empty .SRCINFO that the attach
-        # step below happily uploads. The grep is check.yml's twin - a file
-        # without `pkgbase =` is not a .SRCINFO, whatever makepkg exited.
+        # failed printsrcinfo would tee an empty .SRCINFO. The grep is
+        # check.yml's twin - a file without `pkgbase =` is not a .SRCINFO,
+        # whatever makepkg exited.
         run: |
           set -o pipefail
           runuser -u builder -- makepkg --printsrcinfo | tee .SRCINFO
           grep -q '^pkgbase = colony-firewall-control$' .SRCINFO
-          # An undotted copy is what gets attached: GitHub renames dot-leading
-          # asset filenames (`.SRCINFO` became `default.SRCINFO`), so the
-          # published name never matched what the README told people to
-          # download. Ship a name GitHub keeps; whoever builds from it renames
-          # it back to `.SRCINFO` locally.
+          # The asset is undotted: GitHub renames dot-leading asset filenames
+          # (`.SRCINFO` became `default.SRCINFO`). Whoever builds from it
+          # renames it back to `.SRCINFO` locally.
           cp .SRCINFO SRCINFO
 
       - name: namcap the PKGBUILD
-        working-directory: pkg
+        working-directory: packaging/arch
         # pipefail: namcap exits 0 even when it prints E: lines, so its
-        # nonzero exit means namcap itself crashed - traceback to stderr,
-        # nothing in the log, and without pipefail the grep below would wave
-        # through a run where zero linting happened.
+        # nonzero exit means namcap itself crashed, and without pipefail the
+        # grep below would wave through a run where zero linting happened.
         run: |
           set -o pipefail
           namcap PKGBUILD | tee namcap.log
           # Warnings are advisory; errors are not.
           if grep -q ' E: ' namcap.log; then
-            echo "::error::namcap reported errors in pkg/PKGBUILD"
+            echo "::error::namcap reported errors in packaging/arch/PKGBUILD"
             exit 1
           fi
 
       - name: Build the package (makepkg)
-        working-directory: pkg
+        working-directory: packaging/arch
         run: |
           # --nocheck: check() re-runs the workspace test suite, which the
           # `test` job in check.yml already gates. Deps are preinstalled
@@ -347,21 +476,14 @@ jobs:
           ls -l ./*.pkg.tar.*
 
       - name: namcap the built package
-        working-directory: pkg
+        working-directory: packaging/arch
         run: |
           # Lint the package this recipe defines, not the -debug split makepkg
-          # generates beside it. The debug package's .build-id symlinks point
-          # into the MAIN package's tree, and namcap checks each package in
-          # isolation - so every one of them is flagged E: as dangling. That is
-          # the linter being wrong about a structure makepkg itself created,
-          # and it killed the third v0.2.3 tag run. The debug split is not
-          # shipped anywhere: only PKGBUILD and .SRCINFO are attached to the
-          # release, so nothing the user installs goes unlinted.
-          # The [0-9] is what excludes it: "-debug-" cannot match a digit.
-          # pipefail for the same reason as the PKGBUILD lint above: a
-          # crashed namcap must not pass as a clean log. It also makes an
-          # unmatched glob fatal (namcap errors on the literal pattern)
-          # instead of silently linting nothing.
+          # generates beside it: namcap checks each package in isolation, so
+          # every .build-id symlink of the debug split is flagged E: as
+          # dangling. The debug split is not shipped anywhere. The [0-9] is
+          # what excludes it: "-debug-" cannot match a digit. pipefail also
+          # makes an unmatched glob fatal instead of silently linting nothing.
           set -o pipefail
           namcap ./colony-firewall-control-[0-9]*.pkg.tar.* | tee namcap-pkg.log
           if grep -q ' E: ' namcap-pkg.log; then
@@ -369,63 +491,68 @@ jobs:
             exit 1
           fi
 
-      - name: Upload Arch packaging artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # Both files land at the artifact root (their common directory is
+      # stripped), under their release names.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: aur-assets
-          if-no-files-found: error
+          name: build-arch
           path: |
-            pkg/PKGBUILD
-            pkg/SRCINFO
+            packaging/arch/PKGBUILD
+            packaging/arch/SRCINFO
+          if-no-files-found: error
+          retention-days: 1
 
-  publish:
-    needs: [build, pkgbuild]
-    if: always() && needs.build.result == 'success' && (needs.pkgbuild.result == 'success' || needs.pkgbuild.result == 'skipped')
+  # Sigstore-signed build provenance for the Linux files: `gh attestation
+  # verify <file> --repo Project-Colony/Colony-Firewall-Control` ties their
+  # digest to this workflow and the tagged commit. Its own job, with no
+  # checkout, so no build script ever runs where the OIDC token can be minted.
+  # Linux files are not rewritten by signing, so the digest attested here is
+  # the digest published.
+  attest:
+    name: attest the Linux files
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      # Signed build provenance for the tarball (actions/attest below).
+      contents: read
       id-token: write
       attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-assets
-          path: release-assets
-      # SHA256SUMS is uploaded beside the tarball, so whoever can edit the
-      # release can replace both. This Sigstore-signed SLSA provenance binds
-      # the tarball's digest to this repository's release workflow and commit
-      # instead: `gh attestation verify <tarball> --repo
-      # Project-Colony/Colony-Firewall-Control`. It runs here rather than in
-      # build so no build script can mint the job's OIDC token.
+          name: build-linux
+          path: dist
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: release-assets/colony-firewall-control-*.tar.zst
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: github.ref_type == 'tag'
-        with:
-          name: aur-assets
-          path: aur-assets
-      - name: Create draft release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          draft: true
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.build.outputs.version) }}
-          # A dispatch has no tag yet: publishing the draft creates it, and
-          # without this it would point at the default branch rather than
-          # the commit the assets were built from. Ignored when the tag exists.
-          target_commitish: ${{ github.sha }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.build.outputs.version) }}
-          body_path: release-assets/RELEASE_BODY.md
-          files: |
-            release-assets/colony-firewall-control-*.tar.zst
-            release-assets/SHA256SUMS
-      - name: Attach Arch packaging artifacts
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          draft: true
-          tag_name: ${{ github.ref_name }}
-          files: |
-            aur-assets/PKGBUILD
-            aur-assets/SRCINFO
+          subject-path: |
+            dist/colony-firewall-control-linux
+            dist/colony-firewall-control-*-linux-x86_64.tar.zst
+
+  # In the same run as the builds, chained by `needs:` rather than
+  # `on: release`: a release created with the default GITHUB_TOKEN fires no
+  # release events, so a workflow written that way never runs. Pinned to the
+  # organisation's commit of the shared workflow; design/releases.md says when
+  # that pin moves.
+  sign-and-publish:
+    needs: [release-please, build, pkgbuild, attest]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.pkgbuild.result == 'success' && needs.attest.result == 'success' }}
+    # The ceiling for every job in the called workflow.
+    permissions:
+      actions: read
+      contents: write
+    uses: Project-Colony/Project-Colony-Resources/.github/workflows/sign-and-publish.yml@619460ff4dc0049f129955f0988d368427b9eedb # organisation pin
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+      assets: >-
+        colony-firewall-control-linux
+        colony-firewall-control-${{ needs.build.outputs.version }}-linux-x86_64.tar.zst
+        SHA256SUMS
+        PKGBUILD
+        SRCINFO
+      artifact-pattern: build-*
+      # The default `code-signing-policy: true` links the release notes to
+      # README.md#code-signing-policy, which exists.
+    # Named, not `inherit`: the called workflow gets these two and nothing else.
+    secrets:
+      COLONY_SIGNING_KEY_PEM: ${{ secrets.COLONY_SIGNING_KEY_PEM }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}

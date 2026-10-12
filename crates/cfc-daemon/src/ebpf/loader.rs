@@ -16,8 +16,8 @@ use aya::programs::links::FdLink;
 use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, ProgramError, TracePoint};
 use aya::{Btf, Ebpf, EbpfLoader};
 use cfc_core::Process;
-use cfc_ebpf_common::dns::{self, DnsCursor, DNS_HEADER_LEN};
-use cfc_ebpf_common::{ConnectReport, DnsAnswer, DnsPacket, ExecEvent, ExitEvent};
+use cfc_ebpf_proto::dns::{self, DnsCursor, DNS_HEADER_LEN};
+use cfc_ebpf_proto::{ConnectReport, DnsAnswer, DnsPacket, ExecEvent, ExitEvent};
 use tokio::io::unix::AsyncFd;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -125,7 +125,7 @@ fn classify_load(err: &anyhow::Error) -> Degrade {
     // advice. The needle is our own symbol name, which we control.
     if err
         .chain()
-        .any(|c| c.to_string().contains(cfc_ebpf_common::ABI_SYMBOL))
+        .any(|c| c.to_string().contains(cfc_ebpf_proto::ABI_SYMBOL))
     {
         return Degrade::AbiMismatch;
     }
@@ -412,7 +412,7 @@ pub(super) fn load_and_attach(
     // global keeps its "absent" default and the kernel side falls back to the
     // leader-only check it used before.
     let group_dead_off: u32 = match tracefs::exit_group_dead_offset() {
-        Ok(Some(off)) if off > cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX => {
+        Ok(Some(off)) if off > cfc_ebpf_proto::TRACEPOINT_FIELD_OFFSET_MAX => {
             // The program bounds this read with the same constant and falls
             // back to the leader-only check without a word - it has nowhere
             // to say one. Patching the value through used to leave the debug
@@ -423,7 +423,7 @@ pub(super) fn load_and_attach(
                 "sched_process_exit puts `group_dead` at offset {off}, past \
                  the {}-byte bound the program enforces; process exit is \
                  approximated by thread-group leader exit",
-                cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX
+                cfc_ebpf_proto::TRACEPOINT_FIELD_OFFSET_MAX
             ));
             u32::MAX
         }
@@ -469,8 +469,8 @@ pub(super) fn load_and_attach(
     // "symbol with name ... not found in the symbols table" and the load
     // stops there.
     loader.override_global(
-        cfc_ebpf_common::ABI_SYMBOL,
-        &cfc_ebpf_common::ABI_VERSION,
+        cfc_ebpf_proto::ABI_SYMBOL,
+        &cfc_ebpf_proto::ABI_VERSION,
         true,
     );
     // The kernel's own BTF, used by aya to sanitize the object's BTF against
@@ -510,7 +510,7 @@ pub(super) fn load_and_attach(
     // working programs for one unread field.
     match tracefs::exec_filename_offset() {
         Ok(tracefs::Resolution::Parsed(off))
-            if off > cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX =>
+            if off > cfc_ebpf_proto::TRACEPOINT_FIELD_OFFSET_MAX =>
         {
             // The program bounds its read with the same constant and treats
             // anything past it as "read nothing" - silently, because a BPF
@@ -526,13 +526,13 @@ pub(super) fn load_and_attach(
                 offset = off,
                 "sched_process_exec puts `filename` past the {}-byte bound \
                  the program enforces; exec events will carry no filename",
-                cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX
+                cfc_ebpf_proto::TRACEPOINT_FIELD_OFFSET_MAX
             );
             report.notes.push(format!(
                 "sched_process_exec filename offset {off} is past the \
                  program's {}-byte bound; exec events will carry no path, \
                  and attribution falls back to /proc",
-                cfc_ebpf_common::TRACEPOINT_FIELD_OFFSET_MAX
+                cfc_ebpf_proto::TRACEPOINT_FIELD_OFFSET_MAX
             ));
             report.exec_offset = ExecOffset::Suppressed;
         }
@@ -1362,7 +1362,7 @@ where
 
 /// Copies a POD event out of a ring-buffer record.
 ///
-/// The types come from `cfc-ebpf-common`, which is compiled into both halves,
+/// The types come from `cfc-ebpf-proto`, which is compiled into both halves,
 /// so the layout is the same by construction (and asserted by that crate's
 /// tests). A record shorter than the struct is a truncated write and is
 /// dropped rather than read past.
@@ -1376,7 +1376,7 @@ fn decode<T: Copy>(bytes: &[u8]) -> Option<T> {
         return None;
     }
     // SAFETY: `T` is one of the `#[repr(C)]`, pointer-free, niche-free POD
-    // event structs from `cfc-ebpf-common`; `bytes` is at least `size_of::<T>()`
+    // event structs from `cfc-ebpf-proto`; `bytes` is at least `size_of::<T>()`
     // bytes of initialised ring-buffer memory written by the kernel side from
     // the same type definition. `read_unaligned` makes no alignment
     // assumption about the ring, and the value is copied out before the
@@ -1761,7 +1761,7 @@ mod tests {
         set & (1u64 << bit) != 0
     }
 
-    /// Proves what `systemd/colony-firewalld.service` claims: the five
+    /// Proves what `packaging/systemd/colony-firewalld.service` claims: the five
     /// capabilities it grants are **enough**, and `CAP_SYS_ADMIN` is not
     /// needed. Until now that was a comment in a unit file.
     ///
@@ -1976,7 +1976,7 @@ mod tests {
                 aya::maps::Array::<_, u32>::try_from(aya::maps::Map::Array(mark)).expect("array");
             assert_eq!(
                 mark.get(&0, 0).expect("read"),
-                cfc_ebpf_common::fast_allow::UNARMED,
+                cfc_ebpf_proto::fast_allow::UNARMED,
                 "a restart must disarm a legacy mark left in the pinned map"
             );
             let until = MapData::from_pin(dir.join(enforce::MAP_FAST_ALLOW_UNTIL)).expect("until");

@@ -8,11 +8,21 @@
   "repository": "https://github.com/Project-Colony/Colony-Firewall-Control",
   "maintainer": "MotherSphere",
   "category": "security",
-  "tags": ["firewall", "security", "network", "outbound", "opensnitch"],
+  "tags": [
+    "firewall",
+    "security",
+    "network",
+    "outbound",
+    "opensnitch"
+  ],
   "platforms": {
     "linux-x86_64": {
-      "asset": "colony-firewall-control-0.8.0-linux-x86_64.tar.zst",
-      "binaries": ["colony-firewalld", "colony-firewall", "colony-firewall-tray", "cfc"],
+      "binaries": [
+        "colony-firewalld",
+        "colony-firewall",
+        "colony-firewall-tray",
+        "cfc"
+      ],
       "installPath": "/usr/bin",
       "postInstall": [
         "install -d -m 0755 /etc/colony-firewall",

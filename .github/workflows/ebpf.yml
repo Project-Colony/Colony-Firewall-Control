@@ -25,10 +25,9 @@ on:
     branches: [main]
     paths: &ebpf-paths
       - "crates/cfc-ebpf/**"
-      - "crates/cfc-ebpf-common/**"
+      - "crates/cfc-ebpf-proto/**"
       - "crates/cfc-daemon/src/ebpf/**"
-      - "crates/cfc-daemon/src/ebpf.rs"
-      - "crates/xtask/**"
+      - "crates/cfc-xtask/**"
       - ".github/workflows/ebpf.yml"
   pull_request:
     branches: [main]
@@ -234,7 +233,7 @@ jobs:
             loads_and_attaches
 
   # ---------------------------------------------------------------------------
-  # The claim systemd/colony-firewalld.service makes, tested.
+  # The claim packaging/systemd/colony-firewalld.service makes, tested.
   # ---------------------------------------------------------------------------
   capabilities:
     needs: object

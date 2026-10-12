@@ -31,15 +31,15 @@ jobs:
       - name: Check version consistency (Cargo.toml / PKGBUILD / colony.json)
         run: ./scripts/check-versions.sh
 
-  # Guards the release tarball against pkg/colony.json: every file the
-  # manifest's postInstall installs has to be staged by release.yml, or the
-  # tarball's install.sh silently ships without it (this is how the sysusers
-  # fragment went missing and left the control socket root-only).
+  # Guards the release tarball against packaging/tarball-manifest.json: every
+  # file the manifest's postInstall installs has to be staged by release.yml,
+  # or the tarball's install.sh silently ships without it (this is how the
+  # sysusers fragment went missing and left the control socket root-only).
   release-assets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check release assets against pkg/colony.json
+      - name: Check release assets against packaging/tarball-manifest.json
         run: ./scripts/check-release-assets.sh
       - name: Check startup protection without touching host services
         run: python3 scripts/check-startup-protection.py
@@ -77,10 +77,10 @@ jobs:
   # the configuration nothing else in CI exercises -- and it is the one that
   # keeps the promise that the firewall builds and runs with no eBPF support at
   # all. Without this job the `#[cfg(not(feature = "ebpf"))]` arm in
-  # src/ebpf.rs is compiled by nothing and rots silently.
+  # src/ebpf/mod.rs is compiled by nothing and rots silently.
   #
   # Package-scoped on purpose. An unscoped `--workspace --no-default-features`
-  # would also strip `default = ["std"]` from cfc-ebpf-common, which builds
+  # would also strip `default = ["std"]` from cfc-ebpf-proto, which builds
   # today only because feature unification puts it back.
   no-ebpf:
     runs-on: ubuntu-latest
@@ -191,23 +191,23 @@ jobs:
 
       - name: Shell syntax (PKGBUILDs, install scriptlet, scripts/)
         run: |
-          for f in pkg/PKGBUILD pkg/PKGBUILD-git pkg/colony-firewall-control.install scripts/*.sh; do
+          for f in packaging/arch/PKGBUILD packaging/arch/PKGBUILD-git packaging/arch/colony-firewall-control.install scripts/*.sh; do
             echo "bash -n ${f}"
             bash -n "${f}"
           done
           # The PKGBUILDs must be sourceable: makepkg sources them before
           # it does anything else.
-          bash -c 'source pkg/PKGBUILD    && [ -n "$pkgname" ] && [ -n "$pkgver" ]'
-          bash -c 'source pkg/PKGBUILD-git && [ -n "$pkgname" ]'
+          bash -c 'source packaging/arch/PKGBUILD    && [ -n "$pkgname" ] && [ -n "$pkgver" ]'
+          bash -c 'source packaging/arch/PKGBUILD-git && [ -n "$pkgname" ]'
 
       - name: shellcheck the install scriptlet
         run: |
           # The scriptlet is sourced by pacman as a set of shell functions,
           # hence -s bash with the function-body shell dialect.
-          shellcheck --shell=bash --severity=warning pkg/colony-firewall-control.install
+          shellcheck --shell=bash --severity=warning packaging/arch/colony-firewall-control.install
 
       - name: makepkg --printsrcinfo (both recipes)
-        working-directory: pkg
+        working-directory: packaging/arch
         run: |
           runuser -u builder -- makepkg --printsrcinfo -p PKGBUILD     | tee /tmp/srcinfo-release
           runuser -u builder -- makepkg --printsrcinfo -p PKGBUILD-git | tee /tmp/srcinfo-git
@@ -216,8 +216,8 @@ jobs:
 
       - name: namcap both PKGBUILDs
         run: |
-          namcap pkg/PKGBUILD     | tee /tmp/namcap-release
-          namcap pkg/PKGBUILD-git | tee /tmp/namcap-git
+          namcap packaging/arch/PKGBUILD     | tee /tmp/namcap-release
+          namcap packaging/arch/PKGBUILD-git | tee /tmp/namcap-git
           # Warnings are advisory (namcap flags plenty of style nits on
           # cargo packages); errors are not.
           if grep -q ' E: ' /tmp/namcap-release /tmp/namcap-git; then
@@ -259,9 +259,9 @@ jobs:
           # Both makedepends and depends: without -s, makepkg aborts on any
           # missing dependency rather than installing it.
           #
-          # This list MIRRORS pkg/PKGBUILD-git. Adding an entry to depends= there
-          # and not here fails the job with "Could not resolve all dependencies"
-          # - which is how hicolor-icon-theme announced itself.
+          # This list MIRRORS packaging/arch/PKGBUILD-git. Adding an entry to
+          # depends= there and not here fails the job with "Could not resolve all
+          # dependencies" - which is how hicolor-icon-theme announced itself.
           pacman -Syu --noconfirm --needed \
             rust protobuf pkgconf git \
             nftables libxkbcommon wayland hicolor-icon-theme
@@ -270,8 +270,8 @@ jobs:
         run: |
           useradd -m builder
           install -d -o builder -g builder /build
-          cp pkg/PKGBUILD-git /build/PKGBUILD
-          cp pkg/colony-firewall-control.install /build/
+          cp packaging/arch/PKGBUILD-git /build/PKGBUILD
+          cp packaging/arch/colony-firewall-control.install /build/
           # Package this commit instead of GitHub's HEAD, so a PR is
           # validated against its own tree.
           sed -i "s|^_giturl=.*|_giturl=\"git+file://${GITHUB_WORKSPACE}#commit=${GITHUB_SHA}\"|" /build/PKGBUILD
@@ -333,5 +333,6 @@ jobs:
           usr/share/icons/hicolor/scalable/apps/colony-firewall.svg
           etc/colony-firewall/daemon.toml
           usr/share/doc/colony-firewall-control-git/TROUBLESHOOTING.md
+          usr/share/doc/colony-firewall-control-git/first-run.md
           EOF
           exit "${missing}"

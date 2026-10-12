@@ -208,6 +208,10 @@ pub fn format_local_clock_ms(ms: i64) -> String {
 /// status, not advice.
 pub const CONNECTION_HINT_MAX: usize = 220;
 
+/// Longest read-only refusal rendered verbatim. The daemon's text names the
+/// program it judged, a path of any length, before the advice it ends with.
+pub const READ_ONLY_HINT_MAX: usize = 400;
+
 /// Normalizes a connection-failure detail for display.
 ///
 /// Collapses the whitespace these messages carry from being written across

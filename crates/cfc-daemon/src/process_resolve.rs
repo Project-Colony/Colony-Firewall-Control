@@ -1863,7 +1863,7 @@ mod tests {
 
     // -- kernel exec table integration --------------------------------------
 
-    use cfc_ebpf_common::{ExecEvent, FILENAME_LEN};
+    use cfc_ebpf_proto::{ExecEvent, FILENAME_LEN};
 
     /// A pid that cannot exist: pid_max is at most 2^22 on 64-bit Linux.
     const DEAD_PID: u32 = 0x7fff_fffe;

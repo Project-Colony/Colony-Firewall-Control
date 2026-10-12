@@ -118,6 +118,11 @@ pub struct App {
     /// Set when a gRPC stream drops; the badge shows "reconnecting" instead
     /// of the footer being rewritten every two seconds.
     pub stream_trouble: bool,
+    /// The daemon's reason when it last refused a change because this app
+    /// may only read (a copy that is not the installed, root-owned app).
+    /// Shown as a banner until a change goes through, so it does not scroll
+    /// out of the status log or live only in the log file.
+    pub read_only: Option<String>,
     /// Cached wall clock, refreshed on every tick so views stay pure.
     pub now_ms: i64,
 }
@@ -600,6 +605,7 @@ impl App {
             pause_shown_at_ms: 0,
             pause_pending: false,
             stream_trouble: false,
+            read_only: None,
             now_ms: now_ms(),
         };
         let socket = app.socket_path.clone();
@@ -829,6 +835,7 @@ impl App {
                 Task::perform(delete_rule(socket, id), Message::RuleDeleted)
             }
             Message::RuleDeleted(Ok((id, true))) => {
+                self.read_only = None;
                 self.rules.retain(|r| r.id != id);
                 self.log.info("rule deleted", self.now_ms);
                 Task::none()
@@ -839,6 +846,7 @@ impl App {
                 Task::none()
             }
             Message::RuleDeleted(Err(e)) => {
+                self.note_denial(&e);
                 self.log.error(format!("delete failed: {e}"), self.now_ms);
                 Task::none()
             }
@@ -939,6 +947,9 @@ impl App {
                 }
             }
             Message::PromptStreamEnded(e) => {
+                // An installed app whose binary an upgrade replaced is told
+                // here that it no longer answers prompts.
+                self.note_denial(&e);
                 self.stream_trouble = true;
                 self.prompts.clear();
                 self.detach_orphaned_editor();
@@ -978,6 +989,7 @@ impl App {
                 )
             }
             Message::VerdictSubmitted(Ok((prompt_id, true, note))) => {
+                self.read_only = None;
                 self.settle_card(&prompt_id, true);
                 // The daemon telling the user something true about the rule
                 // it stored - today, that a user-writable binary was
@@ -1004,6 +1016,7 @@ impl App {
                 Task::none()
             }
             Message::VerdictSubmitted(Err(failure)) => {
+                self.note_denial(&failure.message);
                 self.settle_card(&failure.prompt_id, failure.applied);
                 let still = if failure.applied {
                     ""
@@ -1106,6 +1119,7 @@ impl App {
                 Task::perform(set_paused(socket, !current), Message::PausedSet)
             }
             Message::PausedSet(Ok((paused, resume_at_unix_ms))) => {
+                self.read_only = None;
                 self.pause_pending = false;
                 if !paused {
                     self.now_ms = now_ms();
@@ -1129,6 +1143,7 @@ impl App {
                 Task::none()
             }
             Message::PausedSet(Err(e)) => {
+                self.note_denial(&e);
                 self.pause_pending = false;
                 self.log.error(format!("pause failed: {e}"), self.now_ms);
                 Task::none()
@@ -1246,6 +1261,7 @@ impl App {
                 self.update(Message::RuleSaved(Err(failure.message)))
             }
             Message::RuleSaved(Ok(line)) => {
+                self.read_only = None;
                 // Say what was stored: closing the editor in silence read
                 // as accepted whatever scope the rule ended up with.
                 self.log.info(line, self.now_ms);
@@ -1254,6 +1270,7 @@ impl App {
                 Task::perform(fetch_rules(socket), Message::RulesLoaded)
             }
             Message::RuleSaved(Err(e)) => {
+                self.note_denial(&e);
                 if let Some(ed) = &mut self.editor {
                     ed.validation = Some(e.clone());
                 }
@@ -1406,6 +1423,7 @@ impl App {
         let main_panel = column![
             header,
             self.connection_hint(),
+            self.read_only_hint(),
             container(body_card).padding([10, 12]).height(Length::Fill),
             self.status_area(),
         ];
@@ -1432,6 +1450,29 @@ impl App {
             .width(Length::Fill)
             .style(theme::banner_err)
             .into()
+    }
+
+    /// Why this app may not change the firewall, under the header for as
+    /// long as it holds. The daemon's own words: they name the program it
+    /// judged and where changes are accepted from instead.
+    fn read_only_hint(&self) -> Element<'_, Message> {
+        let Some(reason) = &self.read_only else {
+            return Space::new().into();
+        };
+        container(text(reason.as_str()).size(11))
+            .padding([6, 16])
+            .width(Length::Fill)
+            .style(theme::banner_warn)
+            .into()
+    }
+
+    /// Keeps the daemon's reason when it refused a change because this app
+    /// may only read. Other refusals (a dismissed polkit dialog, a rule the
+    /// daemon rejects) say nothing about what this app may do.
+    fn note_denial(&mut self, error: &str) {
+        if error.starts_with(cfc_client::READ_ONLY_DENIAL) {
+            self.read_only = Some(format::connection_hint(error, format::READ_ONLY_HINT_MAX));
+        }
     }
 
     /// The status ring: newest first, each line individually dismissable.
@@ -2354,6 +2395,39 @@ mod tests {
             binds_to_hash: false,
             undecided_rule_id: String::new(),
         }
+    }
+
+    #[test]
+    fn a_read_only_refusal_stays_on_screen_until_a_change_goes_through() {
+        let (mut app, _) = App::new();
+        // A dismissed polkit dialog says nothing about what the app may do.
+        let _ = app.update(Message::PausedSet(Err(
+            "authorization dialog dismissed (polkit action org.projectcolony.firewall.pause)"
+                .into(),
+        )));
+        assert!(app.read_only.is_none());
+
+        let refusal = format!(
+            "{}: /home/u/.local/share/colony/apps/colony-firewall-control-linux is not an \
+             installed Colony Firewall app or tray. Firewall changes are accepted only from \
+             the installed Colony Firewall app and tray, or from root (sudo cfc ...).",
+            cfc_client::READ_ONLY_DENIAL
+        );
+        let _ = app.update(Message::RuleSaved(Err(refusal.clone())));
+        let shown = app.read_only.clone().expect("the refusal is kept");
+        assert!(shown.contains("is not an installed"), "{shown}");
+        assert!(
+            shown.ends_with("(sudo cfc ...)."),
+            "the advice is cut: {shown}"
+        );
+
+        // An upgraded app learns it from the prompt stream instead.
+        app.read_only = None;
+        let _ = app.update(Message::PromptStreamEnded(refusal));
+        assert!(app.read_only.is_some());
+
+        let _ = app.update(Message::PausedSet(Ok((false, 0))));
+        assert!(app.read_only.is_none(), "a change went through");
     }
 
     #[test]

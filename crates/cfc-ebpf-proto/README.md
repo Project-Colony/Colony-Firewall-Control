@@ -1,4 +1,4 @@
-# `cfc-ebpf-common`
+# `cfc-ebpf-proto`
 
 The types and parsers shared between the kernel-side
 [`cfc-ebpf`](../cfc-ebpf) programs and the userspace daemon.

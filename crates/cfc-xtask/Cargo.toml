@@ -1,5 +1,5 @@
 [package]
-name = "xtask"
+name = "cfc-xtask"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

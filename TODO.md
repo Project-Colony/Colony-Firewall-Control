@@ -169,7 +169,7 @@ Fixed with the spec's own escape hatch, `IconThemePath`
 (`crates/cfc-tray/src/theme.rs`). When "colony-firewall" is not installed
 where icon lookup searches - probed across `$HOME/.icons`,
 `$XDG_DATA_HOME/icons`, every `$XDG_DATA_DIRS` entry, and pixmaps - the tray
-writes the packaged SVG (embedded at compile time from `pkg/`, so it is the
+writes the packaged SVG (embedded at compile time from `assets/icons/`, so it is the
 same artwork byte for byte) into `$XDG_RUNTIME_DIR/cfc-tray/icons` and exports
 that directory, in both layouts hosts are known to use: a flat file for GTK's
 unthemed lookup and a `hicolor` tree with an `index.theme` for strict Qt

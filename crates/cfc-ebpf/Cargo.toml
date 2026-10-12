@@ -32,7 +32,7 @@ aya-ebpf = "0.2.1"
 # `default-features = false` drops the `std` feature, turning the shared crate
 # into `#![no_std]`. Same source file, same layout constants, same parsers as
 # the userspace side -- that is the whole point.
-cfc-ebpf-common = { path = "../cfc-ebpf-common", default-features = false }
+cfc-ebpf-proto = { path = "../cfc-ebpf-proto", default-features = false }
 
 [[bin]]
 name = "cfc-ebpf"
