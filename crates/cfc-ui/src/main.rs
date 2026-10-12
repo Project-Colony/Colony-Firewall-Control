@@ -4,13 +4,18 @@ mod app;
 mod editor;
 mod format;
 mod i18n;
+mod preferences;
 mod session_stats;
 mod status_log;
 mod streams;
 mod theme;
 mod views;
 
-use app::App;
+use app::{App, Startup};
+use preferences::Config;
+
+/// Where the daemon accepts the app from (see `cfc-daemon`'s `official`).
+const INSTALLED_PATH: &str = "/usr/bin/colony-firewall";
 
 fn main() -> iced::Result {
     if let Some(line) = cfc_client::version_line(
@@ -30,21 +35,28 @@ fn main() -> iced::Result {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,cfc_ui=info")),
         )
         .init();
-    if let Err(error) = sealed {
+    if let Err(error) = &sealed {
         tracing::warn!(
             "could not seal the process ({error}); the daemon will treat this app as read-only"
         );
     }
 
-    // The interface follows the system language until Preferences can set it.
-    i18n::init_from_env();
-    // Parchment is this app's identity, and stays the theme until the user
-    // picks another.
-    colony_ui::set_active_theme("parchment", "light");
+    // Before the first frame: theme, sizes, fonts, motion and language.
+    let config = Config::load();
+    config.apply();
+    let startup = Startup {
+        config,
+        prefs_file: Config::locate()
+            .inspect_err(|e| tracing::warn!("preferences will not be saved: {e}"))
+            .ok(),
+        official: sealed.is_ok()
+            && std::env::current_exe().is_ok_and(|exe| exe == std::path::Path::new(INSTALLED_PATH)),
+    };
+
     colony_ui::fonts::BYTES
         .into_iter()
         .fold(
-            iced::application(App::new, App::update, App::view),
+            iced::application(move || App::new(startup.clone()), App::update, App::view),
             |app, font| app.font(font),
         )
         .default_font(colony_ui::ui_font())

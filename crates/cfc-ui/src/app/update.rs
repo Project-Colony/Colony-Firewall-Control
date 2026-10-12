@@ -13,12 +13,14 @@ use crate::editor::{build_rule_from_editor, toggled_rule, RuleEditor};
 use crate::format;
 use crate::i18n::{t, t_fmt};
 use crate::views::{self, prompts::PromptAction};
+use colony_ui::preferences::Change;
 
 impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::TabSelected(t) => {
-                self.tab = t;
+            Message::TabSelected(tab) => {
+                self.tab = tab;
+                self.prefs_open = false;
                 Task::none()
             }
             Message::Reconnect => {
@@ -167,13 +169,18 @@ impl App {
                 // A prompt is a held-open connection with a deadline on it;
                 // a card the user only sees if they happen to be looking at
                 // the right tab is not an ask, it is a countdown they lose.
-                let attention = prompt_attention(self.prompts.len(), self.editor.is_some());
+                let attention = if self.config.raise_on_prompt {
+                    prompt_attention(self.prompts.len(), self.editor.is_some())
+                } else {
+                    Attention::None
+                };
                 self.prompts.push(PromptCard::new(ev, self.now_ms));
                 self.sync_key_target();
                 match attention {
                     Attention::None => Task::none(),
                     Attention::TabAndRaise => {
                         self.tab = Tab::Prompts;
+                        self.prefs_open = false;
                         raise_window()
                     }
                 }
@@ -491,6 +498,51 @@ impl App {
                 let socket = self.socket_path.clone();
                 Task::perform(fetch_rules(socket), Message::RulesLoaded)
             }
+            Message::TogglePreferences => {
+                self.prefs_open = !self.prefs_open;
+                self.prefs_category = 0;
+                self.theme_toast = false;
+                Task::none()
+            }
+            Message::PreferencesCategory(index) => {
+                self.prefs_category = index.min(views::preferences::CATEGORY_COUNT - 1);
+                Task::none()
+            }
+            Message::ToggleSection(key) => {
+                if !self.prefs_expanded.remove(key) {
+                    self.prefs_expanded.insert(key.to_string());
+                }
+                Task::none()
+            }
+            Message::Preference(change) => {
+                // Records it and puts it into effect; the next frame shows it.
+                self.config.standard.update(change);
+                if matches!(change, Change::Theme { .. }) {
+                    self.theme_toast = true;
+                }
+                self.save_preferences();
+                Task::none()
+            }
+            Message::SetLanguage(language) => {
+                self.config.language = language;
+                language.apply();
+                self.save_preferences();
+                Task::none()
+            }
+            Message::ToggleRaiseOnPrompt => {
+                self.config.raise_on_prompt = !self.config.raise_on_prompt;
+                self.save_preferences();
+                Task::none()
+            }
+            Message::ToggleTrayNotifications => {
+                self.config.tray_notifications = !self.config.tray_notifications;
+                self.save_preferences();
+                Task::none()
+            }
+            Message::DismissToast => {
+                self.theme_toast = false;
+                Task::none()
+            }
             Message::RuleSaved(Err(e)) => {
                 if let Some(ed) = &mut self.editor {
                     ed.validation = Some(e.clone());
@@ -510,6 +562,15 @@ impl App {
     /// typing.
     pub(super) fn handle_key(&mut self, kp: KeyPress) -> Task<Message> {
         use keyboard::key::Named;
+
+        // Preferences cover the tabs, the prompt cards included: only Esc
+        // applies, and it closes them.
+        if self.prefs_open {
+            return match kp.key {
+                keyboard::Key::Named(Named::Escape) => self.update(Message::TogglePreferences),
+                _ => Task::none(),
+            };
+        }
 
         // While the editor is open only Esc/Enter apply - everything else
         // would fire under the user's fingers mid-form.

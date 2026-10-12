@@ -7,16 +7,18 @@ mod update;
 mod tests;
 
 use cfc_client::{proto, Client};
+use colony_ui::preferences::Change;
 use iced::keyboard;
-use iced::widget::{button, column, container, row, Space};
+use iced::widget::{button, column, container, row, stack, Space};
 use iced::{Element, Length, Subscription, Task};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
 
 use crate::editor::{saved_rule_line, RuleEditor};
 use crate::i18n::{t, t_fmt};
+use crate::preferences::{Config, Language};
 use crate::session_stats::SessionStats;
 use crate::status_log::StatusLog;
 use crate::theme::{sz, ui_text};
@@ -50,8 +52,30 @@ const DEADLINE_TICK_MS: u64 = 400;
 /// on a control the user never saw.
 const PROMPT_ARM_MS: i64 = 1_000;
 
+/// What `main` settles before the window opens.
+#[derive(Debug, Clone, Default)]
+pub struct Startup {
+    pub config: Config,
+    /// Where preferences are saved; `None` saves nothing, which is what
+    /// tests want.
+    pub prefs_file: Option<PathBuf>,
+    /// Sealed, and the installed `/usr/bin/colony-firewall`: the copy the
+    /// daemon takes changes from.
+    pub official: bool,
+}
+
 pub struct App {
     pub socket_path: PathBuf,
+    pub config: Config,
+    pub prefs_file: Option<PathBuf>,
+    pub official: bool,
+    /// Preferences replace the content area while this is set.
+    pub prefs_open: bool,
+    pub prefs_category: usize,
+    /// Preference sections the user opened; every section starts closed.
+    pub prefs_expanded: HashSet<String>,
+    /// The "Theme applied." toast is up.
+    pub theme_toast: bool,
     pub tab: Tab,
     pub daemon: DaemonState,
     pub rules: Vec<proto::RuleInfo>,
@@ -262,6 +286,15 @@ pub enum Message {
     SaveRule,
     RuleSaved(Result<String, String>),
     PromptRuleSaved(Result<(String, bool, Option<String>), VerdictFailure>),
+    /// Sent by the app name in the sidebar and by the page's Close button.
+    TogglePreferences,
+    PreferencesCategory(usize),
+    ToggleSection(&'static str),
+    Preference(Change),
+    SetLanguage(Language),
+    ToggleRaiseOnPrompt,
+    ToggleTrayNotifications,
+    DismissToast,
 }
 
 /// Raw key press forwarded from the subscription. The decision of what a
@@ -301,9 +334,16 @@ fn socket_path_from_env() -> PathBuf {
 }
 
 impl App {
-    pub fn new() -> (Self, Task<Message>) {
+    pub fn new(startup: Startup) -> (Self, Task<Message>) {
         let app = Self {
             socket_path: socket_path_from_env(),
+            config: startup.config,
+            prefs_file: startup.prefs_file,
+            official: startup.official,
+            prefs_open: false,
+            prefs_category: 0,
+            prefs_expanded: HashSet::new(),
+            theme_toast: false,
             tab: Tab::Prompts,
             daemon: DaemonState::Connecting,
             rules: Vec::new(),
@@ -505,10 +545,51 @@ impl App {
         self.sync_key_target();
     }
 
+    /// Saves the preferences after a change. A failure lands in the status
+    /// log: the change still applies, it just will not survive a restart.
+    fn save_preferences(&mut self) {
+        let Some(path) = &self.prefs_file else {
+            return;
+        };
+        if let Err(e) = self.config.save_to(path) {
+            self.log.error(
+                t_fmt("log_save_preferences_failed", &[("error", &e.to_string())]),
+                self.now_ms,
+            );
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let paused = self.status.as_ref().map(|s| s.paused).unwrap_or(false);
 
-        let sidebar = views::sidebar::view(self.tab, self.prompts.len());
+        let sidebar = views::sidebar::view(self.tab, self.prompts.len(), self.prefs_open);
+        if self.prefs_open {
+            let page = views::preferences::view(views::preferences::Args {
+                config: &self.config,
+                category: self.prefs_category,
+                expanded: &self.prefs_expanded,
+                status: self.status.as_ref(),
+                official: self.official,
+                socket: &self.socket_path,
+            });
+            let page: Element<'_, Message> = if self.theme_toast {
+                let typo = colony_ui::Typography::current();
+                stack![
+                    page,
+                    container(colony_ui::widgets::toast(
+                        &typo,
+                        t("theme_applied"),
+                        Message::DismissToast
+                    ))
+                    .padding(16)
+                    .align_bottom(Length::Fill),
+                ]
+                .into()
+            } else {
+                page
+            };
+            return row![sidebar, column![page, self.status_area()]].into();
+        }
         let header = self.header_bar(paused);
         let body: Element<'_, Message> = match self.tab {
             Tab::Prompts => views::prompts::view(

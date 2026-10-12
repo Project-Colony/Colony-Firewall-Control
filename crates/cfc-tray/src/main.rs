@@ -14,6 +14,7 @@ mod i18n;
 mod icon;
 mod model;
 mod notify;
+mod prefs;
 mod theme;
 mod tray;
 
@@ -31,7 +32,6 @@ fn main() -> anyhow::Result<()> {
     // First, before D-Bus or the runtime exist: the daemon accepts answers
     // and pause requests only from a sealed, installed copy of this tray.
     let sealed = cfc_client::seal_official_process();
-    i18n::init_from_env();
     notify::warm_notification_spec_version();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -602,19 +602,25 @@ fn countdown_row<'a>(
         theme::countdown_bar
     };
 
+    let label = ui_text(t_fmt(
+        "prompt_countdown",
+        &[
+            ("verb", format::fallback_verb(timeout_action)),
+            ("time", &format::format_countdown(left)),
+        ],
+    ))
+    .size(sz(10));
+    // A bar shrinking on every tick is motion: with reduced motion (or
+    // effects off) the seconds left are said in text only.
+    if !colony_ui::effects_enabled() {
+        return label.into();
+    }
     column![
         progress_bar(0.0..=1.0, fraction)
             .length(Length::Fill)
             .girth(Length::Fixed(4.0))
             .style(style),
-        ui_text(t_fmt(
-            "prompt_countdown",
-            &[
-                ("verb", format::fallback_verb(timeout_action)),
-                ("time", &format::format_countdown(left)),
-            ],
-        ))
-        .size(sz(10)),
+        label,
     ]
     .spacing(3)
     .into()

@@ -16,6 +16,7 @@ use crate::model::{self, DaemonView, NotifyGate, PromptChoice};
 use crate::notify::{
     notify_brief, notify_pending, probe_actions_supported, with_note, PromptNotifier,
 };
+use crate::prefs::TrayPreferences;
 use crate::tray::{Cmd, TrayApp};
 use crate::{icon, theme};
 
@@ -305,6 +306,9 @@ pub async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
     if let Err(error) = sealed {
         warn!("could not seal the process ({error}); the daemon will treat this tray as read-only");
     }
+    // The app's choices, as they were when the tray started.
+    let prefs = TrayPreferences::load();
+    prefs.apply_language();
 
     let socket = socket_path_from_env();
     info!(socket = %socket.display(), "starting colony-firewall-tray");
@@ -345,8 +349,14 @@ pub async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
     // One capability probe decides the notification strategy for the
     // whole run: per-prompt actionable bubbles when the server advertises
     // "actions", else the generic NotifyGate-driven count notification.
-    let actions_supported = probe_actions_supported().await;
-    info!(actions_supported, "notification strategy chosen");
+    // With prompt notifications off in Preferences, neither: the tray only
+    // shows its icon and menu.
+    let notify_prompts = prefs.prompt_notifications;
+    let actions_supported = notify_prompts && probe_actions_supported().await;
+    info!(
+        notify_prompts,
+        actions_supported, "notification strategy chosen"
+    );
 
     // Subscribe to the prompt feed only in actionable mode. Subscribing
     // makes the daemon hold this uid's prompts for the full
@@ -365,7 +375,7 @@ pub async fn run(sealed: std::io::Result<()>) -> anyhow::Result<()> {
     let mut gate = NotifyGate::default();
     let mut notifier = PromptNotifier::new(handle_tx);
     let mut was_reachable: Option<bool> = None;
-    let generic = !actions_supported;
+    let generic = notify_prompts && !actions_supported;
     // Set once the tray has said its binary was replaced under it.
     let mut told_replaced = false;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);

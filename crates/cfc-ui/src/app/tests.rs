@@ -34,7 +34,7 @@ fn live_seeded_rule_is_sent_or_reported() {
         ),
     ];
     for (exe, dst_ip, dst_port, protocol) in rows {
-        let (mut app, _) = App::new();
+        let (mut app, _) = App::new(Startup::default());
         let _ = app.update(Message::MakeRuleFromEvent {
             exe: exe.into(),
             src_ip: "10.0.0.2".into(),
@@ -93,7 +93,7 @@ fn a_failed_connection_logs_the_actionable_reason_once() {
 
 #[test]
 fn customization_waits_for_a_verdict_and_drops_stale_actions() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     let event = prompt_event();
     app.prompts.push(PromptCard::new(event.clone(), 0));
     let task = app.update(Message::CustomizePromptRule(event.prompt_id.clone()));
@@ -119,7 +119,7 @@ fn customization_waits_for_a_verdict_and_drops_stale_actions() {
 
 #[test]
 fn an_expired_prompt_keeps_its_customization_as_a_new_rule() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     let event = prompt_event();
     app.prompts.push(PromptCard::new(event.clone(), 0));
     let mut editor = RuleEditor::from_prompt(&event);
@@ -137,7 +137,7 @@ fn an_expired_prompt_keeps_its_customization_as_a_new_rule() {
 
 #[test]
 fn a_verdict_that_was_not_applied_leaves_the_prompt_answerable() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     let event = prompt_event();
     app.prompts.push(PromptCard::new(event.clone(), 0));
     let submit = || Message::SubmitVerdict {
@@ -200,7 +200,7 @@ fn prompt(id: &str, exe: &str) -> proto::PromptEvent {
 
 #[test]
 fn verdict_keys_answer_the_armed_top_card_only() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     app.now_ms = 1_000_000;
     app.prompts.push(PromptCard::new(
         prompt("top", "/usr/lib/firefox/firefox"),
@@ -245,7 +245,7 @@ fn verdict_keys_answer_the_armed_top_card_only() {
 
 #[test]
 fn a_card_that_moves_up_is_disarmed_again() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     app.prompts.push(PromptCard::new(
         prompt("top", "/usr/lib/firefox/firefox"),
         0,
@@ -271,7 +271,7 @@ fn a_card_that_moves_up_is_disarmed_again() {
 
 #[test]
 fn pause_ignores_a_click_right_after_resuming() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     app.status = Some(proto::StatusResponse {
         paused: true,
         ..Default::default()
@@ -285,7 +285,7 @@ fn pause_ignores_a_click_right_after_resuming() {
 
 #[test]
 fn pause_waits_for_authorization_and_ignores_clicks_meanwhile() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     app.status = Some(proto::StatusResponse::default());
     app.now_ms += PROMPT_ARM_MS;
     assert_eq!(app.update(Message::TogglePaused).units(), 1);
@@ -300,7 +300,7 @@ fn pause_waits_for_authorization_and_ignores_clicks_meanwhile() {
 
 #[test]
 fn pause_ignores_a_click_right_after_reconnecting() {
-    let (mut app, _) = App::new();
+    let (mut app, _) = App::new(Startup::default());
     let _ = app.update(Message::HandshakeDone(Ok(HandshakeData {
         status: proto::StatusResponse::default(),
         rules: Vec::new(),
@@ -316,4 +316,97 @@ fn a_prompt_card_is_disarmed_right_after_it_appears() {
     assert!(!card.armed(5_000));
     assert!(!card.armed(5_000 + PROMPT_ARM_MS - 1));
     assert!(card.armed(5_000 + PROMPT_ARM_MS));
+}
+
+#[test]
+fn preferences_cover_the_tabs_and_close_the_way_they_opened() {
+    let (mut app, _) = App::new(Startup::default());
+    app.now_ms = 1_000_000;
+    app.prompts
+        .push(PromptCard::new(prompt("top", "/usr/bin/curl"), 0));
+    app.now_ms += PROMPT_ARM_MS;
+
+    let _ = app.update(Message::TogglePreferences);
+    assert!(app.prefs_open);
+    // The cards are out of sight, so their keys answer nothing.
+    assert_eq!(
+        app.handle_key(key("a", keyboard::Modifiers::empty()))
+            .units(),
+        0
+    );
+    assert!(!app.prompts[0].submitting);
+
+    let _ = app.update(Message::PreferencesCategory(99));
+    assert_eq!(
+        app.prefs_category,
+        views::preferences::CATEGORY_COUNT - 1,
+        "About, the last one"
+    );
+    let _ = app.update(Message::ToggleSection("language"));
+    assert!(app.prefs_expanded.contains("language"));
+    let _ = app.update(Message::ToggleSection("language"));
+    assert!(app.prefs_expanded.is_empty());
+
+    // Esc closes them like the app name and Close do, and the next opening
+    // starts on General.
+    let _ = app.handle_key(KeyPress {
+        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+        modifiers: keyboard::Modifiers::empty(),
+    });
+    assert!(!app.prefs_open);
+    let _ = app.update(Message::TogglePreferences);
+    assert_eq!(app.prefs_category, 0);
+    // Picking a tab leaves them too.
+    let _ = app.update(Message::TabSelected(Tab::Live));
+    assert!(!app.prefs_open);
+}
+
+#[test]
+fn a_prompt_takes_the_screen_only_when_the_user_wants_it_to() {
+    let (mut app, _) = App::new(Startup::default());
+    app.tab = Tab::Rules;
+    app.prefs_open = true;
+    let _ = app.update(Message::PromptEvent(prompt("p1", "/usr/bin/curl")));
+    assert_eq!(app.tab, Tab::Prompts);
+    assert!(!app.prefs_open, "the prompt is what needs the screen now");
+
+    let mut startup = Startup::default();
+    startup.config.raise_on_prompt = false;
+    let (mut app, _) = App::new(startup);
+    app.tab = Tab::Rules;
+    let _ = app.update(Message::PromptEvent(prompt("p1", "/usr/bin/curl")));
+    assert_eq!(app.tab, Tab::Rules, "only the sidebar badge counts it");
+    assert_eq!(app.prompts.len(), 1);
+}
+
+#[test]
+fn a_preference_change_is_saved_at_once() {
+    let dir = std::env::temp_dir().join(format!("cfc-ui-app-prefs-{}", std::process::id()));
+    let path = dir.join("preferences.json");
+    let (mut app, _) = App::new(Startup {
+        prefs_file: Some(path.clone()),
+        ..Startup::default()
+    });
+
+    let _ = app.update(Message::ToggleTrayNotifications);
+    let _ = app.update(Message::ToggleRaiseOnPrompt);
+    let saved = Config::from_json(&std::fs::read_to_string(&path).unwrap());
+    assert!(!saved.tray_notifications);
+    assert!(!saved.raise_on_prompt);
+    assert_eq!(saved, app.config);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // A file that cannot be written is said, not swallowed.
+    let (mut app, _) = App::new(Startup {
+        prefs_file: Some("/proc/cfc-ui-cannot-write/preferences.json".into()),
+        ..Startup::default()
+    });
+    let _ = app.update(Message::ToggleTrayNotifications);
+    assert!(!app.config.tray_notifications, "the change still applies");
+    assert!(
+        app.log
+            .iter()
+            .any(|e| e.severity == status_log::Severity::Error),
+        "the failure is in the status log"
+    );
 }

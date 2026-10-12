@@ -1,5 +1,6 @@
-//! The navigation sidebar: the app name, one entry per tab and the
-//! keyboard shortcuts, in the Colony order (design/navigation.md).
+//! The navigation sidebar: the app name, which opens Preferences, one entry
+//! per tab and the keyboard shortcuts, in the Colony order
+//! (design/navigation.md).
 
 use colony_ui::{widgets, Typography};
 use iced::widget::{button, column, container, row, Space};
@@ -7,21 +8,29 @@ use iced::{Alignment, Element, Length};
 
 use crate::app::{Message, Tab};
 use crate::i18n::t;
-use crate::theme::{self, ui_text, ui_text_bold};
+use crate::theme::{self, ui_text};
 
 /// The sidebar's width at a text scale of 1.0; it grows with the scale so the
-/// longest hint still fits on one line.
-const SIDEBAR_WIDTH: f32 = 220.0;
+/// app name and the longest hint still fit on one line.
+const SIDEBAR_WIDTH: f32 = 250.0;
 
-/// `pending_prompts` is shown as a badge on the Prompts entry.
-pub fn view<'a>(tab: Tab, pending_prompts: usize) -> Element<'a, Message> {
+/// The name in the identity button, as the desktop entry and the tray say it.
+const APP_NAME: &str = "Colony Firewall";
+
+/// `pending_prompts` is shown as a badge on the Prompts entry. While
+/// Preferences are open no tab is marked, and the app name is.
+pub fn view<'a>(tab: Tab, pending_prompts: usize, prefs_open: bool) -> Element<'a, Message> {
     let typo = Typography::current();
-    let title_block = column![
-        ui_text_bold("Colony").size(typo.sz(20)),
-        ui_text("Firewall Control").size(typo.sz(14)),
-    ]
-    .spacing(2)
-    .padding([18, 16]);
+    let title_block = container(widgets::identity_button(
+        &typo,
+        APP_NAME,
+        20,
+        prefs_open,
+        Message::TogglePreferences,
+    ))
+    .padding([16, 8]);
+    // No tab reads as current while Preferences cover them.
+    let tab = (!prefs_open).then_some(tab);
 
     let nav = column![
         nav_entry(&typo, t("tab_prompts"), Tab::Prompts, tab, pending_prompts),
@@ -68,10 +77,10 @@ fn nav_entry<'a>(
     typo: &Typography,
     name: &'a str,
     this: Tab,
-    current: Tab,
+    current: Option<Tab>,
     badge: usize,
 ) -> Element<'a, Message> {
-    let selected = this == current;
+    let selected = current == Some(this);
     if badge == 0 {
         return widgets::nav_item(typo, name, selected, Message::TabSelected(this));
     }
