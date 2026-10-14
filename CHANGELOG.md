@@ -6,6 +6,20 @@ After 0.8.0, release-please writes each section from the conventional
 commits merged since the previous release; 0.8.0 and earlier were written by
 hand in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [0.9.0](https://github.com/Project-Colony/Colony-Firewall-Control/compare/v0.8.0...v0.9.0) (2026-10-14)
+
+
+### Features
+
+* add Preferences, French and the Colony theme and typography to the app and tray ([#80](https://github.com/Project-Colony/Colony-Firewall-Control/issues/80)) ([fbde21a](https://github.com/Project-Colony/Colony-Firewall-Control/commit/fbde21a8e61fecc7a04ef706f7f7dd4f76ba74c3))
+* print the version with --version in the app and tray ([#77](https://github.com/Project-Colony/Colony-Firewall-Control/issues/77)) ([5dee404](https://github.com/Project-Colony/Colony-Firewall-Control/commit/5dee40423602a35465e9d4291db255ba7edf0c79))
+
+
+### Documentation
+
+* install the polkit policy in the manual setup and correct the end-to-end test status ([#74](https://github.com/Project-Colony/Colony-Firewall-Control/issues/74)) ([67681b2](https://github.com/Project-Colony/Colony-Firewall-Control/commit/67681b20c9dd754ada3f761b32cd95b70fe10a02))
+* stage the polkit policy in the local tarball recipe and describe the inbound profile difference ([#75](https://github.com/Project-Colony/Colony-Firewall-Control/issues/75)) ([31a3e46](https://github.com/Project-Colony/Colony-Firewall-Control/commit/31a3e469dbd71fed2a51ca180724144784f912de))
+
 ## [0.8.0] - 2026-10-08
 
 ### Changed
