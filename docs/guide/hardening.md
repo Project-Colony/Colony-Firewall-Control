@@ -255,6 +255,51 @@ attribution. [Explicit application confinement](first-run.md#explicit-applicatio
 is a separate launch mode. It is a detection and consent layer, not a
 containment boundary.
 
+### Limits, not bugs
+
+These are properties of the design, not defects waiting for a fix. They are
+stated here before anyone relies on the product, because the failure mode of
+*not* saying them is someone believing they are protected when they are not.
+
+**CFC is a detection and consent layer. It is not a containment boundary.**
+SELinux is a containment boundary. The two are not substitutes.
+
+CFC decides new tracked outbound flows when its table is loaded. This scope
+excludes established/related traffic, local relays, inherited or passed
+sockets, and packet-layer traffic. It is application consent, not domain or
+process containment.
+
+What defeats it completely:
+
+| Limit | What it means |
+|---|---|
+| **Root** | Narrower than it was, and still open. `nft delete table` no longer lifts the denials the eBPF layer holds in the kernel (programs denied outright): those need `rm -rf /sys/fs/bpf/colony-firewall` as well. Rules that name a destination, port or protocol, and anything not yet decided, still fall through to a ruleset root can flush. CFC *is* root; it cannot confine root. |
+| **Code inside an allowed process** | A browser extension, a script under an allowed interpreter, `ptrace`/`LD_PRELOAD` injection. Structural to every application firewall. Making Allow persistent (`72964b5`) improved usability and widened this. |
+| **Loopback** | `oifname "lo" ct state new queue num 0 bypass`: the daemon judges new loopback flows while it runs (unmatched local IPC is allowed without prompting), and they are allowed unfiltered while no daemon listens, so local IPC survives a dead daemon (the systemd-resolved stub answers from its cache; its upstream queries are not loopback). In that window explicit loopback Deny rules are not enforced, nothing is logged, and a loopback connection opened then keeps its authorization once the daemon is back. Anything that can reach a local service which egresses is attributed to that service. |
+| **DNS tunnelling** | The resolver must be allowed for anything to work. CFC *observes* answers, as diagnostics that never satisfy a rule; it does not inspect or block queries. |
+| **Inherited or passed socket descriptors** | Existing connection authorization is not rechecked for each sending executable; socket attribution is ambiguous when ownership is shared. |
+| **CAP_NET_RAW packet sockets** | Packet-layer egress can bypass the IP OUTPUT hook. Layer-2 confinement is outside the shipped rules. Docker grants `CAP_NET_RAW` to containers by default. |
+| **Code inside the official app or tray** | The daemon accepts changes only from root and the installed, sealed app and tray, checking the running process. Code already running inside them is the app: a self-unmapping `LD_PRELOAD` payload living in anonymous memory, synthetic input clicking the GUI (X11, XWayland, and Wayland compositors that offer virtual-keyboard to every client), a same-user program that takes over the notification server and answers the tray's prompts, a connection handed back into the app over D-Bus (a race, repeatable), and code patched in by a parent tracing it from exec before it seals itself (deterministic under the default Yama `ptrace_scope = 1`; scope 2 closes it, the daemon warns at startup). Setgid binaries trusted by connect-time gid would close the preloaded payload, the handed-back socket and the tracing route; not done. See [what this still trusts](#the-control-socket-and-who-can-talk-to-it). |
+| **Prompt fatigue** | Seen in real use: ten Firefox prompts in a row, all denied, browser lost. A malicious installer generating thirty prompts trains the user to click Allow. |
+
+And one tradeoff worth stating plainly: the ruleset is **fail-closed for
+everything except new loopback flows, which are allowed while no daemon
+listens** (the final `ct state new queue num 0` has no `bypass`). Killing the
+daemon drops all new non-loopback outbound traffic. That is the right choice
+for confidentiality and the wrong one for availability: anything that can
+crash the daemon takes the machine's network with it. See
+[fail-open or fail-closed](#fail-open-or-fail-closed).
+
+Since `c281edb` that cuts both ways in the daemon's favour: with the eBPF
+layer up, the pinned `cgroup/connect4|6` programs keep refusing denied
+programs while the daemon is down, so a crash no longer converts a deny into a
+maybe. It converts everything else into a drop, which is the same tradeoff as
+before.
+
+### In detail
+
+Each limit above in more detail, and the ones the table does not list:
+
 - **Anything from root**: `/usr/bin/colony-firewalld` itself is trusted,
   and so is any other root process. Use this firewall alongside, not
   instead of, traditional access controls. Denials the eBPF layer holds in
