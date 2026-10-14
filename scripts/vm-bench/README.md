@@ -67,7 +67,7 @@ not prove which process sends (see `TODO.md` 1a). Read across, and two things
 fall out.
 
 - **A full `RECV_POLL_INTERVAL` is paid per queued flow, not half of one.**
-  `crates/cfc-daemon/src/nfqueue.rs` predicts "up to one interval (mean: half
+  `crates/cfc-daemon/src/nfqueue/mod.rs` predicts "up to one interval (mean: half
   that)", which is right for random arrivals and wrong for a client that
   connects in series: every connect lands just after the worker committed to a
   fresh idle wait, so it waits the whole beat. Measured by changing the

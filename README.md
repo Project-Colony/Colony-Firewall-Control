@@ -87,6 +87,13 @@ terminal asks you about the rest.
 - Headless CLI (`cfc`) for status, rule CRUD, live feed, prompts and log
 - System-tray companion (`colony-firewall-tray`): status at a glance,
   pending-prompt badge and notifications, quick pause/resume
+- The app and the tray speak English and French: the language chosen in
+  Preferences, or by default the system language (`LC_ALL`, `LC_MESSAGES`,
+  then `LANG`); `cfc` output stays in English for scripts and logs
+- Preferences behind the app name: the shared Colony themes, accents and
+  typography, high contrast, the OpenDyslexic font, reduced motion and a text
+  scale, saved at once with no Save button
+  ([guide/preferences.md](docs/guide/preferences.md))
 - JSON export / import for backup and machine-to-machine sync
 - opensnitch JSON import for one-shot migration
 - Named profiles: relaxed / balanced / strict (in `daemon.toml`)
@@ -230,7 +237,7 @@ stays on this machine:
 | Connection log | stored | the same database. For every decided flow: the time, protocol, source and destination address and port, destination host name, program path, pid, uid, verdict and deciding rule. `cfc log` reads it. Capped at `[events] max_rows` rows (100000 by default), oldest first; set it to 0 in `/etc/colony-firewall/daemon.toml` and restart the daemon to keep none |
 | System journal | stored | blocked connections (program, pid, uid, destination) and every accepted or refused change (who asked, which program, the polkit answer), through systemd-journald like any service log |
 | Host names | sent | the daemon names a destination by a reverse (PTR) lookup, confirmed by a forward lookup, through the system resolver, so your DNS server sees those lookups. With the eBPF layer on, DNS answers this machine receives are also read in the kernel; they stay in the daemon's memory |
-| App and tray | stored | no files. The tray writes its icon to `$XDG_RUNTIME_DIR/cfc-tray/icons`, which lives in memory until you log out, only when the icon theme lacks it |
+| App and tray | stored | `$XDG_CONFIG_HOME/Colony/Colony Firewall Control/preferences.json` (`~/.config` when unset): the choices made in Preferences (language, theme, accent, text size, accessibility, prompt and notification options) and nothing else. The app writes it, the tray only reads it. The tray also writes its icon to `$XDG_RUNTIME_DIR/cfc-tray/icons`, which lives in memory until you log out, only when the icon theme lacks it |
 | Rule exports | stored | only where `cfc rules export --out` is told to write |
 
 The app, the tray and `cfc` talk to the daemon only through the local socket
@@ -252,3 +259,6 @@ derivative port.
 - The Rust [tonic](https://github.com/hyperium/tonic),
   [aya](https://github.com/aya-rs/aya), [iced](https://iced.rs/), and
   [nfq](https://crates.io/crates/nfq) crates.
+- The interface fonts, embedded through
+  [colony-ui](https://crates.io/crates/colony-ui) under the SIL Open Font
+  License: JetBrains Mono Nerd Font, OpenDyslexic and Font Awesome 6 Free.

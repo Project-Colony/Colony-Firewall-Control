@@ -17,6 +17,7 @@ pub mod decision;
 pub mod dns;
 pub mod ebpf;
 pub mod ipc;
+pub mod maintenance;
 pub mod nfqueue;
 pub mod official;
 pub mod packet;

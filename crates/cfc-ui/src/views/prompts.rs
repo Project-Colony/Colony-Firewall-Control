@@ -10,10 +10,14 @@
 //! the same clock the daemon will act on - not a guess.
 
 use cfc_client::{convert, proto};
-use iced::widget::{button, column, container, progress_bar, row, scrollable, text, Space};
-use iced::{Element, Font, Length};
+use colony_ui::Palette;
+use iced::widget::{button, column, container, progress_bar, row, scrollable, Space};
+use iced::{Element, Length};
 
-use crate::{format, Message, PromptCard};
+use crate::app::{Message, PromptCard};
+use crate::format;
+use crate::i18n::{t, t_fmt};
+use crate::theme::{self, sz, ui_text, ui_text_bold};
 
 /// Below this many seconds the countdown turns amber.
 const URGENT_SECS: i64 = 5;
@@ -27,7 +31,7 @@ const CMDLINE_MAX_CHARS: usize = 96;
 const LABEL_WIDTH: f32 = 104.0;
 
 /// The one row rendered large: it is the answer to "what is asking?".
-const PROGRAM_LABEL: &str = "Program";
+const PROGRAM_KEY: &str = "prompt_row_program";
 
 pub fn view<'a>(
     prompts: &'a [PromptCard],
@@ -38,9 +42,9 @@ pub fn view<'a>(
     if prompts.is_empty() {
         return container(
             column![
-                text("No pending prompts").size(18),
-                text("Outbound flows that no rule decides will appear here for you to allow or block.").size(12),
-                text("Keyboard, on the top prompt: A allow once / D block for now; Shift+A always allow this program, Shift+D always block it.").size(11),
+                ui_text(t("prompts_empty_title")).size(sz(18)),
+                ui_text(t("prompts_empty_body")).size(sz(12)),
+                ui_text(t("prompts_empty_keys")).size(sz(11)),
             ]
             .spacing(8),
         )
@@ -115,11 +119,11 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
 
     if let Some(p) = ev.process.as_ref() {
         if !p.exe.is_empty() {
-            rows.push(plain(PROGRAM_LABEL, convert::process_display(p)));
+            rows.push(plain(t(PROGRAM_KEY), convert::process_display(p)));
             // Display values go through `display_safe`; the copy keeps the
             // raw string.
             rows.push(DetailRow {
-                label: "Path",
+                label: t("prompt_row_path"),
                 value: convert::display_safe(&p.exe),
                 note: "",
                 copy: Some(p.exe.clone()),
@@ -132,7 +136,7 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         let cmdline = p.cmdline.join(" ");
         if !cmdline.is_empty() && cmdline != p.exe && cmdline != convert::process_display(p) {
             rows.push(DetailRow {
-                label: "Command line",
+                label: t("prompt_row_cmdline"),
                 value: format::ellipsize(&convert::display_safe(&cmdline), CMDLINE_MAX_CHARS),
                 note: "",
                 copy: Some(cmdline),
@@ -140,17 +144,17 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         }
 
         if p.pid != 0 || p.ppid != 0 {
-            rows.push(plain("Process", process_line(p)));
+            rows.push(plain(t("prompt_row_process"), process_line(p)));
         }
 
         // uid is optional in the proto precisely so an unattributed flow
         // never renders as uid 0, i.e. as root. No attribution, no row.
         if p.uid.is_some() {
-            rows.push(plain("User", convert::uid_label(p.uid)));
+            rows.push(plain(t("prompt_row_user"), format::uid_label(p.uid)));
         }
 
         if !p.cwd.is_empty() {
-            rows.push(plain("Working dir", convert::display_safe(&p.cwd)));
+            rows.push(plain(t("prompt_row_cwd"), convert::display_safe(&p.cwd)));
         }
 
         // Before the buttons, because it changes what Allow means here:
@@ -159,27 +163,28 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         // replaced file will prompt again instead of inheriting the access.
         if ev.binds_to_hash {
             rows.push(DetailRow {
-                label: "Rule binding",
-                value: if p.sha256.is_empty() {
-                    "Image hash unavailable; persistent allow cannot be saved".to_string()
+                label: t("prompt_row_binding"),
+                value: t(if p.sha256.is_empty() {
+                    "prompt_binding_no_hash"
                 } else {
-                    "Allow always will pin to this binary".to_string()
-                },
-                note: "(user-writable path)",
+                    "prompt_binding_pinned"
+                })
+                .to_string(),
+                note: t("prompt_note_user_writable"),
                 copy: None,
             });
         }
 
         rows.push(if p.sha256.is_empty() {
             DetailRow {
-                label: "Checksum",
+                label: t("prompt_row_checksum"),
                 value: "-".to_string(),
-                note: "(not hashed)",
+                note: t("prompt_note_not_hashed"),
                 copy: None,
             }
         } else {
             DetailRow {
-                label: "Checksum",
+                label: t("prompt_row_checksum"),
                 value: format::truncate_sha(&p.sha256),
                 note: "",
                 copy: Some(p.sha256.clone()),
@@ -190,13 +195,13 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
         // the distribution installed. Always shown, like Checksum: "not
         // from a package" and "MODIFIED since install" are exactly the
         // answers worth seeing before you allow anything.
-        rows.push(plain("Package", convert::provenance_label(p)));
+        rows.push(plain(t("prompt_row_package"), format::provenance_label(p)));
     }
 
     if let Some(c) = ev.connection.as_ref() {
         let src = format::socket_display(&c.src_ip, c.src_port);
         if !src.is_empty() {
-            rows.push(plain("Source", src));
+            rows.push(plain(t("prompt_row_source"), src));
         }
 
         let remote = format::remote_display(&c.dst_host, &c.dst_ip, c.dst_port);
@@ -204,12 +209,12 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
             // Same trust label as the tray bubble: a name from an observed
             // DNS answer is whatever the answering server said.
             rows.push(DetailRow {
-                label: "Remote",
+                label: t("prompt_row_remote"),
                 value: remote,
                 note: match (c.dst_host.is_empty(), c.dst_host_verified) {
                     (true, _) => "",
-                    (false, true) => "(verified name)",
-                    (false, false) => "(unverified name)",
+                    (false, true) => t("prompt_note_verified_name"),
+                    (false, false) => t("prompt_note_unverified_name"),
                 },
                 copy: None,
             });
@@ -220,14 +225,14 @@ pub fn detail_rows(ev: &proto::PromptEvent) -> Vec<DetailRow> {
             proto::Protocol::Unspecified
         ) {
             rows.push(plain(
-                "Protocol",
+                t("prompt_row_protocol"),
                 convert::protocol_label(c.protocol).to_string(),
             ));
         }
 
         if c.timestamp_unix_ms > 0 {
             rows.push(plain(
-                "Started",
+                t("prompt_row_started"),
                 format::format_local_clock_ms(c.timestamp_unix_ms),
             ));
         }
@@ -248,10 +253,7 @@ pub fn undecided_warning(ev: &proto::PromptEvent, rules: &[proto::RuleInfo]) -> 
         .find(|r| r.id == ev.undecided_rule_id)
         .map(|r| convert::display_safe(&r.name))
         .unwrap_or_else(|| convert::display_safe(&ev.undecided_rule_id));
-    Some(format!(
-        "Rule \"{rule}\" may apply, but the program could not be fully identified; \
-         your answer applies to this connection."
-    ))
+    Some(t_fmt("prompt_undecided", &[("rule", &rule)]))
 }
 
 /// `"pid 4242 (parent pid 1310)"`.
@@ -260,20 +262,24 @@ pub fn undecided_warning(ev: &proto::PromptEvent, rules: &[proto::RuleInfo]) -> 
 /// number is all we can honestly show. Inventing a path by reading
 /// `/proc/<ppid>` from the UI would be a lie the moment the parent exited.
 fn process_line(p: &proto::ProcessInfo) -> String {
+    let pid = p.pid.to_string();
     if p.ppid == 0 {
-        format!("pid {}", p.pid)
+        t_fmt("prompt_pid", &[("pid", &pid)])
     } else {
-        format!("pid {} (parent pid {})", p.pid, p.ppid)
+        t_fmt(
+            "prompt_pid_parent",
+            &[("pid", &pid), ("ppid", &p.ppid.to_string())],
+        )
     }
 }
 
 /// WFC's title line: what happened, and when, on the user's own clock.
 pub fn heading(ev: &proto::PromptEvent) -> String {
     let conn = ev.connection.as_ref();
-    let what = match conn.map(|c| c.direction) {
-        Some(d) if d == proto::Direction::Inbound as i32 => "Incoming connection",
-        _ => "Outgoing connection",
-    };
+    let what = t(match conn.map(|c| c.direction) {
+        Some(d) if d == proto::Direction::Inbound as i32 => "prompt_incoming",
+        _ => "prompt_outgoing",
+    });
     match conn.map(|c| c.timestamp_unix_ms).filter(|t| *t > 0) {
         Some(ts) => format!("{what} - {}", format::format_local_clock_ms(ts)),
         None => what.to_string(),
@@ -286,7 +292,7 @@ pub fn program_label(ev: &proto::PromptEvent) -> String {
         .as_ref()
         .filter(|p| !p.exe.is_empty())
         .map(convert::process_display)
-        .unwrap_or_else(|| "this program".to_string())
+        .unwrap_or_else(|| t("prompt_this_program").to_string())
 }
 
 /// The four answers a card offers, in render order.
@@ -375,24 +381,23 @@ fn exe_scope(ev: &proto::PromptEvent) -> Option<proto::RuleScope> {
 
 /// First line of an action row - the decision.
 pub fn action_title(choice: PromptAction) -> &'static str {
-    match choice {
-        PromptAction::AllowProgram => "Allow this program",
-        PromptAction::BlockProgram => "Block this program",
-        PromptAction::BlockOnce => "Block for now",
-        PromptAction::AllowOnce => "Allow once",
-    }
+    t(match choice {
+        PromptAction::AllowProgram => "prompt_action_allow_program",
+        PromptAction::BlockProgram => "prompt_action_block_program",
+        PromptAction::BlockOnce => "prompt_action_block_once",
+        PromptAction::AllowOnce => "prompt_action_allow_once",
+    })
 }
 
 /// Second line - the consequence, in the same words the rule will have.
 pub fn action_consequence(choice: PromptAction, program: &str) -> String {
-    match choice {
-        PromptAction::AllowProgram => format!("Always allow {program} to connect"),
-        PromptAction::BlockProgram => format!("Always block {program} from connecting"),
-        PromptAction::BlockOnce => "Deny this connection only and ask again next time".to_string(),
-        PromptAction::AllowOnce => {
-            "Permit this connection only and ask again next time".to_string()
-        }
-    }
+    let key = match choice {
+        PromptAction::AllowProgram => "prompt_consequence_allow_program",
+        PromptAction::BlockProgram => "prompt_consequence_block_program",
+        PromptAction::BlockOnce => "prompt_consequence_block_once",
+        PromptAction::AllowOnce => "prompt_consequence_allow_once",
+    };
+    t_fmt(key, &[("program", program)])
 }
 
 // --- Rendering ----------------------------------------------------------
@@ -415,15 +420,15 @@ fn prompt_card<'a>(
     let armed = card.armed(now_ms);
 
     let marker: Element<'a, Message> = if key_target {
-        text("A / D answer this prompt")
-            .size(10)
-            .color(crate::theme::PARCHMENT_MUTED)
+        ui_text(t("prompt_key_target"))
+            .size(sz(10))
+            .color(Palette::TEXT_MUTED())
             .into()
     } else {
         Space::new().into()
     };
     let header = row![
-        text(heading(ev)).size(16),
+        ui_text(heading(ev)).size(sz(16)),
         Space::new().width(Length::Fill),
         marker
     ]
@@ -438,10 +443,10 @@ fn prompt_card<'a>(
     )
     .spacing(3);
 
-    let customize = button(text("Customize this rule before creating it").size(11))
+    let customize = button(ui_text(t("prompt_customize")).size(sz(11)))
         .padding([2, 4])
         .on_press(Message::CustomizePromptRule(ev.prompt_id.clone()))
-        .style(crate::theme::link_button);
+        .style(theme::link_button);
 
     let actions = column![
         action_row(
@@ -472,7 +477,7 @@ fn prompt_card<'a>(
             PromptAction::AllowOnce,
             ev,
             &program,
-            crate::theme::action_secondary,
+            theme::action_secondary,
             false,
             armed
         ),
@@ -485,20 +490,14 @@ fn prompt_card<'a>(
     {
         Space::new().into()
     } else {
-        text(
-            "No executable path for this flow - a \"this program\" rule would have an empty \
-             program and match everything, so only the one-off answers are available.",
-        )
-        .size(10)
-        .color(crate::theme::BURGUNDY_DARK)
-        .into()
+        ui_text(t("prompt_unscopable"))
+            .size(sz(10))
+            .color(Palette::ERROR())
+            .into()
     };
 
     let undecided: Element<'a, Message> = match undecided_warning(ev, rules) {
-        Some(warning) => text(warning)
-            .size(11)
-            .color(crate::theme::BURGUNDY_DARK)
-            .into(),
+        Some(warning) => ui_text(warning).size(sz(11)).color(Palette::ERROR()).into(),
         None => Space::new().into(),
     };
 
@@ -506,26 +505,24 @@ fn prompt_card<'a>(
         column![header, countdown, undecided, table, customize, actions, unscopable].spacing(9),
     )
     .padding(12)
-    .style(crate::theme::panel)
+    .style(theme::panel)
     .into()
 }
 
 fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
-    let emphasised = r.label == PROGRAM_LABEL;
-    let value = text(r.value)
-        .size(if emphasised { 14 } else { 11 })
-        .font(if emphasised {
-            Font::DEFAULT
-        } else {
-            Font::MONOSPACE
-        });
+    let emphasised = r.label == t(PROGRAM_KEY);
+    let value = if emphasised {
+        ui_text_bold(r.value).size(sz(14))
+    } else {
+        ui_text(r.value).size(sz(11))
+    };
 
     let note: Element<'a, Message> = if r.note.is_empty() {
         Space::new().into()
     } else {
-        text(r.note)
-            .size(10)
-            .color(crate::theme::PARCHMENT_MUTED)
+        ui_text(r.note)
+            .size(sz(10))
+            .color(Palette::TEXT_MUTED())
             .into()
     };
 
@@ -535,8 +532,8 @@ fn detail_row<'a>(r: DetailRow) -> Element<'a, Message> {
     };
 
     row![
-        container(text(r.label).size(11).color(crate::theme::PARCHMENT_MUTED))
-            .width(Length::Fixed(LABEL_WIDTH)),
+        container(ui_text(r.label).size(sz(11)).color(Palette::TEXT_MUTED()))
+            .width(theme::scaled(LABEL_WIDTH)),
         value,
         note,
         copy,
@@ -576,8 +573,8 @@ fn action_row<'a>(
 
     button(
         column![
-            text(action_title(choice)).size(title_size),
-            text(action_consequence(choice, program)).size(sub_size),
+            ui_text(action_title(choice)).size(sz(title_size)),
+            ui_text(action_consequence(choice, program)).size(sz(sub_size)),
         ]
         .spacing(1),
     )
@@ -595,29 +592,35 @@ fn countdown_row<'a>(
     now_ms: i64,
 ) -> Element<'a, Message> {
     let Some(left) = format::remaining_secs(card.event.deadline_unix_ms, now_ms) else {
-        return text("no deadline - waiting for your answer")
-            .size(10)
-            .into();
+        return ui_text(t("prompt_no_deadline")).size(sz(10)).into();
     };
 
     let fraction = format::countdown_fraction(card.event.deadline_unix_ms, now_ms, timeout_secs);
     let style = if left <= URGENT_SECS {
-        crate::theme::countdown_bar_urgent
+        theme::countdown_bar_urgent
     } else {
-        crate::theme::countdown_bar
+        theme::countdown_bar
     };
 
+    let label = ui_text(t_fmt(
+        "prompt_countdown",
+        &[
+            ("verb", format::fallback_verb(timeout_action)),
+            ("time", &format::format_countdown(left)),
+        ],
+    ))
+    .size(sz(10));
+    // A bar shrinking on every tick is motion: with reduced motion (or
+    // effects off) the seconds left are said in text only.
+    if !colony_ui::effects_enabled() {
+        return label.into();
+    }
     column![
         progress_bar(0.0..=1.0, fraction)
             .length(Length::Fill)
             .girth(Length::Fixed(4.0))
             .style(style),
-        text(format!(
-            "daemon {} automatically in {}",
-            format::fallback_verb(timeout_action),
-            format::format_countdown(left)
-        ))
-        .size(10),
+        label,
     ]
     .spacing(3)
     .into()
@@ -627,10 +630,10 @@ fn copy_button<'a>(value: String) -> Element<'a, Message> {
     if value.is_empty() {
         return Space::new().into();
     }
-    button(text("copy").size(9))
+    button(ui_text(t("copy")).size(sz(9)))
         .padding([1, 5])
         .on_press(Message::CopyText(value))
-        .style(crate::theme::subtle_icon)
+        .style(theme::subtle_icon)
         .into()
 }
 

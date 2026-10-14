@@ -6,6 +6,8 @@
 use cfc_client::convert::display_safe;
 use cfc_client::proto;
 
+use crate::i18n::{t, t_fmt};
+
 /// Prompt lifetime assumed when the daemon does not report one, so the
 /// countdown bar still has a sane denominator.
 pub const FALLBACK_PROMPT_TIMEOUT_SECS: u32 = 15;
@@ -56,22 +58,70 @@ pub fn countdown_fraction(deadline_unix_ms: i64, now_ms: i64, total_secs: u32) -
 
 /// Present tense, for "…&nbsp;allows automatically in 8s".
 pub fn fallback_verb(action: i32) -> &'static str {
-    match proto::Action::try_from(action).unwrap_or(proto::Action::Unspecified) {
-        proto::Action::Allow => "allows",
-        proto::Action::Deny => "denies",
-        proto::Action::Reject => "rejects",
-        proto::Action::Unspecified => "answers",
-    }
+    t(
+        match proto::Action::try_from(action).unwrap_or(proto::Action::Unspecified) {
+            proto::Action::Allow => "verb_allows",
+            proto::Action::Deny => "verb_denies",
+            proto::Action::Reject => "verb_rejects",
+            proto::Action::Unspecified => "verb_answers",
+        },
+    )
 }
 
 /// Past tense, for the "expired -> allowed by default" log line.
 pub fn fallback_past(action: i32) -> &'static str {
+    t(
+        match proto::Action::try_from(action).unwrap_or(proto::Action::Unspecified) {
+            proto::Action::Allow => "past_allowed",
+            proto::Action::Deny => "past_denied",
+            proto::Action::Reject => "past_rejected",
+            proto::Action::Unspecified => "past_answered",
+        },
+    )
+}
+
+/// A rule's or a verdict's action, as a word of the interface language.
+/// cfc-client's `action_label` is the CLI's token.
+pub fn action_label(action: i32) -> &'static str {
     match proto::Action::try_from(action).unwrap_or(proto::Action::Unspecified) {
-        proto::Action::Allow => "allowed",
-        proto::Action::Deny => "denied",
-        proto::Action::Reject => "rejected",
-        proto::Action::Unspecified => "answered",
+        proto::Action::Allow => t("action_allow"),
+        proto::Action::Deny => t("action_deny"),
+        proto::Action::Reject => t("action_reject"),
+        proto::Action::Unspecified => "?",
     }
+}
+
+/// How long a rule lasts, with a timed rule's exact lifetime.
+pub fn duration_label(rule: &proto::RuleInfo) -> String {
+    match proto::Duration::try_from(rule.duration).unwrap_or(proto::Duration::Unspecified) {
+        proto::Duration::Seconds => format!("{}s", rule.duration_seconds),
+        proto::Duration::Once => t("duration_once").into(),
+        proto::Duration::UntilRestart => t("duration_until_restart").into(),
+        proto::Duration::Always => t("duration_always").into(),
+        proto::Duration::Unspecified => "?".into(),
+    }
+}
+
+/// cfc-client's `provenance_label` in the interface language: whether the
+/// binary still matches what its package installed.
+pub fn provenance_label(p: &proto::ProcessInfo) -> String {
+    let package = p.package.trim();
+    let with = |key| t_fmt(key, &[("package", package)]);
+    match proto::Provenance::try_from(p.provenance).unwrap_or(proto::Provenance::Unspecified) {
+        proto::Provenance::Modified if package.is_empty() => t("provenance_modified").into(),
+        proto::Provenance::Modified => with("provenance_pkg_modified"),
+        proto::Provenance::Verified if package.is_empty() => t("provenance_verified").into(),
+        proto::Provenance::Verified => with("provenance_pkg_verified"),
+        proto::Provenance::Unpackaged => t("provenance_unpackaged").into(),
+        proto::Provenance::Unspecified if package.is_empty() => t("unknown").into(),
+        proto::Provenance::Unspecified => with("provenance_pkg_unverified"),
+    }
+}
+
+/// A process uid, or "unknown" when the daemon could not attribute the flow:
+/// never 0, which would read as root.
+pub fn uid_label(uid: Option<u32>) -> String {
+    uid.map_or_else(|| t("unknown").into(), |u| u.to_string())
 }
 
 /// `"example.com (93.184.216.34:443)"`, or bare `ip:port` when the daemon
@@ -130,7 +180,7 @@ pub fn ellipsize(s: &str, max_chars: usize) -> String {
 pub fn dest_key(dst_host: &str, dst_ip: &str) -> String {
     if dst_host.is_empty() {
         if dst_ip.is_empty() {
-            "unknown".to_string()
+            t("unknown").to_string()
         } else {
             dst_ip.to_string()
         }
@@ -152,7 +202,7 @@ pub fn host_cidr(ip: &str) -> String {
 /// First 16 hex chars, enough to eyeball against a known-good digest.
 pub fn truncate_sha(sha: &str) -> String {
     if sha.is_empty() {
-        "unknown".to_string()
+        t("unknown").to_string()
     } else if sha.len() > 16 {
         format!("{}...", &sha[..16])
     } else {
@@ -236,9 +286,9 @@ pub fn connection_hint(detail: &str, max_chars: usize) -> String {
 pub fn unreachable_log_line(detail: &str) -> String {
     let hint = connection_hint(detail, CONNECTION_HINT_MAX);
     if hint.is_empty() {
-        "daemon unreachable, retrying...".to_string()
+        t("log_daemon_unreachable").to_string()
     } else {
-        format!("daemon unreachable, retrying... - {hint}")
+        t_fmt("log_daemon_unreachable_hint", &[("hint", &hint)])
     }
 }
 
@@ -246,9 +296,9 @@ pub fn unreachable_log_line(detail: &str) -> String {
 /// actually reported rather than whatever the UI asked for.
 pub fn format_resume_in(resume_at_unix_ms: i64, now_ms: i64) -> String {
     match remaining_secs(resume_at_unix_ms, now_ms) {
-        None => "until resumed manually".to_string(),
-        Some(0) => "resuming...".to_string(),
-        Some(s) => format!("resumes in {}", format_countdown(s)),
+        None => t("resume_manually").to_string(),
+        Some(0) => t("resume_now").to_string(),
+        Some(s) => t_fmt("resume_in", &[("time", &format_countdown(s))]),
     }
 }
 
@@ -306,6 +356,51 @@ mod tests {
         assert_eq!(fallback_past(proto::Action::Allow as i32), "allowed");
         assert_eq!(fallback_past(proto::Action::Deny as i32), "denied");
         assert_eq!(fallback_past(proto::Action::Reject as i32), "rejected");
+    }
+
+    #[test]
+    fn provenance_reads_the_package_and_the_verdict_together() {
+        let p = |package: &str, provenance: proto::Provenance| proto::ProcessInfo {
+            package: package.into(),
+            provenance: provenance as i32,
+            ..Default::default()
+        };
+        // Same five shapes as cfc-client's CLI label, in the interface language.
+        for (proc, want) in [
+            (
+                p("curl 8.21.0-1", proto::Provenance::Verified),
+                "curl 8.21.0-1 (verified)",
+            ),
+            (
+                p("curl 8.21.0-1", proto::Provenance::Modified),
+                "curl 8.21.0-1 - MODIFIED since install",
+            ),
+            (
+                p("curl", proto::Provenance::Unspecified),
+                "curl (unverified)",
+            ),
+            (
+                p("stale", proto::Provenance::Unpackaged),
+                "not from a package",
+            ),
+            (p("", proto::Provenance::Unspecified), "unknown"),
+        ] {
+            assert_eq!(provenance_label(&proc), want);
+            assert_eq!(cfc_client::convert::provenance_label(&proc), want);
+        }
+    }
+
+    #[test]
+    fn labels_never_show_an_unattributed_uid_as_root() {
+        assert_eq!(uid_label(None), "unknown");
+        assert_eq!(uid_label(Some(0)), "0");
+        assert_eq!(action_label(proto::Action::Deny as i32), "deny");
+        let timed = proto::RuleInfo {
+            duration: proto::Duration::Seconds as i32,
+            duration_seconds: 90,
+            ..Default::default()
+        };
+        assert_eq!(duration_label(&timed), "90s");
     }
 
     #[test]

@@ -162,7 +162,7 @@ channel. This paragraph used to describe the opposite - a blocking `recv` with
 "no polling, no added latency" whenever no prompt was outstanding - which was
 true of an earlier design and had not been true for some time. A thread parked
 in a blocking `recv` cannot be woken to see a stop flag, and that was ninety
-seconds of hang on every daemon stop; `crates/cfc-daemon/src/nfqueue.rs` has
+seconds of hang on every daemon stop; `crates/cfc-daemon/src/nfqueue/mod.rs` has
 the full argument.
 
 The price is real and is now measured rather than estimated: a queued flow

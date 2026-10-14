@@ -5,7 +5,7 @@
 //! lives in cfc-client so the CLI and the GUI behave identically. All that
 //! is left here is mapping [`StreamItem`] onto App [`Message`]s.
 
-use crate::Message;
+use crate::app::Message;
 use cfc_client::{proto, StreamItem};
 use futures::{stream, Stream, StreamExt};
 use iced::Subscription;
