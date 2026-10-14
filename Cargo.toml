@@ -52,7 +52,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 
 # Async runtime
-tokio = { version = "1.53.2", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 futures = "0.3.34"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
@@ -85,7 +85,7 @@ dns-lookup = "4.0.2"
 # Process / system
 nix = { version = "0.31.3", features = ["process", "user", "signal"] }
 libc = "0.2.190"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 # D-Bus: polkit CheckAuthorization on the system bus in the daemon (pause,
 # resume, rule import), and notification answers on the session bus in the tray.
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
