@@ -1337,7 +1337,12 @@ where
         .ok_or_else(|| anyhow!("no map named `{name}` in the object"))?;
     let ring: RingBuf<MapData> = RingBuf::try_from(map)
         .with_context(|| format!("`{name}` is not a ring buffer (BPF_MAP_TYPE_RINGBUF)"))?;
-    let mut fd = AsyncFd::new(ring).with_context(|| format!("registering `{name}` with tokio"))?;
+    // SAFETY: the `RingBuf` owns its `MapData`, which owns the map fd, and the
+    // `AsyncFd` owns the `RingBuf`: the fd stays open and unchanged until the
+    // `AsyncFd` is dropped, and `as_raw_fd` always returns that same fd.
+    let mut fd = unsafe { AsyncFd::register(ring) }
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("registering `{name}` with tokio"))?;
     let name = name.to_string();
 
     Ok(tokio::spawn(async move {
