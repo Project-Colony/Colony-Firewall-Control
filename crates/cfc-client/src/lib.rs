@@ -451,28 +451,14 @@ pub const PREFERENCES_PROGRAM: &str = "Colony Firewall Control";
 /// under `~/.config` when that is unset or relative.
 ///
 /// The app finds the same file through colony-ui's `paths::config_dir`. The
-/// tray cannot link colony-ui, which brings iced with it, so the rule is
-/// spelled out here, and a test in the app checks that both agree.
+/// tray cannot link colony-ui, which brings iced with it, so it asks `dirs`
+/// directly, as colony-ui does. That keeps the two in step when `HOME` is
+/// unset and the home directory comes from the passwd entry. A test in the
+/// app checks that both agree.
 pub fn preferences_file() -> Option<PathBuf> {
-    preferences_file_in(
-        std::env::var_os("XDG_CONFIG_HOME"),
-        std::env::var_os("HOME"),
-    )
-}
-
-fn preferences_file_in(
-    xdg_config_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    let base = xdg_config_home
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .or_else(|| {
-            home.filter(|h| !h.is_empty())
-                .map(|h| PathBuf::from(h).join(".config"))
-        })?;
     Some(
-        base.join("Colony")
+        dirs::config_local_dir()?
+            .join("Colony")
             .join(PREFERENCES_PROGRAM)
             .join("preferences.json"),
     )
@@ -652,27 +638,6 @@ pub fn stream_prompts_resilient(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_preferences_file_follows_xdg_config_home() {
-        let file = |xdg: Option<&str>, home: Option<&str>| {
-            preferences_file_in(xdg.map(Into::into), home.map(Into::into))
-        };
-        let expect = |base: &str| {
-            Some(PathBuf::from(format!(
-                "{base}/Colony/Colony Firewall Control/preferences.json"
-            )))
-        };
-        assert_eq!(file(Some("/x/cfg"), Some("/home/u")), expect("/x/cfg"));
-        // A relative XDG_CONFIG_HOME is ignored, as the spec says.
-        assert_eq!(
-            file(Some("cfg"), Some("/home/u")),
-            expect("/home/u/.config")
-        );
-        assert_eq!(file(None, Some("/home/u")), expect("/home/u/.config"));
-        assert_eq!(file(None, Some("")), None);
-        assert_eq!(file(None, None), None);
-    }
 
     #[test]
     fn version_line_answers_only_the_version_flags() {

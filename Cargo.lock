@@ -721,6 +721,7 @@ dependencies = [
  "anyhow",
  "cfc-core",
  "cfc-proto",
+ "dirs",
  "hyper-util",
  "libc",
  "thiserror 2.0.21",

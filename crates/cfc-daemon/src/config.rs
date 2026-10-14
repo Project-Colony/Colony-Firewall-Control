@@ -264,7 +264,7 @@ impl Default for EventsConfig {
 }
 
 /// Access control for the gRPC control socket. See the module comment in
-/// `ipc.rs` for the full trust model.
+/// `ipc/mod.rs` for the full trust model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IpcConfig {
@@ -506,7 +506,7 @@ impl Config {
     /// `[provenance] enabled`, consumed deep inside process resolution.
     /// Doing it here rather than in `main` is what makes those switches
     /// hot-reload: SIGHUP re-enters this function (see `reload_policy` in
-    /// `main.rs`), so re-applying on every load is both the startup path
+    /// `maintenance.rs`), so re-applying on every load is both the startup path
     /// and the reload path.
     pub fn load_or_default(path: &Path) -> anyhow::Result<Self> {
         let cfg = match std::fs::read_to_string(path) {
