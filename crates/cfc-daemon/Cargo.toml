@@ -46,8 +46,8 @@ default = ["ebpf"]
 ebpf = ["dep:aya"]
 
 [dependencies]
-cfc-core = { path = "../cfc-core" }
-cfc-proto = { path = "../cfc-proto" }
+cfc-core = { workspace = true }
+cfc-proto = { workspace = true }
 # POD event types shared with the kernel-side crate. Unconditional: the
 # kernel process table is compiled (and unit-tested) in every configuration,
 # it is simply never fed without the `ebpf` feature. The crate is
@@ -76,13 +76,11 @@ libc = { workspace = true }
 sha2 = { workspace = true }
 dns-lookup = { workspace = true }
 # Package provenance: pacman stores its per-file sha256 digests in a gzipped
-# mtree. Already in Cargo.lock transitively; declared crate-local (not
-# workspace-style) on purpose -- only the daemon reads a package database.
-flate2 = "1.1"
+# mtree.
+flate2 = { workspace = true }
 
 # polkit CheckAuthorization on the system bus (pause, resume, rule import).
-# Already in Cargo.lock through cfc-tray, with the same features.
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = { workspace = true }
 
 parking_lot = { workspace = true }
 chrono = { workspace = true }
@@ -91,10 +89,10 @@ ipnet = { workspace = true }
 clap = { workspace = true }
 
 [dev-dependencies]
-proptest = "1"
+proptest = { workspace = true }
 # test-util enables tokio::test(start_paused) for the prompt-timeout tests.
 tokio = { workspace = true, features = ["test-util"] }
 # tests/ipc_integration.rs drives the daemon through the same client the UI
 # and CLI use, over a socket in a temp dir.
-cfc-client = { path = "../cfc-client" }
-tempfile = "3"
+cfc-client = { workspace = true }
+tempfile = { workspace = true }

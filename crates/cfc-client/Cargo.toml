@@ -9,8 +9,8 @@ authors.workspace = true
 description = "Colony Firewall Control - shared UDS gRPC client"
 
 [dependencies]
-cfc-core = { path = "../cfc-core" }
-cfc-proto = { path = "../cfc-proto" }
+cfc-core = { workspace = true }
+cfc-proto = { workspace = true }
 
 tonic = { workspace = true }
 tokio = { workspace = true }

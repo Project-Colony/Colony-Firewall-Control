@@ -68,7 +68,7 @@ target/release/cfc completions fish | sudo install -Dm644 /dev/stdin \
 sudo target/release/cfc man --dir /usr/share/man/man1
 
 # Optional: the eBPF object. Building it needs the pinned nightly and
-# bpf-linker (see crates/cfc-ebpf/README.md); without it the daemon runs on
+# bpf-linker (see docs/internals/architecture.md); without it the daemon runs on
 # sock_diag + /proc.
 cargo xtask build-ebpf
 sudo install -Dm644 "$(cargo xtask ebpf-path)" \
@@ -85,7 +85,7 @@ sudo usermod -aG colony-firewall "$USER"
 ```
 
 On RHEL, Rocky, AlmaLinux or Fedora, where SELinux is enforcing, also load
-the policy module from [packaging/selinux](../../packaging/selinux/README.md)
+the policy module from [packaging/selinux](../internals/selinux.md)
 before the first start: without it the daemon cannot bind NFQUEUE.
 
 Then enable the daemon and enforcement as described in [First run](#first-run).
@@ -178,7 +178,7 @@ This does not refuse inbound SSH: the ruleset hooks `output` on
 `ct state established` and are never queued. Outbound lookups the login
 itself makes (reverse DNS, LDAP or Kerberos from `sshd`'s PAM stack) are
 new flows and are judged like any other; see
-[docs/TROUBLESHOOTING.md](../TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out).
+[troubleshooting](troubleshooting.md#testing-over-ssh-without-locking-yourself-out).
 
 **Boot behaviour.** The nft units load independently before the daemon,
 `network-pre.target`, NetworkManager and systemd-networkd, after the
@@ -226,9 +226,9 @@ Executables over 64 MiB (Chromium, Electron apps, VS Code) are never hashed.
 A hash-pinned rule naming one cannot be decided, so its flows are prompted
 (or take `no_ui_action` with no UI connected), and outside a root-owned
 path an "Allow always" for one cannot be saved, so it prompts for every new
-flow. See [docs/HARDENING.md](../HARDENING.md#rule-design-principles).
+flow. See [hardening](hardening.md#rule-design-principles).
 The complete list of non-goals is in
-[docs/HARDENING.md](../HARDENING.md#what-this-firewall-does-not-protect-against).
+[hardening](hardening.md#what-this-firewall-does-not-protect-against).
 
 Fast Allow was removed: a socket mark cannot prove which process sends, so it
 opened bypasses. The old `[ebpf] fast_allow` and `fast_allow_mark` keys are
@@ -247,7 +247,7 @@ cfc status     # "enforcing yes", and it warns on stderr when it is not
 > connects, but a login that needs the network (LDAP, Kerberos, reverse DNS)
 > can fail, and the opt-in inbound table drops new SSH sessions outright
 > while the daemon is down. Read
-> [docs/TROUBLESHOOTING.md](../TROUBLESHOOTING.md#testing-over-ssh-without-locking-yourself-out) -
+> [troubleshooting](troubleshooting.md#testing-over-ssh-without-locking-yourself-out) -
 > specifically the dead-man's switch - *before* enabling enforcement
 > remotely.
 

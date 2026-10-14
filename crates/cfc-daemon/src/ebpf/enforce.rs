@@ -2,10 +2,10 @@
 //! daemon.
 //!
 //! Everything else in this crate observes. This module is the one part that
-//! *decides* without a userspace round trip, and the reason it exists is a
-//! single sentence in `TODO.md`: today any root process lifts the whole
-//! guarantee with `nft delete table inet colony_firewall`, and killing the
-//! daemon stops every future decision from being made at all.
+//! *decides* without a userspace round trip, and the reason it exists is one
+//! sentence: without it, any root process lifts the whole guarantee with
+//! `nft delete table inet colony_firewall`, and killing the daemon stops every
+//! future decision from being made at all.
 //!
 //! The mechanism is BPF link pinning. A link held only by a process dies with
 //! that process; a link pinned into bpffs is held by the filesystem, so the

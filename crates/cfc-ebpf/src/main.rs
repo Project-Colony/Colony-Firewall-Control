@@ -58,7 +58,7 @@ use cfc_ebpf_proto::{ConnectReport, DNS_BUF_LEN, DnsPacket, ExecEvent, ExitEvent
 /// to the ring is what guarantees a future in-kernel consumer (a whitelist
 /// fast path on the connect hooks) an entry for every pid userspace has heard
 /// of, and that ordering only holds for a map that is actually maintained.
-/// See `README.md`, "Consuming the types".
+/// See `docs/internals/architecture.md`, "Consuming the types".
 ///
 /// 10240 entries at 292 bytes each is ~3 MiB of (preallocated) kernel memory -
 /// the price of keeping that option open, paid knowingly.
@@ -1124,7 +1124,7 @@ const SO_MARK: i32 = 36;
 /// never be taken back - and unreplied UDP is conntrack-NEW on every datagram
 /// (see `nfqueue.rs`), so that mark would carry every datagram past the queue
 /// for as long as the socket lived. The body below is the allowlist that
-/// closes this; `docs/ARCHITECTURE.md` records the two narrower rules that
+/// closes this; `docs/internals/architecture.md` records the two narrower rules that
 /// leaked first.
 ///
 /// Sockets that already carry a mark of their own are left alone entirely,

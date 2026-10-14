@@ -355,15 +355,15 @@ jobs:
             "${STAGE}/"
 
           # Docs, for parity with what packaging/arch/PKGBUILD puts in
-          # /usr/share/doc. `cfc status` points users at TROUBLESHOOTING.md
+          # /usr/share/doc. `cfc status` points users at troubleshooting.md
           # by name, and install.sh at first-run.md, so both have to ship.
           install -m644 \
             README.md \
             CHANGELOG.md \
             LICENSE \
-            docs/ARCHITECTURE.md \
-            docs/HARDENING.md \
-            docs/TROUBLESHOOTING.md \
+            docs/internals/architecture.md \
+            docs/guide/hardening.md \
+            docs/guide/troubleshooting.md \
             docs/guide/first-run.md \
             "${STAGE}/"
 

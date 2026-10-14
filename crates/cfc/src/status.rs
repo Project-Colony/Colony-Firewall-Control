@@ -56,7 +56,7 @@ fn status_warnings(s: &proto::StatusResponse) -> Vec<String> {
     let mut w = Vec::new();
     if !s.enforcing {
         w.push(
-            "no packets seen - is the nftables rule loaded? see docs/TROUBLESHOOTING.md"
+            "no packets seen - is the nftables rule loaded? see docs/guide/troubleshooting.md"
                 .to_string(),
         );
     }
@@ -235,7 +235,7 @@ mod tests {
         let w = status_warnings(&s);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("nftables"));
-        assert!(w[0].contains("docs/TROUBLESHOOTING.md"));
+        assert!(w[0].contains("docs/guide/troubleshooting.md"));
 
         s.skipped_rules = 3;
         let w = status_warnings(&s);

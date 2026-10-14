@@ -11,7 +11,7 @@
 //! since a signal addressed to the tray reaches it whatever it subscribed to.
 //!
 //! The server itself is still trusted: a same-user program that replaces it
-//! answers for the user (see docs/HARDENING.md).
+//! answers for the user (see docs/guide/hardening.md).
 
 use crate::model::KEY_CLOSED;
 use tokio_stream::StreamExt as _;

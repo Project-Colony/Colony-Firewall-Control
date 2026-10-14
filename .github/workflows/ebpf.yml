@@ -301,7 +301,7 @@ jobs:
           #   6.12  the oldest LTS worth supporting today
           #   6.18  the newest LTS
           #   7.1   the kernel every verified-instruction number in
-          #         crates/cfc-ebpf/README.md was measured on
+          #         docs/internals/architecture.md was measured on
           #   main  the whole point: catch a future kernel breaking us here
           #         rather than on a user's machine
           #

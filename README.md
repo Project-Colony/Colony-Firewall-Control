@@ -126,7 +126,7 @@ packages install, and the app shows the daemon's reason when it refuses one.
 
 Not published on the AUR yet. Each release carries the recipe CI built
 against its tag, with the real source checksum (`PKGBUILD` and `SRCINFO`);
-[packaging/README.md](packaging/README.md#arch-linux-aur) shows how to build
+[docs/internals/packaging.md](docs/internals/packaging.md#arch-linux-aur) shows how to build
 it. From a checkout, the `-git` recipe builds the current source:
 
 ```sh
@@ -141,7 +141,7 @@ units, the sysusers fragment, both nftables rulesets and the inbound
 lockout guard, the polkit policy, the desktop entries and icon,
 completions and man pages - and prints the first-run steps on install.
 Without the object the daemon runs on `sock_diag` + `/proc`; the release
-tarball ships it, see [packaging/README.md](packaging/README.md#release-tarball).
+tarball ships it, see [docs/internals/packaging.md](docs/internals/packaging.md#release-tarball).
 
 ### Direct binary download
 
@@ -165,7 +165,7 @@ sudo ./install.sh      # then First run
 
 `sudo ./uninstall.sh` from the same directory removes it again. What the
 tarball contains and how its scripts are generated:
-[packaging/README.md](packaging/README.md#release-tarball).
+[docs/internals/packaging.md](docs/internals/packaging.md#release-tarball).
 
 ### Build from source
 
@@ -178,7 +178,7 @@ cargo build --workspace --release --locked
 Requires Rust 1.89 or newer and `protobuf-compiler`. Installing the build by
 hand (binaries, units, nftables ruleset, group, polkit policy) is in
 [docs/guide/first-run.md](docs/guide/first-run.md#manual-install); building
-and testing for development is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+and testing for development is in [docs/internals/development.md](docs/internals/development.md).
 
 ## Documentation
 

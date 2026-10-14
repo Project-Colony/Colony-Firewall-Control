@@ -61,7 +61,7 @@ The daemon recognises the app and tray by the running image: it must be the
 installed, root-owned `/usr/bin/colony-firewall` or `colony-firewall-tray`,
 started normally (not traced, no seccomp filter, no library preloaded from
 your files). After an upgrade, restart both; until then they are read-only.
-Details and limits are in [docs/HARDENING.md](../HARDENING.md).
+Details and limits are in [hardening](hardening.md).
 
 Executable rules require the canonical mapped target explicitly. An alias
 such as `/bin/tool` on a system where `/bin` links to `/usr/bin` is refused;

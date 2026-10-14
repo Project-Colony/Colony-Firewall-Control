@@ -3,7 +3,7 @@
 %global modulename colony_firewall
 
 # No -debuginfo subpackage, and not as an oversight: the workspace's release
-# profile strips in the linker (Cargo.toml, `strip = true`), so find-debuginfo
+# profile strips in the linker (Cargo.toml, `strip = "symbols"`), so find-debuginfo
 # has nothing to extract, and rpmbuild treats the resulting empty
 # debugfiles.list as an error rather than a warning - a full `rpmbuild -ba`
 # on Fedora dies there. Shipping real debuginfo would mean unstripping the
@@ -99,7 +99,7 @@ cargo build --workspace --profile release --locked
 # -Z build-std and a matching bpf-linker, none of which belong in a distro
 # build root. Without it the daemon reports Degrade::ObjectMissing once and
 # runs on sock_diag + /proc, which is a supported configuration - see
-# docs/TROUBLESHOOTING.md. Users who want the ring-0 layer build it with
+# docs/guide/troubleshooting.md. Users who want the ring-0 layer build it with
 # `cargo xtask build-ebpf` and drop the object at
 # /usr/lib/colony-firewall/cfc-ebpf.o.
 
@@ -236,7 +236,7 @@ fi
 
 %files
 %license LICENSE
-%doc README.md docs/ARCHITECTURE.md docs/HARDENING.md docs/TROUBLESHOOTING.md docs/guide/first-run.md
+%doc README.md docs/internals/architecture.md docs/guide/hardening.md docs/guide/troubleshooting.md docs/guide/first-run.md
 %{_bindir}/colony-firewalld
 %{_bindir}/colony-firewall
 %{_bindir}/colony-firewall-tray
@@ -266,7 +266,7 @@ fi
 %{_mandir}/man1/cfc*.1*
 
 %files selinux
-%doc packaging/selinux/README.md
+%doc docs/internals/selinux.md
 %{_datadir}/selinux/packages/%{selinuxtype}/%{modulename}.pp.bz2
 %{_datadir}/selinux/devel/include/distributed/%{modulename}.if
 

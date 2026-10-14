@@ -358,7 +358,7 @@ an error: with that setting any program of yours can start the app under a
 debugger, change its code before it seals itself and make changes as it,
 and the daemon cannot tell afterwards. Setting
 `kernel.yama.ptrace_scope = 2` closes that route; the commands are in
-[HARDENING.md](HARDENING.md#the-control-socket-and-who-can-talk-to-it).
+[hardening](hardening.md#the-control-socket-and-who-can-talk-to-it).
 Debugging your own programs then needs root.
 
 ## Loopback and the local resolver
@@ -584,7 +584,7 @@ One consequence worth knowing on a desktop: prompts for root-owned
 processes are only delivered to a root subscriber. With none connected,
 they resolve immediately with `no_ui_action` rather than waiting out the
 timeout. If you want to answer those interactively, run `sudo cfc
-prompts`. See docs/HARDENING.md for the full delivery table.
+prompts`. See [hardening](hardening.md) for the full delivery table.
 
 ## Reject behaves like Deny
 

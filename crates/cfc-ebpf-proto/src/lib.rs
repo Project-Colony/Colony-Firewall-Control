@@ -543,7 +543,7 @@ impl Default for DnsAnswer {
 ///
 /// The reason is the verifier's 1,000,000-instruction complexity budget: the
 /// nested answer x label x byte loops of in-kernel name parsing blew past it
-/// (see `crates/cfc-ebpf/README.md`). A constant-length copy does not.
+/// (see `docs/internals/architecture.md`). A constant-length copy does not.
 ///
 /// Layout (`size_of` = 514, `align_of` = 2):
 ///

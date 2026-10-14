@@ -25,6 +25,10 @@ repository = "https://github.com/Project-Colony/Colony-Firewall-Control"
 authors = ["MotherSphere <linhajahad@gmail.com>"]
 
 [workspace.dependencies]
+# Internal crates.
+cfc-core = { path = "crates/cfc-core" }
+cfc-proto = { path = "crates/cfc-proto" }
+cfc-client = { path = "crates/cfc-client" }
 # eBPF: POD event types + pure parsers shared with the kernel-side crate.
 # Dependency-free and no_std-capable; the daemon consumes it with default
 # (std) features for the string/IpAddr helpers.
@@ -37,69 +41,82 @@ cfc-ebpf-proto = { path = "crates/cfc-ebpf-proto" }
 # and nothing at build time beyond aya itself: aya is pure Rust and needs no
 # bpf-linker, no nightly and no BPF-capable kernel to compile. aya 0.14 pairs
 # with the aya-ebpf 0.2.x the kernel-side crate uses, and declares
-# rust-version 1.87, comfortably inside this workspace's 1.89 MSRV. The exact
-# build is pinned by Cargo.lock plus `--locked` in CI, not by an `=` requirement
-# (cargo expands `=0.14` to the same range as `0.14` for a 0.x version, so an
-# `=` here would be a no-op that reads like a guarantee).
-aya = "0.14"
+# rust-version 1.87, comfortably inside this workspace's 1.89 MSRV.
+aya = "0.14.0"
 
 # IPC
-tonic = "0.14"
-prost = "0.14"
-tonic-build = "0.14"
-tonic-prost = "0.14"
-tonic-prost-build = "0.14"
+tonic = "0.14.6"
+prost = "0.14.4"
+tonic-build = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
 
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
-tokio-stream = { version = "0.1.18", features = ["net"] }
-futures = "0.3"
-hyper-util = { version = "0.1", features = ["tokio"] }
-tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1.53.3", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+futures = "0.3.34"
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 # Storage
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Package provenance: pacman stores its per-file sha256 digests in a gzipped
+# mtree. Only the daemon reads a package database.
+flate2 = "1.1.10"
 
 # Serialization
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-toml = "1.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
 
 # Errors & logging
-thiserror = "2.0"
-anyhow = "1.0.102"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Netfilter / proc
-nfq = "0.2"
-procfs = "0.18"
+nfq = "0.2.5"
+procfs = "0.18.0"
 
 # DNS reverse lookup
-dns-lookup = "4.0"
+dns-lookup = "4.0.2"
 
 # Process / system
-nix = { version = "0.31", features = ["process", "user", "signal"] }
-libc = "0.2"
-sha2 = "0.11"
+nix = { version = "0.31.3", features = ["process", "user", "signal"] }
+libc = "0.2.190"
+sha2 = "0.11.1"
+# D-Bus: polkit CheckAuthorization on the system bus in the daemon (pause,
+# resume, rule import), and notification answers on the session bus in the tray.
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 
 # UI
-iced = { version = "0.14", features = ["tokio", "advanced", "image", "lazy"] }
+colony-ui = "0.1.6"
+iced = { version = "0.14.0", features = ["tokio", "advanced", "image", "lazy"] }
 # `images_no_default_features` gives us `Image` (embedded notification
 # icons) without pulling the `image` crate's format decoders: we build
 # the RGBA buffer ourselves and never decode a file.
-notify-rust = { version = "4.17", features = ["images_no_default_features"] }
-ksni = "0.3"
+notify-rust = { version = "4.18.2", features = ["images_no_default_features"] }
+ksni = "0.3.6"
 
 # CLI
-clap = { version = "4.6", features = ["derive"] }
-owo-colors = { version = "4.2", features = ["supports-colors"] }
+clap = { version = "4.6.7", features = ["derive"] }
+# Completion + man generation live behind hidden `cfc` subcommands so
+# packaging can produce them from the freshly built binary (see
+# packaging/arch/PKGBUILD).
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
+owo-colors = { version = "4.4.0", features = ["supports-colors"] }
 
 # Utility
 parking_lot = "0.12.5"
-chrono = { version = "0.4.44", features = ["serde"] }
-uuid = { version = "1.23", features = ["v4", "serde"] }
-ipnet = { version = "2.12", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+ipnet = { version = "2.12.2", features = ["serde"] }
+
+# Tests
+tempfile = "3.27.0"
+proptest = "1.12.0"
 
 [profile.dev]
 opt-level = 0
@@ -114,7 +131,7 @@ debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"
 codegen-units = 1
-strip = true
+strip = "symbols"
 panic = "abort"

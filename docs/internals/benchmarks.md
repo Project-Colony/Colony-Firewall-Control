@@ -4,7 +4,7 @@
 answers nothing on its own, because the interesting comparison needs CFC
 *armed* - the queue rule loaded, the daemon deciding - and arming a fail-closed firewall on a development machine has consequences.
 
-This directory boots a throwaway VM instead. It assembles an initramfs from the
+`scripts/vm-bench/` boots a throwaway VM instead. It assembles an initramfs from the
 host's own kernel modules, `nftables`, `iproute2`, `python3` and the release
 binaries in `target/`, boots it under KVM, and runs the bench there against a
 real daemon. Nothing is downloaded; nothing outside `target/vm-bench` is
@@ -63,7 +63,8 @@ Run on 2026-09-06, Linux 7.2.2, KVM, four vCPUs, 3000 flows unless said.
 | queue, the shipped 5 ms beat | 5.6745 ms | 7.6083 ms |
 
 That run also measured Fast Allow, since removed because a socket mark does
-not prove which process sends (see `TODO.md` 1a). Read across, and two things
+not prove which process sends (see
+[The eBPF layer](architecture.md#the-ebpf-layer)). Read across, and two things
 fall out.
 
 - **A full `RECV_POLL_INTERVAL` is paid per queued flow, not half of one.**

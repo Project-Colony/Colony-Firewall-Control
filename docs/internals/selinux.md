@@ -1,4 +1,89 @@
-# Validating the policy on an enforcing host
+# SELinux policy for Colony Firewall Control
+
+For RHEL, Rocky, AlmaLinux and Fedora, where SELinux is enforcing by default.
+
+The alternative to shipping this file is shipping instructions that say "set it
+permissive", which on those distributions is advice to turn off the thing they
+are built around. So: a real module.
+
+The policy sources live in
+[`packaging/selinux/`](../../packaging/selinux/): `colony_firewall.te`,
+`colony_firewall.if` and `colony_firewall.fc`.
+
+## Build and install
+
+From `packaging/selinux/`:
+
+```sh
+make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
+sudo semodule -i colony_firewall.pp
+sudo restorecon -RvF /usr/bin/colony-firewalld /etc/colony-firewall \
+    /var/lib/colony-firewall /run/colony-firewall
+```
+
+`selinux-policy-devel` provides that Makefile. The `.spec` in `packaging/rpm`
+does all of this in `%post`.
+
+Removing it:
+
+```sh
+sudo semodule -r colony_firewall
+```
+
+## What it grants, and what each denial costs
+
+Grouped that way on purpose: the failure modes are not equivalent, and an AVC
+tells you which kind of trouble you are in.
+
+| group | denial costs |
+|---|---|
+| netlink_netfilter, raw sockets | **everything.** The daemon exits before `READY=1`, and the ruleset is fail-closed (except new loopback flows), so the machine loses non-loopback outbound network |
+| unix socket under `/run` | the CLI, tray and GUI cannot reach the daemon; filtering continues, unattended |
+| `bpf`, `perf_event`, tracefs, cgroup | the ring-0 layer. Attribution falls back to `sock_diag` + `/proc`, hostnames to PTR lookups. Logged once, then filtering continues |
+| bpffs (`/sys/fs/bpf`) | in-kernel denials no longer survive the daemon being killed. Silent apart from `enforcement=process` in the startup line |
+| `/proc` of other domains | process attribution. Connections resolve to "unknown" |
+| `rpm_exec_t`, `rpm_var_lib_t` | provenance. Every binary reports `Unpackaged` |
+
+Only the first two are fatal. Everything else is a narrower feature set and one
+log line, which is the same contract the daemon keeps everywhere else.
+
+## What is deliberately not here
+
+**`CAP_SYS_ADMIN`.** The seven capabilities in `colony_firewall.te` are exactly
+the seven the systemd unit grants - the five BPF/network ones plus `chown`
+(the control socket is chgrped to `colony-firewall` after bind) and
+`dac_read_search` (the `/proc/*/fd` walk behind attribution; its absence once
+took a real machine's network down, see the capability comment in the `.te`).
+That the BPF set is sufficient is a test rather than a claim:
+`attaches_with_only_the_units_capabilities` drops to uid 1000, asserts
+`CAP_SYS_ADMIN` is absent from its own effective set, and requires all five BPF
+programs to load, attach and pin. If an AVC ever asks for `sys_admin`, that is
+a regression to find, not a rule to add.
+
+**A domain for the client binaries.** `cfc`, `colony-firewall` and
+`colony-firewall-tray` run as the invoking user and do nothing privileged.
+Labelling them would confine the user's session rather than the process holding
+`CAP_NET_ADMIN`. They get `colony_firewall_stream_connect` and nothing else.
+
+**A transition to `rpm_t`.** The provenance backend runs `rpm -qa` in the
+daemon's own domain. Transitioning would hand the child a domain that can
+install packages, to run a read-only query.
+
+**`permissive colony_firewalld_t`.** Adding that line would make this file look
+like a policy while behaving like `setenforce 0` for one domain.
+
+## Status
+
+The module builds against `selinux-policy-devel` in CI (`.github/workflows/rhel.yml`,
+Rocky 9 and Fedora containers), which proves the syntax is right and every type
+and interface it names exists on those releases.
+
+It has **not** been exercised against a running enforcing system with the daemon
+under load. Expect a round of `audit2allow -w` on first deployment, and please
+report what it asks for rather than adding it locally - a missing rule here is a
+bug in `colony_firewall.te`. The protocol below is how to run that check.
+
+## Validating the policy on an enforcing host
 
 CI proves this module *compiles* against the real `selinux-policy-devel` of
 Rocky 9 and Fedora, and the `rpm end to end` job proves the package that
@@ -6,9 +91,9 @@ carries it builds and installs. Neither proves the rules are **sufficient**,
 and nothing that runs in a container can: sufficiency is a property of the
 daemon under real load on a kernel with SELinux enforcing. This file is the
 protocol for whoever has such a host. Run it once, report what you see, and
-`TODO.md` 2a stops being open.
+the item on the [roadmap](../project/roadmap.md) closes.
 
-## What you need
+### What you need
 
 - A Rocky 9 or Fedora VM with SELinux enforcing (`getenforce` says
   `Enforcing`). A VM, not your workstation: the ruleset is fail-closed
@@ -22,9 +107,9 @@ protocol for whoever has such a host. Run it once, report what you see, and
   enable --now auditd` first.
 - The package. Either the `rpms-fedora` artifact from the `rhel` workflow
   (Fedora VMs only - they are Fedora RPMs), or a local build on the VM
-  itself following the README's *Building* section.
+  itself following [Build from source](../../README.md#build-from-source) in the main README.
 
-## Step 0: make the domain permissive, on purpose, first
+### Step 0: make the domain permissive, on purpose, first
 
 ```sh
 sudo semanage permissive -a colony_firewalld_t
@@ -53,7 +138,7 @@ sudo semodule -DB     # rebuild policy with dontaudit disabled
 sudo semodule -B      # put it back when done
 ```
 
-## Step 1: install
+### Step 1: install
 
 From the RPM (the selinux subpackage's `%post` runs `semodule` and the
 relabel for you):
@@ -63,8 +148,8 @@ sudo dnf install ./colony-firewall-control-*.x86_64.rpm \
                  ./colony-firewall-control-selinux-*.noarch.rpm
 ```
 
-Or by hand, from a checkout (these are the same commands as README.md in
-this directory):
+Or by hand, from `packaging/selinux/` in a checkout (the same commands as
+[Build and install](#build-and-install) above):
 
 ```sh
 make -f /usr/share/selinux/devel/Makefile colony_firewall.pp
@@ -83,7 +168,7 @@ ls -Z /usr/bin/colony-firewalld    # must say colony_firewalld_exec_t
 If it says `bin_t`, the domain transition never happens, the daemon runs
 unconfined, and every test below passes while testing nothing.
 
-## Step 2: start the daemon and turn enforcement on
+### Step 2: start the daemon and turn enforcement on
 
 ```sh
 sudo systemctl enable --now colony-firewalld
@@ -97,7 +182,7 @@ reaching `active` already proves the queue and the control socket bound - if
 the unit cycles through restarts instead, you have found something: go to
 Step 4 now.
 
-## Step 3: exercise every group the .te documents
+### Step 3: exercise every group the .te documents
 
 The `.te` groups its rules by failure mode. Each row below drives one group;
 the point is that after this table every rule in the module has had the
@@ -121,7 +206,7 @@ something, let NTP and DNS happen, `sudo dnf check-update` for the provenance
 path. The rules that get missed by policies written away from the platform
 are the periodic ones, not the startup ones.
 
-## Step 4: collect the verdict
+### Step 4: collect the verdict
 
 ```sh
 sudo ausearch -m AVC,USER_AVC -ts recent
@@ -139,7 +224,7 @@ or target), across the whole session, with dontaudit disabled. AVCs about
 sudo ausearch -m AVC -ts recent | grep colony
 ```
 
-## Step 5: the same pass, enforcing
+### Step 5: the same pass, enforcing
 
 Only after a clean permissive pass:
 
@@ -154,7 +239,7 @@ surface a rule the permissive pass hid behind another. If the machine loses
 outbound network here, that is the console access earning its place:
 `semanage permissive -a colony_firewalld_t` from the console restores it.
 
-## Reporting
+### Reporting
 
 Open an issue containing:
 
@@ -167,6 +252,7 @@ Open an issue containing:
 A missing rule is a bug in `colony_firewall.te`, **not something to add
 locally**. A local module would fix your machine and nobody else's, and the
 next package update would reintroduce the gap for everyone whose machine it
-never fixed. The one exception the README already carves out: if the denial
+never fixed. The one exception carved out under
+[What is deliberately not here](#what-is-deliberately-not-here): if the denial
 asks for `sys_admin`, that is a regression in the daemon to find, not a rule
 to add anywhere.

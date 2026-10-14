@@ -1411,7 +1411,7 @@ mod tests {
             winner(&set, &mk_conn(), &mk_proc("/usr/bin/x")),
             Some("allow-x")
         );
-        // The documented carve-out (docs/TROUBLESHOOTING.md): the program
+        // The documented carve-out (docs/guide/troubleshooting.md): the program
         // Allow under the generic Allow is what keeps `deny --exe` from
         // winning on 443, so it is the rule credited there.
         let carve_out = sorted(vec![
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[test]
     fn a_digest_only_deny_leaves_every_unhashed_image_open_under_a_generic_allow() {
-        // Documented in docs/HARDENING.md: an image over the hashing cap
+        // Documented in docs/guide/hardening.md: an image over the hashing cap
         // (Chromium, Electron) could be the denied one, so a `--sha256`-only
         // Deny keeps every such flow open under every generic Allow. Adding
         // `--exe` settles every other program.

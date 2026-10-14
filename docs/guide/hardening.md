@@ -195,6 +195,23 @@ with zero hits after weeks of use is probably obsolete or wrong.
 **Stable paths matter.** Symlinks like `/usr/bin/python` may point to a
 different binary after an interpreter upgrade. When in doubt, target the
 real path under `/usr/lib/...` or pin by SHA-256 (`scope.exe_sha256`).
+Rules name the file `/proc/<pid>/exe` reports, and nothing re-resolves a
+stored rule: `/usr/bin/python -> python3.13` has to be written as
+`python3.13`, and that rule stops applying when the link moves to the next
+interpreter, which costs more for a Deny than for an Allow. A rule saved
+before alias validation existed, or whose target a package update later
+turned into a symlink, stays inert until it is edited to name the target.
+
+**Prompts bind an Allow to the binary where its path cannot be trusted.**
+"Allow always" for a program on a path a non-root user can write is saved
+with the SHA-256 of the image the prompt showed, so replacing the file does
+not inherit the rule; on a root-sealed path it is saved by path. The prompt
+says which, and the answer says what was stored. Two boundaries are drawn on
+purpose. Denies never bind to a hash: a hash-bound Deny is one file swap away
+from covering nothing, while a path-bound one covers whatever sits there
+next. And `cfc rules add` does not bind on its own: an explicit command
+stores what it says, and `--pin-hash` asks for the binding, since a package
+update invalidates a hash-bound rule.
 
 **Executables over 64 MiB have no digest.** The daemon does not hash an
 image larger than 64 MiB, and Chromium, Electron apps and VS Code are
@@ -234,12 +251,25 @@ nobody is watching: a program can make its own UDP attribution ambiguous
 
 Normal mode follows the desktop application firewall model of OpenSnitch and
 Windows Firewall Control. It filters new tracked IP flows using socket
-attribution. [Explicit application confinement](guide/first-run.md#explicit-application-confinement)
-is a separate launch mode.
+attribution. [Explicit application confinement](first-run.md#explicit-application-confinement)
+is a separate launch mode. It is a detection and consent layer, not a
+containment boundary.
 
 - **Anything from root**: `/usr/bin/colony-firewalld` itself is trusted,
   and so is any other root process. Use this firewall alongside, not
-  instead of, traditional access controls.
+  instead of, traditional access controls. Denials the eBPF layer holds in
+  the kernel (programs denied outright) survive `nft delete table` and a
+  killed daemon; removing them also takes `rm -rf /sys/fs/bpf/colony-firewall`.
+  Rules that name a destination, port or protocol live only in the nftables
+  path, so flushing the ruleset lifts them.
+- **Code inside an allowed process**: a browser extension, a script under an
+  allowed interpreter, or code injected with `ptrace` or `LD_PRELOAD` speaks
+  with the program's identity and gets its rules. Every application firewall
+  shares this, and a lasting Allow widens it.
+- **Prompt fatigue**: a program that triggers prompt after prompt trains
+  whoever answers them to click Allow. Ten Firefox prompts in a row, all
+  denied, have been seen to cost the browser its network. Write rules for the
+  programs you know in advance (a [profile](profiles.md), `cfc rules add`).
 - **eBPF / unprivileged user namespaces**: a sufficiently privileged user
   can bypass NFQUEUE entirely with `unshare -rn` and a custom net namespace.
 - **Local relays and DNS**: while the daemon runs, explicit rules apply to
@@ -298,6 +328,23 @@ is a separate launch mode.
   flow. Domain isolation requires an application-aware proxy or separate containment.
 - **Container traffic**: Docker / Podman / LXC route through their own
   bridges. You need to enqueue their veth interfaces explicitly in nftables.
+
+### Next to other tools
+
+None of these substitutes for another:
+
+- **SELinux / AppArmor** are mandatory access control in the kernel, covering
+  the whole syscall surface and confining root. They are strictly stronger as
+  enforcement. CFC answers a question they do not: which program, to which
+  destination, decided interactively.
+- **A hypervisor firewall such as Proxmox `pve-firewall`** evaluates in the
+  kernel with no userspace round trip; the NFQUEUE model is the wrong shape for
+  a hypervisor's connection rate, and it has no idea which process opened
+  anything.
+- **UTM appliances** cover the network perimeter: IDS/IPS, content filtering,
+  VPN, captive portal, and devices that cannot run an agent. A C2 channel over
+  443 to a reputable CDN passes a content filter and is what CFC catches;
+  inbound traffic and an IoT device are what they catch and CFC cannot.
 
 ## The control socket and who can talk to it
 
@@ -662,7 +709,7 @@ it reaches out to, including any network lookup an SSH login needs (the
 opt-in inbound table drops new SSH sessions outright while the daemon is down).
 The full matrix - daemon up or down, table loaded or not, with and
 without `bypass` - is in
-[TROUBLESHOOTING.md](TROUBLESHOOTING.md#fail-open-vs-fail-closed-matrix).
+[troubleshooting](troubleshooting.md#fail-open-vs-fail-closed-matrix).
 Read it before enabling enforcement on a machine you only reach over SSH.
 
 `[nfqueue] fail_open` must be `false`; `true` is rejected. Queue overflow

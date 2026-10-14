@@ -112,7 +112,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --profile fast --locked
 
-  # Compile the true release profile (fat LTO, codegen-units=1, panic=abort)
+  # Compile the true release profile (thin LTO, codegen-units=1, panic=abort)
   # so breakage specific to it is caught before tagging a release.
   release-profile:
     runs-on: ubuntu-latest
@@ -129,7 +129,7 @@ jobs:
       - run: cargo build --workspace --profile release --locked
 
   # Verify the declared MSRV (rust-version in Cargo.toml). notify-rust 4.18
-  # requires 1.89; compile the whole workspace with that toolchain.
+  # requires 1.89; build and test the whole workspace with that toolchain.
   #
   # RUSTUP_TOOLCHAIN is what actually pins this job. dtolnay/rust-toolchain
   # only runs `rustup default <toolchain>`, and the repo's root
@@ -170,7 +170,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libnfnetlink-dev libnetfilter-queue-dev
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
 
   # Static validation of the Arch packaging. Fast, deterministic, and a
   # hard gate: syntax, .SRCINFO generation and namcap need no network and
@@ -332,7 +332,7 @@ jobs:
           etc/xdg/autostart/colony-firewall.desktop
           usr/share/icons/hicolor/scalable/apps/colony-firewall.svg
           etc/colony-firewall/daemon.toml
-          usr/share/doc/colony-firewall-control-git/TROUBLESHOOTING.md
+          usr/share/doc/colony-firewall-control-git/troubleshooting.md
           usr/share/doc/colony-firewall-control-git/first-run.md
           EOF
           exit "${missing}"

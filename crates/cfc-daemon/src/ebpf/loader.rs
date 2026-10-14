@@ -951,7 +951,7 @@ pub(super) fn load_and_attach(
                 return;
             }
             // The whole DNS parse happens here, in userspace, because it could
-            // not happen in the kernel: see `crates/cfc-ebpf/README.md`. It is
+            // not happen in the kernel: see `docs/internals/architecture.md`. It is
             // bounded by construction - `MAX_ANSWERS` records, `MAX_LABELS`
             // labels each, `MAX_LABEL_JUMPS` backwards-only compression jumps -
             // so a hostile packet costs a fixed, small amount of work on this
@@ -1135,7 +1135,7 @@ fn drop_stale_link_pin(path: &Path) -> anyhow::Result<()> {
 ///
 /// Worth a line because that number is a *budget*: the kernel gives a program
 /// 1,000,000 and rejects it at 1,000,001, and the DNS observer used to be on
-/// the wrong side of that (see `crates/cfc-ebpf/README.md`). Logging it turns
+/// the wrong side of that (see `docs/internals/architecture.md`). Logging it turns
 /// "a change made the program more expensive" into something visible before it
 /// becomes "the program stopped loading on someone else's kernel".
 pub(super) fn verifier_cost(
@@ -1337,7 +1337,12 @@ where
         .ok_or_else(|| anyhow!("no map named `{name}` in the object"))?;
     let ring: RingBuf<MapData> = RingBuf::try_from(map)
         .with_context(|| format!("`{name}` is not a ring buffer (BPF_MAP_TYPE_RINGBUF)"))?;
-    let mut fd = AsyncFd::new(ring).with_context(|| format!("registering `{name}` with tokio"))?;
+    // SAFETY: the `RingBuf` owns its `MapData`, which owns the map fd, and the
+    // `AsyncFd` owns the `RingBuf`: the fd stays open and unchanged until the
+    // `AsyncFd` is dropped, and `as_raw_fd` always returns that same fd.
+    let mut fd = unsafe { AsyncFd::register(ring) }
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("registering `{name}` with tokio"))?;
     let name = name.to_string();
 
     Ok(tokio::spawn(async move {

@@ -5,8 +5,9 @@ Tracking the port from opensnitch (Go daemon + Python Qt UI) to Rust.
 Phases 0-3 are done and have since been through a hardening pass
 (Phase 3.5). The eBPF backend and the system tray have since landed
 too; the whitelist fast path landed and was later removed (see
-`TODO.md` 1a). What is left is
-VirusTotal lookups, the Colony store listing and publishing to the AUR.
+[The eBPF layer](../internals/architecture.md#the-ebpf-layer)). What is left
+is VirusTotal lookups, publishing to the AUR, and the [open work](#open-work)
+found by using it.
 
 ## Phase 0 - Foundation [done]
 
@@ -169,22 +170,68 @@ end to end on kernel 7.1.8.
       the hostname cache. The kernel gates and copies; the parser runs
       in userspace, because the in-kernel version hit the verifier's
       1,000,000-instruction complexity limit (see
-      `crates/cfc-ebpf/README.md` for the full write-up)
+      [Why the DNS parsing is in userspace](../internals/architecture.md#why-the-dns-parsing-is-in-userspace))
 - [x] Whitelist fast path for already-allowed flows (`[ebpf]
       fast_allow`): removed. Allowed TCP connects were marked with
       SO_MARK at connect time and accepted ahead of the queue rule, and
       a socket mark does not attest which process sends, so it opened
-      bypasses; see `TODO.md` 1a
+      bypasses; see [open work](#open-work)
 
 ## Phase 5 - Polish
 
 - [ ] VirusTotal lookup integration (optional, opt-in)
 - [x] Profile presets: relaxed / balanced / strict
 - [x] Import rules from opensnitch JSON
-- [ ] Colony app store listing (needs a root `colony.json` in Colony's real
-      schema; the store installs one per-user binary, never units or tables)
+- [x] Colony app store listing (the root `colony.json`; the store installs
+      the app alone for the user, never units or tables)
 - [x] AUR PKGBUILD draft (now AUR-ready in `packaging/arch/`; not yet published,
       signed release pending)
 - [x] Shell completions + man pages
 - [x] Persistent verdict log (`cfc log`)
 - [ ] Publish to the AUR
+
+## Open work
+
+Found by using it, ordered by what would change the most.
+
+- [ ] **An in-kernel Allow with sender attestation.** Fast Allow marked the
+      sockets of a process a lasting Allow covered, and a socket mark does
+      not attest the current sender, so it opened bypasses and was removed.
+      Bringing an in-kernel Allow back needs a design that verifies current
+      socket ownership and revocation. Until then allowed flows use NFQUEUE,
+      whose remaining cost still warrants measurement and optimisation with
+      the same policy semantics (see [benchmarks](../internals/benchmarks.md)).
+- [ ] **In-kernel enforcement for rules that depend on a destination.**
+      `process_wide_action` deliberately answers `None` for them, which is
+      correct and also means a program with a port-scoped rule gets no
+      in-kernel enforcement at all. A destination-keyed map would fix it and
+      is a much larger design: the kernel side would need to match addresses,
+      and every DNS-name rule would have to be resolved to addresses in
+      advance.
+- [ ] **Run the SELinux policy on an enforcing host.** It compiles against
+      the real `selinux-policy-devel` of Rocky 9 and Fedora, which proves
+      every type and interface it names exists there, not that its rules are
+      sufficient. The [validation protocol](../internals/selinux.md#validating-the-policy-on-an-enforcing-host)
+      is ready for whoever has an enforcing VM.
+- [ ] **Build the RPM on Rocky 9 itself.** The `rhel` workflow builds,
+      installs and verifies the package in a Fedora container. Rocky 9's own
+      path, the `rust-toolset` module (its default repositories stop short of
+      the 1.89 MSRV), is untried, so "the deployment target can build this
+      package" is still an assumption.
+- [ ] **Watch package provenance inside the unit's sandbox.** The rpm
+      backend runs `rpm -qa` as a child of the daemon, under its
+      `SystemCallFilter`, `ProtectSystem=strict` and
+      `MemoryDenyWriteExecute`. It degrades safely (a warning and an empty
+      index) but has not been observed working there.
+- [ ] **Confirm the tray icon fallback on quickshell/Noctalia.** Without the
+      installed theme icon, the tray writes its SVG under
+      `$XDG_RUNTIME_DIR/cfc-tray/icons` and exports it through
+      `IconThemePath`. That is unit-tested, but nobody has yet watched
+      quickshell/Noctalia, the host that showed a placeholder, render it on a
+      machine without the package.
+- [ ] **Decide how the AUR package gets the eBPF object.** On Arch `rustup`
+      conflicts with `rust`, so `-Z build-std` fails inside `makepkg` and an
+      AUR install runs on `sock_diag` + `/proc`. The ways out: leave it (the
+      release tarball has the object), ship the object as a second `source=()`
+      from the release assets (the one shipped component no AUR user builds
+      from source), or provision a chroot with rustup and bpf-linker.
