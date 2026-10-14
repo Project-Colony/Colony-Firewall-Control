@@ -5,7 +5,7 @@
 
 pkgname=colony-firewall-control
 # x-release-please-start-version
-pkgver=0.9.0
+pkgver=0.9.1
 # x-release-please-end
 pkgrel=1
 pkgdesc="Application-aware outbound firewall for Linux, written in Rust"

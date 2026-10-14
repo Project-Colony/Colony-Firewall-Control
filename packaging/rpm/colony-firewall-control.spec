@@ -12,7 +12,7 @@
 
 Name:           colony-firewall-control
 # x-release-please-start-version
-Version:        0.9.0
+Version:        0.9.1
 # x-release-please-end
 Release:        1%{?dist}
 Summary:        Application-aware outbound firewall for Linux
