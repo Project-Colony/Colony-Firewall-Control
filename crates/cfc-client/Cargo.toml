@@ -21,3 +21,5 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 # close_range(2) and prctl(2) for `seal_official_process`.
 libc = { workspace = true }
+# The config directory for `preferences_file`, asked the way colony-ui asks.
+dirs = "6.0.0"

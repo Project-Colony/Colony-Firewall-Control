@@ -828,7 +828,7 @@ async fn unattributed_prompt_is_delivered_to_any_session() {
 /// production the daemon is root, so this is root; here it is what lets every
 /// other round trip in this file run unprivileged. Who else may change what
 /// (the official app and tray, read-only peers, polkit) is pinned by the
-/// `authorization_table` unit test in `src/ipc.rs`, which can fake peers this
+/// `authorization_table` unit test in `src/ipc/tests.rs`, which can fake peers this
 /// single-uid process cannot be.
 #[tokio::test]
 async fn the_daemons_own_uid_has_full_control() {
