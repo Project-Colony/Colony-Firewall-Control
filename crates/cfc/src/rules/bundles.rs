@@ -362,7 +362,7 @@ pub async fn bundle_remove(
 /// `cfc rules bootstrap-defaults`, kept as the name people already know.
 ///
 /// Exactly `bundle add system`. It predates bundles and is referenced from the
-/// README, the packaging notes and TROUBLESHOOTING, so it stays - but there is
+/// README, the packaging notes and the troubleshooting guide, so it stays - but there is
 /// only one implementation behind the two spellings.
 pub async fn bootstrap_defaults(
     client: &mut Client,

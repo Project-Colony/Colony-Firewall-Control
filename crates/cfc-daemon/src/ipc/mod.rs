@@ -43,7 +43,7 @@
 //! lets the installed app and tray connect; changes come from those two
 //! programs or from `sudo cfc`. Code running *inside* the official app (a
 //! preloaded payload that moved itself to anonymous memory, synthetic X11
-//! input) is still trusted; see docs/HARDENING.md.
+//! input) is still trusted; see docs/guide/hardening.md.
 //!
 //! # Prompt ownership
 //!
