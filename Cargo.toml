@@ -88,7 +88,7 @@ libc = "0.2.190"
 sha2 = "0.11.1"
 # D-Bus: polkit CheckAuthorization on the system bus in the daemon (pause,
 # resume, rule import), and notification answers on the session bus in the tray.
-zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+zbus = { version = "6.0.0", default-features = false, features = ["tokio"] }
 
 # UI
 colony-ui = "0.1.6"
