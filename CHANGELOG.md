@@ -6,6 +6,13 @@ After 0.8.0, release-please writes each section from the conventional
 commits merged since the previous release; 0.8.0 and earlier were written by
 hand in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [0.9.1](https://github.com/Project-Colony/Colony-Firewall-Control/compare/v0.9.0...v0.9.1) (2026-10-14)
+
+
+### Documentation
+
+* bring back the table of known limits that are not bugs ([#83](https://github.com/Project-Colony/Colony-Firewall-Control/issues/83)) ([aa928c2](https://github.com/Project-Colony/Colony-Firewall-Control/commit/aa928c2c7545db7d900e11801e72d9afa367db9c))
+
 ## [0.9.0](https://github.com/Project-Colony/Colony-Firewall-Control/compare/v0.8.0...v0.9.0) (2026-10-14)
 
 

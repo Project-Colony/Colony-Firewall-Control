@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "cfc"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "cfc-client",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-client"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "cfc-core",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "chrono",
  "ipnet",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-daemon"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "aya",
@@ -826,11 +826,11 @@ dependencies = [
 
 [[package]]
 name = "cfc-ebpf-proto"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "cfc-proto"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "prost",
  "tonic",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-tray"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "cfc-client",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-ui"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "cfc-client",
  "cfc-core",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-xtask"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "cfg-if"

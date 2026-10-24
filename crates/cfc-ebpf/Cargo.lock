@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "cfc-ebpf-proto"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "itoa"
