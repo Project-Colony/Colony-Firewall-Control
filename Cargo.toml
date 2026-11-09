@@ -19,7 +19,7 @@ exclude = ["crates/cfc-ebpf"]
 [workspace.package]
 version = "0.9.1" # x-release-please-version
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.99"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Project-Colony/Colony-Firewall-Control"
 authors = ["MotherSphere <linhajahad@gmail.com>"]
@@ -41,7 +41,7 @@ cfc-ebpf-proto = { path = "crates/cfc-ebpf-proto" }
 # and nothing at build time beyond aya itself: aya is pure Rust and needs no
 # bpf-linker, no nightly and no BPF-capable kernel to compile. aya 0.14 pairs
 # with the aya-ebpf 0.2.x the kernel-side crate uses, and declares
-# rust-version 1.87, comfortably inside this workspace's 1.89 MSRV.
+# rust-version 1.87, comfortably inside this workspace's 1.99 MSRV.
 aya = "0.14.0"
 
 # IPC

@@ -12,7 +12,7 @@
 #      actually has.
 #   2. the spec parses and produces a source RPM, with `rpmlint` on top.
 #   3. the package builds, installs and verifies end to end - in a Fedora
-#      container, not on Rocky 9, because the workspace's MSRV is 1.89 and
+#      container, not on Rocky 9, because the workspace's MSRV is 1.99 and
 #      Rocky 9's default repos do not reach it. The Rocky-native path
 #      (`rust-toolset`) remains untried; docs/project/roadmap.md says so rather than
 #      letting a green Fedora build imply the deployment target can build it.
@@ -318,7 +318,7 @@ jobs:
         # instead of a toolchain bootstrap. Fedora RPMs, so they fit a
         # Fedora VM; a Rocky 9 host still has to build by hand until
         # rust-toolset is tried.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rpms-fedora
           path: |
