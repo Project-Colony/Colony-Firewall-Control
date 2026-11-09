@@ -63,7 +63,7 @@ jobs:
     # ubuntu-24.04, not ubuntu-latest: on the ubuntu-26.04 image two process
     # resolution tests (a_deleted_image_keeps_its_suffix_in_another_user_namespace,
     # a_user_writable_binary_gets_its_allow_hash_bound) resolve the exe of a
-    # copied /usr/bin/sleep as <unknown>. Unpin once that is understood.
+    # copied /usr/bin/sleep as <unknown> (issue #95). Unpin once that is understood.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,8 +132,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --workspace --profile release --locked
 
-  # Verify the declared MSRV (rust-version in Cargo.toml): build and test the
-  # whole workspace with that toolchain.
+  # Verify the declared MSRV (rust-version in Cargo.toml). ordered-float 5.5
+  # (through iced's wgpu-hal) requires 1.90; build and test the whole
+  # workspace with that toolchain.
   #
   # RUSTUP_TOOLCHAIN is what actually pins this job. dtolnay/rust-toolchain
   # only runs `rustup default <toolchain>`, and the repo's root
@@ -144,12 +145,12 @@ jobs:
   msrv:
     runs-on: ubuntu-24.04
     env:
-      RUSTUP_TOOLCHAIN: "1.99"
+      RUSTUP_TOOLCHAIN: "1.90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.99"
+          toolchain: "1.90"
       - name: Assert the toolchain in use really is the MSRV
         run: |
           # Keep in sync with rust-version in [workspace.package].

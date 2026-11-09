@@ -216,7 +216,7 @@ Found by using it, ordered by what would change the most.
 - [ ] **Build the RPM on Rocky 9 itself.** The `rhel` workflow builds,
       installs and verifies the package in a Fedora container. Rocky 9's own
       path, the `rust-toolset` module (its default repositories stop short of
-      the 1.99 MSRV), is untried, so "the deployment target can build this
+      the 1.90 MSRV), is untried, so "the deployment target can build this
       package" is still an assumption.
 - [ ] **Watch package provenance inside the unit's sandbox.** The rpm
       backend runs `rpm -qa` as a child of the daemon, under its
