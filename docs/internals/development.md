@@ -1,6 +1,6 @@
 # Development
 
-Requires Rust stable (MSRV 1.89, gated in CI) and `protobuf-compiler`.
+Requires Rust stable (MSRV 1.90, gated in CI) and `protobuf-compiler`.
 On Debian/Ubuntu:
 
 ```sh

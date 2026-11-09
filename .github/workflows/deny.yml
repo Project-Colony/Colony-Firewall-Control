@@ -19,11 +19,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # cargo-deny runs on the runner with the pinned toolchain, not inside
+      # the cargo-deny-action container, which does not ship the toolchain
+      # that rust-toolchain.toml names.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          command: check
-          # Explicit, not inherited. aya arrives through the `ebpf` feature,
-          # and whether an unqualified `check` scans optional dependencies is
-          # an action default nobody here has pinned. Say --all-features so the
-          # advisory scan provably covers the ring-0 layer's dependency tree.
-          arguments: --all-features
+          toolchain: "1.99.1"
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny@0.20.2
+      # --all-features is explicit, not inherited. aya arrives through the
+      # `ebpf` feature; say it so the advisory scan provably covers the ring-0
+      # layer's dependency tree.
+      - run: cargo deny --all-features check

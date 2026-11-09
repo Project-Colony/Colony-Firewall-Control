@@ -21,7 +21,7 @@ use crate::ipc::PeerId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use zbus::zvariant::Value;
+use zbus::Variant;
 
 /// Pause or resume filtering (`SetPaused`, both directions).
 pub const PAUSE: &str = "org.projectcolony.firewall.pause";
@@ -46,7 +46,7 @@ const ALLOW_USER_INTERACTION: u32 = 1;
 trait Authority {
     fn check_authorization(
         &self,
-        subject: &(&str, HashMap<&str, Value<'_>>),
+        subject: &(&str, HashMap<&str, Variant<'_>>),
         action_id: &str,
         details: HashMap<&str, &str>,
         flags: u32,
@@ -73,7 +73,6 @@ pub async fn check(peer: PeerId, action: &'static str) -> Result<(), String> {
         )
     };
     let bus = zbus::connection::Builder::system()
-        .map_err(unreachable)?
         .method_timeout(TIMEOUT + Duration::from_secs(10))
         .build()
         .await
@@ -86,10 +85,10 @@ pub async fn check(peer: PeerId, action: &'static str) -> Result<(), String> {
     let subject = (
         "unix-process",
         HashMap::from([
-            ("pid", Value::from(pid)),
+            ("pid", Variant::from(pid)),
             // Clock ticks since boot, the same field 22 polkit reads.
-            ("start-time", Value::from(start_time)),
-            ("uid", Value::from(peer.uid as i32)),
+            ("start-time", Variant::from(start_time)),
+            ("uid", Variant::from(peer.uid as i32)),
         ]),
     );
     let cancellation = format!("cfc-{pid}-{}", NEXT.fetch_add(1, Ordering::Relaxed));
@@ -205,7 +204,6 @@ mod tests {
     #[test]
     fn service_unknown_maps_to_not_installed() {
         let message = zbus::message::Message::method_call("/", "CheckAuthorization")
-            .unwrap()
             .build(&())
             .unwrap();
         let unknown = zbus::Error::MethodError(

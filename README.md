@@ -175,7 +175,7 @@ cd Colony-Firewall-Control
 cargo build --workspace --release --locked
 ```
 
-Requires Rust 1.89 or newer and `protobuf-compiler`. Installing the build by
+Requires Rust 1.90 or newer and `protobuf-compiler`. Installing the build by
 hand (binaries, units, nftables ruleset, group, polkit policy) is in
 [docs/guide/first-run.md](docs/guide/first-run.md#manual-install); building
 and testing for development is in [docs/internals/development.md](docs/internals/development.md).

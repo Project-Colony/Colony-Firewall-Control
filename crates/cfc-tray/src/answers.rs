@@ -38,10 +38,10 @@ impl Answers {
             .await?;
         let rule = zbus::MatchRule::builder()
             .msg_type(Type::Signal)
-            .sender(owner.as_ref())?
-            .path(PATH)?
-            .interface(SERVER)?
-            .build();
+            .sender(owner.as_ref())
+            .path(PATH)
+            .interface(SERVER)
+            .build()?;
         let stream = MessageStream::for_match_rule(rule, conn, None).await?;
         Ok(Self { owner, stream })
     }
@@ -128,7 +128,6 @@ mod tests {
 
     async fn connect(bus: &Bus) -> zbus::Connection {
         Builder::address(bus.address.as_str())
-            .unwrap()
             .build()
             .await
             .unwrap()
@@ -152,9 +151,7 @@ mod tests {
             return;
         };
         let server = Builder::address(bus.address.as_str())
-            .unwrap()
             .name(SERVER)
-            .unwrap()
             .build()
             .await
             .unwrap();

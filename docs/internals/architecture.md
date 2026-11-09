@@ -1092,7 +1092,7 @@ The kernel-side crate is **not** a member of the root workspace: it is listed un
 `Cargo.lock`. Consequences, all intentional:
 
 * `cargo build --workspace`, `cargo test --workspace`,
-  `cargo clippy --workspace --all-targets` and the MSRV 1.89 check never see
+  `cargo clippy --workspace --all-targets` and the MSRV 1.90 check never see
   the crate and are completely unaffected by it;
 * `aya-ebpf` never enters the root lockfile, so it never widens the `cargo deny`
   surface of the shipped userspace binaries;
