@@ -11,17 +11,7 @@ version = 2
 # Unmaintained crates are surfaced as warnings, not hard failures.
 unmaintained = "workspace"
 yanked = "deny"
-ignore = [
-    # quick-xml 0.37.x / 0.39.x DoS advisories (duplicate-attribute quadratic
-    # scan, unbounded namespace allocation). Both versions reach us only as
-    # BUILD-TIME dependencies: wayland-scanner parses the Wayland protocol XML
-    # files vendored inside the wayland/winit crates, never untrusted input at
-    # runtime. The fixed quick-xml (>= 0.41) is a semver-major bump that must
-    # come from winit/iced upstream.
-    # TODO: drop both ignores when iced/winit update wayland-scanner.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-]
+ignore = []
 
 [licenses]
 version = 2

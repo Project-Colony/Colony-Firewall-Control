@@ -45,29 +45,29 @@ cfc-ebpf-proto = { path = "crates/cfc-ebpf-proto" }
 aya = "0.14.0"
 
 # IPC
-tonic = "0.14.6"
+tonic = "0.14.9"
 prost = "0.14.4"
-tonic-build = "0.14.6"
-tonic-prost = "0.14.6"
-tonic-prost-build = "0.14.6"
+tonic-build = "0.14.9"
+tonic-prost = "0.14.9"
+tonic-prost-build = "0.14.9"
 
 # Async runtime
-tokio = { version = "1.53.3", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 futures = "0.3.34"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 # Storage
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 # Package provenance: pacman stores its per-file sha256 digests in a gzipped
 # mtree. Only the daemon reads a package database.
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-toml = "1.1.8"
+toml = "1.2.1"
 
 # Errors & logging
 thiserror = "2.0.21"
@@ -76,7 +76,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Netfilter / proc
-nfq = "0.2.5"
+nfq = "0.2.6"
 procfs = "0.18.0"
 
 # DNS reverse lookup
@@ -84,11 +84,11 @@ dns-lookup = "4.0.2"
 
 # Process / system
 nix = { version = "0.31.3", features = ["process", "user", "signal"] }
-libc = "0.2.190"
+libc = "0.2.191"
 sha2 = "0.11.1"
 # D-Bus: polkit CheckAuthorization on the system bus in the daemon (pause,
 # resume, rule import), and notification answers on the session bus in the tray.
-zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy", "tracing"] }
 
 # UI
 colony-ui = "0.1.6"
@@ -96,8 +96,8 @@ iced = { version = "0.14.0", features = ["tokio", "advanced", "image", "lazy"] }
 # `images_no_default_features` gives us `Image` (embedded notification
 # icons) without pulling the `image` crate's format decoders: we build
 # the RGBA buffer ourselves and never decode a file.
-notify-rust = { version = "4.18.2", features = ["images_no_default_features"] }
-ksni = "0.3.6"
+notify-rust = { version = "4.19.0", features = ["images_no_default_features"] }
+ksni = "0.3.7"
 
 # CLI
 clap = { version = "4.6.7", features = ["derive"] }
@@ -109,9 +109,9 @@ clap_mangen = "0.3.3"
 owo-colors = { version = "4.4.0", features = ["supports-colors"] }
 
 # Utility
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 chrono = { version = "0.4.45", features = ["serde"] }
-uuid = { version = "1.28.0", features = ["v4", "serde"] }
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
 
 # Tests
