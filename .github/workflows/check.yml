@@ -60,7 +60,11 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: on the ubuntu-26.04 image two process
+    # resolution tests (a_deleted_image_keeps_its_suffix_in_another_user_namespace,
+    # a_user_writable_binary_gets_its_allow_hash_bound) resolve the exe of a
+    # copied /usr/bin/sleep as <unknown>. Unpin once that is understood.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -83,7 +87,7 @@ jobs:
   # would also strip `default = ["std"]` from cfc-ebpf-proto, which builds
   # today only because feature unification puts it back.
   no-ebpf:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -138,7 +142,7 @@ jobs:
   # tested stable. The env var outranks rust-toolchain.toml, and the
   # assertion step below makes a future regression loud instead of silent.
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: "1.99"
     steps:
