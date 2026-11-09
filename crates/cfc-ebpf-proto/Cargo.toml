@@ -2,7 +2,10 @@
 name = "cfc-ebpf-proto"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Not the workspace MSRV: the kernel-side crate also builds this one with the
+# nightly pinned in crates/cfc-ebpf/rust-toolchain.toml (1.98.0-nightly), which
+# cargo refuses for a package that asks for a newer rustc.
+rust-version = "1.89"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
