@@ -11,7 +11,14 @@ version = 2
 # Unmaintained crates are surfaced as warnings, not hard failures.
 unmaintained = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono is declared unmaintained and no maintained release exists to move
+    # to. It is a direct dependency (timestamps in cfc-core, the daemon, the
+    # CLI and the UI) and procfs also pulls it in. Replacing it with jiff or
+    # time is a code migration of its own; until then the advisory is listed
+    # here so it stays visible instead of failing every run.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no fixed release; replacing it is a separate code migration" },
+]
 
 [licenses]
 version = 2
