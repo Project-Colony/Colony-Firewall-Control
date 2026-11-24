@@ -6,6 +6,13 @@ After 0.8.0, release-please writes each section from the conventional
 commits merged since the previous release; 0.8.0 and earlier were written by
 hand in the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [0.9.3](https://github.com/Project-Colony/Colony-Firewall-Control/compare/v0.9.2...v0.9.3) (2026-11-24)
+
+
+### Fixes
+
+* **deps:** update dependencies and Rust to 1.100 ([#102](https://github.com/Project-Colony/Colony-Firewall-Control/issues/102)) ([e3cf924](https://github.com/Project-Colony/Colony-Firewall-Control/commit/e3cf9245a1f19b5399be4e95cdca46c047ed818d))
+
 ## [0.9.2](https://github.com/Project-Colony/Colony-Firewall-Control/compare/v0.9.1...v0.9.2) (2026-11-09)
 
 
