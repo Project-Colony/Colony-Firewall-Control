@@ -2,7 +2,11 @@
 name = "cfc-ebpf-proto"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Not the workspace value: the kernel-side crate builds this one with its dated
+# nightly (crates/cfc-ebpf/rust-toolchain.toml, rustc 1.98.0-nightly), and cargo
+# refuses a dependency whose rust-version is newer than the compiler. 1.90 is
+# the minimum the workspace MSRV job verified for this crate.
+rust-version = "1.90"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
