@@ -42,7 +42,7 @@ cfc-ebpf-proto = { path = "crates/cfc-ebpf-proto" }
 # bpf-linker, no nightly and no BPF-capable kernel to compile. aya 0.14 pairs
 # with the aya-ebpf 0.2.x the kernel-side crate uses, and declares
 # rust-version 1.87, comfortably inside this workspace's 1.100 MSRV.
-aya = "0.14.0"
+aya = "0.16.0"
 
 # IPC
 tonic = "0.14.9"
