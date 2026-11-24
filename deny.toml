@@ -8,15 +8,17 @@
 # the check (this is the default for advisories config v2 -- vulnerabilities
 # are always errors).
 version = 2
-# Unmaintained crates are surfaced as warnings, not hard failures.
+# An unmaintained advisory fails the check when the crate is a direct
+# dependency of a workspace crate.
 unmaintained = "workspace"
 yanked = "deny"
 ignore = [
     # chrono is declared unmaintained and no maintained release exists to move
     # to. It is a direct dependency (timestamps in cfc-core, the daemon, the
     # CLI and the UI) and procfs also pulls it in. Replacing it with jiff or
-    # time is a code migration of its own; until then the advisory is listed
-    # here so it stays visible instead of failing every run.
+    # time is a code migration of its own. Until then the advisory is ignored
+    # so it does not fail every run; cargo-deny no longer reports it, so remove
+    # this entry when chrono goes.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no fixed release; replacing it is a separate code migration" },
 ]
 

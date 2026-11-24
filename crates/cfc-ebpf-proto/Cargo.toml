@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 # Not the workspace value: the kernel-side crate builds this one with its dated
 # nightly (crates/cfc-ebpf/rust-toolchain.toml, rustc 1.98.0-nightly), and cargo
-# refuses a dependency whose rust-version is newer than the compiler. 1.90 is
-# the minimum the workspace MSRV job verified for this crate.
-rust-version = "1.90"
+# refuses a dependency whose rust-version is newer than the compiler. 1.98 is
+# that nightly, which the ebpf workflow builds with. Resolver 3 resolves the
+# root lockfile for the lowest member rust-version, so this is also the floor
+# `cargo update` uses. Move it with the nightly pin.
+rust-version = "1.98"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

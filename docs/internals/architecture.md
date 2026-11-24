@@ -78,7 +78,10 @@ docs/               the guides (guide/), these internals (internals/) and the ro
 
 Every root workspace member inherits `version`, `edition`, `rust-version`,
 `license` and `repository` from `[workspace.package]`, so the whole workspace
-carries one version. Every dependency, internal crates included, is declared
+carries one version. The one exception is the `rust-version` of
+`cfc-ebpf-proto`: it declares 1.98, the nightly that `crates/cfc-ebpf` builds it
+with, and so sets the Rust version that `cargo update` resolves the root
+lockfile for. Every dependency, internal crates included, is declared
 once in `[workspace.dependencies]` with its full version, and members inherit
 it with `workspace = true`. `crates/cfc-ebpf` is excluded from the root workspace: it
 builds for `bpfel-unknown-none` with the nightly pinned in its own

@@ -109,7 +109,9 @@ clap_mangen = "0.3.4"
 owo-colors = { version = "4.4.0", features = ["supports-colors"] }
 
 # Utility
-parking_lot = "0.13.0"
+# Held at 0.12: 0.13 removes the automatic eventual fairness that the daemon's
+# per-packet locks rely on under load.
+parking_lot = "0.12.5"
 chrono = { version = "0.4.45", features = ["serde"] }
 uuid = { version = "1.29.3", features = ["v4", "serde"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
