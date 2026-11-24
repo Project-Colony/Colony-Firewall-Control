@@ -22,12 +22,12 @@ jobs:
       # cargo-deny runs on the runner with the pinned toolchain, not inside
       # the cargo-deny-action container, which does not ship the toolchain
       # that rust-toolchain.toml names.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: "1.99.1"
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+          toolchain: "1.100.0"
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          tool: cargo-deny@0.20.2
+          tool: cargo-deny@0.22.0
       # --all-features is explicit, not inherited. aya arrives through the
       # `ebpf` feature; say it so the advisory scan provably covers the ring-0
       # layer's dependency tree.

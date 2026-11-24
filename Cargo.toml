@@ -19,7 +19,7 @@ exclude = ["crates/cfc-ebpf"]
 [workspace.package]
 version = "0.9.2" # x-release-please-version
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.100"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Project-Colony/Colony-Firewall-Control"
 authors = ["MotherSphere <linhajahad@gmail.com>"]
@@ -41,12 +41,12 @@ cfc-ebpf-proto = { path = "crates/cfc-ebpf-proto" }
 # and nothing at build time beyond aya itself: aya is pure Rust and needs no
 # bpf-linker, no nightly and no BPF-capable kernel to compile. aya 0.14 pairs
 # with the aya-ebpf 0.2.x the kernel-side crate uses, and declares
-# rust-version 1.87, comfortably inside this workspace's 1.90 MSRV.
+# rust-version 1.87, comfortably inside this workspace's 1.100 MSRV.
 aya = "0.14.0"
 
 # IPC
 tonic = "0.14.9"
-prost = "0.14.4"
+prost = "0.14.6"
 tonic-build = "0.14.9"
 tonic-prost = "0.14.9"
 tonic-prost-build = "0.14.9"
@@ -59,7 +59,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 # Storage
-rusqlite = { version = "0.41.1", features = ["bundled"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 # Package provenance: pacman stores its per-file sha256 digests in a gzipped
 # mtree. Only the daemon reads a package database.
 flate2 = "1.1.11"
@@ -67,11 +67,11 @@ flate2 = "1.1.11"
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-toml = "1.2.1"
+toml = "1.2.2"
 
 # Errors & logging
 thiserror = "2.0.21"
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
@@ -83,12 +83,12 @@ procfs = "0.18.0"
 dns-lookup = "4.0.2"
 
 # Process / system
-nix = { version = "0.31.3", features = ["process", "user", "signal"] }
+nix = { version = "0.32.0", features = ["process", "user", "signal"] }
 libc = "0.2.191"
 sha2 = "0.11.1"
 # D-Bus: polkit CheckAuthorization on the system bus in the daemon (pause,
 # resume, rule import), and notification answers on the session bus in the tray.
-zbus = { version = "6.2.1", default-features = false, features = ["tokio", "proxy", "tracing"] }
+zbus = { version = "6.5.0", default-features = false, features = ["tokio", "proxy", "tracing"] }
 
 # UI
 colony-ui = "0.1.6"
@@ -100,18 +100,20 @@ notify-rust = { version = "4.19.0", features = ["images_no_default_features"] }
 ksni = "0.3.7"
 
 # CLI
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 # Completion + man generation live behind hidden `cfc` subcommands so
 # packaging can produce them from the freshly built binary (see
 # packaging/arch/PKGBUILD).
-clap_complete = "4.6.11"
-clap_mangen = "0.3.3"
+clap_complete = "4.6.12"
+clap_mangen = "0.3.4"
 owo-colors = { version = "4.4.0", features = ["supports-colors"] }
 
 # Utility
+# Held at 0.12: 0.13 removes the automatic eventual fairness that the daemon's
+# per-packet locks rely on under load.
 parking_lot = "0.12.5"
 chrono = { version = "0.4.45", features = ["serde"] }
-uuid = { version = "1.29.2", features = ["v4", "serde"] }
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
 
 # Tests
